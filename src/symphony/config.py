@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Literal, Self
 
 import yaml
-from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .agent.codex_models import (
@@ -55,6 +55,14 @@ SUPPORTED_CLAUDE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 # opposite family for cross-family blind-spot diversity. `accept` is dormant.
 RoleName = Literal["implement", "review_find", "review_verify", "fix", "accept"]
 _BUILDER_ROLES: frozenset[str] = frozenset({"implement", "fix", "accept"})
+
+# Roles whose command builder actually threads `effort` through to a dispatch
+# flag (`orchestrator.poll._base._run_agent` → `build_runner_command`).
+# `review_find`/`fix` take no `effort` param and `review_verify`/`accept` are
+# never resolved on any dispatch path at all, so an `effort` cell on any of
+# them is pure dead configuration — rejected in `validate_roles_matrix` rather
+# than silently persisted (SYM-191 review).
+_EFFORT_WIRED_ROLES: frozenset[str] = frozenset({"implement"})
 
 # Legacy top-level role fields the `roles:` matrix supersedes. Each is still
 # honored (mapped into the matrix below) but now warns, and collides loudly
@@ -92,7 +100,13 @@ class RoleConfig(BaseModel):
     the back-compat default for the role, which may itself be `None` (no
     `--model`, CLI default). `effort` is a family-specific literal (like
     `model`) validated in `Config.load`; `effort=None` passes no flag.
+
+    `extra="forbid"`: a typo'd key (e.g. `effr`) would otherwise silently drop
+    under pydantic's default `extra="ignore"`, persisting a cell the operator
+    thinks is set but the daemon never sees (SYM-191 review).
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     agent: Literal["claude", "codex"] | None = None
     model: str | None = None
@@ -563,6 +577,22 @@ class RepoBinding(BaseModel):
         return ResolvedRole(agent=agent, model=model, effort=effort)
 
 
+def _synthetic_matrix_validation_binding() -> RepoBinding:
+    """A placeholder binding used only to family/effort-check the *global*
+    roles matrix when there are zero real bindings to loop over (SYM-191
+    review). Every field but the required identity/`states` ones takes its
+    class default, so a role resolves exactly as it would for a brand-new
+    default binding — good enough to catch an invalid global cell before it's
+    persisted; `config_crud._reject_unsupported_efforts` reuses it for the
+    same reason.
+    """
+    return RepoBinding(
+        project_key="_global_",
+        github_repo="_global_",
+        states=TrackerStates(ready="_global_"),
+    )
+
+
 def binding_natural_key(binding: RepoBinding) -> tuple[str, str, str, str, str]:
     """The binding's natural key — the components the orchestrator's
     `_binding_key` uses, in the same order (project key, github repo, issue
@@ -757,8 +787,15 @@ class Config(BaseModel):
         Public so `effective_config.assemble_effective_config` can re-run it
         after a `model_copy` (which, unlike normal construction, skips model
         validators) swaps in DB-sourced bindings/roles.
+
+        A fresh DB has zero `self.repos`, which would otherwise skip this
+        entire loop and let an invalid *global* cell (e.g. `effort: "turbo"`)
+        save silently — the operator then can't create a first binding
+        either, since assembly re-validates the now-stored global cell
+        (SYM-191 review). Falling back to a synthetic default-shaped binding
+        family/effort-checks the global matrix on its own.
         """
-        for binding in self.repos:
+        for binding in self.repos or [_synthetic_matrix_validation_binding()]:
             self._reject_legacy_matrix_conflicts(binding)
             declared = set(self.roles) | set(binding.roles)
             for name in declared:
@@ -772,6 +809,17 @@ class Config(BaseModel):
                 ) or (global_role is not None and global_role.effort is not None)
                 if not (explicit_model or explicit_effort):
                     continue
+                if explicit_effort and name not in _EFFORT_WIRED_ROLES:
+                    # Only `implement`'s command builder threads `effort`
+                    # through to a dispatch flag — persisting it on any other
+                    # role would look effective in the resolved matrix while
+                    # every dispatch path silently ignores it (SYM-191
+                    # review).
+                    raise ValueError(
+                        f"role {name!r} does not support an effort override; "
+                        f"effort only reaches dispatch for the "
+                        f"{sorted(_EFFORT_WIRED_ROLES)!r} role(s)"
+                    )
                 role = binding.resolved_role(name, self.roles)
                 if explicit_model and not _role_model_in_family(role.agent, role.model):
                     if role.agent == "codex":
@@ -782,27 +830,37 @@ class Config(BaseModel):
                         f"role {name!r}: unknown {family} model {role.model!r}; "
                         f"supported: {', '.join(supported)}"
                     )
-                if explicit_effort:
-                    # The effort/model pair is validated together (a model can
-                    # constrain its valid efforts), and only the model pins the
-                    # family — so effort without an explicit model can't be
-                    # checked locally.
-                    if not explicit_model:
-                        raise ValueError(
-                            f"role {name!r}: effort {role.effort!r} requires an "
-                            f"explicit model (the effort/model pair can't be "
-                            f"validated otherwise)"
-                        )
-                    if not _role_effort_in_family(role.agent, role.effort):
-                        if role.agent == "codex":
-                            family, supported = "Codex", sorted(SUPPORTED_CODEX_EFFORTS)
-                        else:
-                            family, supported = "Claude", sorted(SUPPORTED_CLAUDE_EFFORTS)
-                        raise ValueError(
-                            f"role {name!r}: unknown {family} effort "
-                            f"{role.effort!r}; supported: "
-                            f"{', '.join(supported)}"
-                        )
+                if explicit_effort and role.agent == "claude" and role.model is None:
+                    # No model resolves (the ordinary default: claude builders
+                    # pass no `--model`), so there is no known model to check
+                    # the effort against, and the CLI's own default model may
+                    # not support it — fail closed here rather than letting
+                    # the mismatch surface only at dispatch (SYM-191 review).
+                    raise ValueError(
+                        f"role {name!r} sets effort {role.effort!r} for claude with no "
+                        "resolved model; pin an explicit model on this role to set an "
+                        "effort override"
+                    )
+                if explicit_effort and not _role_effort_in_family(role.agent, role.effort):
+                    # The effort is family-checked against the *resolved* role,
+                    # not the explicit cell: server-side assembly resolves the
+                    # inherited agent (and model) so an effort override over an
+                    # inherited model still validates (SYM-191). The exact
+                    # `(model, effort)` capability pair is a separate online
+                    # check the save path and preflight run.
+                    if role.agent == "codex":
+                        family, supported = "Codex", sorted(SUPPORTED_CODEX_EFFORTS)
+                    else:
+                        family, supported = "Claude", sorted(SUPPORTED_CLAUDE_EFFORTS)
+                    raise ValueError(
+                        f"role {name!r}: unknown {family} effort "
+                        f"{role.effort!r}; supported: "
+                        f"{', '.join(supported)}"
+                    )
+            if not self.repos:
+                # The synthetic binding isn't a real one; its own diversity
+                # posture isn't the operator's to fix here.
+                continue
             implement = binding.resolved_role("implement", self.roles)
             for review_name in ("review_find", "review_verify"):
                 review = binding.resolved_role(review_name, self.roles)

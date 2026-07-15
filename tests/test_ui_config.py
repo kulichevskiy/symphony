@@ -29,7 +29,7 @@ def _config() -> Config:
                 max_concurrent=3,
                 webhook_secret=SECRET,
                 env={"MY_TOKEN": SECRET},
-                roles={"review_find": RoleConfig(agent="claude", model="opus", effort="high")},
+                roles={"review_find": RoleConfig(agent="claude", model="opus")},
                 states=TrackerStates(ready="Ready"),
             )
         ],
@@ -73,7 +73,7 @@ async def test_config_returns_bindings_roles_and_caps() -> None:
     assert binding["roles"]["review_find"] == {
         "agent": "claude",
         "model": "opus",
-        "effort": "high",
+        "effort": None,
     }
     # A role with no override resolves from the binding's legacy agent.
     assert binding["roles"]["implement"]["agent"] == "codex"

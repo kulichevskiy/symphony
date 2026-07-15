@@ -21,6 +21,18 @@ class ConfigGlobals:
     version: int = 1
 
 
+class StaleVersionError(Exception):
+    """Optimistic-locking conflict on the single global-config row: the stored
+    `version` no longer matches the one the caller loaded (a concurrent edit).
+    Carries the current version so the API can render it."""
+
+    def __init__(self, current_version: int) -> None:
+        self.current_version = current_version
+        super().__init__(
+            f"config globals version conflict (current={current_version}); reload and retry"
+        )
+
+
 async def get(conn: aiosqlite.Connection) -> ConfigGlobals | None:
     """Return the global-config document, or `None` if it was never written."""
     cur = await conn.execute("SELECT roles, migrated_at, version FROM config_globals WHERE id = 1")
@@ -60,3 +72,60 @@ async def set_globals(
     )
     if commit:
         await conn.commit()
+
+
+async def update_roles(
+    conn: aiosqlite.Connection,
+    *,
+    roles: dict[str, Any],
+    expected_version: int,
+    commit: bool = True,
+) -> int:
+    """Replace the global roles matrix under optimistic locking.
+
+    The write only lands when the stored `version` still equals
+    `expected_version` (0 when no row exists yet — a fresh, never-migrated DB);
+    otherwise a `StaleVersionError` is raised. `migrated_at` is preserved. On
+    success `version` is bumped to `expected_version + 1` and returned.
+
+    The check-and-write is a single conditional `UPDATE`/`INSERT` statement,
+    not a separate `SELECT` followed by a write — SQLite serializes each
+    statement at the file-lock level, so this stays atomic across concurrent
+    connections/processes racing on the same `expected_version` (unlike a
+    read-then-upsert, where two writers could both read the same current
+    version before either writes).
+    """
+    new_version = expected_version + 1
+    payload = json.dumps(roles, separators=(",", ":"))
+    if expected_version == 0:
+        # No row exists yet at any version >= 1 (see schema default), so a
+        # fresh DB's first write is an insert guarded against a racing first
+        # write rather than an update keyed on a stored version.
+        cur = await conn.execute(
+            """
+            INSERT INTO config_globals (id, roles, migrated_at, version)
+            SELECT 1, ?, '', ?
+             WHERE NOT EXISTS (SELECT 1 FROM config_globals WHERE id = 1)
+            """,
+            (payload, new_version),
+        )
+    else:
+        cur = await conn.execute(
+            """
+            UPDATE config_globals
+               SET roles = ?, version = ?
+             WHERE id = 1 AND version = ?
+            """,
+            (payload, new_version, expected_version),
+        )
+    if cur.rowcount != 1:
+        current = await get(conn)
+        # The conditional INSERT/UPDATE above already opened a write
+        # transaction even though it matched zero rows; leaving it open would
+        # hold the connection's write lock until some later, unrelated
+        # commit/rollback (SYM-191 review).
+        await conn.rollback()
+        raise StaleVersionError(current.version if current is not None else 0)
+    if commit:
+        await conn.commit()
+    return new_version

@@ -41,8 +41,12 @@ ui:
 #           default (no `--model` flag).
 #   effort: reasoning effort. Codex roles translate it to
 #           `--config model_reasoning_effort=<v>` (minimal | low | medium |
-#           high); Claude roles have no effort knob. Setting effort requires
-#           an explicit model on the same role. Unset → the CLI default.
+#           high); Claude roles pass `--effort` (low | medium | high | xhigh |
+#           max), and support varies per model (e.g. sonnet offers fewer tiers
+#           than opus) — checked against the resolved role's model at save
+#           time. An explicit model on the same role isn't required: an
+#           effort override validates against whatever model the role
+#           resolves to (its own, or inherited). Unset → the CLI default.
 # All-unset reproduces today's behavior exactly. The example below puts the
 # builder on claude and the reviewer on codex (the historical default).
 roles:
@@ -66,17 +70,17 @@ repos:
     github_repo: org/api-svc
     # Per-binding `roles:` override — deep-merges per field over the global
     # `roles:` above. Here the global default already puts the builder on
-    # claude and the reviewer on codex; this binding only pins its
-    # implementer to Sonnet and spends extra reasoning effort on the
-    # adversarial verifier (codex `review_verify`, with an explicit model
-    # since effort requires one). Everything unset falls back to the global
-    # cell, then to today's CLI default.
+    # claude and the reviewer on codex; this binding pins its implementer to
+    # Sonnet and spends extra reasoning effort on it (`effort` only reaches
+    # dispatch for `implement` — see `_EFFORT_WIRED_ROLES`), and pins the
+    # adversarial verifier to a specific codex model. Everything unset falls
+    # back to the global cell, then to today's CLI default.
     roles:
       implement:
         model: sonnet
+        effort: high
       review_verify:
         model: gpt-5.1-codex
-        effort: high
     local_review: true
     remote_review: true
     issue_label: symphony

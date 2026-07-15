@@ -1273,7 +1273,10 @@ repos:
         Config.load(p)
 
 
-def test_roles_effort_without_model_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_roles_effort_without_model_validates_resolved_role(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """An effort override with no explicit model is family-checked against the
+    *resolved* role (SYM-191 relaxation): agent codex + effort `high` resolves
+    to a codex role and validates, no explicit model required."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
 repos:
@@ -1287,7 +1290,50 @@ repos:
 """
     p = tmp_path / "cfg.yaml"
     p.write_text(raw)
-    with pytest.raises(ValidationError, match="effort.*requires.*model"):
+    cfg = Config.load(p)
+    assert cfg.repos[0].resolved_role("implement", cfg.roles).effort == "high"
+
+
+def test_roles_effort_without_model_bad_family_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """The resolved-role effort check still rejects an effort outside the
+    resolved agent's family even with no explicit model: agent codex + effort
+    `xhigh` (a Claude-only level) fails against the resolved codex role."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: codex
+    roles:
+      implement:
+        effort: xhigh
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError, match="unknown Codex effort"):
+        Config.load(p)
+
+
+def test_roles_effort_without_model_claude_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A claude effort override with no model anywhere in the chain fails
+    closed even when the effort is in the Claude family: there is no resolved
+    model to check it against, and the CLI's own default model may not
+    support it (SYM-191 review)."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    agent: claude
+    roles:
+      implement:
+        effort: max
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError, match="no resolved model"):
         Config.load(p)
 
 
@@ -1445,11 +1491,11 @@ def test_roles_effort_unset_defaults_to_none() -> None:
 
 
 def test_roles_effort_resolves_per_field_over_global(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """Global `roles` effort default + per-binding override deep-merge per field.
-
-    Effort requires an explicit model (validated as a pair), so each role pins
-    a codex model; the assertion is about which `effort` wins per field.
-    """
+    """Global `roles` effort default + per-binding override deep-merge per
+    field: a binding's own override wins; a binding with none falls back to
+    the global default. `effort` only wires for `implement`
+    (`test_roles_effort_rejected_for_unwired_role` covers the other roles),
+    so this exercises the merge with implement alone."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
 roles:
@@ -1457,10 +1503,6 @@ roles:
     agent: codex
     model: gpt-5.1-codex
     effort: medium
-  review_find:
-    agent: codex
-    model: gpt-5.1-codex
-    effort: high
 repos:
   - linear_team_key: ENG
     github_repo: org/repo
@@ -1468,10 +1510,34 @@ repos:
       implement:
         effort: low
 {_BINDING_STATES}
+  - linear_team_key: WEB
+    github_repo: org/web
+{_BINDING_STATES}
 """
     p = tmp_path / "cfg.yaml"
     p.write_text(raw)
     cfg = Config.load(p)
-    binding = cfg.repos[0]
-    assert binding.resolved_role("implement", cfg.roles).effort == "low"
-    assert binding.resolved_role("review_find", cfg.roles).effort == "high"
+    assert cfg.repos[0].resolved_role("implement", cfg.roles).effort == "low"
+    assert cfg.repos[1].resolved_role("implement", cfg.roles).effort == "medium"
+
+
+@pytest.mark.parametrize("role", ["review_find", "review_verify", "fix", "accept"])
+def test_roles_effort_rejected_for_unwired_role(role: str, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Only `implement`'s command builder threads `effort` through to a
+    dispatch flag; an `effort` cell on any other role is dead configuration
+    that would otherwise look effective in the resolved matrix while every
+    dispatch path silently ignores it (SYM-191 review)."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    roles:
+      {role}:
+        effort: high
+{_BINDING_STATES}
+"""
+    p = tmp_path / "cfg.yaml"
+    p.write_text(raw)
+    with pytest.raises(ValidationError, match="does not support an effort override"):
+        Config.load(p)

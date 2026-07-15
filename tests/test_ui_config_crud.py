@@ -758,7 +758,11 @@ async def test_duplicate_rejected_across_jira_bindings_relying_on_global_base_ur
 
 
 @pytest.mark.asyncio
-async def test_options_payload(tmp_path: Path) -> None:
+async def test_options_payload(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        return None
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
     conn, db_path = await _open(tmp_path)
     try:
         app = _app(conn, db_path)
@@ -817,5 +821,622 @@ async def test_crud_router_not_mounted_when_yaml_owns_topology(tmp_path: Path) -
         assert options.status_code == 404
         assert bindings.status_code == 404
         assert created.status_code == 404
+    finally:
+        await conn.close()
+
+
+# --- global roles matrix (SYM-191) -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_roles_get_put_round_trip(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            # Fresh DB: no globals row yet → empty matrix at version 0.
+            got = await client.get("/api/config/roles")
+            assert got.status_code == 200
+            assert got.json() == {"roles": {}, "version": 0}
+
+            put = await client.put(
+                "/api/config/roles",
+                json={"roles": {"implement": {"agent": "codex"}}, "version": 0},
+            )
+            assert put.status_code == 200, put.text
+            assert put.json()["version"] == 1
+            assert put.json()["roles"] == {"implement": {"agent": "codex"}}
+
+            reread = await client.get("/api/config/roles")
+            assert reread.json() == {
+                "roles": {"implement": {"agent": "codex"}},
+                "version": 1,
+            }
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_roles_put_rejects_bad_effort_with_zero_bindings(tmp_path: Path) -> None:
+    """A fresh DB has no bindings for the family/effort loop to walk — the
+    global matrix must still be validated on its own (SYM-191 review)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            put = await client.put(
+                "/api/config/roles",
+                json={
+                    "roles": {"implement": {"agent": "claude", "effort": "turbo"}},
+                    "version": 0,
+                },
+            )
+            assert put.status_code == 422, put.text
+            assert put.json()["detail"][0]["loc"] == ["roles"]
+
+            # Rejected, not persisted — a reread still shows the empty matrix.
+            reread = await client.get("/api/config/roles")
+            assert reread.json() == {"roles": {}, "version": 0}
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_roles_put_rejects_unknown_role_cell_field(tmp_path: Path) -> None:
+    """A typo'd role-cell key (e.g. `effr` for `effort`) is rejected, not
+    silently dropped — `RoleConfig`'s default `extra="ignore"` would otherwise
+    persist a cell the operator thinks is set but the daemon never sees
+    (SYM-191 review)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            put = await client.put(
+                "/api/config/roles",
+                json={
+                    "roles": {"implement": {"agent": "claude", "effr": "high"}},
+                    "version": 0,
+                },
+            )
+            assert put.status_code == 422, put.text
+
+            # Rejected, not persisted — a reread still shows the empty matrix.
+            reread = await client.get("/api/config/roles")
+            assert reread.json() == {"roles": {}, "version": 0}
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_binding_rejects_unknown_role_cell_field(tmp_path: Path) -> None:
+    """The same unknown-field guard applies to a per-binding `roles:`
+    override — `RepoBinding.roles` shares the same `RoleConfig` cell type."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(roles={"implement": {"agent": "claude", "effr": "high"}})
+                },
+            )
+            assert resp.status_code == 422, resp.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_roles_put_version_conflict(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            first = await client.put(
+                "/api/config/roles",
+                json={"roles": {"implement": {"agent": "codex"}}, "version": 0},
+            )
+            assert first.status_code == 200
+            # A second write still carrying the stale version 0 → 409.
+            stale = await client.put(
+                "/api/config/roles",
+                json={"roles": {"implement": {"agent": "claude"}}, "version": 0},
+            )
+            assert stale.status_code == 409
+            assert stale.json()["detail"]["current_version"] == 1
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_roles_put_diversity_warning_non_blocking(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            created = await client.post("/api/config/bindings", json={"payload": _payload()})
+            assert created.status_code == 201, created.text
+            # Bindings default implement→claude; forcing the reviewer to claude
+            # too loses cross-family diversity — a non-blocking warning.
+            put = await client.put(
+                "/api/config/roles",
+                json={"roles": {"review_find": {"agent": "claude"}}, "version": 0},
+            )
+            assert put.status_code == 200, put.text
+            assert any("diversity" in w for w in put.json()["warnings"])
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_effort_with_inherited_model_saves(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """An effort override with no explicit model saves — it is family-checked
+    against the resolved role — as long as that role resolves a codex agent,
+    which needs no per-model capability check (SYM-191)."""
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        return None
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            created = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(roles={"implement": {"agent": "codex", "effort": "high"}})
+                },
+            )
+            assert created.status_code == 201, created.text
+            assert created.json()["payload"]["roles"] == {
+                "implement": {"agent": "codex", "effort": "high"}
+            }
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_claude_effort_with_no_resolved_model_rejected(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A claude role that resolves `effort` but no `model` (e.g. `implement:
+    {agent: claude, effort: xhigh}` — the ordinary default, since claude
+    builders pass no `--model`) fails at save: there is no model to check the
+    effort against, and the CLI's own default model may not support it, so the
+    mismatch would otherwise only surface at dispatch (SYM-191 review)."""
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        return None
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(roles={"implement": {"agent": "claude", "effort": "xhigh"}})
+                },
+            )
+            assert resp.status_code == 422, resp.text
+            assert resp.json()["detail"][0]["loc"] == ["roles"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_options_claude_efforts_per_model(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        return {"opus": ["low", "high"], "sonnet": ["medium"]}.get(model, ["low"])
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.get("/api/config/options")
+        body = resp.json()
+        assert body["claude_efforts_by_model"]["opus"] == ["low", "high"]
+        assert body["claude_efforts_by_model"]["sonnet"] == ["medium"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_options_uses_dotenv_sourced_key(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """`ANTHROPIC_API_KEY` living only in `.env` (not `os.environ`) must still
+    drive the options capability fetch, matching the save path's key
+    resolution (`_env_key_source`) — otherwise the dropdown falls back to the
+    family-wide set while save validates against the narrower per-model set
+    (SYM-191 review)."""
+    seen_keys: list[str | None] = []
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        seen_keys.append(api_key)
+        return ["low", "medium"]
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    monkeypatch.setattr(
+        "symphony.ui.config_crud._env_key_source",
+        lambda: {"ANTHROPIC_API_KEY": "dotenv-only-key"},
+    )
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.get("/api/config/options")
+        assert resp.status_code == 200
+        assert seen_keys and all(key == "dotenv-only-key" for key in seen_keys)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_options_fetches_claude_efforts_concurrently(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Per-alias capability fetches must run concurrently, not sequentially —
+    a slow/unreachable Anthropic API should cost one wait, not one per alias
+    (SYM-191 review)."""
+    import asyncio
+
+    concurrent = 0
+    max_concurrent = 0
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        nonlocal concurrent, max_concurrent
+        concurrent += 1
+        max_concurrent = max(max_concurrent, concurrent)
+        await asyncio.sleep(0.05)
+        concurrent -= 1
+        return ["low"]
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.get("/api/config/options")
+        assert resp.status_code == 200
+        assert max_concurrent > 1
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_options_claude_efforts_fall_back_without_key(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """No ANTHROPIC_API_KEY → the capability fetch returns None; the endpoint
+    falls back to the family-wide effort set rather than an empty list."""
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        return None
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.get("/api/config/options")
+        body = resp.json()
+        assert set(body["claude_efforts_by_model"]["opus"]) == {
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+        }
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_save_rejects_unsupported_claude_effort(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A claude (model, effort) pair the live capability check rejects fails at
+    save with a `roles` field path — not silently at dispatch."""
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        return ["low", "medium"]
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(
+                        roles={"implement": {"agent": "claude", "model": "opus", "effort": "xhigh"}}
+                    )
+                },
+            )
+            assert resp.status_code == 422, resp.text
+            assert resp.json()["detail"][0]["loc"] == ["roles"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_effort_on_unrelated_binding_does_not_block_save(
+    tmp_path: Path,
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """A now-unsupported claude (model, effort) on binding A (e.g. saved
+    fail-open before ANTHROPIC_API_KEY was configured) must not fail a save on
+    unrelated binding B: `_reject_unsupported_efforts` is scoped to the
+    candidate for a single-binding save."""
+
+    caps: list[str] = ["low", "medium", "high", "xhigh", "max"]
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        return caps
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            created_a = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(
+                        project_key="ENG-A",
+                        github_repo="org/repo-a",
+                        roles={
+                            "implement": {"agent": "claude", "model": "opus", "effort": "xhigh"}
+                        },
+                    )
+                },
+            )
+            assert created_a.status_code == 201, created_a.text
+
+            # Capability check now rejects binding A's stored effort — as if
+            # the key/model capabilities changed after A was saved.
+            caps[:] = ["low", "medium"]
+
+            created_b = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(
+                        project_key="ENG-B",
+                        github_repo="org/repo-b",
+                        roles={"implement": {"agent": "claude", "model": "opus", "effort": "low"}},
+                    )
+                },
+            )
+            assert created_b.status_code == 201, created_b.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_global_roles_put_not_blocked_by_unrelated_binding_override(
+    tmp_path: Path,
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """A binding pinning its own explicit `(model, effort)` for one role must
+    not block a global roles PUT that doesn't touch that role: the pair is
+    fully overridden, so it never resolves through the edited global cell
+    (SYM-191 review)."""
+
+    caps: list[str] = ["low", "medium", "high", "xhigh", "max"]
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        return caps
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            created = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(
+                        roles={"implement": {"agent": "claude", "model": "opus", "effort": "xhigh"}}
+                    )
+                },
+            )
+            assert created.status_code == 201, created.text
+
+            # Capability check now rejects the binding's stored `implement`
+            # pair — as if the key/model capabilities changed after it saved.
+            caps[:] = ["low", "medium"]
+
+            # An unrelated global cell (`review_find`) must still save.
+            put = await client.put(
+                "/api/config/roles",
+                json={"roles": {"review_find": {"agent": "claude"}}, "version": 0},
+            )
+            assert put.status_code == 200, put.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_only_inherited_rechecks_a_binding_role_with_unpinned_agent(
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """`only_inherited=True` (the `put_roles` sweep) must not skip a binding
+    role just because its own `model`/`effort` are pinned — that's only safe
+    when `agent` is pinned too, since an unpinned `agent` still resolves
+    through whichever global cell the write just changed. Exercises
+    `_reject_unsupported_efforts` directly (not the full CRUD save path,
+    which would also reject a genuine cross-family mismatch structurally
+    before this check even runs) to isolate the online-capability skip logic
+    itself (SYM-191 review)."""
+    from symphony.config import LinearStates, RepoBinding, RoleConfig
+    from symphony.ui import config_crud
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        # "xhigh" is structurally a valid claude effort but unsupported by
+        # this (live-reported) model — only the online check catches it.
+        return ["low", "medium", "high"]
+
+    monkeypatch.setattr(config_crud, "fetch_claude_effort_capabilities", _caps)
+
+    binding = RepoBinding(
+        linear_team_key="ENG",
+        github_repo="org/repo",
+        linear_states=LinearStates(ready="Todo"),
+        roles={"implement": RoleConfig(model="opus", effort="xhigh")},
+    )
+    trial = Config(roles={"implement": RoleConfig(agent="claude")}, repos=[binding])
+
+    with pytest.raises(config_crud.HTTPException) as exc_info:
+        await config_crud._reject_unsupported_efforts(
+            trial, bindings=[binding], only_inherited=True
+        )
+    assert exc_info.value.status_code == 422
+    assert "xhigh" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
+async def test_reject_unsupported_efforts_honors_binding_env_alias_pin(
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """A binding pinning `ANTHROPIC_DEFAULT_SONNET_MODEL` through its own
+    (unresolved) `env:` mapping runs its claude subprocess against that pin
+    (`{**os.environ, **spec.env}`), so the save-time capability recheck must
+    resolve `sonnet` against the same pin for that binding — not the
+    process-wide default — or it validates the wrong model (SYM-191 review)."""
+    from symphony.config import LinearStates, RepoBinding, RoleConfig
+    from symphony.ui import config_crud
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("PINNED_SONNET", "claude-sonnet-4-6")
+
+    seen_models: list[str] = []
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        seen_models.append(model)
+        # Only the pinned model supports "high" — the unpinned default
+        # ("claude-sonnet-5") doesn't — so validating against the wrong model
+        # would flip this test's outcome.
+        return ["low", "medium", "high"] if model == "claude-sonnet-4-6" else ["low"]
+
+    monkeypatch.setattr(config_crud, "fetch_claude_effort_capabilities", _caps)
+
+    binding = RepoBinding(
+        linear_team_key="ENG",
+        github_repo="org/repo",
+        linear_states=LinearStates(ready="Todo"),
+        env={"ANTHROPIC_DEFAULT_SONNET_MODEL": "PINNED_SONNET"},
+        roles={"implement": RoleConfig(agent="claude", model="sonnet", effort="high")},
+    )
+    trial = Config(repos=[binding])
+
+    await config_crud._reject_unsupported_efforts(trial, bindings=[binding])
+    assert seen_models == ["claude-sonnet-4-6"]
+
+
+@pytest.mark.asyncio
+async def test_save_fails_closed_on_capability_lookup_error(
+    tmp_path: Path,
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """A present `ANTHROPIC_API_KEY` that fails the Models-API capability
+    lookup (auth error, network error, malformed response) must fail the save
+    with a 422, not silently accept the effort as if no key were configured
+    at all (SYM-191 review)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "broken-key")
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        raise ValueError(f"could not reach the Models API to validate claude model {model!r}")
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _caps)
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(
+                        roles={"implement": {"agent": "claude", "model": "opus", "effort": "xhigh"}}
+                    )
+                },
+            )
+            assert resp.status_code == 422, resp.text
+            assert resp.json()["detail"][0]["loc"] == ["roles"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_roles_put_rejects_when_bindings_change_during_validation(
+    tmp_path: Path,
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """A binding created while a roles PUT's (network-bound) capability check
+    is in flight must not be silently missed: the in-lock recheck against a
+    fresh binding listing fails the write with a 409 rather than committing
+    against a stale binding snapshot (SYM-191 review)."""
+    conn, db_path = await _open(tmp_path)
+    original_list_all = config_bindings.list_all
+    calls = {"n": 0}
+
+    async def _list_all(c: Any) -> list[Any]:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # Simulate a binding create landing between the pre-lock snapshot
+            # and the in-lock recheck.
+            await config_bindings.insert(
+                c, payload=_payload(), key=("ENG", "org/repo", "", "linear", "default")
+            )
+        return await original_list_all(c)
+
+    monkeypatch.setattr("symphony.ui.config_crud.config_bindings.list_all", _list_all)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            put = await client.put(
+                "/api/config/roles",
+                json={"roles": {"implement": {"agent": "codex"}}, "version": 0},
+            )
+            assert put.status_code == 409, put.text
+            assert "bindings changed" in put.json()["detail"]["msg"]
+
+            # Not persisted — a reread still shows the empty matrix.
+            reread = await client.get("/api/config/roles")
+            assert reread.json() == {"roles": {}, "version": 0}
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_binding_create_rejects_when_globals_change_during_validation(
+    tmp_path: Path,
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """A global roles PUT landing while a binding save's (network-bound)
+    capability check is in flight must not be silently missed: the in-lock
+    recheck against the current globals version fails the write with a 409
+    rather than committing against a stale global-roles snapshot (SYM-191
+    review)."""
+    conn, db_path = await _open(tmp_path)
+    original_get = db.config_globals.get
+    calls = {"n": 0}
+
+    async def _get(c: Any) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return None
+        # Simulate a global roles PUT landing between the pre-lock validation
+        # and the in-lock recheck.
+        await db.config_globals.set_globals(c, roles={"implement": {"agent": "codex"}}, version=1)
+        return await original_get(c)
+
+    monkeypatch.setattr("symphony.ui.config_crud.config_globals.get", _get)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.post("/api/config/bindings", json={"payload": _payload()})
+            assert resp.status_code == 409, resp.text
+            assert "global roles matrix changed" in resp.json()["detail"]["msg"]
+
+            # Not persisted — no binding was created.
+            listed = await client.get("/api/config/bindings")
+            assert listed.json() == []
     finally:
         await conn.close()

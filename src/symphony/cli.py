@@ -24,7 +24,7 @@ import aiosqlite
 import click
 
 from . import db
-from .agent.claude_models import fetch_claude_effort_capabilities
+from .agent.claude_models import _resolve_alias_model_id, fetch_claude_effort_capabilities
 from .agent.codex_models import SUPPORTED_CODEX_EFFORTS
 from .app import build_server_config, create_app
 from .auth import Auth0Settings
@@ -596,11 +596,13 @@ async def _preflight_validate_capabilities(cfg: Config) -> bool:
     # over the process env, matching `{**os.environ, **spec.env}` in the runner.
     env_key = os.environ.get("ANTHROPIC_API_KEY", "")
     codex_pairs: set[tuple[str, str]] = set()
-    # (key, model, effort); key "" means no API key is available for that binding
-    # (claude runs via CLI auth). Keying by the resolved key exercises every
-    # distinct binding key, so a present-but-broken one fails rather than hiding
-    # behind another binding's valid key.
-    claude_checks: set[tuple[str, str, str]] = set()
+    # (key, model, effort, resolved_model); key "" means no API key is available
+    # for that binding (claude runs via CLI auth). Keying by the resolved key
+    # exercises every distinct binding key, so a present-but-broken one fails
+    # rather than hiding behind another binding's valid key. `resolved_model` is
+    # the alias resolved against *this binding's* env (see below) — it, not the
+    # bare `model` alias, is what actually gets queried and cached.
+    claude_checks: set[tuple[str, str, str, str]] = set()
     for binding in cfg.repos:
         # Presence, not truthiness: the runner merges `{**os.environ, **spec.env}`,
         # so a binding that sets ANTHROPIC_API_KEY — even to "" (typo/empty secret)
@@ -611,6 +613,11 @@ async def _preflight_validate_capabilities(cfg: Config) -> bool:
             binding_key = binding.env["ANTHROPIC_API_KEY"]
         else:
             binding_key = env_key
+        # Same merge the runner uses for the actual subprocess: a binding
+        # pinning `ANTHROPIC_DEFAULT_SONNET_MODEL` etc. via its own `env:` runs
+        # against that pin, not the process-wide var, so the alias must resolve
+        # the same way here or this validates the wrong model (SYM-191 review).
+        binding_env = {**os.environ, **binding.env}
         for name in get_args(RoleName):
             role = binding.resolved_role(name, cfg.roles)
             if role.effort is None or role.model is None:
@@ -618,20 +625,21 @@ async def _preflight_validate_capabilities(cfg: Config) -> bool:
             if role.agent == "codex":
                 codex_pairs.add((role.model, role.effort))
             else:
-                claude_checks.add((binding_key, role.model, role.effort))
+                resolved_model = _resolve_alias_model_id(role.model, binding_env)
+                claude_checks.add((binding_key, role.model, role.effort, resolved_model))
 
     ok = True
     for model, effort in sorted(codex_pairs):
         ok = _report_effort_support("codex", model, effort, sorted(SUPPORTED_CODEX_EFFORTS)) and ok
 
-    # One Models API call per distinct (key, model): every binding key is
-    # exercised at least once.
+    # One Models API call per distinct (key, resolved_model): every binding key
+    # AND every distinct alias pin is exercised at least once.
     caps_cache: dict[tuple[str, str], list[str] | None] = {}
     warned_models: set[str] = set()
-    for key, model, effort in sorted(claude_checks):
-        cache_key = (key, model)
+    for key, model, effort, resolved_model in sorted(claude_checks):
+        cache_key = (key, resolved_model)
         if cache_key not in caps_cache:
-            caps_cache[cache_key] = await fetch_claude_effort_capabilities(model, key)
+            caps_cache[cache_key] = await fetch_claude_effort_capabilities(resolved_model, key)
             if caps_cache[cache_key] is None and model not in warned_models:
                 # No key for this binding — claude runs via CLI auth, so skip the
                 # online effort check with a warning rather than hard-failing an

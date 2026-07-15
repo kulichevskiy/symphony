@@ -203,6 +203,181 @@ async def test_fetch_claude_effort_capabilities_missing_key_returns_none(
     assert await fetch_claude_effort_capabilities("sonnet") is None
 
 
+@pytest.mark.parametrize(
+    ("alias", "expected_model_id"),
+    [
+        ("opus", "claude-opus-4-8"),
+        ("sonnet", "claude-sonnet-5"),
+        ("haiku", "claude-haiku-4-5-20251001"),
+    ],
+)
+async def test_fetch_claude_effort_capabilities_resolves_cli_alias(
+    monkeypatch, alias, expected_model_id
+) -> None:  # type: ignore[no-untyped-def]
+    """The Models API has no `opus`/`sonnet`/`haiku` alias — only the `claude`
+    CLI does — so the short alias must be mapped to a full model ID before the
+    request goes out, or `/v1/models/<alias>` 404s (SYM-191 review)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    seen_paths = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        return httpx.Response(200, json={"capabilities": {"effort": {"low": {}}}})
+
+    _install_mock_transport(monkeypatch, _handler)
+    await fetch_claude_effort_capabilities(alias)
+    assert seen_paths == [f"/v1/models/{expected_model_id}"]
+
+
+async def test_fetch_claude_effort_capabilities_alias_env_override(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    """An org's Claude Code model allowlist can pin `sonnet` to an older ID
+    than the one hard-coded here; `SYMPHONY_CLAUDE_ALIAS_SONNET` lets an
+    operator tell us the real pinned ID instead of the guess (SYM-191 review)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("SYMPHONY_CLAUDE_ALIAS_SONNET", "claude-sonnet-4-6")
+    seen_paths = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        return httpx.Response(200, json={"capabilities": {"effort": {"low": {}}}})
+
+    _install_mock_transport(monkeypatch, _handler)
+    await fetch_claude_effort_capabilities("sonnet")
+    assert seen_paths == ["/v1/models/claude-sonnet-4-6"]
+
+
+async def test_fetch_claude_effort_capabilities_honors_anthropic_default_model_env(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    """Claude Code's own `ANTHROPIC_DEFAULT_SONNET_MODEL` pins what `sonnet`
+    resolves to for the CLI itself; when a deployment sets it, that IS the
+    real pinned ID — honor it over our hard-coded guess (SYM-191 review)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "claude-sonnet-4-6")
+    seen_paths = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        return httpx.Response(200, json={"capabilities": {"effort": {"low": {}}}})
+
+    _install_mock_transport(monkeypatch, _handler)
+    await fetch_claude_effort_capabilities("sonnet")
+    assert seen_paths == ["/v1/models/claude-sonnet-4-6"]
+
+
+async def test_fetch_claude_effort_capabilities_strips_1m_context_suffix(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    """Claude Code's documented 1M-context pinning syntax
+    (`ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-4-8[1m]'`) is stripped by the
+    CLI itself before use; the Models API never recognizes the bracket suffix
+    either (`/v1/models/claude-opus-4-8[1m]` 404s), so the pinned value must
+    be stripped here too before the capability lookup (SYM-191 review)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-4-8[1m]")
+    seen_paths = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        return httpx.Response(200, json={"capabilities": {"effort": {"low": {}}}})
+
+    _install_mock_transport(monkeypatch, _handler)
+    await fetch_claude_effort_capabilities("opus")
+    assert seen_paths == ["/v1/models/claude-opus-4-8"]
+
+
+async def test_fetch_claude_effort_capabilities_symphony_override_wins_over_anthropic_default(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    """`SYMPHONY_CLAUDE_ALIAS_SONNET` is the more explicit, check-specific
+    override — it should win when both it and Claude Code's own
+    `ANTHROPIC_DEFAULT_SONNET_MODEL` are set (SYM-191 review)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "claude-sonnet-4-6")
+    monkeypatch.setenv("SYMPHONY_CLAUDE_ALIAS_SONNET", "claude-sonnet-explicit")
+    seen_paths = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        return httpx.Response(200, json={"capabilities": {"effort": {"low": {}}}})
+
+    _install_mock_transport(monkeypatch, _handler)
+    await fetch_claude_effort_capabilities("sonnet")
+    assert seen_paths == ["/v1/models/claude-sonnet-explicit"]
+
+
+async def test_fetch_claude_effort_capabilities_full_model_id_passes_through(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    seen_paths = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        return httpx.Response(200, json={"capabilities": {"effort": {"low": {}}}})
+
+    _install_mock_transport(monkeypatch, _handler)
+    await fetch_claude_effort_capabilities("claude-sonnet-4-6")
+    assert seen_paths == ["/v1/models/claude-sonnet-4-6"]
+
+
+async def test_fetch_claude_effort_capabilities_filters_unsupported_levels(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    """A level whose value is `null` or carries `supported: false` must be
+    dropped — its mere presence as a key in the tree previously passed the
+    caller's plain membership check even though the model rejects it
+    (SYM-191 review)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "capabilities": {
+                    "effort": {
+                        "low": {},
+                        "medium": {"supported": True},
+                        "high": {"supported": False},
+                        "xhigh": None,
+                    }
+                }
+            },
+        )
+
+    _install_mock_transport(monkeypatch, _handler)
+    assert await fetch_claude_effort_capabilities("sonnet") == ["low", "medium"]
+
+
+async def test_fetch_claude_effort_capabilities_ignores_sibling_metadata_keys(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    """The Models API's `effort` tree carries a sibling `supported` boolean
+    alongside the per-level entries, not just per-level flags. That key must
+    not be returned as if it were an effort level (SYM-191 review)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "capabilities": {
+                    "effort": {
+                        "low": {},
+                        "medium": {},
+                        "high": {},
+                        "supported": True,
+                    }
+                }
+            },
+        )
+
+    _install_mock_transport(monkeypatch, _handler)
+    assert await fetch_claude_effort_capabilities("sonnet") == ["low", "medium", "high"]
+
+
 async def test_fetch_claude_effort_capabilities_http_error_raises_valueerror(
     monkeypatch,
 ) -> None:  # type: ignore[no-untyped-def]
@@ -394,6 +569,81 @@ repos:
     assert "HTTP 401" in result.output
     # Both distinct binding keys were exercised (not just the first).
     assert set(seen_keys) == {"sk-a", "sk-b"}
+
+
+def test_preflight_honors_binding_specific_claude_alias_pin(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A binding pinning `ANTHROPIC_DEFAULT_SONNET_MODEL` via its own `env:`
+    mapping runs its claude subprocess against that pin
+    (`{**os.environ, **spec.env}`), so the capability check must resolve
+    `sonnet` against the SAME pin for that binding — not the process-wide
+    default — or it validates the wrong model (SYM-191 review). A sibling
+    binding with no pin must still resolve against the ordinary default,
+    proving each binding's own resolution isn't cached over the other's."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    monkeypatch.setenv("PINNED_SONNET", "claude-sonnet-4-6")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    _install_fake(
+        monkeypatch,
+        _FakeLinear(viewer_keys=["ENG", "OPS"], states={"ENG": _STD_STATES, "OPS": _STD_STATES}),
+    )
+
+    seen_models: list[str] = []
+
+    async def _fetch(model: str, _api_key: str | None = None) -> list[str]:
+        seen_models.append(model)
+        # Only the pinned model supports "high" — the unpinned default
+        # doesn't — so a binding validated against the wrong model would flip
+        # this test's pass/fail outcome for that binding.
+        return ["low", "medium", "high"] if model == "claude-sonnet-4-6" else ["low"]
+
+    monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _fetch)
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        f"""
+{_db_path_lines(tmp_path)}
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api-svc
+    agent: claude
+    review_strategy: remote
+    env:
+      ANTHROPIC_DEFAULT_SONNET_MODEL: PINNED_SONNET
+    roles:
+      implement:
+        model: sonnet
+        effort: high
+    linear_states:
+      ready: Todo
+      in_progress: In Progress
+      code_review: Needs Approval
+      needs_approval: Needs Approval
+      blocked: Blocked
+      done: Done
+  - linear_team_key: OPS
+    github_repo: org/ops-svc
+    agent: claude
+    review_strategy: remote
+    roles:
+      implement:
+        model: sonnet
+        effort: high
+    linear_states:
+      ready: Todo
+      in_progress: In Progress
+      code_review: Needs Approval
+      needs_approval: Needs Approval
+      blocked: Blocked
+      done: Done
+"""
+    )
+    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    # Both bindings' distinct resolved models were exercised — not collapsed
+    # into one cache entry keyed on the bare "sonnet" alias.
+    assert set(seen_models) == {"claude-sonnet-4-6", "claude-sonnet-5"}
+    assert "claude model 'sonnet' supports effort 'high'" in result.output
+    assert "effort 'high' not supported by claude model 'sonnet'; supported: low" in result.output
+    assert result.exit_code != 0, result.output
 
 
 def test_preflight_empty_binding_key_override_is_not_masked_by_parent(

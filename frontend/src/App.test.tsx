@@ -19,8 +19,12 @@ function stubBodyFor(url: string): unknown {
       claude_aliases: [],
       codex_efforts: [],
       claude_efforts: [],
+      claude_efforts_by_model: {},
       merge_strategies: ["squash", "merge", "rebase"],
     };
+  }
+  if (url.includes("/api/config/roles")) {
+    return { roles: {}, version: 0 };
   }
   if (url.includes("/api/config")) {
     return {

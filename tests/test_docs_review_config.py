@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from symphony.config import Config
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -48,6 +50,13 @@ def test_example_config_documents_per_issue_token_budget() -> None:
     # The unit is effective tokens, not dollars.
     assert "effective tokens" in text.lower()
     assert "not dollars" in text.lower()
+
+
+def test_example_config_loads() -> None:
+    # The shipped example must stay loadable — a stale `roles:` cell (e.g. an
+    # effort override on a role validation no longer wires) would otherwise
+    # only be caught by an operator copying it (SYM-191 review).
+    Config.load(ROOT / "examples" / "config.yaml")
 
 
 def test_readme_documents_review_venues_and_role_knobs() -> None:
