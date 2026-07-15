@@ -770,9 +770,7 @@ class _OrchestratorBase:
                 return current
         return None
 
-    async def _launch_gate_admits(
-        self, binding: RepoBinding, *, first_dispatch: bool
-    ) -> bool:
+    async def _launch_gate_admits(self, binding: RepoBinding, *, first_dispatch: bool) -> bool:
         """The single authoritative pre-spawn check (SYM-193).
 
         Re-validates against the current binding row immediately before an
@@ -803,8 +801,7 @@ class _OrchestratorBase:
         )
         if occupancy >= current.max_concurrent:
             log.info(
-                "launch gate: binding %s at capacity (occupancy=%d, cap=%d), "
-                "aborting spawn",
+                "launch gate: binding %s at capacity (occupancy=%d, cap=%d), aborting spawn",
                 binding.linear_team_key,
                 occupancy,
                 current.max_concurrent,

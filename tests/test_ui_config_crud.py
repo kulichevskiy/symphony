@@ -1486,9 +1486,7 @@ async def test_binding_create_rejects_when_globals_change_during_validation(
 
 
 async def _create_binding(client: Any, **overrides: Any) -> dict[str, Any]:
-    resp = await client.post(
-        "/api/config/bindings", json={"payload": _payload(**overrides)}
-    )
+    resp = await client.post("/api/config/bindings", json={"payload": _payload(**overrides)})
     assert resp.status_code == 201, resp.text
     return resp.json()
 

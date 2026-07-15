@@ -61,9 +61,7 @@ async def _insert(conn, *, enabled: bool = True, **extra) -> None:
 
 
 async def _queue_rows(conn, scope_team: str) -> int:
-    cur = await conn.execute(
-        "SELECT COUNT(*) FROM tracker_queue WHERE team_key = ?", (scope_team,)
-    )
+    cur = await conn.execute("SELECT COUNT(*) FROM tracker_queue WHERE team_key = ?", (scope_team,))
     row = await cur.fetchone()
     return int(row[0])
 
@@ -104,9 +102,7 @@ async def test_disable_mid_run_clears_existing_lanes(tmp_path: Path) -> None:
 
     harness = await Harness.create(tmp_path, config=cfg, reload_bindings=True)
     try:
-        harness.sim.seed_issue(
-            identifier="ENG-1", team_key=TEAM, state_name=READY, title="queued"
-        )
+        harness.sim.seed_issue(identifier="ENG-1", team_key=TEAM, state_name=READY, title="queued")
         await harness.warmup()
         await harness.step()
         assert await _queue_rows(harness.conn, TEAM) > 0
@@ -137,9 +133,7 @@ async def test_run_carries_binding_key_from_dispatch(tmp_path: Path) -> None:
         scheduled = await harness.step()
         assert len(scheduled) == 1
         binding = harness.orch.config.repos[0]
-        cur = await harness.conn.execute(
-            "SELECT binding_key FROM runs WHERE stage = 'implement'"
-        )
+        cur = await harness.conn.execute("SELECT binding_key FROM runs WHERE stage = 'implement'")
         rows = await cur.fetchall()
         assert rows
         assert all(str(r["binding_key"]) == _binding_storage_key(binding) for r in rows)

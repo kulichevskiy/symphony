@@ -1056,9 +1056,7 @@ def create_config_crud_router(
             # between the check and the delete.
             existing = await config_bindings.get(conn, binding_id)
             if existing is not None:
-                blockers = await _drain_blockers(
-                    conn, existing, scheduled_slots=scheduled_slots
-                )
+                blockers = await _drain_blockers(conn, existing, scheduled_slots=scheduled_slots)
                 if blockers is not None:
                     raise _drain_conflict("delete", blockers)
             try:
