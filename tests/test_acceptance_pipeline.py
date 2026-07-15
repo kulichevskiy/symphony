@@ -103,6 +103,10 @@ def _claude_result(text: str, *, cost: float = 0.0) -> str:
     )
 
 
+def _codex_agent_message(text: str) -> str:
+    return json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": text}})
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -742,11 +746,11 @@ async def test_acceptance_runner_routes_codex_role_through_command_and_cost(
 ) -> None:
     """`roles.accept.agent: codex` must drive the actual acceptance-verdict
     subprocess argv and its cost estimation, not just the post-rejection fix
-    run (SYM-192 review). The transcript classifier only understands
-    Claude's stream-json shape, so a codex run still reports `infra_error`
-    here (a separate, pre-existing gap) — this asserts the part SYM-192
-    fixes: command construction and cost attribution follow the resolved
-    role even on that path.
+    run (SYM-192 review). This transcript carries no `item.completed`
+    agent-message at all, so it still classifies as `infra_error` — for the
+    right reason now ("no final message"), not because the classifier can't
+    read Codex's shape (see
+    `test_acceptance_runner_parses_codex_pass_verdict` for that).
     """
     runner = _ScriptedRunner(
         [
@@ -791,6 +795,62 @@ async def test_acceptance_runner_routes_codex_role_through_command_and_cost(
     assert verdict.kind == "infra_error"
     # gpt-5.1-codex pricing: $1.25/M input + $10/M output.
     assert verdict.cost == pytest.approx(11.25)
+
+
+@pytest.mark.asyncio
+async def test_acceptance_runner_parses_codex_pass_verdict(tmp_path: Path) -> None:
+    """A Codex accept run that exits 0 with the footer must classify as
+    `pass`, not `infra_error` (SYM-192 review: the classifier previously only
+    understood Claude's `result`/`assistant` transcript shape, so an
+    otherwise-successful Codex run always fell through to `infra_error`).
+    """
+    runner = _ScriptedRunner(
+        [
+            RunnerEvent(kind="started", pid=1234),
+            RunnerEvent(
+                kind="stdout",
+                line=json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {
+                            "input_tokens": 1_000_000,
+                            "output_tokens": 1_000_000,
+                            "cached_input_tokens": 0,
+                        },
+                    }
+                ),
+            ),
+            RunnerEvent(
+                kind="stdout",
+                line=_codex_agent_message(
+                    f"The patch implements the requested icon.\n\n{ACCEPTANCE_FOOTER_PASS}"
+                ),
+            ),
+            RunnerEvent(kind="exit", returncode=0),
+        ]
+    )
+
+    verdict = await run_acceptance(
+        runner=runner,
+        run_id="acceptance-1",
+        workspace_path=tmp_path,
+        mode="code_only",
+        linear_description="Add a settings icon to the toolbar.",
+        pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
+        criteria=["toolbar has settings icon"],
+        stall_secs=15,
+        agent="codex",
+        codex_model="gpt-5.1-codex",
+        effort="high",
+    )
+
+    assert verdict.kind == "pass"
+    assert "The patch implements the requested icon." in verdict.details
+    # gpt-5.1-codex pricing: $1.25/M input + $10/M output — Codex never
+    # self-prices, so this must come from the runner's token-based estimate,
+    # not the (always-zero) classifier cost.
+    assert verdict.cost == pytest.approx(11.25)
+    assert verdict.usage.cost_usd == pytest.approx(11.25)
 
 
 @pytest.mark.asyncio
@@ -1579,3 +1639,24 @@ def test_acceptance_classifier_parses_reject_footer() -> None:
 
     assert verdict.kind == "reject"
     assert verdict.cost == pytest.approx(0.08)
+
+
+def test_acceptance_classifier_parses_codex_reject_footer() -> None:
+    transcript = _codex_agent_message(
+        f"The diff only adds text, not an icon.\n\n{ACCEPTANCE_FOOTER_REJECT}"
+    )
+
+    verdict = acceptance_classifier(transcript=transcript, agent="codex")
+
+    assert verdict.kind == "reject"
+
+
+def test_acceptance_classifier_treats_codex_api_error_as_infra_error() -> None:
+    transcript = json.dumps(
+        {"type": "turn.failed", "error": {"message": "API Error: 500 internal error"}}
+    )
+
+    verdict = acceptance_classifier(transcript=transcript, agent="codex")
+
+    assert verdict.kind == "infra_error"
+    assert "500" in verdict.details

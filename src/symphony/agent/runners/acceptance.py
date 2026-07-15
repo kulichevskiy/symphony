@@ -303,6 +303,7 @@ async def run_acceptance(
         parsed = acceptance_classifier(
             transcript=collected.stdout,
             criteria=criteria,
+            agent=agent,
         )
         usage = _usage_delta_with_cost(
             acceptance_run.usage,
@@ -324,6 +325,7 @@ async def run_acceptance(
         acceptance_classifier(
             transcript=collected.stdout,
             criteria=criteria,
+            agent=agent,
         ),
         acceptance_run.usage,
     )
@@ -526,6 +528,7 @@ async def _run_playwright_acceptance(
         parsed = acceptance_classifier(
             transcript=collected.stdout,
             criteria=criteria,
+            agent=agent,
         )
         usage = _usage_delta_with_cost(
             acceptance_run.usage,
@@ -547,6 +550,7 @@ async def _run_playwright_acceptance(
     verdict = acceptance_classifier(
         transcript=collected.stdout,
         criteria=criteria,
+        agent=agent,
     )
     return _with_usage(
         _validate_dev_artifacts(
@@ -586,7 +590,16 @@ def _usage_delta_with_cost(usage: UsageDelta, cost: float) -> UsageDelta:
 
 
 def _with_usage(verdict: AcceptanceVerdict, usage: UsageDelta) -> AcceptanceVerdict:
-    return replace(verdict, usage=_usage_delta_with_cost(usage, verdict.cost))
+    """Attach usage to `verdict`, keeping the higher of the two cost figures.
+
+    Claude self-prices, so `verdict.cost` (from the transcript's `result`
+    event) and `usage.cost_usd` (the runner's tracked total) already agree.
+    Codex never prices itself — the classifier always reports 0 — so without
+    `max()` a passing/rejecting Codex run would silently report $0 instead of
+    the runner's per-token cost estimate (SYM-192 review).
+    """
+    cost = max(verdict.cost, usage.cost_usd)
+    return replace(verdict, cost=cost, usage=_usage_delta_with_cost(usage, cost))
 
 
 @dataclass

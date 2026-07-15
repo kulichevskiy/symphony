@@ -87,6 +87,25 @@ def _acceptance_events(
     ]
 
 
+def _codex_acceptance_events(verdict_footer: str = ACCEPTANCE_FOOTER_PASS) -> list[RunnerEvent]:
+    return [
+        RunnerEvent(kind="started", pid=2222),
+        RunnerEvent(
+            kind="stdout",
+            line=json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": f"Acceptance verdict.\n\n{verdict_footer}",
+                    },
+                }
+            ),
+        ),
+        RunnerEvent(kind="exit", returncode=0),
+    ]
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -473,7 +492,7 @@ async def test_acceptance_verdict_run_uses_resolved_accept_role(
             ),
         )
         await _seed_review_candidate(conn, binding)
-        runner = _FakeRunner([_acceptance_events(), _merge_events()])
+        runner = _FakeRunner([_codex_acceptance_events(), _merge_events()])
         workspace = MagicMock()
         workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
         workspace.release = MagicMock()
