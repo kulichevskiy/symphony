@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from symphony.config import Config, LinearStates, RepoBinding, Secrets, TrackerStates
+from symphony.config import Config, LinearStates, RepoBinding, ResolvedRole, Secrets, TrackerStates
 from symphony.linear.client import Linear, LinearError
 from symphony.linear.slash import SlashIntent, SlashKind
 from symphony.orchestrator.poll import Orchestrator
@@ -526,7 +526,7 @@ async def test_dispatch_success_persists_followup_state_under_scoped_issue_id(tm
             push_fn=AsyncMock(),
         )
         orch._run_agent = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
-            return_value=(UsageDelta(cost_usd=0.25), "exit", 0)
+            return_value=(UsageDelta(cost_usd=0.25), "exit", 0, ResolvedRole(agent="claude"))
         )
 
         # `_run_agent` is mocked, so simulate the agent advancing HEAD so the

@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 import aiosqlite
 
 from ... import db
-from ...config import RepoBinding
+from ...config import RepoBinding, ResolvedRole
 from ...github.client import GitHubError
 from ...linear.client import LinearError
 from ...linear.templates import (
@@ -205,7 +205,7 @@ class _LifecycleMixin(_OrchestratorBase):
             run_id: str,
             workspace_path: Path,
             prior_total: float,
-        ) -> tuple[UsageDelta, str, int | None]: ...
+        ) -> tuple[UsageDelta, str, int | None, ResolvedRole]: ...
 
         async def _run_dirty_tree_fix_turn(
             self,
@@ -732,7 +732,7 @@ class _LifecycleMixin(_OrchestratorBase):
         head_before = await _workspace_head_sha(workspace_path)
 
         try:
-            cumulative_usage, final_kind, final_returncode = await self._run_agent(
+            cumulative_usage, final_kind, final_returncode, implement_role = await self._run_agent(
                 binding=binding,
                 issue=issue,
                 storage_issue_id=issue_id,
@@ -790,7 +790,6 @@ class _LifecycleMixin(_OrchestratorBase):
         head_after = await _workspace_head_sha(workspace_path)
         head_advanced = bool(head_after) and head_after != head_before
         log_path = self.config.log_root / f"{run_id}.log"
-        implement_role = binding.resolved_role("implement", self.config.roles)
         final_message = _read_run_final_message(log_path, agent=implement_role.agent)
         # A killed-then-redispatched run re-runs the agent conservatively; it
         # re-confirms (SYMPHONY_DONE) without a *new* commit. If the branch

@@ -2524,14 +2524,19 @@ class _OrchestratorBase:
         run_id: str,
         workspace_path: Path,
         prior_total: float,
-    ) -> tuple[UsageDelta, str, int | None]:
+    ) -> tuple[UsageDelta, str, int | None, ResolvedRole]:
         """Spawn the runner and consume events. Returns
-        (cumulative_usage, final_event_kind, final_returncode).
+        (cumulative_usage, final_event_kind, final_returncode, resolved_role).
 
         `prior_total` is the issue's cost so far. It is passed through to
         `_run_stage_command` but is no longer consumed anywhere: activity
         digests now report per-run token counts rather than a cumulative
         dollar total, so it is currently unused.
+
+        The resolved role is returned so callers that parse/attribute the run
+        after it finishes (e.g. the completion gate) use the role that was
+        actually launched, not a fresh re-resolution against `self.config.roles`
+        — which may have hot-reloaded mid-run.
         """
         storage_issue_id = storage_issue_id or issue.id
         # Consume a pending blocked-resume handoff (set when the operator
@@ -2555,7 +2560,7 @@ class _OrchestratorBase:
             workspace_path=workspace_path,
             mcp_servers=binding.mcp_servers,
         )
-        return await self._run_stage_command(
+        cumulative_usage, final_kind, final_returncode = await self._run_stage_command(
             binding=binding,
             issue=issue,
             storage_issue_id=storage_issue_id,
@@ -2566,6 +2571,7 @@ class _OrchestratorBase:
             role=role,
             prior_total=prior_total,
         )
+        return cumulative_usage, final_kind, final_returncode, role
 
     async def _run_stage_command(
         self,
