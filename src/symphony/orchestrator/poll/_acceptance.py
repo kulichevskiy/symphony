@@ -882,7 +882,11 @@ class _AcceptanceMixin(_OrchestratorBase):
                 else:
                     workspace_path = await self._workspace.acquire(binding, issue)
                     try:
-                        accept_role = binding.resolved_role("accept", self.config.roles)
+                        accept_role = binding.resolved_role(
+                            "accept",
+                            self.config.roles,
+                            visual_acceptance=effective_mode in {"dev", "preview"},
+                        )
                         verdict = await run_acceptance(
                             runner=self._runner,
                             run_id=run_id,

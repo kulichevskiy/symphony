@@ -488,11 +488,20 @@ class RepoBinding(BaseModel):
         """Whether the `@codex` GitHub-bot review runs on the PR."""
         return self.remote_review
 
-    def resolved_reviewer_agent(self) -> Literal["claude", "codex"]:
-        """Reviewer agent after applying the implementer-opposite default."""
+    def resolved_reviewer_agent(
+        self, global_roles: Mapping[RoleName, RoleConfig] | None = None
+    ) -> Literal["claude", "codex"]:
+        """Reviewer agent after applying the implementer-opposite default.
+
+        Opposes the *resolved* `implement` role (which may come from the
+        `roles:` matrix), not the raw legacy `agent` field — a roles-only DB
+        config can leave `agent` at its `claude` default while the matrix
+        resolves `implement` to codex.
+        """
         if self.reviewer_agent is not None:
             return self.reviewer_agent
-        return "codex" if self.agent == "claude" else "claude"
+        implement_agent = self.resolved_role("implement", global_roles).agent
+        return "codex" if implement_agent == "claude" else "claude"
 
     def resolved_reviewer_codex_model(self) -> str:
         """Codex model for the reviewer when it's the codex agent."""
@@ -527,43 +536,69 @@ class RepoBinding(BaseModel):
         """Per-binding override wins; falls back to `command_timeout_secs`."""
         return self.verify_timeout_secs if self.verify_timeout_secs is not None else global_default
 
-    def _default_role_agent(self, name: RoleName) -> Literal["claude", "codex"]:
+    def _default_role_agent(
+        self, name: RoleName, global_roles: Mapping[RoleName, RoleConfig] | None = None
+    ) -> Literal["claude", "codex"]:
         if name in _BUILDER_ROLES:
             return self.agent
+        # Both review roles key off the *resolved* `implement` role, not the
+        # raw legacy `agent` field — a roles-only DB config can leave `agent`
+        # at its `claude` default while the matrix resolves `implement` to
+        # codex, and a review default keyed off the stale field would silently
+        # collapse the family diversity these roles exist to preserve.
         if name == "review_verify":
             # Adversarial verifier defaults to the implementer's family, kept
             # opposite `review_find` (which defaults to the reviewer-opposite
             # family) so the two-pass loop keeps its model diversity.
-            return self.agent
-        return self.resolved_reviewer_agent()
+            return self.resolved_role("implement", global_roles).agent
+        return self.resolved_reviewer_agent(global_roles)
 
-    def _default_role_model(self, name: RoleName, agent: Literal["claude", "codex"]) -> str | None:
+    def _default_role_model(
+        self,
+        name: RoleName,
+        agent: Literal["claude", "codex"],
+        global_roles: Mapping[RoleName, RoleConfig] | None = None,
+    ) -> str | None:
         """Back-compat model default for a role given its resolved agent.
 
         Maps the legacy top-level fields into the matrix so a config with no
         `roles:` block resolves to exactly today's values: codex builders
         carry `codex_model`; claude builders pass no `--model`; `review_find`
         carries `reviewer_codex_model` (codex) or `local_review_claude_model`
-        (claude); `review_verify` carries the implementer's `codex_model`
+        (claude); `review_verify` carries the resolved `implement` role's model
         (codex, matching its implementer-family default agent) or
         `local_review_verifier_claude_model` (claude).
         """
         if name in _BUILDER_ROLES:
             return self.codex_model if agent == "codex" else None
         if name == "review_verify":
-            return self.codex_model if agent == "codex" else self.local_review_verifier_claude_model
+            if agent == "codex":
+                return self.resolved_role("implement", global_roles).model
+            return self.local_review_verifier_claude_model
         if agent == "codex":
             return self.resolved_reviewer_codex_model()
         return self.local_review_claude_model
 
     def resolved_role(
-        self, name: RoleName, global_roles: Mapping[RoleName, RoleConfig] | None = None
+        self,
+        name: RoleName,
+        global_roles: Mapping[RoleName, RoleConfig] | None = None,
+        *,
+        visual_acceptance: bool = False,
     ) -> ResolvedRole:
         """Resolve a role to `{agent, model}`.
 
         Deep-merges per field: a per-binding `roles[name]` field wins over the
         global `roles[name]` field, and an unset field falls back to the
         back-compat default derived from the legacy top-level fields.
+
+        `visual_acceptance=True` (the `accept` role for a `dev`/`preview`
+        acceptance run) forces an unconfigured `accept` default off codex:
+        codex has no `--mcp-config` flag to drive the Playwright MCP server
+        those modes need, so a codex-builder binding with no explicit
+        `roles.accept.agent` must fall back to claude rather than resolving
+        the acceptance stage into a guaranteed infra error. An explicit
+        `roles.accept.agent: codex` override still passes through untouched.
         """
         binding_role = self.roles.get(name)
         global_role = (global_roles or {}).get(name)
@@ -583,9 +618,11 @@ class RepoBinding(BaseModel):
         if effort is None and global_role is not None:
             effort = global_role.effort
         if agent is None:
-            agent = self._default_role_agent(name)
+            agent = self._default_role_agent(name, global_roles)
+            if visual_acceptance and name == "accept" and agent == "codex":
+                agent = "claude"
         if model is None:
-            model = self._default_role_model(name, agent)
+            model = self._default_role_model(name, agent, global_roles)
         # `effort` has no legacy top-level field, so its only source is the
         # `roles:` blocks; unset stays None (no flag).
         return ResolvedRole(agent=agent, model=model, effort=effort)

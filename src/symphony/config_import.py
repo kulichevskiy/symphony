@@ -88,7 +88,7 @@ def _baseline_model(
     g = global_roles.get(name)
     if g is not None and g.model is not None:
         return g.model
-    return base._default_role_model(name, agent)  # noqa: SLF001
+    return base._default_role_model(name, agent, global_roles)  # noqa: SLF001
 
 
 def _sparse_matrix(

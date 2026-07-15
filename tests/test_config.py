@@ -14,6 +14,7 @@ from symphony.config import (
     Config,
     LinearStates,
     RepoBinding,
+    RoleConfig,
     Secrets,
     TrackerStates,
     UIStatusThresholds,
@@ -1582,3 +1583,36 @@ repos:
     p.write_text(raw)
     cfg = Config.load(p)
     assert cfg.repos[0].resolved_role(role, cfg.roles).effort == "high"
+
+
+def test_roles_review_defaults_follow_resolved_implement_not_legacy_agent() -> None:
+    """A roles-only DB config can leave the legacy `agent` field at its
+    `claude` default while the global matrix resolves `implement` to codex.
+    `review_find`/`review_verify` defaults must key off that *resolved*
+    `implement` role, not the stale `agent` field, or the two-pass loop's
+    family diversity silently collapses (SYM-192 review)."""
+    binding = _review_binding()  # agent left at its "claude" default
+    global_roles = {"implement": RoleConfig(agent="codex", model="gpt-5.1-codex-max")}
+    impl = binding.resolved_role("implement", global_roles)
+    assert impl.agent == "codex" and impl.model == "gpt-5.1-codex-max"
+    rf = binding.resolved_role("review_find", global_roles)
+    rv = binding.resolved_role("review_verify", global_roles)
+    assert rf.agent == "claude"  # opposite the *resolved* codex implementer
+    assert rv.agent == "codex" and rv.model == "gpt-5.1-codex-max"  # implementer's family + model
+
+
+def test_visual_acceptance_defaults_accept_role_to_claude_for_codex_binding() -> None:
+    """Codex has no `--mcp-config` flag for the Playwright MCP server dev/
+    preview acceptance needs. An unconfigured `accept` role on a codex
+    binding must default to claude for those modes rather than resolving
+    into a guaranteed infra error (SYM-192 review)."""
+    binding = _review_binding(agent="codex")
+    assert binding.resolved_role("accept").agent == "codex"
+    assert binding.resolved_role("accept", visual_acceptance=True).agent == "claude"
+
+
+def test_visual_acceptance_honors_explicit_codex_override() -> None:
+    """An operator who explicitly pins `roles.accept.agent: codex` gets
+    exactly that, even for a visual acceptance run."""
+    binding = _review_binding(agent="codex", roles={"accept": RoleConfig(agent="codex")})
+    assert binding.resolved_role("accept", visual_acceptance=True).agent == "codex"
