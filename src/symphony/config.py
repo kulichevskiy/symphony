@@ -530,6 +530,11 @@ class RepoBinding(BaseModel):
     def _default_role_agent(self, name: RoleName) -> Literal["claude", "codex"]:
         if name in _BUILDER_ROLES:
             return self.agent
+        if name == "review_verify":
+            # Adversarial verifier defaults to the implementer's family, kept
+            # opposite `review_find` (which defaults to the reviewer-opposite
+            # family) so the two-pass loop keeps its model diversity.
+            return self.agent
         return self.resolved_reviewer_agent()
 
     def _default_role_model(self, name: RoleName, agent: Literal["claude", "codex"]) -> str | None:
@@ -537,16 +542,18 @@ class RepoBinding(BaseModel):
 
         Maps the legacy top-level fields into the matrix so a config with no
         `roles:` block resolves to exactly today's values: codex builders
-        carry `codex_model`; claude builders pass no `--model`; review roles
-        carry `reviewer_codex_model` (codex) or the local-review claude
-        finder/verifier models (claude).
+        carry `codex_model`; claude builders pass no `--model`; `review_find`
+        carries `reviewer_codex_model` (codex) or `local_review_claude_model`
+        (claude); `review_verify` carries the implementer's `codex_model`
+        (codex, matching its implementer-family default agent) or
+        `local_review_verifier_claude_model` (claude).
         """
         if name in _BUILDER_ROLES:
             return self.codex_model if agent == "codex" else None
+        if name == "review_verify":
+            return self.codex_model if agent == "codex" else self.local_review_verifier_claude_model
         if agent == "codex":
             return self.resolved_reviewer_codex_model()
-        if name == "review_verify":
-            return self.local_review_verifier_claude_model
         return self.local_review_claude_model
 
     def resolved_role(
@@ -872,6 +879,21 @@ class Config(BaseModel):
                         UserWarning,
                         stacklevel=2,
                     )
+            # The two-pass local-review loop's adversarial value depends on
+            # `review_verify` disagreeing with `review_find` (see
+            # `_default_role_agent`); warn if a `roles:` override collapses
+            # them onto the same agent+model.
+            find = binding.resolved_role("review_find", self.roles)
+            verify = binding.resolved_role("review_verify", self.roles)
+            if find.agent == verify.agent and find.model == verify.model:
+                warnings.warn(
+                    f"binding {binding.project_key}/{binding.github_repo}: "
+                    f"role 'review_verify' uses the same agent+model "
+                    f"({verify.agent!r}, {verify.model!r}) as 'review_find'; "
+                    "the two-pass review loop's adversarial diversity is lost.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
     @classmethod
     def peek_db_path(cls, path: Path) -> Path:

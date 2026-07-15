@@ -373,8 +373,9 @@ async def run_local_review_session(
                 await workspace_scrubber(workspace_path, head_sha)
             return single_out
 
-        # Pass 1 — finder, opposite the implementer's family. Lists every
-        # suspicion, emits no verdict marker; its findings feed pass 2.
+        # Pass 1 — finder, resolved from the `review_find` role (defaults to
+        # the family opposite `implement`). Lists every suspicion, emits no
+        # verdict marker; its findings feed pass 2.
         finder_out = await _run_reviewer_pass(
             agent=reviewer_role.agent,
             codex_model=reviewer_role.codex_model_arg(),
@@ -416,9 +417,11 @@ async def run_local_review_session(
             base_branch=base_branch,
             pass_one_findings=pass_one_findings,
         )
-        # Pass 2 — adversarial verifier, the implementer's family (model
-        # diversity vs pass 1). Refutes/confirms pass-1 findings, adds
-        # misses, and emits the single marker the loop parses.
+        # Pass 2 — adversarial verifier, resolved from the `review_verify`
+        # role (defaults to the implementer's family, kept opposite
+        # `review_find` for model diversity vs pass 1). Refutes/confirms
+        # pass-1 findings, adds misses, and emits the single marker the loop
+        # parses.
         verifier_out = await _run_reviewer_pass(
             agent=verifier_role.agent,
             codex_model=verifier_role.codex_model_arg(),

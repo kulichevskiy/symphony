@@ -1011,8 +1011,10 @@ repos:
 
 
 def test_roles_old_style_claude_config_resolves_identically() -> None:
-    """A binding with no `roles:` block resolves builder→claude/None,
-    review→opposite-family (codex) carrying the legacy codex_model."""
+    """A binding with no `roles:` block resolves builder→claude/None;
+    `review_find`→opposite-family (codex) carrying the legacy codex_model;
+    `review_verify`→the implementer's own family (claude, matching
+    `implement`) so it stays opposite `review_find` for two-pass diversity."""
     binding = _review_binding(agent="claude", codex_model="gpt-5.1-codex-max")
     impl = binding.resolved_role("implement")
     assert impl.agent == "claude"
@@ -1023,12 +1025,15 @@ def test_roles_old_style_claude_config_resolves_identically() -> None:
     rf = binding.resolved_role("review_find")
     rv = binding.resolved_role("review_verify")
     assert rf.agent == "codex" and rf.model == "gpt-5.1-codex-max"
-    assert rv.agent == "codex" and rv.model == "gpt-5.1-codex-max"
+    assert rv.agent == "claude" and rv.model is None
+    assert rf.agent != rv.agent
 
 
 def test_roles_old_style_codex_config_resolves_identically() -> None:
-    """codex builder carries codex_model; review defaults to claude with the
-    legacy local-review claude models (finder vs verifier kept distinct)."""
+    """codex builder carries codex_model; `review_find` defaults to the
+    opposite family (claude) with the legacy finder claude model;
+    `review_verify` defaults to the implementer's own family (codex)
+    carrying the implementer's codex_model, staying opposite `review_find`."""
     binding = _review_binding(
         agent="codex",
         codex_model="gpt-5.1-codex",
@@ -1040,6 +1045,19 @@ def test_roles_old_style_codex_config_resolves_identically() -> None:
     rf = binding.resolved_role("review_find")
     rv = binding.resolved_role("review_verify")
     assert rf.agent == "claude" and rf.model == "sonnet"
+    assert rv.agent == "codex" and rv.model == "gpt-5.1-codex"
+    assert rf.agent != rv.agent
+
+
+def test_roles_review_verify_defaults_opposite_review_find_when_implement_claude() -> None:
+    """Default two-pass diversity: with no `roles:` override, `review_verify`
+    resolves to the implementer's family (claude), opposite `review_find`
+    (codex) — the adversarial verifier never silently collapses onto the
+    finder's agent+model."""
+    binding = _review_binding(agent="claude", local_review_verifier_claude_model="opus")
+    rf = binding.resolved_role("review_find")
+    rv = binding.resolved_role("review_verify")
+    assert (rf.agent, rf.model) != (rv.agent, rv.model)
     assert rv.agent == "claude" and rv.model == "opus"
 
 
