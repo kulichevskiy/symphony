@@ -66,7 +66,7 @@ import aiosqlite
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
-from ..agent.claude_models import fetch_claude_effort_capabilities
+from ..agent.claude_models import _resolve_alias_model_id, fetch_claude_effort_capabilities
 from ..agent.codex_models import SUPPORTED_CODEX_EFFORTS, SUPPORTED_CODEX_MODELS
 from ..config import (
     _LEGACY_ROLE_FIELDS,
@@ -505,7 +505,13 @@ async def _reject_unsupported_efforts(
     preflight uses, keyed the same way (per binding, its own `env:`
     ANTHROPIC_API_KEY taking precedence over the process key) — so a
     deployment whose key lives only in a binding's `env:` is validated the
-    same way it will actually run, not silently skipped. codex efforts are
+    same way it will actually run, not silently skipped. Likewise, a binding's
+    own `ANTHROPIC_DEFAULT_SONNET_MODEL`/`OPUS`/`HAIKU` (via its `env:`
+    mapping) takes precedence over the process-wide var when resolving a bare
+    `sonnet`/`opus`/`haiku` alias, matching the runner's `{**os.environ,
+    **spec.env}` precedence — otherwise this would validate the alias against
+    whatever the process pins it to, not what that binding's subprocess
+    actually runs (SYM-191 review). codex efforts are
     the fixed family enum (already checked structurally by
     `validate_roles_matrix`). A `None` result (no ANTHROPIC_API_KEY anywhere
     for that binding) skips the pair: the daemon may run claude via CLI auth,
@@ -540,13 +546,25 @@ async def _reject_unsupported_efforts(
     pair is validated against (SYM-191 review)."""
     env_source = _env_key_source()
     process_key = env_source.get("ANTHROPIC_API_KEY", "")
-    pairs: set[tuple[str, str, str]] = set()  # (key, model, effort)
+    pairs: set[tuple[str, str, str, str]] = set()  # (key, model, effort, resolved_model)
     for binding in (
         bindings
         if bindings is not None
         else (trial.repos or [_synthetic_matrix_validation_binding()])
     ):
         binding_key = _binding_anthropic_key(binding, env_source, process_key)
+        # Same merge the runner uses for the actual subprocess
+        # (`{**os.environ, **spec.env}`): a binding pinning
+        # `ANTHROPIC_DEFAULT_SONNET_MODEL` etc. via its own (unresolved) `env:`
+        # mapping runs against that pin, not the process-wide var, so the alias
+        # must resolve the same way here or this validates the wrong model
+        # (SYM-191 review). `binding.env` here maps var name -> source name, not
+        # the value itself (see `_binding_anthropic_key`), so resolve each
+        # through `env_source` before merging.
+        binding_env = {
+            **env_source,
+            **{var: env_source.get(source, "") for var, source in binding.env.items()},
+        }
         for name in get_args(RoleName):
             if only_inherited:
                 binding_role = binding.roles.get(name)
@@ -567,13 +585,14 @@ async def _reject_unsupported_efforts(
                     "resolved model; pin an explicit model on this role to set an "
                     "effort override",
                 )
-            pairs.add((binding_key, role.model, role.effort))
+            resolved_model = _resolve_alias_model_id(role.model, binding_env)
+            pairs.add((binding_key, role.model, role.effort, resolved_model))
     caps: dict[tuple[str, str], list[str] | None] = {}
-    for key, model, effort in sorted(pairs):
-        cache_key = (key, model)
+    for key, model, effort, resolved_model in sorted(pairs):
+        cache_key = (key, resolved_model)
         if cache_key not in caps:
             try:
-                caps[cache_key] = await fetch_claude_effort_capabilities(model, key)
+                caps[cache_key] = await fetch_claude_effort_capabilities(resolved_model, key)
             except ValueError as e:
                 raise _validation_error(["roles"], str(e)) from e
         supported = caps[cache_key]

@@ -106,9 +106,20 @@ function modelsFor(options: ConfigOptions, agent: string): string[] {
  *  role (so a binding that leaves `implement.agent` inherited still resolves
  *  to a global `codex` default instead of silently falling through to the
  *  hardcoded `claude` guess below); otherwise `fix` mirrors `implement`
- *  (kept in lockstep by `cellChange`) and `review_verify` defaults to the
- *  implementer-opposite family (`resolved_reviewer_agent`), same as the
- *  server's default when nothing overrides anything. */
+ *  (kept in lockstep by `cellChange`).
+ *
+ *  `review_verify` does NOT mirror `implement` here: server-side,
+ *  `resolved_role`'s fallback for a non-builder role is
+ *  `resolved_reviewer_agent()` (`config.py`), which reads only the binding's
+ *  legacy top-level `agent`/`reviewer_agent` fields — never `implement`'s
+ *  resolved matrix value. Every DB-managed binding has those legacy fields at
+ *  their pydantic defaults (the CRUD API rejects them outright, and the
+ *  importer strips them into explicit matrix cells instead), so an inherited
+ *  `review_verify` always resolves to the fixed opposite of the default
+ *  `"claude"`, i.e. `"codex"` — regardless of what `implement.agent` is
+ *  pinned to. Deriving it from `implement` here would disagree with the
+ *  server whenever `implement.agent` is pinned via the matrix (binding or
+ *  global) but `review_verify.agent` is left inherited (SYM-191 review). */
 function effectiveAgent(
   role: string,
   roles: RolesMatrix,
@@ -116,11 +127,7 @@ function effectiveAgent(
 ): string {
   const own = String(roles[role]?.agent ?? globalRoles[role]?.agent ?? "");
   if (own) return own;
-  if (role === "review_verify") {
-    return effectiveAgent("implement", roles, globalRoles) === "codex"
-      ? "claude"
-      : "codex";
-  }
+  if (role === "review_verify") return "codex";
   if (role === "fix") return effectiveAgent("implement", roles, globalRoles);
   return "claude";
 }

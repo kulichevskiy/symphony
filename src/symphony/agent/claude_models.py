@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Mapping
 
 import httpx
 
@@ -69,7 +70,7 @@ _ANTHROPIC_DEFAULT_MODEL_ENV: dict[str, str] = {
 }
 
 
-def _resolve_alias_model_id(model: str) -> str:
+def _resolve_alias_model_id(model: str, env: Mapping[str, str] | None = None) -> str:
     """Resolve a CLI-only alias to the full model ID to check capabilities for.
 
     Checks `SYMPHONY_CLAUDE_ALIAS_<ALIAS>` (e.g. `SYMPHONY_CLAUDE_ALIAS_SONNET
@@ -80,20 +81,29 @@ def _resolve_alias_model_id(model: str) -> str:
     name itself for a full `claude-*` ID. Strips a trailing `[1m]`-style
     context-window suffix (see `_strip_context_suffix`) from whichever source
     wins, since the Models API never recognizes it.
+
+    `env` is the lookup source, defaulting to the process env. The runner
+    spawns each binding's claude subprocess with `{**os.environ, **spec.env}`
+    (binding `env:` wins), so a binding pinning `ANTHROPIC_DEFAULT_SONNET_MODEL`
+    etc. through its own `env:` mapping actually runs against that pin, not
+    whatever the process-wide var says — callers checking a specific binding
+    must pass that same merged mapping here, or this resolves against the
+    wrong model (SYM-191 review).
     """
-    override = os.environ.get(_alias_override_env(model))
+    lookup: Mapping[str, str] = env if env is not None else os.environ
+    override = lookup.get(_alias_override_env(model))
     if override:
         return _strip_context_suffix(override)
     pin_env = _ANTHROPIC_DEFAULT_MODEL_ENV.get(model)
     if pin_env:
-        pinned = os.environ.get(pin_env)
+        pinned = lookup.get(pin_env)
         if pinned:
             return _strip_context_suffix(pinned)
     return _strip_context_suffix(_CLAUDE_ALIAS_MODEL_IDS.get(model, model))
 
 
 async def fetch_claude_effort_capabilities(
-    model: str, api_key: str | None = None
+    model: str, api_key: str | None = None, env: Mapping[str, str] | None = None
 ) -> list[str] | None:
     """Return the effort levels claude `model` supports, in API order.
 
@@ -105,7 +115,10 @@ async def fetch_claude_effort_capabilities(
     the process env
     `ANTHROPIC_API_KEY`. Preflight resolves the key from the process env OR a
     binding's `env:` mapping and passes it in, so a key supplied only through a
-    binding still drives validation.
+    binding still drives validation. `env` is the alias-pin lookup source
+    forwarded to `_resolve_alias_model_id` (see there) — pass a binding's
+    effective env (`{**os.environ, **binding.env}`) to honor a binding-specific
+    `ANTHROPIC_DEFAULT_<ALIAS>_MODEL` pin; `None` falls back to the process env.
 
     Returns `None` when no key is available anywhere. The daemon can run claude
     via the CLI's own auth (OAuth in the containerized deployment) with no API
@@ -124,7 +137,7 @@ async def fetch_claude_effort_capabilities(
     key = api_key if api_key is not None else os.environ.get("ANTHROPIC_API_KEY", "")
     if not key:
         return None
-    api_model = _resolve_alias_model_id(model)
+    api_model = _resolve_alias_model_id(model, env)
     try:
         async with httpx.AsyncClient(base_url=CLAUDE_MODELS_API_BASE, timeout=30) as client:
             resp = await client.get(

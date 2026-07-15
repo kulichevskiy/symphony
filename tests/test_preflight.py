@@ -571,6 +571,81 @@ repos:
     assert set(seen_keys) == {"sk-a", "sk-b"}
 
 
+def test_preflight_honors_binding_specific_claude_alias_pin(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A binding pinning `ANTHROPIC_DEFAULT_SONNET_MODEL` via its own `env:`
+    mapping runs its claude subprocess against that pin
+    (`{**os.environ, **spec.env}`), so the capability check must resolve
+    `sonnet` against the SAME pin for that binding — not the process-wide
+    default — or it validates the wrong model (SYM-191 review). A sibling
+    binding with no pin must still resolve against the ordinary default,
+    proving each binding's own resolution isn't cached over the other's."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    monkeypatch.setenv("PINNED_SONNET", "claude-sonnet-4-6")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    _install_fake(
+        monkeypatch,
+        _FakeLinear(viewer_keys=["ENG", "OPS"], states={"ENG": _STD_STATES, "OPS": _STD_STATES}),
+    )
+
+    seen_models: list[str] = []
+
+    async def _fetch(model: str, _api_key: str | None = None) -> list[str]:
+        seen_models.append(model)
+        # Only the pinned model supports "high" — the unpinned default
+        # doesn't — so a binding validated against the wrong model would flip
+        # this test's pass/fail outcome for that binding.
+        return ["low", "medium", "high"] if model == "claude-sonnet-4-6" else ["low"]
+
+    monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _fetch)
+    p = tmp_path / "cfg.yaml"
+    p.write_text(
+        f"""
+{_db_path_lines(tmp_path)}
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api-svc
+    agent: claude
+    review_strategy: remote
+    env:
+      ANTHROPIC_DEFAULT_SONNET_MODEL: PINNED_SONNET
+    roles:
+      implement:
+        model: sonnet
+        effort: high
+    linear_states:
+      ready: Todo
+      in_progress: In Progress
+      code_review: Needs Approval
+      needs_approval: Needs Approval
+      blocked: Blocked
+      done: Done
+  - linear_team_key: OPS
+    github_repo: org/ops-svc
+    agent: claude
+    review_strategy: remote
+    roles:
+      implement:
+        model: sonnet
+        effort: high
+    linear_states:
+      ready: Todo
+      in_progress: In Progress
+      code_review: Needs Approval
+      needs_approval: Needs Approval
+      blocked: Blocked
+      done: Done
+"""
+    )
+    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    # Both bindings' distinct resolved models were exercised — not collapsed
+    # into one cache entry keyed on the bare "sonnet" alias.
+    assert set(seen_models) == {"claude-sonnet-4-6", "claude-sonnet-5"}
+    assert "claude model 'sonnet' supports effort 'high'" in result.output
+    assert "effort 'high' not supported by claude model 'sonnet'; supported: low" in result.output
+    assert result.exit_code != 0, result.output
+
+
 def test_preflight_empty_binding_key_override_is_not_masked_by_parent(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]

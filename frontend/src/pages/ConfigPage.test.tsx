@@ -710,16 +710,37 @@ describe("RoleMatrixEditor", () => {
     expect(screen.queryByLabelText("binding fix model")).toBeNull();
   });
 
-  it("hides review_verify's model cell when the binding leaves everything inherited and the global implementer is codex", () => {
-    // implement resolves to codex from the global matrix (own cell empty) ->
-    // review_verify's implementer-opposite default resolves to claude, so its
-    // model cell should stay wired here; flip the global implementer to
-    // claude and review_verify's default flips to codex, hiding it.
+  it("hides review_verify's model cell when its own agent is inherited, regardless of the global implementer", () => {
+    // review_verify's inherited default does NOT mirror implement (server's
+    // `resolved_reviewer_agent()` fallback reads only the binding's legacy
+    // `agent`/`reviewer_agent` fields, always defaults for a DB-managed
+    // binding) — it's always the fixed "codex", so the model cell stays
+    // hidden here even though the global matrix pins `implement` to `claude`
+    // (SYM-191 review).
     render(
       <RoleMatrixEditor
         scope="binding"
         roles={{ review_verify: { model: "opus" } }}
         globalRoles={{ implement: { agent: "claude" } }}
+        options={OPTIONS}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.queryByLabelText("binding review_verify model")).toBeNull();
+  });
+
+  it("does not treat review_verify's inherited default as implement-opposite when the global matrix pins only implement", () => {
+    // An imported or API-created global matrix pinning only
+    // `implement.agent: codex` and leaving `review_verify.agent` inherited
+    // must NOT flip review_verify's effective family to "claude" (the
+    // implement-opposite) — the server's fallback for an inherited
+    // review_verify ignores the matrix's `implement` cell entirely, so it
+    // stays "codex" regardless (SYM-191 review).
+    render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={{}}
+        globalRoles={{ implement: { agent: "codex" } }}
         options={OPTIONS}
         onChange={() => {}}
       />,
@@ -865,11 +886,11 @@ describe("RoleMatrixEditor", () => {
   });
 
   it("hides review_verify's model cell when its agent inherits Codex from a default Claude implementer", () => {
-    // With everything inherited, `implement` resolves to the class default
-    // `claude`, so `review_verify` resolves to the implementer-opposite
-    // family (Codex) — a Codex-resolved verifier reads its model from the
-    // legacy `binding.codex_model`, never this cell, so it must stay hidden
-    // even though the cell's own `agent` is `""` rather than `"codex"`
+    // With everything inherited, review_verify's fixed fallback (Codex —
+    // see `effectiveAgent`) applies regardless of what `implement` resolves
+    // to — a Codex-resolved verifier reads its model from the legacy
+    // `binding.codex_model`, never this cell, so it must stay hidden even
+    // though the cell's own `agent` is `""` rather than `"codex"`
     // (SYM-191 review).
     render(
       <RoleMatrixEditor scope="binding" roles={{}} options={OPTIONS} onChange={() => {}} />,

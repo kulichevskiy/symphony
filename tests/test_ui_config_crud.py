@@ -1292,6 +1292,45 @@ async def test_only_inherited_rechecks_a_binding_role_with_unpinned_agent(
 
 
 @pytest.mark.asyncio
+async def test_reject_unsupported_efforts_honors_binding_env_alias_pin(
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """A binding pinning `ANTHROPIC_DEFAULT_SONNET_MODEL` through its own
+    (unresolved) `env:` mapping runs its claude subprocess against that pin
+    (`{**os.environ, **spec.env}`), so the save-time capability recheck must
+    resolve `sonnet` against the same pin for that binding — not the
+    process-wide default — or it validates the wrong model (SYM-191 review)."""
+    from symphony.config import LinearStates, RepoBinding, RoleConfig
+    from symphony.ui import config_crud
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("PINNED_SONNET", "claude-sonnet-4-6")
+
+    seen_models: list[str] = []
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        seen_models.append(model)
+        # Only the pinned model supports "high" — the unpinned default
+        # ("claude-sonnet-5") doesn't — so validating against the wrong model
+        # would flip this test's outcome.
+        return ["low", "medium", "high"] if model == "claude-sonnet-4-6" else ["low"]
+
+    monkeypatch.setattr(config_crud, "fetch_claude_effort_capabilities", _caps)
+
+    binding = RepoBinding(
+        linear_team_key="ENG",
+        github_repo="org/repo",
+        linear_states=LinearStates(ready="Todo"),
+        env={"ANTHROPIC_DEFAULT_SONNET_MODEL": "PINNED_SONNET"},
+        roles={"implement": RoleConfig(agent="claude", model="sonnet", effort="high")},
+    )
+    trial = Config(repos=[binding])
+
+    await config_crud._reject_unsupported_efforts(trial, bindings=[binding])
+    assert seen_models == ["claude-sonnet-4-6"]
+
+
+@pytest.mark.asyncio
 async def test_save_fails_closed_on_capability_lookup_error(
     tmp_path: Path,
     monkeypatch,  # type: ignore[no-untyped-def]
