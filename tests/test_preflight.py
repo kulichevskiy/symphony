@@ -248,6 +248,45 @@ async def test_fetch_claude_effort_capabilities_alias_env_override(
     assert seen_paths == ["/v1/models/claude-sonnet-4-6"]
 
 
+async def test_fetch_claude_effort_capabilities_honors_anthropic_default_model_env(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    """Claude Code's own `ANTHROPIC_DEFAULT_SONNET_MODEL` pins what `sonnet`
+    resolves to for the CLI itself; when a deployment sets it, that IS the
+    real pinned ID — honor it over our hard-coded guess (SYM-191 review)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "claude-sonnet-4-6")
+    seen_paths = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        return httpx.Response(200, json={"capabilities": {"effort": {"low": {}}}})
+
+    _install_mock_transport(monkeypatch, _handler)
+    await fetch_claude_effort_capabilities("sonnet")
+    assert seen_paths == ["/v1/models/claude-sonnet-4-6"]
+
+
+async def test_fetch_claude_effort_capabilities_symphony_override_wins_over_anthropic_default(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    """`SYMPHONY_CLAUDE_ALIAS_SONNET` is the more explicit, check-specific
+    override — it should win when both it and Claude Code's own
+    `ANTHROPIC_DEFAULT_SONNET_MODEL` are set (SYM-191 review)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "claude-sonnet-4-6")
+    monkeypatch.setenv("SYMPHONY_CLAUDE_ALIAS_SONNET", "claude-sonnet-explicit")
+    seen_paths = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        return httpx.Response(200, json={"capabilities": {"effort": {"low": {}}}})
+
+    _install_mock_transport(monkeypatch, _handler)
+    await fetch_claude_effort_capabilities("sonnet")
+    assert seen_paths == ["/v1/models/claude-sonnet-explicit"]
+
+
 async def test_fetch_claude_effort_capabilities_full_model_id_passes_through(
     monkeypatch,
 ) -> None:  # type: ignore[no-untyped-def]

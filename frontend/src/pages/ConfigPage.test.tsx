@@ -582,6 +582,70 @@ describe("RoleMatrixEditor", () => {
     expect(roles.accept).toBeUndefined();
   });
 
+  it("mirrors implement's codex model onto fix/accept's hidden model cell", () => {
+    // `_synthesize_legacy_role_fields` only derives the legacy `codex_model`
+    // that a codex-resolved fix/accept actually dispatch with when
+    // impl.model == fix.model == acc.model; picking a non-default codex
+    // model on implement must carry it onto fix/accept too, or their
+    // dispatch silently keeps the stale/default model (SYM-191 review).
+    let roles: RolesMatrix = {};
+    const { rerender } = render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={roles}
+        options={OPTIONS}
+        onChange={(next) => {
+          roles = next;
+        }}
+      />,
+    );
+    // Step 1: pick Codex as the implementer (mirrors fix/accept's agent, per
+    // the existing builder-agent sync).
+    fireEvent.change(screen.getByLabelText("binding implement agent"), {
+      target: { value: "codex" },
+    });
+    rerender(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={roles}
+        options={OPTIONS}
+        onChange={(next) => {
+          roles = next;
+        }}
+      />,
+    );
+    // Step 2: pick a non-default Codex model.
+    fireEvent.change(screen.getByLabelText("binding implement model"), {
+      target: { value: "gpt-5.1-codex" },
+    });
+    expect(roles.implement).toEqual({ agent: "codex", model: "gpt-5.1-codex" });
+    expect(roles.fix).toEqual({ agent: "codex", model: "gpt-5.1-codex" });
+    expect(roles.accept).toEqual({ agent: "codex", model: "gpt-5.1-codex" });
+
+    // A stale fix/accept model (e.g. loaded from before this sync existed)
+    // is corrected, not just filled in when absent.
+    roles = {
+      implement: { agent: "codex", model: "gpt-5.1-codex" },
+      fix: { agent: "codex", model: "stale-model" },
+      accept: { agent: "codex", model: "stale-model" },
+    };
+    rerender(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={roles}
+        options={OPTIONS}
+        onChange={(next) => {
+          roles = next;
+        }}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("binding implement model"), {
+      target: { value: "gpt-5.1-codex" },
+    });
+    expect(roles.fix).toEqual({ agent: "codex", model: "gpt-5.1-codex" });
+    expect(roles.accept).toEqual({ agent: "codex", model: "gpt-5.1-codex" });
+  });
+
   it("hides fix's model cell once its (propagated) agent resolves to codex", () => {
     let roles: RolesMatrix = {
       implement: { agent: "claude" },

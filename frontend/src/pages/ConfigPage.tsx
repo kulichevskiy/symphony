@@ -187,6 +187,20 @@ export function RoleMatrixEditor({
       setCell(next, "fix", "agent", value);
       setCell(next, "accept", "agent", value);
     }
+    // `_synthesize_legacy_role_fields` only derives the legacy `codex_model`
+    // (what a codex-resolved `fix`/`accept` actually dispatch with — their
+    // own model cell is a no-op for codex, see `modelWired`) when
+    // `impl.model == fix.model == acc.model`. Keep those two cells mirroring
+    // `implement`'s model whenever the (possibly just-changed) family is
+    // codex, in whichever order agent/model are set, or a picked non-default
+    // model silently never reaches `fix`/`accept` (SYM-191 review).
+    if (role === "implement" && (field === "agent" || field === "model")) {
+      if (effectiveAgent("implement", next) === "codex") {
+        const implModel = String(next.implement?.model ?? "");
+        setCell(next, "fix", "model", implModel);
+        setCell(next, "accept", "model", implModel);
+      }
+    }
     onChange(next);
   }
 

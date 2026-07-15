@@ -26,8 +26,10 @@ _ANTHROPIC_VERSION = "2023-06-01"
 # one hard-coded here (docs: family aliases resolve to the newest version the
 # allowlist permits — https://docs.anthropic.com/en/docs/claude-code/model-config),
 # so this default can validate a different model than the one the CLI
-# actually runs. `_alias_override_env` lets an operator in that situation tell
-# us the real pinned ID instead.
+# actually runs. `_resolve_alias_model_id` checks `_alias_override_env` first
+# (an operator overriding just this check), then Claude Code's own
+# `ANTHROPIC_DEFAULT_<ALIAS>_MODEL` pinning variable (the deployment already
+# states the real pinned ID there when set).
 _CLAUDE_ALIAS_MODEL_IDS: dict[str, str] = {
     "opus": "claude-opus-4-8",
     "sonnet": "claude-sonnet-5",
@@ -39,18 +41,35 @@ def _alias_override_env(alias: str) -> str:
     return f"SYMPHONY_CLAUDE_ALIAS_{alias.upper()}"
 
 
+# Claude Code's own documented alias-pinning variables
+# (https://code.claude.com/docs/en/model-config): when set, the CLI resolves
+# the bare alias to this ID instead of its built-in default, so a deployment
+# using them already tells us the real pinned ID — no guessing needed.
+_ANTHROPIC_DEFAULT_MODEL_ENV: dict[str, str] = {
+    "opus": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "sonnet": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "haiku": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+}
+
+
 def _resolve_alias_model_id(model: str) -> str:
     """Resolve a CLI-only alias to the full model ID to check capabilities for.
 
     Checks `SYMPHONY_CLAUDE_ALIAS_<ALIAS>` (e.g. `SYMPHONY_CLAUDE_ALIAS_SONNET
-    =claude-sonnet-4-6`) first, for an operator whose org allowlist pins the
-    alias away from our hard-coded guess; falls back to
-    `_CLAUDE_ALIAS_MODEL_IDS`, then the model name itself for a full `claude-*`
-    ID.
+    =claude-sonnet-4-6`) first, for an operator overriding just this check;
+    then Claude Code's own `ANTHROPIC_DEFAULT_<ALIAS>_MODEL` pinning variable,
+    which — when a deployment sets it — already tells the CLI itself what the
+    alias resolves to; falls back to `_CLAUDE_ALIAS_MODEL_IDS`, then the model
+    name itself for a full `claude-*` ID.
     """
     override = os.environ.get(_alias_override_env(model))
     if override:
         return override
+    pin_env = _ANTHROPIC_DEFAULT_MODEL_ENV.get(model)
+    if pin_env:
+        pinned = os.environ.get(pin_env)
+        if pinned:
+            return pinned
     return _CLAUDE_ALIAS_MODEL_IDS.get(model, model)
 
 
