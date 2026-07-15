@@ -1616,3 +1616,41 @@ def test_visual_acceptance_honors_explicit_codex_override() -> None:
     exactly that, even for a visual acceptance run."""
     binding = _review_binding(agent="codex", roles={"accept": RoleConfig(agent="codex")})
     assert binding.resolved_role("accept", visual_acceptance=True).agent == "codex"
+
+
+def test_visual_acceptance_clears_codex_model_and_effort_when_forcing_claude() -> None:
+    """A `roles.accept` cell that sets only `model`/`effort` (no `agent`) on a
+    codex-family binding is inherited/validated as codex settings. Forcing the
+    agent to claude for dev/preview acceptance must also drop that stale
+    codex model/effort, or the resulting command runs
+    `claude --model gpt-5.1-codex-max` / `claude --effort minimal`, which
+    fails despite validation passing (SYM-192 review)."""
+    binding = _review_binding(
+        agent="codex",
+        codex_model="gpt-5.1-codex-max",
+        roles={"accept": RoleConfig(model="gpt-5.1-codex-max", effort="minimal")},
+    )
+    forced = binding.resolved_role("accept", visual_acceptance=True)
+    assert forced.agent == "claude"
+    assert forced.model is None
+    assert forced.effort is None
+    # Non-forced (non-visual-acceptance) resolution keeps the codex cells.
+    unforced = binding.resolved_role("accept")
+    assert unforced.agent == "codex"
+    assert unforced.model == "gpt-5.1-codex-max"
+    assert unforced.effort == "minimal"
+
+
+def test_review_verify_codex_override_does_not_inherit_claude_implement_model() -> None:
+    """`implement` resolving to Claude with a pinned model (e.g. global
+    `roles.implement.model: sonnet`) must not leak that model into a binding
+    that overrides only `roles.review_verify.agent: codex` — `codex --model
+    sonnet` is not a supported codex model (SYM-192 review)."""
+    binding = _review_binding(roles={"review_verify": RoleConfig(agent="codex")})
+    global_roles = {"implement": RoleConfig(model="sonnet")}
+    impl = binding.resolved_role("implement", global_roles)
+    assert impl.agent == "claude" and impl.model == "sonnet"
+    rv = binding.resolved_role("review_verify", global_roles)
+    assert rv.agent == "codex"
+    assert rv.model != "sonnet"
+    assert rv.model == binding.resolved_reviewer_codex_model()

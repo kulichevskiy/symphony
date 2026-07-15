@@ -573,7 +573,14 @@ class RepoBinding(BaseModel):
             return self.codex_model if agent == "codex" else None
         if name == "review_verify":
             if agent == "codex":
-                return self.resolved_role("implement", global_roles).model
+                implement_role = self.resolved_role("implement", global_roles)
+                # Only reuse `implement`'s model when it actually resolved to
+                # codex too — an explicit `roles.review_verify.agent: codex`
+                # override on a Claude-family `implement` must not inherit a
+                # Claude model string into a codex command (SYM-192 review).
+                if implement_role.agent == "codex":
+                    return implement_role.model
+                return self.resolved_reviewer_codex_model()
             return self.local_review_verifier_claude_model
         if agent == "codex":
             return self.resolved_reviewer_codex_model()
@@ -620,7 +627,14 @@ class RepoBinding(BaseModel):
         if agent is None:
             agent = self._default_role_agent(name, global_roles)
             if visual_acceptance and name == "accept" and agent == "codex":
+                # `model`/`effort` above may already carry codex-family
+                # values inherited from an unset-agent `roles.accept` cell
+                # (e.g. a codex model or effort string) — discard them so
+                # they don't ride along into the forced Claude command
+                # (SYM-192 review).
                 agent = "claude"
+                model = None
+                effort = None
         if model is None:
             model = self._default_role_model(name, agent, global_roles)
         # `effort` has no legacy top-level field, so its only source is the
