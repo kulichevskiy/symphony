@@ -877,6 +877,7 @@ class _AcceptanceMixin(_OrchestratorBase):
                 else:
                     workspace_path = await self._workspace.acquire(binding, issue)
                     try:
+                        accept_role = binding.resolved_role("accept", self.config.roles)
                         verdict = await run_acceptance(
                             runner=self._runner,
                             run_id=run_id,
@@ -893,6 +894,10 @@ class _AcceptanceMixin(_OrchestratorBase):
                             dev_command=binding.acceptance.dev_command,
                             dev_port=binding.acceptance.dev_port,
                             log_root=self.config.log_root,
+                            agent=accept_role.agent,
+                            codex_model=role_codex_model(accept_role),
+                            claude_model=role_claude_model(accept_role),
+                            effort=accept_role.effort,
                         )
                         verdict = _replace_acceptance_criteria_labels(
                             verdict=verdict,

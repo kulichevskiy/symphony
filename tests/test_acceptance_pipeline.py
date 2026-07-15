@@ -737,6 +737,63 @@ async def test_acceptance_runner_invokes_claude_headless_for_code_only(
 
 
 @pytest.mark.asyncio
+async def test_acceptance_runner_routes_codex_role_through_command_and_cost(
+    tmp_path: Path,
+) -> None:
+    """`roles.accept.agent: codex` must drive the actual acceptance-verdict
+    subprocess argv and its cost estimation, not just the post-rejection fix
+    run (SYM-192 review). The transcript classifier only understands
+    Claude's stream-json shape, so a codex run still reports `infra_error`
+    here (a separate, pre-existing gap) — this asserts the part SYM-192
+    fixes: command construction and cost attribution follow the resolved
+    role even on that path.
+    """
+    runner = _ScriptedRunner(
+        [
+            RunnerEvent(kind="started", pid=1234),
+            RunnerEvent(
+                kind="stdout",
+                line=json.dumps(
+                    {
+                        "type": "turn.completed",
+                        "usage": {
+                            "input_tokens": 1_000_000,
+                            "output_tokens": 1_000_000,
+                            "cached_input_tokens": 0,
+                        },
+                    }
+                ),
+            ),
+            RunnerEvent(kind="exit", returncode=1),
+        ]
+    )
+
+    verdict = await run_acceptance(
+        runner=runner,
+        run_id="acceptance-1",
+        workspace_path=tmp_path,
+        mode="code_only",
+        linear_description="Add a settings icon to the toolbar.",
+        pr_diff_summary="diff --git a/ui.py b/ui.py\n+ add_icon('settings')",
+        criteria=["toolbar has settings icon"],
+        stall_secs=15,
+        agent="codex",
+        codex_model="gpt-5.1-codex",
+        effort="high",
+    )
+
+    assert runner.captured_spec is not None
+    command = runner.captured_spec.command
+    assert command[0] == "codex"
+    assert "--dangerously-bypass-approvals-and-sandbox" in command
+    assert command[command.index("--model") + 1] == "gpt-5.1-codex"
+    assert command[command.index("--config") + 1] == 'model_reasoning_effort="high"'
+    assert verdict.kind == "infra_error"
+    # gpt-5.1-codex pricing: $1.25/M input + $10/M output.
+    assert verdict.cost == pytest.approx(11.25)
+
+
+@pytest.mark.asyncio
 async def test_dev_acceptance_launches_dev_server_and_enables_playwright_mcp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1342,6 +1399,51 @@ def test_acceptance_command_disallows_claude_tools_without_budget() -> None:
     assert "--mcp-config" not in command
     assert "--max-budget-usd" not in command
     assert command[-1] == "judge this"
+
+
+def test_acceptance_command_threads_claude_model_and_effort() -> None:
+    """The resolved `accept` role's Claude model/effort must reach the
+    acceptance-verdict argv, not just the post-rejection fix run (SYM-192
+    review)."""
+    command = build_acceptance_command(
+        prompt="judge this", claude_model="claude-haiku-4-5", effort="high"
+    )
+
+    assert command[command.index("--model") + 1] == "claude-haiku-4-5"
+    assert command[command.index("--effort") + 1] == "high"
+    assert command[-1] == "judge this"
+
+
+def test_acceptance_command_supports_codex_agent() -> None:
+    """`roles.accept.agent: codex` must drive the actual acceptance-verdict
+    command, not silently fall back to the default Claude command (SYM-192
+    review)."""
+    command = build_acceptance_command(
+        prompt="judge this", agent="codex", codex_model="gpt-5.5", effort="high"
+    )
+
+    assert command[0] == "codex"
+    assert "--dangerously-bypass-approvals-and-sandbox" in command
+    assert command[command.index("--model") + 1] == "gpt-5.5"
+    assert '--config' in command
+    assert command[command.index("--config") + 1] == 'model_reasoning_effort="high"'
+    assert command[-1] == "judge this"
+    assert "claude" not in command
+
+
+def test_acceptance_command_codex_ignores_mcp_config_path(tmp_path: Path) -> None:
+    """Codex MCP wiring lives in its own config.toml, unaffected by the
+    Playwright `mcp_config_path` used for Claude's dev/preview modes."""
+    command = build_acceptance_command(
+        prompt="judge this",
+        mode="dev",
+        agent="codex",
+        codex_model="gpt-5.5",
+        mcp_config_path=tmp_path / "unused.json",
+    )
+
+    assert command[0] == "codex"
+    assert "--mcp-config" not in command
 
 
 @pytest.mark.asyncio

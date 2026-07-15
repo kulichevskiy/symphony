@@ -1004,13 +1004,14 @@ def runs_backfill_model_usage(db_path: Path, log_root: Path, config_path: Path |
     if config_path is not None:
         cfg = Config.load(config_path)
         for binding in cfg.repos:
-            implement_role = binding.resolved_role("implement", cfg.roles)
-            reviewer_role = binding.resolved_role("review_find", cfg.roles)
             codex_models_by_team.setdefault(
                 binding.linear_team_key,
                 CodexModels(
-                    implementer=implement_role.codex_model_arg(),
-                    reviewer=reviewer_role.codex_model_arg(),
+                    implementer=binding.resolved_role("implement", cfg.roles).codex_model_arg(),
+                    fix=binding.resolved_role("fix", cfg.roles).codex_model_arg(),
+                    accept=binding.resolved_role("accept", cfg.roles).codex_model_arg(),
+                    reviewer=binding.resolved_role("review_find", cfg.roles).codex_model_arg(),
+                    verifier=binding.resolved_role("review_verify", cfg.roles).codex_model_arg(),
                 ),
             )
 
