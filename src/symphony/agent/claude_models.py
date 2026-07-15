@@ -10,6 +10,7 @@ check, run manually via `symphony preflight`; daemon boot stays structural
 from __future__ import annotations
 
 import os
+import re
 
 import httpx
 
@@ -41,6 +42,20 @@ def _alias_override_env(alias: str) -> str:
     return f"SYMPHONY_CLAUDE_ALIAS_{alias.upper()}"
 
 
+# Claude Code's documented 1M-context pinning syntax
+# (https://code.claude.com/docs/en/model-config#context-window):
+# `ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-4-8[1m]'`. The CLI itself strips
+# this bracket suffix before resolving the model; the Models API never
+# recognizes it either (a `[1m]`-suffixed ID 404s), so strip it the same way
+# here before the capability lookup — the effort tree is identical for the
+# 1M- and default-context variant of a given model.
+_CONTEXT_SUFFIX_RE = re.compile(r"\[[^\[\]]*\]$")
+
+
+def _strip_context_suffix(model: str) -> str:
+    return _CONTEXT_SUFFIX_RE.sub("", model)
+
+
 # Claude Code's own documented alias-pinning variables
 # (https://code.claude.com/docs/en/model-config): when set, the CLI resolves
 # the bare alias to this ID instead of its built-in default, so a deployment
@@ -60,17 +75,19 @@ def _resolve_alias_model_id(model: str) -> str:
     then Claude Code's own `ANTHROPIC_DEFAULT_<ALIAS>_MODEL` pinning variable,
     which — when a deployment sets it — already tells the CLI itself what the
     alias resolves to; falls back to `_CLAUDE_ALIAS_MODEL_IDS`, then the model
-    name itself for a full `claude-*` ID.
+    name itself for a full `claude-*` ID. Strips a trailing `[1m]`-style
+    context-window suffix (see `_strip_context_suffix`) from whichever source
+    wins, since the Models API never recognizes it.
     """
     override = os.environ.get(_alias_override_env(model))
     if override:
-        return override
+        return _strip_context_suffix(override)
     pin_env = _ANTHROPIC_DEFAULT_MODEL_ENV.get(model)
     if pin_env:
         pinned = os.environ.get(pin_env)
         if pinned:
-            return pinned
-    return _CLAUDE_ALIAS_MODEL_IDS.get(model, model)
+            return _strip_context_suffix(pinned)
+    return _strip_context_suffix(_CLAUDE_ALIAS_MODEL_IDS.get(model, model))
 
 
 async def fetch_claude_effort_capabilities(

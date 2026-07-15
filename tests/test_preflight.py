@@ -267,6 +267,27 @@ async def test_fetch_claude_effort_capabilities_honors_anthropic_default_model_e
     assert seen_paths == ["/v1/models/claude-sonnet-4-6"]
 
 
+async def test_fetch_claude_effort_capabilities_strips_1m_context_suffix(
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    """Claude Code's documented 1M-context pinning syntax
+    (`ANTHROPIC_DEFAULT_OPUS_MODEL='claude-opus-4-8[1m]'`) is stripped by the
+    CLI itself before use; the Models API never recognizes the bracket suffix
+    either (`/v1/models/claude-opus-4-8[1m]` 404s), so the pinned value must
+    be stripped here too before the capability lookup (SYM-191 review)."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-4-8[1m]")
+    seen_paths = []
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        seen_paths.append(request.url.path)
+        return httpx.Response(200, json={"capabilities": {"effort": {"low": {}}}})
+
+    _install_mock_transport(monkeypatch, _handler)
+    await fetch_claude_effort_capabilities("opus")
+    assert seen_paths == ["/v1/models/claude-opus-4-8"]
+
+
 async def test_fetch_claude_effort_capabilities_symphony_override_wins_over_anthropic_default(
     monkeypatch,
 ) -> None:  # type: ignore[no-untyped-def]

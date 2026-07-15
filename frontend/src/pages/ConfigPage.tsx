@@ -101,20 +101,27 @@ function modelsFor(options: ConfigOptions, agent: string): string[] {
 }
 
 /** Best-effort resolved agent family for `role`, used only to decide whether
- *  a dead model cell should be hidden — NOT a full inheritance resolution
- *  (this component never sees the global matrix, so a global override this
- *  binding leaves inherited can still slip past). An explicit cell wins;
- *  otherwise `fix` mirrors `implement` (kept in lockstep by `cellChange`) and
- *  `review_verify` defaults to the implementer-opposite family
- *  (`resolved_reviewer_agent`), same as the server's default when nothing
- *  overrides anything. */
-function effectiveAgent(role: string, roles: RolesMatrix): string {
-  const own = String(roles[role]?.agent ?? "");
+ *  a dead model cell should be hidden — NOT a full inheritance resolution.
+ *  An explicit binding cell wins, then the global matrix's cell for the same
+ *  role (so a binding that leaves `implement.agent` inherited still resolves
+ *  to a global `codex` default instead of silently falling through to the
+ *  hardcoded `claude` guess below); otherwise `fix` mirrors `implement`
+ *  (kept in lockstep by `cellChange`) and `review_verify` defaults to the
+ *  implementer-opposite family (`resolved_reviewer_agent`), same as the
+ *  server's default when nothing overrides anything. */
+function effectiveAgent(
+  role: string,
+  roles: RolesMatrix,
+  globalRoles: RolesMatrix,
+): string {
+  const own = String(roles[role]?.agent ?? globalRoles[role]?.agent ?? "");
   if (own) return own;
   if (role === "review_verify") {
-    return effectiveAgent("implement", roles) === "codex" ? "claude" : "codex";
+    return effectiveAgent("implement", roles, globalRoles) === "codex"
+      ? "claude"
+      : "codex";
   }
-  if (role === "fix") return effectiveAgent("implement", roles);
+  if (role === "fix") return effectiveAgent("implement", roles, globalRoles);
   return "claude";
 }
 
@@ -137,11 +144,13 @@ function effortsFor(options: ConfigOptions, agent: string, model: string): strin
 export function RoleMatrixEditor({
   scope,
   roles,
+  globalRoles = {},
   options,
   onChange,
 }: {
   scope: string;
   roles: RolesMatrix;
+  globalRoles?: RolesMatrix;
   options: ConfigOptions;
   onChange: (next: RolesMatrix) => void;
 }) {
@@ -195,7 +204,7 @@ export function RoleMatrixEditor({
     // codex, in whichever order agent/model are set, or a picked non-default
     // model silently never reaches `fix`/`accept` (SYM-191 review).
     if (role === "implement" && (field === "agent" || field === "model")) {
-      if (effectiveAgent("implement", next) === "codex") {
+      if (effectiveAgent("implement", next, globalRoles) === "codex") {
         const implModel = String(next.implement?.model ?? "");
         setCell(next, "fix", "model", implModel);
         setCell(next, "accept", "model", implModel);
@@ -234,7 +243,7 @@ export function RoleMatrixEditor({
               fields.model &&
               !(
                 (role === "review_verify" || role === "fix") &&
-                effectiveAgent(role, roles) === "codex"
+                effectiveAgent(role, roles, globalRoles) === "codex"
               );
             // Include a stored effort not in the current option list (e.g.
             // loaded before a model change tightened the set) so the Select
@@ -465,11 +474,13 @@ function canonicalizePayload(
 export function BindingForm({
   binding,
   options,
+  globalRoles = {},
   onSaved,
   onCancel,
 }: {
   binding: BindingRecord | null;
   options: ConfigOptions;
+  globalRoles?: RolesMatrix;
   onSaved: (warnings?: string[]) => void;
   onCancel: () => void;
 }) {
@@ -787,6 +798,7 @@ export function BindingForm({
           <RoleMatrixEditor
             scope="binding"
             roles={(payload.roles as RolesMatrix | undefined) ?? {}}
+            globalRoles={globalRoles}
             options={options}
             onChange={(next) => {
               const cleaned = { ...payload };
@@ -914,10 +926,12 @@ function EditableBindingCard({
 export function BindingsPanel({
   bindings,
   options,
+  globalRoles = {},
   onChanged,
 }: {
   bindings: BindingRecord[];
   options: ConfigOptions;
+  globalRoles?: RolesMatrix;
   onChanged: () => void;
 }) {
   const [editing, setEditing] = useState<BindingRecord | null>(null);
@@ -1039,6 +1053,7 @@ export function BindingsPanel({
           key="new"
           binding={null}
           options={options}
+          globalRoles={globalRoles}
           onSaved={(warnings) => {
             setCreating(false);
             setSavedWarnings(warnings?.length ? warnings : null);
@@ -1052,6 +1067,7 @@ export function BindingsPanel({
           key={editing.id}
           binding={editing}
           options={options}
+          globalRoles={globalRoles}
           onSaved={(warnings) => {
             setEditing(null);
             setSavedWarnings(warnings?.length ? warnings : null);
@@ -1223,6 +1239,7 @@ export function ConfigPage() {
           <BindingsPanel
             bindings={bindings.data}
             options={options.data}
+            globalRoles={roles.data?.roles}
             onChanged={refetchAll}
           />
           {roles.data ? (

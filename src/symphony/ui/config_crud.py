@@ -530,10 +530,14 @@ async def _reject_unsupported_efforts(
     can't save silently.
 
     `only_inherited` (set by `put_roles`) skips a binding/role pair whose
-    `model` *and* `effort` are both pinned by the binding itself — that
-    resolved pair is untouched by a global roles write, so a stale/unsupported
-    override on an unrelated role or binding can't block an otherwise-unrelated
-    global edit."""
+    `agent`, `model`, *and* `effort` are all pinned by the binding itself —
+    only then is the resolved pair fully binding-owned and untouched by a
+    global roles write, so a stale/unsupported override on an unrelated role
+    or binding can't block an otherwise-unrelated global edit. A binding role
+    that pins `model`/`effort` but leaves `agent` inherited must still be
+    rechecked: the global write can flip its resolved agent (e.g. claude ->
+    codex or back), changing which family's efforts that pinned model/effort
+    pair is validated against (SYM-191 review)."""
     env_source = _env_key_source()
     process_key = env_source.get("ANTHROPIC_API_KEY", "")
     pairs: set[tuple[str, str, str]] = set()  # (key, model, effort)
@@ -548,6 +552,7 @@ async def _reject_unsupported_efforts(
                 binding_role = binding.roles.get(name)
                 if (
                     binding_role is not None
+                    and binding_role.agent is not None
                     and binding_role.model is not None
                     and binding_role.effort is not None
                 ):

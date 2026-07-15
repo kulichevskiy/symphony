@@ -1252,6 +1252,46 @@ async def test_global_roles_put_not_blocked_by_unrelated_binding_override(
 
 
 @pytest.mark.asyncio
+async def test_only_inherited_rechecks_a_binding_role_with_unpinned_agent(
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """`only_inherited=True` (the `put_roles` sweep) must not skip a binding
+    role just because its own `model`/`effort` are pinned — that's only safe
+    when `agent` is pinned too, since an unpinned `agent` still resolves
+    through whichever global cell the write just changed. Exercises
+    `_reject_unsupported_efforts` directly (not the full CRUD save path,
+    which would also reject a genuine cross-family mismatch structurally
+    before this check even runs) to isolate the online-capability skip logic
+    itself (SYM-191 review)."""
+    from symphony.config import LinearStates, RepoBinding, RoleConfig
+    from symphony.ui import config_crud
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+
+    async def _caps(model: str, api_key: str | None = None) -> list[str] | None:
+        # "xhigh" is structurally a valid claude effort but unsupported by
+        # this (live-reported) model — only the online check catches it.
+        return ["low", "medium", "high"]
+
+    monkeypatch.setattr(config_crud, "fetch_claude_effort_capabilities", _caps)
+
+    binding = RepoBinding(
+        linear_team_key="ENG",
+        github_repo="org/repo",
+        linear_states=LinearStates(ready="Todo"),
+        roles={"implement": RoleConfig(model="opus", effort="xhigh")},
+    )
+    trial = Config(roles={"implement": RoleConfig(agent="claude")}, repos=[binding])
+
+    with pytest.raises(config_crud.HTTPException) as exc_info:
+        await config_crud._reject_unsupported_efforts(
+            trial, bindings=[binding], only_inherited=True
+        )
+    assert exc_info.value.status_code == 422
+    assert "xhigh" in str(exc_info.value.detail)
+
+
+@pytest.mark.asyncio
 async def test_save_fails_closed_on_capability_lookup_error(
     tmp_path: Path,
     monkeypatch,  # type: ignore[no-untyped-def]

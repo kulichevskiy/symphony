@@ -477,6 +477,22 @@ describe("BindingsPanel", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0][0]).toBe("/api/config/bindings/1");
   });
+
+  it("threads globalRoles down into the binding's role matrix editor", () => {
+    // implement's agent cell is left inherited on the binding; only the
+    // global matrix pins it to codex. The binding form must still see that
+    // to hide fix's dead model cell (SYM-191 review).
+    render(
+      <BindingsPanel
+        bindings={[]}
+        options={OPTIONS}
+        globalRoles={{ implement: { agent: "codex" } }}
+        onChanged={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByText("New binding"));
+    expect(screen.queryByLabelText("binding fix model")).toBeNull();
+  });
 });
 
 describe("RoleMatrixEditor", () => {
@@ -679,6 +695,36 @@ describe("RoleMatrixEditor", () => {
       />,
     );
     expect(screen.queryByLabelText("binding fix model")).toBeNull();
+  });
+
+  it("hides fix's model cell when the binding leaves agent inherited and the global matrix resolves it to codex", () => {
+    render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={{ fix: { model: "sonnet" } }}
+        globalRoles={{ implement: { agent: "codex" } }}
+        options={OPTIONS}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.queryByLabelText("binding fix model")).toBeNull();
+  });
+
+  it("hides review_verify's model cell when the binding leaves everything inherited and the global implementer is codex", () => {
+    // implement resolves to codex from the global matrix (own cell empty) ->
+    // review_verify's implementer-opposite default resolves to claude, so its
+    // model cell should stay wired here; flip the global implementer to
+    // claude and review_verify's default flips to codex, hiding it.
+    render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={{ review_verify: { model: "opus" } }}
+        globalRoles={{ implement: { agent: "claude" } }}
+        options={OPTIONS}
+        onChange={() => {}}
+      />,
+    );
+    expect(screen.queryByLabelText("binding review_verify model")).toBeNull();
   });
 
   it("shows review_verify's model cell for a claude (or inherited) agent", () => {
