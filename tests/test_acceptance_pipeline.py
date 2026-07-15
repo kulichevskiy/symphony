@@ -1425,7 +1425,7 @@ def test_acceptance_command_supports_codex_agent() -> None:
     assert command[0] == "codex"
     assert "--dangerously-bypass-approvals-and-sandbox" in command
     assert command[command.index("--model") + 1] == "gpt-5.5"
-    assert '--config' in command
+    assert "--config" in command
     assert command[command.index("--config") + 1] == 'model_reasoning_effort="high"'
     assert command[-1] == "judge this"
     assert "claude" not in command
