@@ -560,6 +560,7 @@ def build_local_review_command(
     base_branch: str,
     codex_model: str = DEFAULT_CODEX_MODEL,
     claude_model: str | None = None,
+    effort: str | None = None,
     last_message_path: str | None = None,
     pass_two: bool = False,
 ) -> list[str]:
@@ -600,9 +601,10 @@ def build_local_review_command(
             # the sandbox (pass_two still gates the write/execute *prompt*).
             "--dangerously-bypass-approvals-and-sandbox",
             "--json",
-            "--model",
-            codex_model,
         ]
+        if effort is not None:
+            command.extend(["--config", f'model_reasoning_effort="{effort}"'])
+        command.extend(["--model", codex_model])
         if last_message_path is not None:
             command.extend(["-o", last_message_path])
         command.append(prompt)
@@ -639,6 +641,8 @@ def build_local_review_command(
         ]
         if claude_model is not None:
             command.extend(["--model", claude_model])
+        if effort is not None:
+            command.extend(["--effort", effort])
         command.extend(["--", prompt])
         return command
     raise ValueError(f"unknown reviewer agent {agent!r}")

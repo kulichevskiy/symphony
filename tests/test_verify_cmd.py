@@ -22,7 +22,7 @@ import pytest
 
 from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
-from symphony.config import Config, LinearStates, RepoBinding
+from symphony.config import Config, LinearStates, RepoBinding, ResolvedRole
 from symphony.linear.client import LinearIssue
 from symphony.orchestrator.poll import Orchestrator
 from symphony.pipeline.local_review import (
@@ -142,8 +142,7 @@ def _session_kwargs(runner: _StagedRunner, command_runner) -> dict:  # type: ign
         "issue_title": "Add auth",
         "issue_body": "OAuth login.",
         "labels": ["feature"],
-        "implementer_agent": "claude",
-        "implementer_codex_model": "gpt-5.3-codex",
+        "fixer_role": ResolvedRole(agent="claude"),
         "stall_secs": 60,
         "command_runner": command_runner,
     }
@@ -291,10 +290,9 @@ async def test_verify_session_fix_turn_carries_fix_role_model() -> None:
             ]
         }
     )
-    result = await run_verify_session(
-        **_session_kwargs(runner, command_runner),
-        fix_claude_model="claude-opus-4-6",
-    )
+    kwargs = _session_kwargs(runner, command_runner)
+    kwargs["fixer_role"] = ResolvedRole(agent="claude", model="claude-opus-4-6")
+    result = await run_verify_session(**kwargs)
     assert result.ok
     argv = runner.captured[0].command
     assert argv[argv.index("--model") + 1] == "claude-opus-4-6"

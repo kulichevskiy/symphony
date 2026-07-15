@@ -11,6 +11,7 @@ import pytest
 
 from symphony.agent.process import Usage
 from symphony.agent.runner import RunnerEvent, RunnerSpec
+from symphony.config import ResolvedRole
 from symphony.pipeline.cost_guard import UsageCostEstimator
 from symphony.pipeline.local_review import (
     VERDICT_APPROVED_MARKER,
@@ -325,10 +326,9 @@ async def test_session_total_cost_reflects_codex_token_pricing(
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="codex",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",

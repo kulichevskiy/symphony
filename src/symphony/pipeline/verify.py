@@ -22,9 +22,9 @@ from pathlib import Path
 from ..agent.process import Usage
 from ..agent.prompt import review_comment_fix_prompt
 from ..agent.runner import Runner, RunnerSpec
+from ..config import ResolvedRole
 from .local_review_io import collect_runner_output
 from .local_review_session import (
-    ImplementerAgent,
     _build_fix_command,
     _safe_run_id,
 )
@@ -134,9 +134,7 @@ async def run_verify_session(
     issue_title: str,
     issue_body: str,
     labels: list[str],
-    implementer_agent: ImplementerAgent,
-    implementer_codex_model: str,
-    fix_claude_model: str | None = None,
+    fixer_role: ResolvedRole,
     stall_secs: int,
     command_secs: int = 1800,
     wall_clock_secs: int = 0,
@@ -182,10 +180,11 @@ async def run_verify_session(
         run_id=_safe_run_id(parent_run_id, "verify-fix"),
         workspace_path=workspace_path,
         command=_build_fix_command(
-            agent=implementer_agent,
-            codex_model=implementer_codex_model,
+            agent=fixer_role.agent,
+            codex_model=fixer_role.codex_model_arg(),
             prompt=prompt,
-            claude_model=fix_claude_model,
+            claude_model=fixer_role.claude_model_arg(),
+            effort=fixer_role.effort,
         ),
         stall_secs=stall_secs,
         command_secs=command_secs,

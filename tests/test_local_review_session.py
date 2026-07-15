@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from symphony.agent.runner import RunnerEvent, RunnerSpec
+from symphony.config import ResolvedRole
 from symphony.pipeline.local_review import (
     VERDICT_APPROVED_MARKER,
     VERDICT_CHANGES_REQUESTED_MARKER,
@@ -160,10 +161,9 @@ async def test_first_review_approves_and_session_returns_approved(
         issue_title="Add OAuth",
         issue_body="Users should sign in via Google.",
         labels=["feature"],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="codex",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -211,10 +211,9 @@ async def test_allow_fixes_false_fails_without_local_review_fix_turn(
         issue_title="Add OAuth",
         issue_body="Users should sign in via Google.",
         labels=["feature"],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="codex",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -260,10 +259,15 @@ async def test_persists_transcripts_for_review_and_fix_iterations(
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent=implementer_agent,
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent=reviewer_agent,
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(
+            agent=reviewer_agent, model="gpt-5.1-codex" if reviewer_agent == "codex" else None
+        ),
+        verifier_role=ResolvedRole(
+            agent=implementer_agent, model="gpt-5.1-codex" if implementer_agent == "codex" else None
+        ),
+        fixer_role=ResolvedRole(
+            agent=implementer_agent, model="gpt-5.1-codex" if implementer_agent == "codex" else None
+        ),
         cap=5,
         stall_secs=300,
         last_message_dir=log_dir,
@@ -308,10 +312,9 @@ async def test_fix_then_approve_dispatches_fix_run_in_correct_workspace(
         issue_title="t",
         issue_body="b",
         labels=["x"],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="codex",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -372,12 +375,9 @@ async def test_local_review_claude_model_injected_into_reviewer_and_fixer(
         issue_title="t",
         issue_body="b",
         labels=["x"],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="claude",
-        reviewer_codex_model="gpt-5.1-codex",
-        local_review_claude_model="claude-sonnet-4-6",
-        fix_claude_model="claude-opus-4-6",
+        reviewer_role=ResolvedRole(agent="claude", model="claude-sonnet-4-6"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude", model="claude-opus-4-6"),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -422,10 +422,9 @@ async def test_local_review_claude_model_unset_omits_model_flag(
         issue_title="t",
         issue_body="b",
         labels=["x"],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="claude",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="claude"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -464,10 +463,9 @@ async def test_codex_fix_run_allows_git_writes(tmp_path: Path) -> None:
         issue_title="Add auth",
         issue_body="Users should sign in via Google.",
         labels=["feature"],
-        implementer_agent="codex",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="codex",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        fixer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -506,10 +504,9 @@ async def test_reviewer_spawn_failure_returns_reviewer_failed(
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="codex",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=log_dir,
@@ -543,10 +540,9 @@ async def test_reviewer_stall_returns_reviewer_failed(tmp_path: Path) -> None:
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="codex",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -612,10 +608,9 @@ async def test_claude_transient_api_error_surfaces_as_reviewer_failed(
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="claude",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="claude"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -647,10 +642,9 @@ async def test_fix_run_stall_returns_fix_run_failed(tmp_path: Path) -> None:
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="codex",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=log_dir,
@@ -701,10 +695,9 @@ async def test_blocked_fix_run_halts_session_as_blocked(tmp_path: Path) -> None:
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="codex",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -760,10 +753,9 @@ async def test_reviewer_prefers_last_message_file_over_stdout(
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="codex",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=last_dir,
@@ -819,10 +811,9 @@ async def test_stale_last_message_does_not_smuggle_into_next_iteration(
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="codex",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=1,
         stall_secs=300,
         last_message_dir=last_dir,
@@ -867,10 +858,15 @@ async def test_large_diff_runs_two_passes_with_per_pass_families(
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent=implementer_agent,
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent=reviewer_agent,
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(
+            agent=reviewer_agent, model="gpt-5.1-codex" if reviewer_agent == "codex" else None
+        ),
+        verifier_role=ResolvedRole(
+            agent=implementer_agent, model="gpt-5.1-codex" if implementer_agent == "codex" else None
+        ),
+        fixer_role=ResolvedRole(
+            agent=implementer_agent, model="gpt-5.1-codex" if implementer_agent == "codex" else None
+        ),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -892,6 +888,57 @@ async def test_large_diff_runs_two_passes_with_per_pass_families(
     assert verifier_spec.command[0] == implementer_agent
     # Pass-1 findings are injected into the verifier's prompt.
     assert "suspicion at foo.py:1" in verifier_spec.command[-1]
+
+
+@pytest.mark.asyncio
+async def test_two_pass_finder_and_verifier_reflect_per_role_model_effort(
+    tmp_path: Path,
+) -> None:
+    """review_find and review_verify each drive their own pass's argv — model
+    and reasoning effort per role (SYM-192)."""
+    finder_text = "## Findings\n- suspicion at foo.py:1"
+    verifier_text = f"held\n{VERDICT_APPROVED_MARKER}"
+    runner = _ScriptedRunner(
+        scripts=[
+            _message_stream("codex", finder_text),
+            _message_stream("claude", verifier_text),
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=500, changed_files=10)
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-2pass",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex", effort="low"),
+        verifier_role=ResolvedRole(agent="claude", model="opus", effort="high"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    finder_spec, verifier_spec = runner.specs
+    # Finder (review_find): codex model + reasoning effort.
+    assert finder_spec.command[0] == "codex"
+    assert finder_spec.command[finder_spec.command.index("--model") + 1] == "gpt-5.1-codex"
+    assert 'model_reasoning_effort="low"' in finder_spec.command
+    # Verifier (review_verify): claude model + effort.
+    assert verifier_spec.command[0] == "claude"
+    assert verifier_spec.command[verifier_spec.command.index("--model") + 1] == "opus"
+    assert verifier_spec.command[verifier_spec.command.index("--effort") + 1] == "high"
 
 
 @pytest.mark.asyncio
@@ -929,10 +976,9 @@ async def test_two_pass_finder_stream_error_surfaces_without_verifier(
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="claude",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="claude"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -988,10 +1034,9 @@ async def test_two_pass_finder_with_findings_and_stray_error_still_verifies(
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="claude",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="claude"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -1036,11 +1081,9 @@ async def test_finder_uses_sonnet_verifier_stays_on_opus(
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="claude",
-        reviewer_codex_model="gpt-5.1-codex",
-        local_review_claude_model="claude-sonnet-4-6",
+        reviewer_role=ResolvedRole(agent="claude", model="claude-sonnet-4-6"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -1084,12 +1127,9 @@ async def test_verifier_claude_model_override_runs_verifier_on_it(
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="claude",
-        reviewer_codex_model="gpt-5.1-codex",
-        local_review_claude_model="claude-sonnet-4-6",
-        local_review_verifier_claude_model="claude-opus-4-8",
+        reviewer_role=ResolvedRole(agent="claude", model="claude-sonnet-4-6"),
+        verifier_role=ResolvedRole(agent="claude", model="claude-opus-4-8"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -1134,10 +1174,9 @@ async def test_two_pass_merged_verdict_is_pass_twos(tmp_path: Path) -> None:
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="codex",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=1,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -1197,10 +1236,9 @@ async def test_small_diff_collapses_to_single_pass(
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="codex",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -1234,10 +1272,9 @@ async def test_no_diff_size_provider_defaults_to_single_pass(
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="codex",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -1281,10 +1318,15 @@ async def test_pass_two_verifier_gets_tier_b_command(
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent=implementer_agent,
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent=reviewer_agent,
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(
+            agent=reviewer_agent, model="gpt-5.1-codex" if reviewer_agent == "codex" else None
+        ),
+        verifier_role=ResolvedRole(
+            agent=implementer_agent, model="gpt-5.1-codex" if implementer_agent == "codex" else None
+        ),
+        fixer_role=ResolvedRole(
+            agent=implementer_agent, model="gpt-5.1-codex" if implementer_agent == "codex" else None
+        ),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -1381,10 +1423,9 @@ async def test_workspace_scrubbed_after_pass_two_before_fixer(
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="codex",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=1,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -1425,10 +1466,9 @@ async def test_safe_run_id_strips_unfriendly_chars(tmp_path: Path) -> None:
         issue_title="t",
         issue_body="b",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="codex",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         last_message_dir=tmp_path / "last",
@@ -1517,10 +1557,9 @@ async def test_wall_clock_secs_wired_to_specs_and_distinguishes_error(
         issue_title="Test",
         issue_body="Test",
         labels=[],
-        implementer_agent="claude",
-        implementer_codex_model="gpt-5.1-codex",
-        reviewer_agent="codex",
-        reviewer_codex_model="gpt-5.1-codex",
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
         cap=5,
         stall_secs=300,
         wall_clock_secs=2,

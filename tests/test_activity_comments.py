@@ -17,7 +17,7 @@ from symphony.agent.activity import (
     parse_codex_activity_line,
 )
 from symphony.agent.runner import RunnerEvent, RunnerSpec
-from symphony.config import Config, LinearStates, RepoBinding
+from symphony.config import Config, LinearStates, RepoBinding, ResolvedRole
 from symphony.linear.client import LinearIssue
 from symphony.orchestrator.poll import Orchestrator
 from symphony.pipeline.cost_guard import UsageDelta
@@ -511,6 +511,7 @@ async def test_orchestrator_final_flushes_unpublished_activity_events(
             run_id="run-1",
             workspace_path=workspace,
             stage="implement",
+            role=ResolvedRole(agent="codex"),
             prior_total=1.0,
         )
 
@@ -598,6 +599,7 @@ async def test_orchestrator_posts_long_running_heartbeat_without_new_output(
             run_id="run-1",
             workspace_path=workspace,
             stage="implement",
+            role=ResolvedRole(agent="codex"),
             prior_total=0.0,
         )
 

@@ -108,8 +108,9 @@ async def test_run_sum_reconciles_with_runs_tokens(tmp_path: Path) -> None:
 
 
 def test_parse_local_review_role_files_by_model(tmp_path: Path) -> None:
-    """fix-* transcripts attribute to the implementer model, review-* to the
-    reviewer model; Claude's `modelUsage` wins over the passed codex model."""
+    """fix-* transcripts attribute to the `fix` role model, review-*-verify to
+    the `review_verify` model, other review-* to the `review_find` model
+    (SYM-192); Claude's `modelUsage` wins over the passed codex model."""
     (tmp_path / "fix-1.out.log").write_text(
         json.dumps(
             {
@@ -145,15 +146,38 @@ def test_parse_local_review_role_files_by_model(tmp_path: Path) -> None:
         ),
         encoding="utf-8",
     )
+    # A pass-2 verifier transcript attributes to the distinct review_verify
+    # model, not the finder's.
+    (tmp_path / "review-1-verify.out.log").write_text(
+        "\n".join(
+            [
+                json.dumps({"type": "thread.started"}),
+                json.dumps(
+                    {
+                        "type": "token_count",
+                        "info": {
+                            "total_token_usage": {
+                                "input_tokens": 12,
+                                "output_tokens": 4,
+                            }
+                        },
+                    }
+                ),
+            ]
+        ),
+        encoding="utf-8",
+    )
     # An unrelated file is ignored (no fix-/review- prefix).
     (tmp_path / "notes.out.log").write_text("garbage", encoding="utf-8")
 
     usages = _parse_local_review_model_usage(
         tmp_path,
-        implementer_codex_model="gpt-5.1-codex",
+        fixer_codex_model="gpt-5.1-codex",
         reviewer_codex_model="gpt-5.5",
+        verifier_codex_model="gpt-5.6",
     )
     assert set(usages) == {
         ModelUsage("claude", "claude-opus-4-8", 100, 20, 0, 0),
         ModelUsage("codex", "gpt-5.5", 40, 8, 0, 0),
+        ModelUsage("codex", "gpt-5.6", 12, 4, 0, 0),
     }

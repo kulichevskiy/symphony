@@ -56,14 +56,6 @@ SUPPORTED_CLAUDE_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 RoleName = Literal["implement", "review_find", "review_verify", "fix", "accept"]
 _BUILDER_ROLES: frozenset[str] = frozenset({"implement", "fix", "accept"})
 
-# Roles whose command builder actually threads `effort` through to a dispatch
-# flag (`orchestrator.poll._base._run_agent` → `build_runner_command`).
-# `review_find`/`fix` take no `effort` param and `review_verify`/`accept` are
-# never resolved on any dispatch path at all, so an `effort` cell on any of
-# them is pure dead configuration — rejected in `validate_roles_matrix` rather
-# than silently persisted (SYM-191 review).
-_EFFORT_WIRED_ROLES: frozenset[str] = frozenset({"implement"})
-
 # Legacy top-level role fields the `roles:` matrix supersedes. Each is still
 # honored (mapped into the matrix below) but now warns, and collides loudly
 # with its matrix equivalent so an operator never sets both.
@@ -123,6 +115,21 @@ class ResolvedRole(BaseModel):
     agent: Literal["claude", "codex"]
     model: str | None = None
     effort: str | None = None
+
+    def codex_model_arg(self) -> str:
+        """Codex `--model` for this role: the resolved model for a codex role,
+        else the CLI default (the claude command path ignores it)."""
+        return self.model if self.agent == "codex" and self.model else DEFAULT_CODEX_MODEL
+
+    def claude_model_arg(self) -> str | None:
+        """Claude `--model` for this role: the resolved model for a claude
+        role, `None` (no flag) for a codex role."""
+        return self.model if self.agent == "claude" else None
+
+    def attribution_codex_model(self) -> str | None:
+        """Codex model to attribute this role's usage/cost to, or `None` for a
+        claude role (whose runs emit no codex-priced usage lines)."""
+        return self.model if self.agent == "codex" else None
 
 
 def _role_model_in_family(agent: Literal["claude", "codex"], model: str | None) -> bool:
@@ -809,17 +816,9 @@ class Config(BaseModel):
                 ) or (global_role is not None and global_role.effort is not None)
                 if not (explicit_model or explicit_effort):
                     continue
-                if explicit_effort and name not in _EFFORT_WIRED_ROLES:
-                    # Only `implement`'s command builder threads `effort`
-                    # through to a dispatch flag — persisting it on any other
-                    # role would look effective in the resolved matrix while
-                    # every dispatch path silently ignores it (SYM-191
-                    # review).
-                    raise ValueError(
-                        f"role {name!r} does not support an effort override; "
-                        f"effort only reaches dispatch for the "
-                        f"{sorted(_EFFORT_WIRED_ROLES)!r} role(s)"
-                    )
+                # Every role's command builder now threads `effort` through to
+                # a dispatch flag (SYM-192), so an effort cell is effective on
+                # any of the five roles — no per-role wiring gate.
                 role = binding.resolved_role(name, self.roles)
                 if explicit_model and not _role_model_in_family(role.agent, role.model):
                     if role.agent == "codex":

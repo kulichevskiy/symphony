@@ -73,12 +73,14 @@ from ._helpers import (
     _parse_rfc3339,
     _termination_kwargs,
     build_fix_runner_command,
+    role_claude_model,
+    role_codex_model,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
-    from ...agent.codex_models import DEFAULT_CODEX_MODEL
+    from ...config import ResolvedRole
     from ._base import BindingKey
 
 log = logging.getLogger(__name__)
@@ -234,10 +236,9 @@ class _AcceptanceMixin(_OrchestratorBase):
             workspace_path: Path,
             command: list[str],
             stage: str,
-            agent: str,
+            role: ResolvedRole,
             binding: RepoBinding,
             issue: LinearIssue,
-            codex_model: str = DEFAULT_CODEX_MODEL,
             activity_stage: str | None = None,
             prior_total: float = 0.0,
             clear_pid_on_finish: bool = False,
@@ -1258,10 +1259,13 @@ class _AcceptanceMixin(_OrchestratorBase):
         prompt: str,
         prior_total: float,
     ) -> tuple[UsageDelta, str, int | None]:
+        role = binding.resolved_role("accept", self.config.roles)
         command = build_fix_runner_command(
-            binding.agent,
+            role.agent,
             prompt,
-            codex_model=binding.codex_model,
+            codex_model=role_codex_model(role),
+            claude_model=role_claude_model(role),
+            effort=role.effort,
             workspace_path=workspace_path,
             mcp_servers=binding.mcp_servers,
         )
@@ -1270,8 +1274,7 @@ class _AcceptanceMixin(_OrchestratorBase):
             workspace_path=workspace_path,
             command=command,
             stage="acceptance_fix",
-            agent=binding.agent,
-            codex_model=binding.codex_model,
+            role=role,
             binding=binding,
             issue=issue,
             activity_stage="acceptance_fix",

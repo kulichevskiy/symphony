@@ -15,7 +15,7 @@ from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.app import create_app
 from symphony.auth import Auth0Settings
-from symphony.config import Config, LinearStates, RepoBinding
+from symphony.config import Config, LinearStates, RepoBinding, ResolvedRole
 from symphony.linear.client import LinearIssue
 from symphony.orchestrator.poll import Orchestrator
 from symphony.ui import live as live_module
@@ -621,7 +621,7 @@ async def test_run_log_is_flushed_line_by_line_while_run_is_live(tmp_path: Path)
                 workspace_path=tmp_path / "ws",
                 command=["true"],
                 stage="implement",
-                agent="claude",
+                role=ResolvedRole(agent="claude"),
                 binding=binding,
                 issue=issue,
             )

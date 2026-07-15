@@ -1521,12 +1521,11 @@ repos:
     assert cfg.repos[1].resolved_role("implement", cfg.roles).effort == "medium"
 
 
-@pytest.mark.parametrize("role", ["review_find", "review_verify", "fix", "accept"])
-def test_roles_effort_rejected_for_unwired_role(role: str, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """Only `implement`'s command builder threads `effort` through to a
-    dispatch flag; an `effort` cell on any other role is dead configuration
-    that would otherwise look effective in the resolved matrix while every
-    dispatch path silently ignores it (SYM-191 review)."""
+@pytest.mark.parametrize("role", ["implement", "review_find", "review_verify", "fix", "accept"])
+def test_roles_effort_wired_for_every_role(role: str, tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """Every role's command builder now threads `effort` through to a dispatch
+    flag (SYM-192), so an `effort` cell is effective — and resolves — on any of
+    the five roles, not just `implement`."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
 repos:
@@ -1534,10 +1533,11 @@ repos:
     github_repo: org/repo
     roles:
       {role}:
+        agent: codex
         effort: high
 {_BINDING_STATES}
 """
     p = tmp_path / "cfg.yaml"
     p.write_text(raw)
-    with pytest.raises(ValidationError, match="does not support an effort override"):
-        Config.load(p)
+    cfg = Config.load(p)
+    assert cfg.repos[0].resolved_role(role, cfg.roles).effort == "high"

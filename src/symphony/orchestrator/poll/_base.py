@@ -39,13 +39,12 @@ from ...agent.activity import (
     digest_fingerprint,
     format_activity_digest,
 )
-from ...agent.codex_models import DEFAULT_CODEX_MODEL
 from ...agent.model_usage import ModelUsage, parse_model_usage
 from ...agent.process import parse_event_line
 from ...agent.prompt import implement_prompt
 from ...agent.runner import Runner, RunnerSpec
 from ...agent.runners.local import LocalRunner
-from ...config import Config, RepoBinding, binding_natural_key
+from ...config import Config, RepoBinding, ResolvedRole, binding_natural_key
 from ...effective_config import ConfigBootError, assemble_effective_config
 from ...github.client import GitHub, GitHubClient, GitHubError
 from ...github.webhook import GitHubWebhookEvent
@@ -104,6 +103,9 @@ from ._helpers import (
     build_fix_runner_command,
     build_runner_command,
     pr_number_from_url,
+    role_attribution_codex_model,
+    role_claude_model,
+    role_codex_model,
 )
 
 PushFn = Callable[[Path, str], Awaitable[None]]
@@ -2347,11 +2349,16 @@ class _OrchestratorBase:
         self,
         *,
         binding: RepoBinding,
+        agent: str,
         run_id: str,
         stage: str,
         workspace_path: Path,
     ) -> ActivitySession | None:
-        if binding.agent != "codex" or stage not in {"implement", "review_fix"}:
+        # `agent` is the stage's resolved-role agent (SYM-192), not the legacy
+        # `binding.agent`: activity sessions are a codex-only feature, and a
+        # DB binding's payload is legacy-free so `binding.agent` is always the
+        # default.
+        if agent != "codex" or stage not in {"implement", "review_fix"}:
             return None
         settings = _activity_settings_for(self.config, binding)
         if not settings.enabled:
@@ -2539,12 +2546,11 @@ class _OrchestratorBase:
             operator_comment=handoff.operator_comment if handoff else "",
         )
         role = binding.resolved_role("implement", self.config.roles)
-        is_codex = role.agent == "codex"
         command = build_runner_command(
             role.agent,
             prompt,
-            codex_model=role.model if (is_codex and role.model) else binding.codex_model,
-            claude_model=None if is_codex else role.model,
+            codex_model=role_codex_model(role),
+            claude_model=role_claude_model(role),
             effort=role.effort,
             workspace_path=workspace_path,
             mcp_servers=binding.mcp_servers,
@@ -2557,6 +2563,7 @@ class _OrchestratorBase:
             run_id=run_id,
             workspace_path=workspace_path,
             stage="implement",
+            role=role,
             prior_total=prior_total,
         )
 
@@ -2570,6 +2577,7 @@ class _OrchestratorBase:
         run_id: str,
         workspace_path: Path,
         stage: str,
+        role: ResolvedRole,
         prior_total: float,
     ) -> tuple[UsageDelta, str, int | None]:
         storage_issue_id = storage_issue_id or issue.id
@@ -2591,11 +2599,12 @@ class _OrchestratorBase:
         final_kind = "exit"
         final_returncode: int | None = None
         cost_estimator = _UsageCostEstimator(
-            agent=binding.agent,
-            codex_model=binding.codex_model,
+            agent=role.agent,
+            codex_model=role_codex_model(role),
         )
         activity = self._activity_session(
             binding=binding,
+            agent=role.agent,
             run_id=run_id,
             stage=stage,
             workspace_path=workspace_path,
@@ -2648,19 +2657,10 @@ class _OrchestratorBase:
                         break
         finally:
             self._active_run_ids.discard(run_id)
-        await _record_run_model_usage(self._conn, run_id, log_path, codex_model=binding.codex_model)
+        await _record_run_model_usage(
+            self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
+        )
         return cumulative_usage, final_kind, final_returncode
-
-    def _fix_claude_model(self, binding: RepoBinding) -> str | None:
-        """The `fix` role's resolved Claude `--model`.
-
-        Resolves through the same matrix + per-binding override path as the
-        `implement` role (SYM-124): set → `--model <alias>`, unset → CLI
-        default. `None` for a codex-resolved `fix` role (the `--model` flag
-        is claude-only; codex carries its model via `codex_model`).
-        """
-        role = binding.resolved_role("fix", self.config.roles)
-        return None if role.agent == "codex" else role.model
 
     async def _run_fix_agent(
         self,
@@ -2672,11 +2672,13 @@ class _OrchestratorBase:
         prompt: str,
         prior_total: float,
     ) -> tuple[UsageDelta, str, int | None]:
+        role = binding.resolved_role("fix", self.config.roles)
         command = build_fix_runner_command(
-            binding.agent,
+            role.agent,
             prompt,
-            codex_model=binding.codex_model,
-            claude_model=self._fix_claude_model(binding),
+            codex_model=role_codex_model(role),
+            claude_model=role_claude_model(role),
+            effort=role.effort,
             workspace_path=workspace_path,
             mcp_servers=binding.mcp_servers,
         )
@@ -2685,8 +2687,7 @@ class _OrchestratorBase:
             workspace_path=workspace_path,
             command=command,
             stage="review",
-            agent=binding.agent,
-            codex_model=binding.codex_model,
+            role=role,
             binding=binding,
             issue=issue,
             activity_stage="review_fix",
@@ -2811,10 +2812,13 @@ class _OrchestratorBase:
             pid=None,
             started_at=self._now().isoformat(),
         )
+        role = binding.resolved_role("implement", self.config.roles)
         command = build_fix_runner_command(
-            binding.agent,
+            role.agent,
             dirty_tree_fix_prompt(dirty_files),
-            codex_model=binding.codex_model,
+            codex_model=role_codex_model(role),
+            claude_model=role_claude_model(role),
+            effort=role.effort,
             workspace_path=workspace_path,
         )
         status = "failed"
@@ -2824,8 +2828,7 @@ class _OrchestratorBase:
                 workspace_path=workspace_path,
                 command=command,
                 stage="implement_fix",
-                agent=binding.agent,
-                codex_model=binding.codex_model,
+                role=role,
                 binding=binding,
                 issue=issue,
             )
@@ -2852,10 +2855,9 @@ class _OrchestratorBase:
         workspace_path: Path,
         command: list[str],
         stage: str,
-        agent: str,
+        role: ResolvedRole,
         binding: RepoBinding,
         issue: LinearIssue,
-        codex_model: str = DEFAULT_CODEX_MODEL,
         activity_stage: str | None = None,
         prior_total: float = 0.0,
         clear_pid_on_finish: bool = False,
@@ -2877,10 +2879,11 @@ class _OrchestratorBase:
         cumulative_usage = UsageDelta()
         final_kind = "exit"
         final_returncode: int | None = None
-        cost_estimator = _UsageCostEstimator(agent=agent, codex_model=codex_model)
+        cost_estimator = _UsageCostEstimator(agent=role.agent, codex_model=role_codex_model(role))
         activity = (
             self._activity_session(
                 binding=binding,
+                agent=role.agent,
                 run_id=run_id,
                 stage=activity_stage,
                 workspace_path=workspace_path,
@@ -2938,7 +2941,9 @@ class _OrchestratorBase:
             self._active_run_ids.discard(run_id)
             if clear_pid_on_finish:
                 await db.runs.update_pid(self._conn, run_id, None)
-        await _record_run_model_usage(self._conn, run_id, log_path, codex_model=codex_model)
+        await _record_run_model_usage(
+            self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
+        )
         return cumulative_usage, final_kind, final_returncode
 
     async def _fail_run(
@@ -3688,14 +3693,19 @@ async def _record_run_model_usage(
 def _parse_local_review_model_usage(
     log_dir: Path,
     *,
-    implementer_codex_model: str | None,
+    fixer_codex_model: str | None,
     reviewer_codex_model: str | None,
+    verifier_codex_model: str | None,
 ) -> list[ModelUsage]:
     """Parse local-review role transcripts into per-(provider, model) usage.
 
-    `fix-*.out.log` are implementer turns, `review-*.out.log` reviewer
-    turns; each file is one process, so it is parsed independently and the
-    rows are merged downstream. Sync (file IO) — call via `to_thread`.
+    Each transcript is one subprocess, parsed independently with the codex
+    model of the resolved role that produced it (SYM-192) — Claude ignores it
+    (its `modelUsage` carries the exact model). Filename → role:
+    `fix-*.out.log` is the `fix` fixer, `review-*-verify.out.log` the
+    `review_verify` pass, other `review-*.out.log` the `review_find` finder /
+    single pass. Rows are merged downstream. Sync (file IO) — call via
+    `to_thread`.
     """
     usages: list[ModelUsage] = []
     try:
@@ -3704,7 +3714,9 @@ def _parse_local_review_model_usage(
         return usages
     for path in paths:
         if path.name.startswith("fix-"):
-            codex_model = implementer_codex_model
+            codex_model = fixer_codex_model
+        elif path.name.startswith("review-") and path.name.endswith("-verify.out.log"):
+            codex_model = verifier_codex_model
         elif path.name.startswith("review-"):
             codex_model = reviewer_codex_model
         else:

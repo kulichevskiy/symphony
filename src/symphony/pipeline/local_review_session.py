@@ -44,6 +44,7 @@ from ..agent.codex_cli import build_codex_workspace_write_command
 from ..agent.codex_models import DEFAULT_CODEX_MODEL
 from ..agent.prompt import review_comment_fix_prompt
 from ..agent.runner import Runner, RunnerSpec
+from ..config import ResolvedRole
 from .cost_guard import UsageCostEstimator
 from .local_review import (
     DiffSize,
@@ -107,6 +108,7 @@ def _build_fix_command(
     codex_model: str,
     prompt: str,
     claude_model: str | None = None,
+    effort: str | None = None,
     mcp_servers: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """Mirror `build_fix_runner_command` without importing from orchestrator.
@@ -133,6 +135,8 @@ def _build_fix_command(
         ]
         if claude_model is not None:
             command.extend(["--model", claude_model])
+        if effort is not None:
+            command.extend(["--effort", effort])
         if mcp_servers:
             command.extend(["--mcp-config", json.dumps({"mcpServers": dict(mcp_servers)})])
         command.extend(["--", prompt])
@@ -141,6 +145,7 @@ def _build_fix_command(
         return build_codex_workspace_write_command(
             prompt=prompt,
             codex_model=codex_model,
+            effort=effort,
         )
     raise ValueError(f"unknown implementer agent {agent!r}")
 
@@ -154,13 +159,9 @@ async def run_local_review_session(
     issue_title: str,
     issue_body: str,
     labels: list[str],
-    implementer_agent: ImplementerAgent,
-    implementer_codex_model: str,
-    reviewer_agent: ReviewerAgent,
-    reviewer_codex_model: str,
-    local_review_claude_model: str | None = None,
-    local_review_verifier_claude_model: str | None = None,
-    fix_claude_model: str | None = None,
+    reviewer_role: ResolvedRole,
+    verifier_role: ResolvedRole,
+    fixer_role: ResolvedRole,
     cap: int,
     stall_secs: int,
     command_secs: int = 1800,
@@ -204,24 +205,25 @@ async def run_local_review_session(
         base_branch=base_branch,
     )
 
-    # One estimator per agent — codex sums token deltas across calls,
-    # so it must persist across iterations. Sharing the reviewer
-    # estimator across all reviewer subprocess calls (and likewise for
-    # the fixer) keeps the cumulative-token invariant intact. The pass-2
-    # verifier runs in the implementer's family, so it needs its own
-    # estimator: feeding its (separate) codex token stream through the
-    # reviewer's estimator would corrupt the cumulative-max bookkeeping.
+    # One estimator per role — codex sums token deltas across calls, so it
+    # must persist across iterations. Sharing the reviewer estimator across
+    # all finder subprocess calls (and likewise the verifier / fixer) keeps
+    # the cumulative-token invariant intact. Each pass runs its own resolved
+    # role (review_find / review_verify / fix), which may differ in agent and
+    # model, so each needs its own estimator: feeding a separate codex token
+    # stream through another role's estimator would corrupt the cumulative-max
+    # bookkeeping.
     reviewer_estimator = UsageCostEstimator(
-        agent=reviewer_agent,
-        codex_model=reviewer_codex_model or DEFAULT_CODEX_MODEL,
+        agent=reviewer_role.agent,
+        codex_model=reviewer_role.codex_model_arg(),
     )
     verifier_estimator = UsageCostEstimator(
-        agent=implementer_agent,
-        codex_model=implementer_codex_model,
+        agent=verifier_role.agent,
+        codex_model=verifier_role.codex_model_arg(),
     )
     fixer_estimator = UsageCostEstimator(
-        agent=implementer_agent,
-        codex_model=implementer_codex_model,
+        agent=fixer_role.agent,
+        codex_model=fixer_role.codex_model_arg(),
     )
 
     async def _run_reviewer_pass(
@@ -229,6 +231,7 @@ async def run_local_review_session(
         agent: ReviewerAgent,
         codex_model: str,
         claude_model: str | None,
+        effort: str | None,
         prompt: str,
         stem: str,
         run_suffix: str,
@@ -259,6 +262,7 @@ async def run_local_review_session(
             base_branch=base_branch,
             codex_model=codex_model or DEFAULT_CODEX_MODEL,
             claude_model=claude_model,
+            effort=effort,
             last_message_path=(str(last_message_path) if agent == "codex" else None),
             pass_two=pass_two,
         )
@@ -352,9 +356,10 @@ async def run_local_review_session(
             small = is_small_diff(await diff_size_provider(workspace_path))
         if small:
             single_out = await _run_reviewer_pass(
-                agent=reviewer_agent,
-                codex_model=reviewer_codex_model,
-                claude_model=local_review_claude_model,
+                agent=reviewer_role.agent,
+                codex_model=reviewer_role.codex_model_arg(),
+                claude_model=reviewer_role.claude_model_arg(),
+                effort=reviewer_role.effort,
                 prompt=review_prompt,
                 stem=f"review-{iteration}",
                 run_suffix=f"rev-{iteration}",
@@ -371,9 +376,10 @@ async def run_local_review_session(
         # Pass 1 — finder, opposite the implementer's family. Lists every
         # suspicion, emits no verdict marker; its findings feed pass 2.
         finder_out = await _run_reviewer_pass(
-            agent=reviewer_agent,
-            codex_model=reviewer_codex_model,
-            claude_model=local_review_claude_model,
+            agent=reviewer_role.agent,
+            codex_model=reviewer_role.codex_model_arg(),
+            claude_model=reviewer_role.claude_model_arg(),
+            effort=reviewer_role.effort,
             prompt=finder_prompt,
             stem=f"review-{iteration}-find",
             run_suffix=f"rev-{iteration}-find",
@@ -391,7 +397,7 @@ async def run_local_review_session(
             return finder_out
 
         pass_one_findings = extract_last_agent_message(
-            agent=reviewer_agent,
+            agent=reviewer_role.agent,
             stdout=finder_out.stdout,
             last_message_file=finder_out.last_message_file,
         )
@@ -414,9 +420,10 @@ async def run_local_review_session(
         # diversity vs pass 1). Refutes/confirms pass-1 findings, adds
         # misses, and emits the single marker the loop parses.
         verifier_out = await _run_reviewer_pass(
-            agent=implementer_agent,
-            codex_model=implementer_codex_model,
-            claude_model=local_review_verifier_claude_model,
+            agent=verifier_role.agent,
+            codex_model=verifier_role.codex_model_arg(),
+            claude_model=verifier_role.claude_model_arg(),
+            effort=verifier_role.effort,
             prompt=verifier_prompt,
             stem=f"review-{iteration}-verify",
             run_suffix=f"rev-{iteration}-verify",
@@ -442,7 +449,7 @@ async def run_local_review_session(
         # reads it verbatim regardless of which agent's JSONL the stdout
         # is in (the parser prefers `last_message_file`).
         verifier_message = extract_last_agent_message(
-            agent=implementer_agent,
+            agent=verifier_role.agent,
             stdout=verifier_out.stdout,
             last_message_file=verifier_out.last_message_file,
         )
@@ -470,10 +477,11 @@ async def run_local_review_session(
             trigger=verdict.findings,
         )
         command = _build_fix_command(
-            agent=implementer_agent,
-            codex_model=implementer_codex_model,
+            agent=fixer_role.agent,
+            codex_model=fixer_role.codex_model_arg(),
             prompt=prompt,
-            claude_model=fix_claude_model,
+            claude_model=fixer_role.claude_model_arg(),
+            effort=fixer_role.effort,
             mcp_servers=mcp_servers,
         )
         spec = RunnerSpec(
@@ -544,7 +552,7 @@ async def run_local_review_session(
         # gate — `SYMPHONY_BLOCKED` marker, else no-marker + no-HEAD-advance
         # classifier — and halt the loop on a blocked verdict. Other outcomes
         # keep rc=0 == ok: the loop's own re-review / dedup handles them.
-        final_message = extract_last_agent_message(agent=implementer_agent, stdout=collected.stdout)
+        final_message = extract_last_agent_message(agent=fixer_role.agent, stdout=collected.stdout)
         head_after = await head_sha_provider(workspace_path)
         head_advanced = bool(head_after) and head_after != head_before
         if not head_advanced:
@@ -587,7 +595,7 @@ async def run_local_review_session(
         )
 
     return await run_local_review_loop(
-        reviewer_agent=reviewer_agent,
+        reviewer_agent=reviewer_role.agent,
         reviewer=_reviewer,
         fixer=_fixer,
         cap=cap,
