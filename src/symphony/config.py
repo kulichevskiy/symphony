@@ -77,7 +77,7 @@ _LEGACY_FIELD_CELLS: dict[str, tuple[tuple[RoleName, str], ...]] = {
     "agent": (("implement", "agent"), ("fix", "agent"), ("accept", "agent")),
     "codex_model": (("implement", "model"), ("fix", "model"), ("accept", "model")),
     "reviewer_agent": (("review_find", "agent"), ("review_verify", "agent")),
-    "reviewer_codex_model": (("review_find", "model"), ("review_verify", "model")),
+    "reviewer_codex_model": (("review_find", "model"),),
     "local_review_claude_model": (("review_find", "model"),),
     "local_review_verifier_claude_model": (("review_verify", "model"),),
 }
@@ -868,7 +868,7 @@ class Config(BaseModel):
                 # posture isn't the operator's to fix here.
                 continue
             implement = binding.resolved_role("implement", self.roles)
-            for review_name in ("review_find", "review_verify"):
+            for review_name in ("review_find",):
                 review = binding.resolved_role(review_name, self.roles)
                 if review.agent == implement.agent:
                     warnings.warn(
