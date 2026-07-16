@@ -34,6 +34,9 @@ function stubBodyFor(url: string): unknown {
       bindings: [],
     };
   }
+  if (url.includes("/api/connections")) {
+    return [];
+  }
   if (url.includes("/api/issues")) {
     return [];
   }

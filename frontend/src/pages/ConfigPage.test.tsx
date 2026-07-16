@@ -14,6 +14,7 @@ import type {
   BindingRecord,
   ConfigOptions,
   ConfigView,
+  Connection,
   RolesMatrix,
 } from "@/lib/api";
 import { registerTokenProvider } from "@/lib/auth";
@@ -23,9 +24,17 @@ import {
   BindingsPanel,
   ConfigDetails,
   ConfigPage,
+  ConnectionsPanel,
   GlobalRolesCard,
   RoleMatrixEditor,
 } from "./ConfigPage";
+
+const CONNECTIONS: Connection[] = [
+  { provider: "github", label: "GitHub", status: "not_connected", expires_at: null },
+  { provider: "linear", label: "Linear", status: "not_connected", expires_at: null },
+  { provider: "claude", label: "Claude", status: "not_connected", expires_at: null },
+  { provider: "codex", label: "Codex", status: "not_connected", expires_at: null },
+];
 
 const config: ConfigView = {
   read_only: true,
@@ -96,6 +105,36 @@ afterEach(() => {
   registerTokenProvider(null);
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+describe("ConnectionsPanel", () => {
+  it("renders one card per provider with its status", () => {
+    const html = renderToStaticMarkup(<ConnectionsPanel connections={CONNECTIONS} />);
+    for (const label of ["GitHub", "Linear", "Claude", "Codex"]) {
+      expect(html).toContain(label);
+    }
+    expect(html.match(/Not connected/g)).toHaveLength(4);
+    // Connect/Disconnect/Test are present but inert.
+    expect(html).toContain("Connect");
+    expect(html).toContain("disabled");
+  });
+
+  it("shows status and expiry for a connected provider", () => {
+    const html = renderToStaticMarkup(
+      <ConnectionsPanel
+        connections={[
+          {
+            provider: "github",
+            label: "GitHub",
+            status: "connected",
+            expires_at: "2026-08-01T00:00:00Z",
+          },
+        ]}
+      />,
+    );
+    expect(html).toContain("Connected");
+    expect(html).toContain("2026-08-01T00:00:00Z");
+  });
 });
 
 describe("ConfigDetails", () => {
@@ -1200,6 +1239,9 @@ describe("ConfigPage", () => {
           { status: 200 },
         );
       }
+      if (url === "/api/connections" && method === "GET") {
+        return new Response(JSON.stringify(CONNECTIONS), { status: 200 });
+      }
       if (url === "/api/config/roles" && method === "PUT") {
         return new Response(JSON.stringify({ roles: {}, version: 1, warnings: [] }), {
           status: 200,
@@ -1218,6 +1260,11 @@ describe("ConfigPage", () => {
 
     await screen.findByText("Global roles matrix");
     expect(rolesGetCalls).toBe(1);
+    // The Connections section renders its four provider cards from the API.
+    await screen.findByText("GitHub");
+    for (const label of ["Linear", "Claude", "Codex"]) {
+      expect(screen.getByText(label)).toBeTruthy();
+    }
 
     fireEvent.click(screen.getByText("Save global matrix"));
     // With `staleTime: Infinity`, a remount after a save would otherwise re-seed

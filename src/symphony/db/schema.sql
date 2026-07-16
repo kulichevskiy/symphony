@@ -380,3 +380,17 @@ CREATE TABLE IF NOT EXISTS config_repo_secrets (
     updated_at  TEXT NOT NULL DEFAULT '',
     updated_by  TEXT NOT NULL DEFAULT ''
 );
+
+-- Per-provider OAuth/credential store for UI onboarding (OAuth in UI 1/7).
+-- One row per provider (github/linear/claude/codex). `credential` holds the
+-- Fernet-encrypted payload — ciphertext at rest, keyed by a deployment secret
+-- (see `symphony.crypto`); it never leaves the process (the API serializes
+-- `status` + `expires_at` only). A missing row means "not connected".
+CREATE TABLE IF NOT EXISTS oauth_connections (
+    provider    TEXT PRIMARY KEY,
+    credential  BLOB NOT NULL DEFAULT '',
+    status      TEXT NOT NULL DEFAULT 'not_connected',
+    expires_at  TEXT,
+    updated_at  TEXT NOT NULL DEFAULT '',
+    updated_by  TEXT NOT NULL DEFAULT ''
+);

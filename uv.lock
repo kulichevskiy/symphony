@@ -746,6 +746,7 @@ source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
     { name = "click" },
+    { name = "cryptography" },
     { name = "fastapi" },
     { name = "httpx" },
     { name = "pydantic" },
@@ -771,6 +772,7 @@ dev = [
 requires-dist = [
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "click", specifier = ">=8.1" },
+    { name = "cryptography", specifier = ">=43" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.28" },
     { name = "pydantic", specifier = ">=2.9" },
