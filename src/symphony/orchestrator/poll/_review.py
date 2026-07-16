@@ -109,6 +109,7 @@ from ...tracker import (
 from ._base import SlashHandlerFailure as SlashHandlerFailure
 from ._base import (
     _binding_key,
+    _binding_storage_key,
     _OrchestratorBase,
     _tracker_context_for_binding,
 )
@@ -2924,6 +2925,7 @@ class _ReviewMixin(_OrchestratorBase):
             status="running",
             pid=None,
             started_at=now,
+            binding_key=_binding_storage_key(binding),
         )
         run = db.runs.Run(
             id=new_run_id,
@@ -3306,6 +3308,7 @@ class _ReviewMixin(_OrchestratorBase):
             status="running",
             pid=None,
             started_at=now,
+            binding_key=_binding_storage_key(binding),
         )
         state = await db.review_state.get(self._conn, pr.issue_id)
         body = resumed(

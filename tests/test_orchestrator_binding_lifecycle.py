@@ -141,6 +141,31 @@ async def test_run_carries_binding_key_from_dispatch(tmp_path: Path) -> None:
         await harness.close()
 
 
+async def _update_stored_binding(conn, **fields) -> None:
+    """Edit the sole `config_bindings` row directly in the DB, leaving any
+    already-loaded `self.config` untouched — mirrors an operator edit landing
+    while a task sits behind a semaphore, before the next tick's reload."""
+    stored = (await db.config_bindings.list_all(conn))[0]
+    payload = dict(stored.payload)
+    enabled = fields.pop("enabled", stored.enabled)
+    payload.update(fields)
+    await db.config_bindings.update(
+        conn,
+        stored.id,
+        payload=payload,
+        key=(
+            stored.project_key,
+            stored.github_repo,
+            stored.issue_label,
+            stored.tracker_provider,
+            stored.tracker_site,
+        ),
+        enabled=enabled,
+        priority=stored.priority,
+        expected_version=stored.version,
+    )
+
+
 @pytest.mark.asyncio
 async def test_launch_gate_disabled_aborts_first_dispatch_not_followups(
     tmp_path: Path,
@@ -158,12 +183,13 @@ async def test_launch_gate_disabled_aborts_first_dispatch_not_followups(
         assert await harness.orch._launch_gate_admits(binding, first_dispatch=True)
         assert await harness.orch._launch_gate_admits(binding, first_dispatch=False)
 
-        # Disable it in the live config (as a mid-run reload would).
-        disabled = binding.model_copy(update={"enabled": False})
-        harness.orch.config = harness.orch.config.model_copy(update={"repos": [disabled]})
+        # Disable it directly in the DB — `self.config` stays stale (no
+        # reload ran), which is exactly the window a task queued behind a
+        # semaphore can sit in (SYM-193).
+        await _update_stored_binding(harness.conn, enabled=False)
         # First dispatch aborts; follow-up (drain) still proceeds.
-        assert not await harness.orch._launch_gate_admits(disabled, first_dispatch=True)
-        assert await harness.orch._launch_gate_admits(disabled, first_dispatch=False)
+        assert not await harness.orch._launch_gate_admits(binding, first_dispatch=True)
+        assert await harness.orch._launch_gate_admits(binding, first_dispatch=False)
     finally:
         await harness.close()
 
@@ -226,12 +252,11 @@ async def test_launch_gate_blocks_spawn_over_lowered_cap(tmp_path: Path) -> None
         # cap=2, occupancy=1 → still admits.
         assert await harness.orch._launch_gate_admits(binding, first_dispatch=True)
 
-        # Lower the cap to 1 in the live config: occupancy (1) now meets the
-        # cap, so nothing new is admitted even though a queued task waited on
-        # the old (capacity-2) semaphore.
-        lowered = binding.model_copy(update={"max_concurrent": 1})
-        harness.orch.config = harness.orch.config.model_copy(update={"repos": [lowered]})
-        assert not await harness.orch._launch_gate_admits(lowered, first_dispatch=True)
+        # Lower the cap to 1 directly in the DB (self.config stays stale, as
+        # it would while a task sits behind the old capacity-2 semaphore):
+        # occupancy (1) now meets the cap, so nothing new is admitted.
+        await _update_stored_binding(harness.conn, max_concurrent=1)
+        assert not await harness.orch._launch_gate_admits(binding, first_dispatch=True)
     finally:
         await harness.close()
 

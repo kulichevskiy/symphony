@@ -758,13 +758,23 @@ class _OrchestratorBase:
         layout `_binding_key` produces."""
         return self._scheduled_binding_counts.get(key, 0)
 
-    def _current_binding_row(self, binding: RepoBinding) -> RepoBinding | None:
-        """The binding currently loaded (hot-reloaded from the DB) matching
-        `binding`'s natural key, or `None` if it's gone. The launch gate
-        re-resolves the row here so it validates against the *current* config —
-        a scheduled task can sit behind semaphores long enough for the operator
-        to disable the binding or lower its cap (SYM-193)."""
+    async def _current_binding_row(self, binding: RepoBinding) -> RepoBinding | None:
+        """The binding matching `binding`'s natural key, read fresh from the
+        config DB, or `None` if it's gone. The launch gate re-resolves the row
+        here — rather than off `self.config`, which only picks up an
+        operator's disable/cap edit on the next tick's `_reload_bindings` —
+        so a scheduled task sitting behind a semaphore long enough for the
+        edit to land still sees it immediately before spawn (SYM-193).
+
+        Falls back to `self.config.repos` when the DB owns no bindings yet
+        (pre-migration YAML topology, or a one-shot CLI dispatch that never
+        assembled from the DB) so that path keeps working unchanged."""
         key = _binding_key(binding)
+        stored = await db.config_bindings.get_by_natural_key(self._conn, key)
+        if stored is not None:
+            return RepoBinding.model_validate({**stored.payload, "enabled": stored.enabled})
+        if await db.config_bindings.count(self._conn) > 0:
+            return None
         for current in self.config.repos:
             if _binding_key(current) == key:
                 return current
@@ -783,7 +793,7 @@ class _OrchestratorBase:
         re-checked against the *current* cap, so a lowered `max_concurrent`
         admits nothing new until occupancy falls below it, regardless of which
         semaphore a queued task waited on. Running work is never killed."""
-        current = self._current_binding_row(binding)
+        current = await self._current_binding_row(binding)
         if current is None:
             log.info(
                 "launch gate: binding %s no longer configured, aborting spawn",

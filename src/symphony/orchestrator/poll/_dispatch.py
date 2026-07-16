@@ -430,7 +430,7 @@ class _DispatchMixin(_OrchestratorBase):
             # the stale `binding` would otherwise dispatch with the settings
             # the edit just replaced (SYM-193 review).
             async with self._config_write_lock:
-                current = self._current_binding_row(binding) or binding
+                current = await self._current_binding_row(binding) or binding
                 return self._schedule_dispatch(current, issue)
 
     async def _blocking_existing_pr(

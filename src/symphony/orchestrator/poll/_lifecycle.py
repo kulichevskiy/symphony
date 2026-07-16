@@ -1500,6 +1500,7 @@ class _LifecycleMixin(_OrchestratorBase):
                 status="running",
                 pid=None,
                 started_at=self._now().isoformat(),
+                binding_key=_binding_storage_key(binding),
             )
 
             async def _on_iteration(i: int, verdict: LocalVerdict, _cost_so_far: float) -> None:
@@ -1942,6 +1943,7 @@ class _LifecycleMixin(_OrchestratorBase):
             status="running",
             pid=None,
             started_at=self._now().isoformat(),
+            binding_key=_binding_storage_key(binding),
         )
         result: VerifyResult | None = None
         try:

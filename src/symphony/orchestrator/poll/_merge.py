@@ -645,7 +645,7 @@ class _MergeMixin(_OrchestratorBase):
         )
 
     async def _merge_required_check_terminal_run(
-        self, *, issue: LinearIssue, merge_run_id: str | None
+        self, *, binding: RepoBinding, issue: LinearIssue, merge_run_id: str | None
     ) -> db.runs.Run:
         run_id = merge_run_id or str(uuid.uuid4())
         started_at = self._now().isoformat()
@@ -658,6 +658,7 @@ class _MergeMixin(_OrchestratorBase):
                 status="running",
                 pid=None,
                 started_at=started_at,
+                binding_key=_binding_storage_key(binding),
             )
         return db.runs.Run(
             id=run_id,
@@ -973,6 +974,7 @@ class _MergeMixin(_OrchestratorBase):
                 if not binding.resolved_remote_review():
                     if _local_review_infra_failed(local_review_result):
                         run = await self._merge_required_check_terminal_run(
+                            binding=binding,
                             issue=issue,
                             merge_run_id=merge_run_id,
                         )
@@ -1020,6 +1022,7 @@ class _MergeMixin(_OrchestratorBase):
 
             if pending_local_only_needs_approval is not None:
                 run = await self._merge_required_check_terminal_run(
+                    binding=binding,
                     issue=issue,
                     merge_run_id=merge_run_id,
                 )
