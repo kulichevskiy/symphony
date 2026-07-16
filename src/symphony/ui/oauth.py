@@ -262,6 +262,8 @@ def create_oauth_routers(
                     body = resp.json()
                 except ValueError:
                     body = {}
+                if not isinstance(body, dict):
+                    body = {}
                 live = (not body.get("errors")) and bool((body.get("data") or {}).get("viewer"))
         else:
             live = resp.status_code == 200
