@@ -513,6 +513,7 @@ export function BindingForm({
   const [conflict, setConflict] = useState<number | null | false>(false);
   const [blockers, setBlockers] = useState<DrainBlockers | null>(null);
   const [saving, setSaving] = useState(false);
+  const [clearSecret, setClearSecret] = useState(false);
 
   function patch(next: Record<string, unknown>) {
     setPayload(next);
@@ -554,6 +555,7 @@ export function BindingForm({
     setFieldErrors([]);
     setConflict(false);
     setBlockers(null);
+    const secretEdited = clearSecret || !!str(get(payload, "webhook_secret"));
     const body: BindingWrite = {
       payload,
       // Preserve the current enabled state on edit (the card's toggle owns
@@ -561,6 +563,14 @@ export function BindingForm({
       enabled: binding ? binding.enabled : true,
       priority,
       version: binding ? binding.version : undefined,
+      webhook_secret_clear: clearSecret,
+      // Send the repo-secret version the form loaded so a rotation from
+      // another tab/binding of the same repo since then 409s instead of
+      // silently overwriting (SYM-194 review) — only when this save actually
+      // sets or clears the secret, since an unrelated field edit didn't load
+      // a version to defend.
+      webhook_secret_version:
+        binding && secretEdited ? binding.webhook_secret_version : undefined,
     };
     try {
       const saved = binding
@@ -793,10 +803,28 @@ export function BindingForm({
             <Input
               type="password"
               value={str(get(payload, "webhook_secret"))}
-              onChange={(e) => setKey("webhook_secret", e.target.value)}
+              onChange={(e) => {
+                if (e.target.value) setClearSecret(false);
+                setKey("webhook_secret", e.target.value);
+              }}
               aria-label="webhook_secret"
+              disabled={clearSecret}
               placeholder={binding?.webhook_secret_set ? "set — leave blank to keep" : ""}
             />
+            {binding?.webhook_secret_set ? (
+              <label className="flex items-center gap-1 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={clearSecret}
+                  onChange={(e) => {
+                    setClearSecret(e.target.checked);
+                    if (e.target.checked) setKey("webhook_secret", "");
+                  }}
+                  aria-label="webhook_secret_clear"
+                />
+                Clear stored secret
+              </label>
+            ) : null}
             {!options.github_webhook_secret_configured ? (
               <span className="block text-xs text-muted-foreground">
                 No global GITHUB_WEBHOOK_SECRET configured — required here when

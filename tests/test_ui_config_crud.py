@@ -21,7 +21,7 @@ from fastapi import FastAPI
 from symphony import db
 from symphony.app import create_app
 from symphony.config import Config
-from symphony.db import config_bindings
+from symphony.db import config_bindings, config_repo_secrets
 from symphony.ui.config_crud import create_config_crud_router
 
 from .test_auth import JWKS_URI, _jwks, _settings, _token
@@ -713,6 +713,66 @@ async def test_repo_secret_version_conflict_on_update_with_omitted_version(
             )
             statuses = sorted(r.status_code for r in results)
             assert statuses == [200, 409], [r.text for r in results]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_update_rechecks_repo_secret_state_under_the_lock(
+    tmp_path: Path,
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """An update that doesn't touch the secret (preserve-on-omit) never calls
+    `_write_repo_secret` at all, so nothing else re-validates the
+    `webhook_enabled` fail-closed invariant against the secret's *current*
+    state. If another writer clears the repo's only secret while this update's
+    (network-bound) capability check is in flight, the pre-lock read is stale
+    by the time this write would commit — the in-lock recheck must catch that
+    and 422 rather than let a webhook_enabled binding with no secret land
+    (SYM-194 review)."""
+    conn, db_path = await _open(tmp_path)
+    original_get = config_repo_secrets.get
+    calls = {"n": 0}
+
+    async def _get(c: Any, github_repo: str) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # Simulate another tab clearing this repo's secret between the
+            # pre-lock read and the in-lock recheck.
+            await config_repo_secrets.set_secret(
+                c,
+                github_repo=github_repo,
+                secret="",
+                expected_version=1,
+                updated_at="t",
+                updated_by="other-tab",
+                commit=True,
+            )
+        return await original_get(c, github_repo)
+
+    try:
+        app = _app(conn, db_path, github_webhook_secret="")
+        async with _client(app) as client:
+            created = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_enabled=True, webhook_secret="s3cr3t")},
+            )
+            assert created.status_code == 201, created.text
+
+            monkeypatch.setattr("symphony.ui.config_crud.config_repo_secrets.get", _get)
+            updated = await client.put(
+                f"/api/config/bindings/{created.json()['id']}",
+                json={
+                    "payload": _payload(webhook_enabled=True),
+                    "version": created.json()["version"],
+                },
+            )
+            assert updated.status_code == 422, updated.text
+            assert updated.json()["detail"][0]["loc"] == ["webhook_secret"]
+
+            # Not persisted — a reread still shows the original version.
+            reread = await client.get("/api/config/bindings")
+            assert reread.json()[0]["version"] == created.json()["version"]
     finally:
         await conn.close()
 

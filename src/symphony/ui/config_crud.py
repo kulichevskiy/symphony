@@ -1107,14 +1107,32 @@ def create_config_crud_router(
         # acquired — see the matching comment in `put_roles` for why.
         wgs, globals_version = await _assemble_and_validate(conn, base, binding, exclude_id=None)
         async with lock:
+            fresh_others = await _other_bindings(conn, base, exclude_id=None)
             # Re-check the cheap, DB-state-dependent duplicate-selector
             # invariant against a fresh listing, now that the lock excludes
             # concurrent writers — the trial above ran before the lock (and
             # after the slow capability check), so a same-selector binding
             # from a racing create/update could have landed since (SYM-191
             # review).
-            _reject_duplicate_selector(binding, await _other_bindings(conn, base, exclude_id=None))
+            _reject_duplicate_selector(binding, fresh_others)
             await _reject_stale_globals(conn, globals_version)
+            # Same concern, for the repo-secret fail-closed check (SYM-194
+            # review): `old_secret`/`has_secret` above were read before the
+            # slow capability check, and preserve-on-omit (`secret_action` is
+            # `None`) never reaches `_write_repo_secret`'s version check at
+            # all — so a concurrent clear of this repo's secret landing in
+            # that window would otherwise reach commit unnoticed. Re-read
+            # fresh, under a name distinct from the pre-lock `old_secret`: the
+            # `create_expected_version` fallback below must keep using the
+            # pre-lock read, not this one, or a second write's expected
+            # version would always match (since it's now read inside the very
+            # lock that serializes it after the first write's commit),
+            # silently defeating the omitted-version race test below.
+            locked_secret = await config_repo_secrets.get(conn, binding.github_repo)
+            locked_has_secret = _resulting_has_secret(secret_action, locked_secret)
+            _validate_webhook_secret(
+                binding, base, has_secret=locked_has_secret, other_repo_bindings=fresh_others
+            )
             # Secret + binding land in one transaction: the secret write stays
             # uncommitted (`commit=False`) and the binding insert's commit
             # flushes both. A conflict or a duplicate rolls the whole thing back
@@ -1126,8 +1144,8 @@ def create_config_crud_router(
             # defaults to `None` — unlike `update_binding`, trusting that
             # default here would let a second binding on an already-secreted
             # repo silently overwrite it with no 409 (SYM-194 review). Fall
-            # back to the version this request just read, so the create path
-            # shares the same optimistic-lock contract as update.
+            # back to the version this request just read (pre-lock), so the
+            # create path shares the same optimistic-lock contract as update.
             create_expected_version = (
                 body.webhook_secret_version
                 if body.webhook_secret_version is not None
@@ -1236,10 +1254,25 @@ def create_config_crud_router(
                 if blockers is not None:
                     raise _drain_conflict("rename or re-point", blockers)
             # Same re-check as `create_binding` — see that comment.
-            _reject_duplicate_selector(
-                binding, await _other_bindings(conn, base, exclude_id=binding_id)
-            )
+            fresh_others = await _other_bindings(conn, base, exclude_id=binding_id)
+            _reject_duplicate_selector(binding, fresh_others)
             await _reject_stale_globals(conn, globals_version)
+            # Same re-check as `create_binding` — see that comment: `old_secret`
+            # was read before the slow capability check, and preserve-on-omit
+            # never reaches `_write_repo_secret`'s version check at all, so a
+            # concurrent write to this repo's secret in that window would
+            # otherwise reach commit unnoticed. Re-read fresh (against
+            # `binding.github_repo`, not `old.github_repo` — same rename
+            # concern as above), under a name distinct from the pre-lock
+            # `old_secret` — `update_expected_version` below must keep using
+            # the pre-lock read, not this one, or the omitted-version race
+            # test would silently stop catching the conflict (see the matching
+            # comment in `create_binding`).
+            locked_secret = await config_repo_secrets.get(conn, binding.github_repo)
+            locked_has_secret = _resulting_has_secret(secret_action, locked_secret)
+            _validate_webhook_secret(
+                binding, base, has_secret=locked_has_secret, other_repo_bindings=fresh_others
+            )
             # Secret + binding in one transaction — see `create_binding`. A
             # binding version conflict (below) rolls back the secret write too.
             # Same fallback as `create_binding`: an omitted version must not

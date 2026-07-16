@@ -486,6 +486,12 @@ export interface BindingRecord {
   tracker_provider: string;
   tracker_site: string;
   webhook_secret_set: boolean;
+  /** The repo-secret's own optimistic-lock version — send back as
+   *  `webhook_secret_version` on a write that sets/clears the secret so a
+   *  concurrent rotation from another tab/binding surfaces as a 409. */
+  webhook_secret_version: number;
+  webhook_secret_updated_at: string;
+  webhook_secret_updated_by: string;
   payload: Record<string, unknown>;
   /** Whether the binding has active work (running runs, open PRs, parked
    *  waits, or scheduled slots) — a delete/rename would be drain-blocked. */
@@ -494,12 +500,19 @@ export interface BindingRecord {
   warnings?: string[];
 }
 
-/** Create/update body. `version` is required for updates (optimistic lock). */
+/** Create/update body. `version` is required for updates (optimistic lock).
+ *  The webhook secret is write-only and travels outside `payload` (SYM-194):
+ *  `webhook_secret_clear` is the explicit clear marker, and
+ *  `webhook_secret_version` is the repo-secret version the form loaded —
+ *  send it on any save that sets or clears the secret so a rotation from
+ *  another tab/binding since load surfaces as a 409, not a silent overwrite. */
 export interface BindingWrite {
   payload: Record<string, unknown>;
   enabled: boolean;
   priority: number;
   version?: number;
+  webhook_secret_clear?: boolean;
+  webhook_secret_version?: number;
 }
 
 /** One field-level validation error the form maps back to an input. */

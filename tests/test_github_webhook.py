@@ -158,6 +158,43 @@ def test_cli_skips_github_webhook_settings_when_repos_are_disabled() -> None:
     assert _github_webhook_settings(cfg) is None
 
 
+def test_legacy_secret_precedence_last_binding_wins() -> None:
+    """A legacy (not-yet-imported) YAML topology with multiple bindings on the
+    same `github_repo` disagreeing on `webhook_secret` must resolve the same
+    tie-break the pre-SYM-194 dict comprehension did: the *last* binding in
+    `cfg.repos` wins, not the first (SYM-194 review)."""
+    cfg = Config(
+        repos=[
+            _binding(webhook_secret="first"),
+            RepoBinding(
+                linear_team_key="ENG",
+                github_repo="org/repo",
+                issue_label="second-label",
+                webhook_enabled=True,
+                webhook_secret="second",
+                linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
+            ),
+        ]
+    )
+
+    settings = _github_webhook_settings(cfg)
+
+    assert settings is not None
+    assert settings.secrets_for_repo("org/repo") == ("second",)
+
+
+def test_db_owned_repo_secret_overrides_legacy_binding_secret() -> None:
+    """The DB-owned repo-secret view takes precedence over any legacy
+    per-binding secret for a repo it already covers — the per-binding value is
+    only a fallback for a repo the view doesn't cover yet (SYM-194)."""
+    cfg = Config(repos=[_binding(webhook_secret="legacy")])
+
+    settings = _github_webhook_settings(cfg, {"org/repo": "from-view"})
+
+    assert settings is not None
+    assert settings.secrets_for_repo("org/repo") == ("from-view",)
+
+
 def test_live_github_webhook_settings_disables_repos_instead_of_raising() -> None:
     """A DB reload can hot-add/edit a webhook-enabled repo without a secret
     while `GITHUB_WEBHOOK_SECRET` is empty. The per-request callable passed

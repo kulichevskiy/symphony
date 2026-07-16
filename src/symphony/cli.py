@@ -180,11 +180,17 @@ def _github_webhook_settings(
     # hot-swapped by the config write path. A legacy YAML topology (not yet
     # imported) still carries the secret on the binding itself, so merge those
     # in as a fallback for any repo the view doesn't cover — back-compat for
-    # the pre-cutover daemon.
-    merged: dict[str, str] = dict(repo_secrets or {})
+    # the pre-cutover daemon. Build the legacy fallback first and let the view
+    # overwrite it per-repo: iterating `cfg.repos` in order and overwriting on
+    # each match (rather than keeping only the first) preserves the pre-SYM-194
+    # dict-comprehension's tie-break — the *last* binding wins — for a legacy
+    # topology with multiple bindings on one repo that disagree on the secret
+    # (SYM-194 review).
+    merged: dict[str, str] = {}
     for binding in cfg.repos:
-        if binding.webhook_secret and binding.github_repo not in merged:
+        if binding.webhook_secret:
             merged[binding.github_repo] = binding.webhook_secret
+    merged.update(repo_secrets or {})
     if not enabled_bindings and not cfg.github_webhook_secret and not merged:
         return None
     try:
