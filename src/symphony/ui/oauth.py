@@ -251,7 +251,20 @@ def create_oauth_routers(
                 resp = await client.post(cfg.test_url, headers=headers, json=cfg.test_body)
             else:
                 resp = await client.get(cfg.test_url, headers=headers)
-        live = resp.status_code == 200
+        if cfg.test_body is not None:
+            # GraphQL (Linear): a 200 can still carry an auth-failure body
+            # (`{"errors": [...]}`), so the status/success signal is the
+            # body shape, not the HTTP status — same rule as the Linear
+            # client's `_query`.
+            live = False
+            if resp.status_code == 200:
+                try:
+                    body = resp.json()
+                except ValueError:
+                    body = {}
+                live = bool(body.get("data", {}).get("viewer")) and not body.get("errors")
+        else:
+            live = resp.status_code == 200
         await db.oauth_connections.update_status(
             conn,
             provider=provider,
