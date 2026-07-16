@@ -311,7 +311,7 @@ async def test_linear_start_returns_authorize_url(tmp_path: Path) -> None:
         assert parsed.netloc == "linear.app"
         q = parse_qs(parsed.query)
         assert q["client_id"] == ["lin-client-id"]
-        assert q["scope"] == ["read write"]
+        assert q["scope"] == ["read,write"]
         assert q["code_challenge_method"] == ["S256"]
         assert q["redirect_uri"] == ["http://test/api/oauth/linear/callback"]
         assert q["state"]  # a state was minted

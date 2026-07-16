@@ -92,6 +92,7 @@ def linear_provider(client_id: str, client_secret: str) -> OAuthProvider:
         client_secret=client_secret,
         scopes=_LINEAR_SCOPES,
         test_body=_LINEAR_VIEWER_QUERY,
+        scope_separator=",",
     )
 
 

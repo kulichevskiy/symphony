@@ -58,6 +58,7 @@ class OAuthProvider:
     client_secret: str
     scopes: tuple[str, ...]
     test_body: dict[str, Any] | None = None
+    scope_separator: str = " "
 
     @property
     def configured(self) -> bool:
@@ -132,7 +133,7 @@ def build_authorize_url(
     params = {
         "client_id": provider.client_id,
         "redirect_uri": redirect_uri,
-        "scope": " ".join(provider.scopes),
+        "scope": provider.scope_separator.join(provider.scopes),
         "state": state,
         "response_type": "code",
         "code_challenge": code_challenge,
