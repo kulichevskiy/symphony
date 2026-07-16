@@ -383,14 +383,10 @@ async def test_delivery_uses_db_github_token_for_push_and_pr(
         class _RecordingGitHub:
             def __init__(self, **kwargs: object) -> None:
                 gh_ctor_calls.append(kwargs)
-                self.ensure_pr = AsyncMock(
-                    return_value="https://github.com/org/repo/pull/42"
-                )
+                self.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
                 self.pr_comment = AsyncMock()
 
-        monkeypatch.setattr(
-            "symphony.orchestrator.poll._lifecycle.GitHub", _RecordingGitHub
-        )
+        monkeypatch.setattr("symphony.orchestrator.poll._lifecycle.GitHub", _RecordingGitHub)
 
         result_line = json.dumps(
             {

@@ -110,9 +110,7 @@ async def test_resolve_run_credentials_bundles_both(tmp_path: Path) -> None:
 def test_materialize_writes_git_credential_store_and_env(tmp_path: Path) -> None:
     home = tmp_path / "creds"
     home.mkdir()
-    env = materialize_credentials(
-        RunCredentials(github_token="gho_x", linear_token="lin_y"), home
-    )
+    env = materialize_credentials(RunCredentials(github_token="gho_x", linear_token="lin_y"), home)
     # git credential helper: a global config pointing at a store file that
     # carries the token, so an HTTPS `git push` inside the run authenticates.
     gitconfig = Path(env["GIT_CONFIG_GLOBAL"])
@@ -142,9 +140,7 @@ def test_materialize_includes_prior_gitconfig_so_identity_still_resolves(
     prior.write_text("[user]\n\tname = Symphony\n\temail = symphony@localhost\n", encoding="utf-8")
     home = tmp_path / "creds"
     home.mkdir()
-    env = materialize_credentials(
-        RunCredentials(github_token="gho_x"), home, prior_gitconfig=prior
-    )
+    env = materialize_credentials(RunCredentials(github_token="gho_x"), home, prior_gitconfig=prior)
     gitconfig_text = Path(env["GIT_CONFIG_GLOBAL"]).read_text()
     assert f"path = {prior}" in gitconfig_text
     assert "helper = store" in gitconfig_text
