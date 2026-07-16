@@ -74,16 +74,17 @@ def test_issued_states_are_distinct_and_unguessable() -> None:
 def test_pkce_challenge_is_s256_of_verifier() -> None:
     verifier, challenge = generate_pkce()
     expected = (
-        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
-        .rstrip(b"=")
-        .decode()
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
     )
     assert challenge == expected
 
 
 def test_authorize_url_carries_minimal_scopes_and_pkce() -> None:
     url = build_authorize_url(
-        _GITHUB, state="st", code_challenge="ch", redirect_uri="https://app/api/oauth/github/callback"
+        _GITHUB,
+        state="st",
+        code_challenge="ch",
+        redirect_uri="https://app/api/oauth/github/callback",
     )
     parsed = urlparse(url)
     assert parsed.netloc == "github.com"

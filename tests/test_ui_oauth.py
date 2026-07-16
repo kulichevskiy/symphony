@@ -155,9 +155,7 @@ async def test_callback_happy_path_stores_encrypted_token(tmp_path: Path) -> Non
         app = _app(conn, db_path)
         async with _client(app) as client:
             state = await _mint_state(client)
-            resp = await client.get(
-                f"/api/oauth/github/callback?code=the-code&state={state}"
-            )
+            resp = await client.get(f"/api/oauth/github/callback?code=the-code&state={state}")
         # Redirects the browser back into the SPA.
         assert resp.status_code == 302
         assert "/ui/config" in resp.headers["location"]

@@ -188,9 +188,7 @@ def create_oauth_routers(
         if not token:
             raise HTTPException(status_code=404, detail=f"{provider} is not connected")
         async with httpx.AsyncClient() as client:
-            resp = await client.get(
-                cfg.test_url, headers={"Authorization": f"Bearer {token}"}
-            )
+            resp = await client.get(cfg.test_url, headers={"Authorization": f"Bearer {token}"})
         live = resp.status_code == 200
         await db.oauth_connections.update_status(
             conn,
