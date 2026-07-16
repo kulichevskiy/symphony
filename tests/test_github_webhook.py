@@ -122,6 +122,36 @@ def test_cli_rejects_enabled_github_webhook_repo_without_secret() -> None:
         _github_webhook_settings(cfg)
 
 
+@pytest.mark.asyncio
+async def test_migrated_repo_secret_reaches_verifier(tmp_path: Path) -> None:
+    """Post-cutover (SYM-194): a per-binding YAML webhook secret imported into
+    the repo-secret table is loaded into the view at boot and reaches the
+    verifier settings, so verification keeps working without manual re-entry."""
+    from symphony.config_import import import_config
+    from symphony.db.config_repo_secrets import load_view
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        yaml_path = tmp_path / "config.yaml"
+        yaml_path.write_text(
+            "repos:\n"
+            "  - linear_team_key: ENG\n"
+            "    github_repo: org/repo\n"
+            "    webhook_enabled: true\n"
+            "    webhook_secret: yaml-secret\n"
+            "    linear_states: {ready: Todo, code_review: Needs Approval}\n"
+        )
+        await import_config(yaml_path, conn, now="t")
+        view = await load_view(conn)
+        # The migrated binding no longer carries the secret itself.
+        cfg = Config(repos=[_binding(webhook_secret=None)])
+        settings = _github_webhook_settings(cfg, view.as_map())
+    finally:
+        await conn.close()
+    assert settings is not None
+    assert settings.secrets_for_repo("org/repo") == ("yaml-secret",)
+
+
 def test_cli_skips_github_webhook_settings_when_repos_are_disabled() -> None:
     cfg = Config(repos=[_binding(webhook_enabled=False)])
 
@@ -151,6 +181,71 @@ def test_live_github_webhook_settings_disables_repos_instead_of_raising() -> Non
 async def _delivery_rows(conn: object) -> list[tuple[str, str]]:
     cur = await conn.execute("SELECT id, status FROM webhook_deliveries ORDER BY id")
     return [(str(row[0]), str(row[1])) for row in await cur.fetchall()]
+
+
+@pytest.mark.asyncio
+async def test_repo_secret_set_via_crud_hot_swaps_verifier(tmp_path: Path) -> None:
+    """Acceptance (SYM-194): a webhook secret set through the config API is
+    accepted by the verifier on the next request — no restart. The verifier
+    reads its repo secrets from the shared `RepoSecretView` the config write
+    path hot-swaps."""
+    from symphony.db.config_repo_secrets import RepoSecretView
+
+    db_path = tmp_path / "s.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        view = RepoSecretView()
+        handler = _Handler()
+        app = create_app(
+            handler,
+            conn,
+            # enabled_repos=None → every repo enabled; repo secrets come live
+            # from the shared view the CRUD router writes.
+            github_webhook_settings=lambda: GitHubWebhookSettings(
+                secret="", repo_secrets=view.as_map(), enabled_repos=None
+            ),
+            github_handler=handler,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_external_config=Config(linear_api_key="k"),
+            ui_repo_secret_view=view,
+        )
+        body = _body(_pull_request_payload())
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            # Before the secret exists, the signed delivery is rejected.
+            pre = await client.post(
+                "/github/webhook",
+                content=body,
+                headers=_headers(body, secret="hot-secret", delivery="d1"),
+            )
+            assert pre.status_code == 401
+
+            # Operator sets the repo's webhook secret through the config API.
+            created = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": {
+                        "project_key": "ENG",
+                        "github_repo": "org/repo",
+                        "states": {"ready": "Todo"},
+                        "webhook_secret": "hot-secret",
+                    }
+                },
+            )
+            assert created.status_code == 201, created.text
+
+            # The very next signed delivery verifies — no restart.
+            post = await client.post(
+                "/github/webhook",
+                content=body,
+                headers=_headers(body, secret="hot-secret", delivery="d2"),
+            )
+            assert post.status_code == 200, post.text
+            assert handler.events and handler.events[-1].repo == "org/repo"
+    finally:
+        await conn.close()
 
 
 @pytest.mark.asyncio

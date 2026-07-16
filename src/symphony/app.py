@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
+from typing import cast
 
 import aiosqlite
 from fastapi import Depends, FastAPI
@@ -18,6 +19,7 @@ from uvicorn import Config as UvicornConfig
 
 from .auth import Auth0Settings, create_auth_config_router, create_auth_dependency
 from .config import Config
+from .db.config_repo_secrets import RepoSecretView
 from .github.client import GitHub
 from .github.webhook import (
     GitHubWebhookHandler,
@@ -98,6 +100,7 @@ def create_app(
     ui_command_sink: CommandSink | None = None,
     ui_pause_controller: PauseController | None = None,
     ui_config_write_lock: object | None = None,
+    ui_repo_secret_view: object | None = None,
     ui_db_owns_topology: bool = True,
     ui_webhook_public_url: str | None = None,
     auth0_settings: Auth0Settings | None = None,
@@ -254,6 +257,7 @@ def create_app(
                     auth_dependency=auth_dep,
                     clock=clock,
                     scheduled_slots=_scheduled_slots,
+                    repo_secret_view=cast(RepoSecretView | None, ui_repo_secret_view),
                 ),
                 dependencies=api_dependencies,
             )

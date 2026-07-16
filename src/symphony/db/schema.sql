@@ -364,3 +364,19 @@ CREATE TABLE IF NOT EXISTS config_globals (
     migrated_at TEXT NOT NULL DEFAULT '',
     version     INTEGER NOT NULL DEFAULT 1
 );
+
+-- Repo-scoped webhook secret (SYM-194). Keyed by `github_repo`, not by a
+-- binding: GitHub signature verification is per repo, so two bindings on one
+-- repo share a single secret. Its own `version` participates in the same
+-- optimistic-locking check as bindings — two tabs editing *different* bindings
+-- of one repo would otherwise race on the shared secret with no conflict. The
+-- value is write-only: it never leaves the process in an API response, export,
+-- or log (audit diffs redact it to set/cleared/changed flags). An empty
+-- `secret` means "no secret set" (cleared).
+CREATE TABLE IF NOT EXISTS config_repo_secrets (
+    github_repo TEXT PRIMARY KEY,
+    secret      TEXT NOT NULL DEFAULT '',
+    version     INTEGER NOT NULL DEFAULT 1,
+    updated_at  TEXT NOT NULL DEFAULT '',
+    updated_by  TEXT NOT NULL DEFAULT ''
+);

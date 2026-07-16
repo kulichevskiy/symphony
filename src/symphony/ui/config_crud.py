@@ -19,10 +19,11 @@ Every write:
     (branch_prefix, base_branch) are drain-guarded — allowed only when the
     binding has no running runs, tracked open PRs, parked operator waits, or
     in-memory scheduled slots; otherwise a 409 with the blocker list;
-  * rejects `webhook_enabled: true` with no resolvable secret (per-binding or
-    the global `GITHUB_WEBHOOK_SECRET`) — the daemon's hot-reload path
-    (`cli._live_github_webhook_settings`) swallows that misconfiguration by
-    disabling *every* repo's webhook verification, not just this one;
+  * rejects `webhook_enabled: true` with no resolvable secret (the repo's own
+    secret after this save, or the global `GITHUB_WEBHOOK_SECRET`) — the
+    daemon's hot-reload path (`cli._live_github_webhook_settings`) swallows
+    that misconfiguration by disabling *every* repo's webhook verification, not
+    just this one;
   * rejects a binding whose provider has no resolvable tracker credentials
     (`LINEAR_API_KEY`, or `JIRA_BASE_URL`/`JIRA_EMAIL`/`JIRA_API_TOKEN`) — a
     fresh DB-owned install boots with zero bindings, skipping `cli._run`'s
@@ -46,12 +47,21 @@ check so an unsupported `(model, effort)` pair fails in the form, not at
 dispatch. `GET /api/config/options` serves claude efforts *per model* from the
 same source.
 
-Secrets never appear in a response: `webhook_secret` is dropped from the served
-payload in favour of a `webhook_secret_set` flag. `mcp_servers` entries have no
-`resolve_env`-style name indirection (unlike the top-level `env` field), so an
-operator embeds literal credentials straight into a server's `env`/`headers` —
-those are redacted to per-key `true` flags the same way, and restored from the
-stored row on write when the operator round-trips them untouched.
+The repo webhook secret is *write-only* and repo-scoped (SYM-194): it lives in
+its own `config_repo_secrets` table (shared across a repo's bindings), never a
+binding payload. A save routes `payload["webhook_secret"]` there — a non-empty
+value sets/replaces it, an omitted/empty value keeps it (preserve-on-omit), and
+`webhook_secret_clear` clears it. Responses carry only the non-secret metadata
+(`webhook_secret_set` flag, the repo-secret's own `version`, and its
+`updated_at/by`) — never the value. That `version` participates in optimistic
+locking so two tabs editing *different* bindings of one repo conflict on the
+shared secret (409). A committed write hot-swaps the in-process `RepoSecretView`
+the verifier reads, so a new secret takes effect without a tick reload or
+restart. `mcp_servers` entries have no `resolve_env`-style name indirection
+(unlike the top-level `env` field), so an operator embeds literal credentials
+straight into a server's `env`/`headers` — those are redacted to per-key `true`
+flags the same way, and restored from the stored row on write when the operator
+round-trips them untouched.
 """
 
 from __future__ import annotations
@@ -81,7 +91,15 @@ from ..config import (
     _synthetic_matrix_validation_binding,
     binding_natural_key,
 )
-from ..db import config_bindings, config_globals, issue_prs, operator_waits, runs
+from ..db import (
+    config_bindings,
+    config_globals,
+    config_repo_secrets,
+    issue_prs,
+    operator_waits,
+    runs,
+)
+from ..db.config_repo_secrets import RepoSecretView
 
 _ROLES_ADAPTER: TypeAdapter[dict[RoleName, RoleConfig]] = TypeAdapter(dict[RoleName, RoleConfig])
 
@@ -106,12 +124,22 @@ _FIELD_ALIASES = frozenset({"linear_team_key", "linear_states"})
 class BindingWrite(BaseModel):
     """Create/update request. `payload` is the sparse operator-set
     `RepoBinding` field dict; `version` is required for updates (optimistic
-    lock) and ignored for creates."""
+    lock) and ignored for creates.
+
+    The repo webhook secret is *write-only* and lives in its own repo-scoped
+    table, not the binding payload (SYM-194). Its value still travels in
+    `payload["webhook_secret"]` (the advanced-JSON view masks it): a non-empty
+    value sets/replaces it, an omitted/empty value keeps it, and
+    `webhook_secret_clear` is the explicit clear marker. `webhook_secret_version`
+    is the repo-secret optimistic-lock version the client loaded (`None` skips
+    the check, for a save carrying a value with no loaded version)."""
 
     payload: dict[str, Any]
     enabled: bool = True
     priority: int = 0
     version: int | None = None
+    webhook_secret_clear: bool = False
+    webhook_secret_version: int | None = None
 
 
 class RolesWrite(BaseModel):
@@ -193,10 +221,106 @@ def _restore_mcp_secrets(old_servers: Any, new_servers: dict[str, Any]) -> dict[
     return restored
 
 
-def _serialize(row: config_bindings.StoredBinding) -> dict[str, Any]:
-    """One binding for the API — secret values redacted."""
+# Secret actions resolved from a write request. `None` = keep (preserve-on-omit).
+_KEEP: None = None
+_SET = "set"
+_CLEAR = "clear"
+
+
+def _pop_secret_action(payload: dict[str, Any], body: BindingWrite) -> tuple[str | None, str]:
+    """Strip `webhook_secret` from the (to-be-stored) binding payload and
+    resolve the write-only secret action (SYM-194). The secret lives in the
+    repo-scoped table, never the binding payload — so it is dropped here
+    unconditionally. `webhook_secret_clear` is the explicit clear marker; a
+    non-empty payload value is a set/replace; an omitted or empty value keeps
+    the stored secret."""
+    raw = payload.pop("webhook_secret", None)
+    if body.webhook_secret_clear:
+        return _CLEAR, ""
+    if isinstance(raw, str) and raw:
+        return _SET, raw
+    return _KEEP, ""
+
+
+def _secret_flag(action: str | None, *, had_secret: bool) -> str | None:
+    """Audit-log flag for a secret change — never the value (SYM-194)."""
+    if action == _CLEAR:
+        return "cleared"
+    if action == _SET:
+        return "changed" if had_secret else "set"
+    return None
+
+
+def _resulting_has_secret(
+    action: str | None, old_secret: config_repo_secrets.RepoSecret | None
+) -> bool:
+    """The repo's secret state *after* the pending write — the input to the
+    `webhook_enabled` fail-closed check."""
+    if action == _SET:
+        return True
+    if action == _CLEAR:
+        return False
+    return bool(old_secret and old_secret.secret)
+
+
+async def _write_repo_secret(
+    conn: aiosqlite.Connection,
+    github_repo: str,
+    action: str | None,
+    value: str,
+    body: BindingWrite,
+    updated_by: str,
+    clock: Callable[[], datetime] | None,
+) -> None:
+    """Write the repo secret as part of the caller's open transaction
+    (`commit=False`); a version conflict surfaces as a 409 (SYM-194)."""
+    if action is None:
+        return
+    try:
+        await config_repo_secrets.set_secret(
+            conn,
+            github_repo=github_repo,
+            secret=value,
+            expected_version=body.webhook_secret_version,
+            updated_at=_now_iso(clock),
+            updated_by=updated_by,
+            commit=False,
+        )
+    except config_repo_secrets.StaleVersionError as e:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "msg": "repo webhook secret was modified by another writer; reload and retry",
+                "current_version": e.current_version,
+            },
+        ) from e
+
+
+def _apply_secret_to_view(
+    view: RepoSecretView, github_repo: str, action: str | None, value: str
+) -> None:
+    """Hot-swap the verifier's live view once a secret write has committed."""
+    if action == _SET:
+        view.set(github_repo, value)
+    elif action == _CLEAR:
+        view.set(github_repo, "")
+
+
+def _add_secret_flag(changes: dict[str, Any], action: str | None, *, had_secret: bool) -> None:
+    flag = _secret_flag(action, had_secret=had_secret)
+    if flag is not None:
+        changes["webhook_secret"] = flag
+
+
+def _serialize(
+    row: config_bindings.StoredBinding,
+    repo_secret: config_repo_secrets.RepoSecret | None,
+) -> dict[str, Any]:
+    """One binding for the API — secret values redacted. The repo webhook
+    secret is surfaced as its non-secret metadata only (set flag, its own
+    version, updated_at/by); the value never appears (SYM-194)."""
     payload = dict(row.payload)
-    webhook_secret_set = bool(payload.pop("webhook_secret", None))
+    payload.pop("webhook_secret", None)  # never stored here, but strip defensively
     mcp_servers = payload.get("mcp_servers")
     if isinstance(mcp_servers, dict):
         payload["mcp_servers"] = _redact_mcp_servers(mcp_servers)
@@ -212,7 +336,10 @@ def _serialize(row: config_bindings.StoredBinding) -> dict[str, Any]:
         "issue_label": row.issue_label,
         "tracker_provider": row.tracker_provider,
         "tracker_site": row.tracker_site,
-        "webhook_secret_set": webhook_secret_set,
+        "webhook_secret_set": bool(repo_secret and repo_secret.secret),
+        "webhook_secret_version": repo_secret.version if repo_secret is not None else 0,
+        "webhook_secret_updated_at": repo_secret.updated_at if repo_secret is not None else "",
+        "webhook_secret_updated_by": repo_secret.updated_by if repo_secret is not None else "",
         "payload": payload,
     }
 
@@ -400,13 +527,16 @@ def _branch_or_key_changed(
     return False
 
 
-def _validate_webhook_secret(binding: RepoBinding, base: Config) -> None:
+def _validate_webhook_secret(binding: RepoBinding, base: Config, *, has_secret: bool) -> None:
     """Fail closed at save time: a `webhook_enabled` binding with no
-    resolvable secret (its own `webhook_secret` or the global
-    `GITHUB_WEBHOOK_SECRET`) makes `cli._live_github_webhook_settings` swallow
-    the resulting error on the daemon's next hot reload and silently disable
-    *every* repo's webhook verification, not just this one."""
-    if binding.webhook_enabled and not binding.webhook_secret and not base.github_webhook_secret:
+    resolvable secret (the repo's own webhook secret — the resulting state
+    after this save — or the global `GITHUB_WEBHOOK_SECRET`) makes
+    `cli._live_github_webhook_settings` swallow the resulting error on the
+    daemon's next hot reload and silently disable *every* repo's webhook
+    verification, not just this one. `has_secret` is the repo's secret state
+    *after* the pending write (set/kept-non-empty → True, cleared/never-set →
+    False), since the secret now lives in the repo-scoped table (SYM-194)."""
+    if binding.webhook_enabled and not has_secret and not base.github_webhook_secret:
         raise _validation_error(
             ["webhook_secret"],
             "webhook_enabled requires a webhook_secret when no global "
@@ -731,6 +861,7 @@ def create_config_crud_router(
     auth_dependency: Callable[..., Awaitable[dict[str, Any]]] | None = None,
     clock: Callable[[], datetime] | None = None,
     scheduled_slots: Callable[[tuple[str, str, str, str, str]], int] | None = None,
+    repo_secret_view: RepoSecretView | None = None,
 ) -> APIRouter:
     """Router mounting the binding CRUD + options endpoints under `/api/config`.
 
@@ -749,6 +880,11 @@ def create_config_crud_router(
 
     router = APIRouter(prefix="/api/config")
     lock = write_lock if write_lock is not None else asyncio.Lock()
+    # The verifier reads repo secrets from this shared view on every request, so
+    # a set/replace/clear here hot-swaps it without a tick reload or restart
+    # (SYM-194). A private view (tests with no daemon) still exercises the write
+    # path; only the daemon's own view reaches its live verifier.
+    secret_view = repo_secret_view if repo_secret_view is not None else RepoSecretView()
 
     def _base_config() -> Config:
         current = config_provider() if callable(config_provider) else config_provider
@@ -890,12 +1026,18 @@ def create_config_crud_router(
     @router.get("/bindings")
     async def list_bindings() -> list[dict[str, Any]]:
         conn = await conn_provider()
+        secrets = {s.github_repo: s for s in await config_repo_secrets.list_all(conn)}
         out: list[dict[str, Any]] = []
         for row in await config_bindings.list_all(conn):
             # `active_work` drives the card's indicator and previews whether a
             # delete/rename would be drain-blocked (SYM-193).
             blockers = await _drain_blockers(conn, row, scheduled_slots=scheduled_slots)
-            out.append({**_serialize(row), "active_work": blockers is not None})
+            out.append(
+                {
+                    **_serialize(row, secrets.get(row.github_repo)),
+                    "active_work": blockers is not None,
+                }
+            )
         return out
 
     @router.get("/bindings/{binding_id}")
@@ -904,7 +1046,7 @@ def create_config_crud_router(
         row = await config_bindings.get(conn, binding_id)
         if row is None:
             raise HTTPException(status_code=404, detail="binding not found")
-        return _serialize(row)
+        return _serialize(row, await config_repo_secrets.get(conn, row.github_repo))
 
     @router.post("/bindings", status_code=201)
     async def create_binding(
@@ -913,11 +1055,16 @@ def create_config_crud_router(
     ) -> dict[str, Any]:
         payload = _sanitize_payload(body.payload)
         base = _base_config()
+        # The repo webhook secret is write-only and lives in its own table, not
+        # the binding payload — strip it here and route it below (SYM-194).
+        secret_action, secret_value = _pop_secret_action(payload, body)
         binding = _validate_binding(payload, jira_base_url=base.jira_base_url)
         binding.enabled = body.enabled
-        _validate_webhook_secret(binding, base)
-        _validate_tracker_credentials(binding, base)
         conn = await conn_provider()
+        old_secret = await config_repo_secrets.get(conn, binding.github_repo)
+        has_secret = _resulting_has_secret(secret_action, old_secret)
+        _validate_webhook_secret(binding, base, has_secret=has_secret)
+        _validate_tracker_credentials(binding, base)
         # Assembly + validation (including the external Models-API capability
         # check, up to the full 30s httpx timeout) runs before the lock is
         # acquired — see the matching comment in `put_roles` for why.
@@ -931,6 +1078,14 @@ def create_config_crud_router(
             # review).
             _reject_duplicate_selector(binding, await _other_bindings(conn, base, exclude_id=None))
             await _reject_stale_globals(conn, globals_version)
+            # Secret + binding land in one transaction: the secret write stays
+            # uncommitted (`commit=False`) and the binding insert's commit
+            # flushes both. A conflict or a duplicate rolls the whole thing back
+            # (SYM-194). Placed after the reject checks above so a rejection
+            # never leaves a pending secret write holding the write lock.
+            await _write_repo_secret(
+                conn, binding.github_repo, secret_action, secret_value, body, updated_by, clock
+            )
             try:
                 new_id = await config_bindings.insert(
                     conn,
@@ -953,14 +1108,13 @@ def create_config_crud_router(
                     "a binding with this project/repo/label/provider/site already exists",
                 ) from e
             row = await config_bindings.get(conn, new_id)
-        _log.info(
-            "config binding %s created by %s: %s",
-            new_id,
-            updated_by,
-            _diff(None, payload, enabled=body.enabled, priority=body.priority),
-        )
+            new_secret = await config_repo_secrets.get(conn, binding.github_repo)
+        _apply_secret_to_view(secret_view, binding.github_repo, secret_action, secret_value)
+        changes = _diff(None, payload, enabled=body.enabled, priority=body.priority)
+        _add_secret_flag(changes, secret_action, had_secret=bool(old_secret and old_secret.secret))
+        _log.info("config binding %s created by %s: %s", new_id, updated_by, changes)
         assert row is not None
-        return {**_serialize(row), "warnings": wgs}
+        return {**_serialize(row, new_secret), "warnings": wgs}
 
     @router.put("/bindings/{binding_id}")
     async def update_binding(
@@ -976,12 +1130,13 @@ def create_config_crud_router(
         old = await config_bindings.get(conn, binding_id)
         if old is None:
             raise HTTPException(status_code=404, detail="binding not found")
-        # The served payload redacts `webhook_secret` (see `_serialize`); if
-        # the write omits it, keep the stored secret rather than dropping it
-        # on every edit that round-trips the redacted GET response. An
-        # explicit (even empty) value in the payload still overrides it.
-        if "webhook_secret" not in payload and old.payload.get("webhook_secret"):
-            payload["webhook_secret"] = old.payload["webhook_secret"]
+        # The repo webhook secret is write-only and repo-scoped: strip it from
+        # the payload and resolve the action (SYM-194). An omitted/empty value
+        # keeps the stored secret (preserve-on-omit) — no write happens, so a
+        # routine edit that round-trips the redacted GET can't wipe it; a
+        # non-empty value replaces it; `webhook_secret_clear` clears it.
+        secret_action, secret_value = _pop_secret_action(payload, body)
+        old_secret = await config_repo_secrets.get(conn, old.github_repo)
         # Same round-trip concern for `mcp_servers`' redacted `env`/`headers`
         # (see `_redact_mcp_servers`/`_restore_mcp_secrets`).
         if isinstance(payload.get("mcp_servers"), dict):
@@ -990,7 +1145,8 @@ def create_config_crud_router(
             )
         binding = _validate_binding(payload, jira_base_url=base.jira_base_url)
         binding.enabled = body.enabled
-        _validate_webhook_secret(binding, base)
+        has_secret = _resulting_has_secret(secret_action, old_secret)
+        _validate_webhook_secret(binding, base, has_secret=has_secret)
         _validate_tracker_credentials(binding, base)
         # Assembly + validation (including the external Models-API capability
         # check, up to the full 30s httpx timeout) runs before the lock is
@@ -1016,6 +1172,11 @@ def create_config_crud_router(
                 binding, await _other_bindings(conn, base, exclude_id=binding_id)
             )
             await _reject_stale_globals(conn, globals_version)
+            # Secret + binding in one transaction — see `create_binding`. A
+            # binding version conflict (below) rolls back the secret write too.
+            await _write_repo_secret(
+                conn, binding.github_repo, secret_action, secret_value, body, updated_by, clock
+            )
             try:
                 row = await config_bindings.update(
                     conn,
@@ -1044,13 +1205,14 @@ def create_config_crud_router(
                     ["github_repo"],
                     "a binding with this project/repo/label/provider/site already exists",
                 ) from e
-        _log.info(
-            "config binding %s updated by %s: %s",
-            binding_id,
-            updated_by,
-            _diff(old, payload, enabled=body.enabled, priority=body.priority),
+            new_secret = await config_repo_secrets.get(conn, binding.github_repo)
+        _apply_secret_to_view(secret_view, binding.github_repo, secret_action, secret_value)
+        changes = _diff(old, payload, enabled=body.enabled, priority=body.priority)
+        _add_secret_flag(
+            changes, secret_action, had_secret=bool(old_secret and old_secret.secret)
         )
-        return {**_serialize(row), "warnings": wgs}
+        _log.info("config binding %s updated by %s: %s", binding_id, updated_by, changes)
+        return {**_serialize(row, new_secret), "warnings": wgs}
 
     @router.delete("/bindings/{binding_id}", status_code=204)
     async def delete_binding(

@@ -488,6 +488,122 @@ async def test_webhook_secret_survives_edit_of_redacted_payload(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_repo_secret_metadata_in_response(tmp_path: Path) -> None:
+    """The response carries the repo-secret set flag, its own `version`, and
+    updated metadata — never the value (SYM-194)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            created = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_secret="s3cr3t")},
+            )
+            assert created.status_code == 201, created.text
+            rec = created.json()
+            assert rec["webhook_secret_set"] is True
+            assert rec["webhook_secret_version"] == 1
+            assert rec["webhook_secret_updated_by"] == "local"
+            assert "s3cr3t" not in created.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_repo_secret_version_conflict_across_bindings(tmp_path: Path) -> None:
+    """The repo secret is shared across a repo's bindings, so its own `version`
+    guards concurrent edits: two tabs editing *different* bindings of the same
+    repo conflict on the shared secret (SYM-194 acceptance)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            b1 = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_secret="a")},
+            )
+            assert b1.status_code == 201, b1.text
+            assert b1.json()["webhook_secret_version"] == 1
+
+            # A second binding on the SAME repo (distinct label — not a
+            # duplicate selector) sees the shared secret at version 1.
+            b2 = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(issue_label="bug")},
+            )
+            assert b2.status_code == 201, b2.text
+            assert b2.json()["webhook_secret_version"] == 1
+
+            # Tab A replaces the secret from binding 1 → version 2.
+            put1 = await client.put(
+                f"/api/config/bindings/{b1.json()['id']}",
+                json={
+                    "payload": _payload(webhook_secret="b"),
+                    "version": b1.json()["version"],
+                    "webhook_secret_version": 1,
+                },
+            )
+            assert put1.status_code == 200, put1.text
+            assert put1.json()["webhook_secret_version"] == 2
+
+            # Tab B still holds version 1 and tries to replace it from binding
+            # 2 → conflict on the shared repo secret.
+            put2 = await client.put(
+                f"/api/config/bindings/{b2.json()['id']}",
+                json={
+                    "payload": _payload(issue_label="bug", webhook_secret="c"),
+                    "version": b2.json()["version"],
+                    "webhook_secret_version": 1,
+                },
+            )
+            assert put2.status_code == 409, put2.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_repo_secret_explicit_clear(tmp_path: Path) -> None:
+    """Omit keeps; an explicit clear marker removes the secret (SYM-194)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            created = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_secret="s3cr3t")},
+            )
+            bid = created.json()["id"]
+            assert created.json()["webhook_secret_set"] is True
+
+            # Ordinary edit that omits the secret → kept.
+            got = await client.get(f"/api/config/bindings/{bid}")
+            kept = await client.put(
+                f"/api/config/bindings/{bid}",
+                json={
+                    "payload": {**got.json()["payload"], "max_concurrent": 7},
+                    "version": got.json()["version"],
+                },
+            )
+            assert kept.status_code == 200, kept.text
+            assert kept.json()["webhook_secret_set"] is True
+
+            # Explicit clear marker → removed.
+            cleared = await client.put(
+                f"/api/config/bindings/{bid}",
+                json={
+                    "payload": {**kept.json()["payload"]},
+                    "version": kept.json()["version"],
+                    "webhook_secret_clear": True,
+                    "webhook_secret_version": kept.json()["webhook_secret_version"],
+                },
+            )
+            assert cleared.status_code == 200, cleared.text
+            assert cleared.json()["webhook_secret_set"] is False
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_mcp_server_secrets_redacted_on_read(tmp_path: Path) -> None:
     """`mcp_servers` has no `resolve_env`-style name indirection (unlike the
     top-level `env` field), so an operator embeds literal credentials
