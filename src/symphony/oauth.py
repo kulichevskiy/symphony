@@ -21,7 +21,8 @@ import hashlib
 import secrets
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 from urllib.parse import urlencode
 
 import httpx
@@ -43,7 +44,16 @@ class OAuthError(Exception):
 @dataclass(frozen=True)
 class OAuthProvider:
     """Everything the engine needs for one provider. `test_url` is the endpoint
-    the Connections page's *Test* button pings with the stored token."""
+    the Connections page's *Test* button pings with the stored token.
+
+    `test_body` carries the request body for providers whose liveness probe is a
+    POST (e.g. Linear's GraphQL `viewer` query) — `None` means the probe is a
+    bare GET (GitHub's `/user`).
+
+    `authorize_extra_params` carries provider-specific consent params beyond the
+    common PKCE/state/scope set (e.g. Linear's `actor=app`, so resources created
+    by Symphony's automation attribute to the app rather than the authorizing
+    human)."""
 
     provider: str
     authorize_url: str
@@ -52,6 +62,9 @@ class OAuthProvider:
     client_id: str
     client_secret: str
     scopes: tuple[str, ...]
+    test_body: dict[str, Any] | None = None
+    scope_separator: str = " "
+    authorize_extra_params: dict[str, str] = field(default_factory=dict)
 
     @property
     def configured(self) -> bool:
@@ -122,17 +135,31 @@ def build_authorize_url(
     provider: OAuthProvider, *, state: str, code_challenge: str, redirect_uri: str
 ) -> str:
     """The provider consent URL the browser is 302'd to — minimal scopes, PKCE
-    challenge, and the single-use `state`."""
+    challenge, the single-use `state`, and any provider-specific extras
+    (`authorize_extra_params`)."""
     params = {
         "client_id": provider.client_id,
         "redirect_uri": redirect_uri,
-        "scope": " ".join(provider.scopes),
+        "scope": provider.scope_separator.join(provider.scopes),
         "state": state,
         "response_type": "code",
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
+        **provider.authorize_extra_params,
     }
     return f"{provider.authorize_url}?{urlencode(params)}"
+
+
+@dataclass(frozen=True)
+class TokenResponse:
+    """The result of a token exchange. `refresh_token`/`expires_in` are `None`
+    for providers whose access token doesn't expire (e.g. GitHub's classic
+    OAuth apps); Linear's does (24h) and returns both, so the caller must
+    preserve them rather than discarding everything but `access_token`."""
+
+    access_token: str
+    refresh_token: str | None = None
+    expires_in: int | None = None
 
 
 async def exchange_code(
@@ -142,10 +169,9 @@ async def exchange_code(
     code_verifier: str,
     redirect_uri: str,
     client: httpx.AsyncClient | None = None,
-) -> str:
-    """Exchange an authorization `code` for the user token, returning the access
-    token string. Raises `OAuthError` if the provider returns an error payload
-    or no token."""
+) -> TokenResponse:
+    """Exchange an authorization `code` for the user token. Raises `OAuthError`
+    if the provider returns an error payload or no access token."""
     data = {
         "client_id": provider.client_id,
         "client_secret": provider.client_secret,
@@ -170,4 +196,10 @@ async def exchange_code(
     token = payload.get("access_token")
     if not isinstance(token, str) or not token:
         raise OAuthError(f"token exchange with {provider.provider} returned no access token")
-    return token
+    refresh_token = payload.get("refresh_token")
+    expires_in = payload.get("expires_in")
+    return TokenResponse(
+        access_token=token,
+        refresh_token=refresh_token if isinstance(refresh_token, str) else None,
+        expires_in=expires_in if isinstance(expires_in, int) else None,
+    )

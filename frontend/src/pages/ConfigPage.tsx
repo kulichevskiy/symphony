@@ -1315,10 +1315,10 @@ function connectionStatusClass(status: string): string {
   return "text-muted-foreground";
 }
 
-// Providers with a wired redirect-OAuth flow. GitHub is the reference engine
-// (OAuth in UI 2/7); Linear and the CLI logins arrive in later slices, so their
-// buttons stay inert until then.
-const WIRED_PROVIDERS = new Set(["github"]);
+// Providers with a wired redirect-OAuth flow. GitHub (OAuth in UI 2/7) and
+// Linear (3/7) share the redirect engine; the CLI logins (Claude/Codex) arrive
+// in later slices, so their buttons stay inert until then.
+const WIRED_PROVIDERS = new Set(["github", "linear"]);
 
 export function ConnectionCard({
   connection,
@@ -1550,8 +1550,8 @@ export function ConfigPage() {
       <div className="mb-2 mt-6">
         <h2 className="text-lg font-semibold">Connections</h2>
         <p className="mt-0.5 text-sm text-muted-foreground">
-          Credentials for the providers Symphony talks to. Connect GitHub here;
-          the other providers arrive in later releases.
+          Credentials for the providers Symphony talks to. Connect GitHub and
+          Linear here; the other providers arrive in later releases.
         </p>
       </div>
       {connections.data ? (

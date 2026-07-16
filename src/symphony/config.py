@@ -700,6 +700,12 @@ class Secrets(BaseSettings):
     github_oauth_client_secret: str = Field(
         default="", validation_alias="GITHUB_OAUTH_CLIENT_SECRET"
     )
+    # Linear OAuth app for the same redirect flow (OAuth in UI 3/7). Replaces
+    # LINEAR_API_KEY as the credential source once the resolver lands in 4/7.
+    linear_oauth_client_id: str = Field(default="", validation_alias="LINEAR_OAUTH_CLIENT_ID")
+    linear_oauth_client_secret: str = Field(
+        default="", validation_alias="LINEAR_OAUTH_CLIENT_SECRET"
+    )
     # Encryption key for UI-stored OAuth credentials (OAuth in UI 1/7+). Read
     # via this `.env`-backed settings class rather than `os.environ` directly:
     # the Coolify deployment mounts `.env` as a file and deliberately does NOT
@@ -835,6 +841,8 @@ class Config(BaseModel):
     auth0_allowed_emails: str = ""
     github_oauth_client_id: str = ""
     github_oauth_client_secret: str = ""
+    linear_oauth_client_id: str = ""
+    linear_oauth_client_secret: str = ""
     jira_webhook_secret: str = ""
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
@@ -1025,6 +1033,8 @@ class Config(BaseModel):
                 "auth0_allowed_emails": secrets.auth0_allowed_emails,
                 "github_oauth_client_id": secrets.github_oauth_client_id,
                 "github_oauth_client_secret": secrets.github_oauth_client_secret,
+                "linear_oauth_client_id": secrets.linear_oauth_client_id,
+                "linear_oauth_client_secret": secrets.linear_oauth_client_secret,
                 "telegram_bot_token": secrets.telegram_bot_token,
                 "telegram_chat_id": secrets.telegram_chat_id,
                 "symphony_encryption_key": secrets.symphony_encryption_key,

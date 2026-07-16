@@ -98,6 +98,25 @@ def test_authorize_url_carries_minimal_scopes_and_pkce() -> None:
     assert q["redirect_uri"] == ["https://app/api/oauth/github/callback"]
 
 
+def test_authorize_url_carries_extra_params() -> None:
+    linear = OAuthProvider(
+        provider="linear",
+        authorize_url="https://linear.app/oauth/authorize",
+        token_url="https://api.linear.app/oauth/token",
+        test_url="https://api.linear.app/graphql",
+        client_id="cid",
+        client_secret="csecret",
+        scopes=("read", "write"),
+        scope_separator=",",
+        authorize_extra_params={"actor": "app"},
+    )
+    url = build_authorize_url(
+        linear, state="st", code_challenge="ch", redirect_uri="https://app/cb"
+    )
+    q = parse_qs(urlparse(url).query)
+    assert q["actor"] == ["app"]
+
+
 @pytest.mark.asyncio
 @respx.mock
 async def test_exchange_code_returns_access_token() -> None:
@@ -107,13 +126,45 @@ async def test_exchange_code_returns_access_token() -> None:
     token = await exchange_code(
         _GITHUB, code="the-code", code_verifier="v", redirect_uri="https://app/cb"
     )
-    assert token == "gho_live"
+    assert token.access_token == "gho_live"
+    assert token.refresh_token is None
+    assert token.expires_in is None
     sent = route.calls.last.request
     body = parse_qs(sent.content.decode())
     assert body["code"] == ["the-code"]
     assert body["code_verifier"] == ["v"]
     assert body["client_secret"] == ["csecret"]
     assert body["grant_type"] == ["authorization_code"]
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_exchange_code_preserves_refresh_token_and_expiry() -> None:
+    respx.post("https://api.linear.app/oauth/token").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "access_token": "lin_live",
+                "refresh_token": "lin_refresh",
+                "expires_in": 86399,
+                "token_type": "Bearer",
+            },
+        )
+    )
+    linear = OAuthProvider(
+        provider="linear",
+        authorize_url="https://linear.app/oauth/authorize",
+        token_url="https://api.linear.app/oauth/token",
+        test_url="https://api.linear.app/graphql",
+        client_id="cid",
+        client_secret="csecret",
+        scopes=("read", "write"),
+        scope_separator=",",
+    )
+    token = await exchange_code(linear, code="the-code", code_verifier="v", redirect_uri="cb")
+    assert token.access_token == "lin_live"
+    assert token.refresh_token == "lin_refresh"
+    assert token.expires_in == 86399
 
 
 @pytest.mark.asyncio

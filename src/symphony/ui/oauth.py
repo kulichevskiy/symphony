@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 import httpx
@@ -35,6 +35,7 @@ from ..oauth import (
     OAuthError,
     OAuthProvider,
     OAuthStateStore,
+    TokenResponse,
     build_authorize_url,
     exchange_code,
     generate_pkce,
@@ -68,9 +69,52 @@ def github_provider(client_id: str, client_secret: str) -> OAuthProvider:
     )
 
 
+# Linear OAuth endpoints + minimal scopes: `read`/`write` cover reading and
+# mutating issues (the credential the resolver in 4/7 swaps in for
+# LINEAR_API_KEY). `Test` pings the GraphQL `viewer` query — a POST, unlike
+# GitHub's GET probe, so it rides `OAuthProvider.test_body`. `actor=app`
+# attributes issues/comments Symphony creates to the app rather than the
+# authorizing operator — Linear's default `actor=user` is for interactive
+# use, not agents/service accounts (Linear OAuth docs).
+_LINEAR_AUTHORIZE_URL = "https://linear.app/oauth/authorize"
+_LINEAR_TOKEN_URL = "https://api.linear.app/oauth/token"
+_LINEAR_TEST_URL = "https://api.linear.app/graphql"
+_LINEAR_SCOPES = ("read", "write")
+_LINEAR_VIEWER_QUERY = {"query": "{ viewer { id } }"}
+_LINEAR_AUTHORIZE_EXTRA_PARAMS = {"actor": "app"}
+
+
+def linear_provider(client_id: str, client_secret: str) -> OAuthProvider:
+    """The Linear `OAuthProvider`, reusing the same redirect engine as GitHub
+    (registered even when unconfigured — `start` 503s so the card still
+    renders)."""
+    return OAuthProvider(
+        provider="linear",
+        authorize_url=_LINEAR_AUTHORIZE_URL,
+        token_url=_LINEAR_TOKEN_URL,
+        test_url=_LINEAR_TEST_URL,
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=_LINEAR_SCOPES,
+        test_body=_LINEAR_VIEWER_QUERY,
+        scope_separator=",",
+        authorize_extra_params=_LINEAR_AUTHORIZE_EXTRA_PARAMS,
+    )
+
+
 def _now_iso(clock: Callable[[], datetime] | None) -> str:
     now = clock() if clock is not None else datetime.now(UTC)
     return now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _expires_at_iso(clock: Callable[[], datetime] | None, token: TokenResponse) -> str | None:
+    """`token.expires_in` (seconds from now, e.g. Linear's 24h) as an absolute
+    timestamp, or `None` for a provider whose token doesn't expire."""
+    if token.expires_in is None:
+        return None
+    now = clock() if clock is not None else datetime.now(UTC)
+    expires = now + timedelta(seconds=token.expires_in)
+    return expires.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _spa_redirect(request: Request, params: str, public_origin: str | None) -> RedirectResponse:
@@ -120,11 +164,12 @@ def create_oauth_routers(
     async def oauth_start(provider: str, request: Request) -> dict[str, str]:
         cfg = _provider(provider)
         if not cfg.configured:
+            env = provider.upper()
             raise HTTPException(
                 status_code=503,
                 detail=(
                     f"{provider} OAuth is not configured; set "
-                    "GITHUB_OAUTH_CLIENT_ID/GITHUB_OAUTH_CLIENT_SECRET in the deployment env"
+                    f"{env}_OAUTH_CLIENT_ID/{env}_OAUTH_CLIENT_SECRET in the deployment env"
                 ),
             )
         if not cipher.available:
@@ -176,9 +221,11 @@ def create_oauth_routers(
         await db.oauth_connections.set_connection(
             conn,
             provider=provider,
-            credential=token,
+            credential=token.access_token,
             cipher=cipher,
+            refresh_token=token.refresh_token,
             status="connected",
+            expires_at=_expires_at_iso(clock, token),
             updated_at=_now_iso(clock),
             updated_by="oauth",
         )
@@ -214,9 +261,32 @@ def create_oauth_routers(
             return {"status": "expired"}
         if not token:
             raise HTTPException(status_code=404, detail=f"{provider} is not connected")
+        headers = {"Authorization": f"Bearer {token}"}
         async with httpx.AsyncClient() as client:
-            resp = await client.get(cfg.test_url, headers={"Authorization": f"Bearer {token}"})
-        live = resp.status_code == 200
+            # A POST body (Linear's GraphQL `viewer` query) vs a bare GET
+            # (GitHub's `/user`) — the only per-provider shape in the probe.
+            if cfg.test_body is not None:
+                resp = await client.post(cfg.test_url, headers=headers, json=cfg.test_body)
+            else:
+                resp = await client.get(cfg.test_url, headers=headers)
+        if cfg.test_body is not None:
+            # GraphQL (Linear): a 200 can still carry an auth-failure body
+            # (`{"errors": [...]}`), so the status/success signal is the
+            # body shape, not the HTTP status — same rule as the Linear
+            # client's `_query`.
+            live = False
+            if resp.status_code == 200:
+                try:
+                    body = resp.json()
+                except ValueError:
+                    body = {}
+                if not isinstance(body, dict):
+                    body = {}
+                data = body.get("data")
+                has_viewer = isinstance(data, dict) and bool(data.get("viewer"))
+                live = not body.get("errors") and has_viewer
+        else:
+            live = resp.status_code == 200
         await db.oauth_connections.update_status(
             conn,
             provider=provider,
