@@ -1163,7 +1163,6 @@ def create_config_crud_router(
         # routine edit that round-trips the redacted GET can't wipe it; a
         # non-empty value replaces it; `webhook_secret_clear` clears it.
         secret_action, secret_value = _pop_secret_action(payload, body)
-        old_secret = await config_repo_secrets.get(conn, old.github_repo)
         # Same round-trip concern for `mcp_servers`' redacted `env`/`headers`
         # (see `_redact_mcp_servers`/`_restore_mcp_secrets`).
         if isinstance(payload.get("mcp_servers"), dict):
@@ -1172,6 +1171,11 @@ def create_config_crud_router(
             )
         binding = _validate_binding(payload, jira_base_url=base.jira_base_url)
         binding.enabled = body.enabled
+        # Read the secret against `binding.github_repo`, not `old.github_repo`:
+        # a rename changes the target repo, and validating/auditing against the
+        # old repo's secret would fail-open a rename onto an unsecured repo
+        # (SYM-194 review).
+        old_secret = await config_repo_secrets.get(conn, binding.github_repo)
         has_secret = _resulting_has_secret(secret_action, old_secret)
         _validate_webhook_secret(binding, base, has_secret=has_secret)
         _validate_tracker_credentials(binding, base)
@@ -1201,12 +1205,19 @@ def create_config_crud_router(
             await _reject_stale_globals(conn, globals_version)
             # Secret + binding in one transaction — see `create_binding`. A
             # binding version conflict (below) rolls back the secret write too.
+            # Same fallback as `create_binding`: an omitted version must not
+            # skip the 409 conflict check (SYM-194 review).
+            update_expected_version = (
+                body.webhook_secret_version
+                if body.webhook_secret_version is not None
+                else (old_secret.version if old_secret is not None else 0)
+            )
             await _write_repo_secret(
                 conn,
                 binding.github_repo,
                 secret_action,
                 secret_value,
-                body.webhook_secret_version,
+                update_expected_version,
                 updated_by,
                 clock,
             )
