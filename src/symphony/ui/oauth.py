@@ -265,7 +265,8 @@ def create_oauth_routers(
                 if not isinstance(body, dict):
                     body = {}
                 data = body.get("data")
-                live = (not body.get("errors")) and isinstance(data, dict) and bool(data.get("viewer"))
+                has_viewer = isinstance(data, dict) and bool(data.get("viewer"))
+                live = not body.get("errors") and has_viewer
         else:
             live = resp.status_code == 200
         await db.oauth_connections.update_status(
