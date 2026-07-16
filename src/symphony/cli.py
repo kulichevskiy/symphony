@@ -527,9 +527,18 @@ def config_import_cmd(config_path: Path, replace: bool, issue_bindings_path: Pat
     import json
 
     _setup_logging()
-    issue_bindings = (
-        json.loads(issue_bindings_path.read_text()) if issue_bindings_path is not None else None
-    )
+    issue_bindings = None
+    if issue_bindings_path is not None:
+        try:
+            issue_bindings = json.loads(issue_bindings_path.read_text())
+        except json.JSONDecodeError as e:
+            click.echo(f"invalid --issue-bindings JSON: {e}", err=True)
+            sys.exit(2)
+        if not isinstance(issue_bindings, dict):
+            click.echo(
+                "--issue-bindings must be a JSON object mapping identifier -> binding key", err=True
+            )
+            sys.exit(2)
     asyncio.run(_config_import(config_path, replace=replace, issue_bindings=issue_bindings))
 
 

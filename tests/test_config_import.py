@@ -505,6 +505,28 @@ repos:
 
 
 @pytest.mark.asyncio
+async def test_import_skips_webhook_secret_placeholder(tmp_path: Path) -> None:
+    """An un-edited restore export carries the export placeholder, not a real
+    secret — importing it must not persist the placeholder as a real webhook
+    secret (SYM-195)."""
+    from symphony.config_export import WEBHOOK_SECRET_PLACEHOLDER
+
+    conn, _result, _rows, _globals_row = await _import(
+        tmp_path,
+        f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+    webhook_secret: {WEBHOOK_SECRET_PLACEHOLDER}
+{_STATES}
+""",
+    )
+    secret = await db.config_repo_secrets.get(conn, "org/api")
+    assert secret is None
+    await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_replace_does_not_delete_existing_bindings(tmp_path: Path) -> None:
     """A `--replace` import that fails partway (duplicate natural key across
     two unlabeled bindings on the same scope) must roll back the delete too —
