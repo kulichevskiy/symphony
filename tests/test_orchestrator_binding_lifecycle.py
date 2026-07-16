@@ -10,6 +10,7 @@ Runs carry the binding key they were dispatched under.
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -257,6 +258,49 @@ async def test_launch_gate_blocks_spawn_over_lowered_cap(tmp_path: Path) -> None
         # occupancy (1) now meets the cap, so nothing new is admitted.
         await _update_stored_binding(harness.conn, max_concurrent=1)
         assert not await harness.orch._launch_gate_admits(binding, first_dispatch=True)
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_launch_gate_serializes_with_config_write_lock(tmp_path: Path) -> None:
+    """The gate's fresh binding read must be serialized with config API
+    writes via the shared `_config_write_lock` (SYM-193 review) — otherwise a
+    queued task's read can race an operator's disable/cap edit and admit one
+    more spawn right after the edit commits."""
+    conn = await db.connect(tmp_path / "symphony.sqlite")
+    await _insert(conn, enabled=True)
+    cfg = await assemble_effective_config(conn, _base(tmp_path))
+    await conn.close()
+
+    harness = await Harness.create(tmp_path, config=cfg)
+    try:
+        await harness.warmup()
+        binding = harness.orch.config.repos[0]
+
+        release_writer = asyncio.Event()
+
+        async def hold_lock_then_disable() -> None:
+            async with harness.orch._config_write_lock:  # noqa: SLF001
+                await _update_stored_binding(harness.conn, enabled=False)
+                await release_writer.wait()
+
+        writer = asyncio.create_task(hold_lock_then_disable())
+        await asyncio.sleep(0)  # writer grabs the lock and commits the disable
+
+        gate_task = asyncio.create_task(
+            harness.orch._launch_gate_admits(binding, first_dispatch=True)  # noqa: SLF001
+        )
+        for _ in range(3):
+            await asyncio.sleep(0)
+        # The write already committed, but the gate must still be blocked
+        # behind the same lock rather than racing in to admit a spawn.
+        assert not gate_task.done()
+
+        release_writer.set()
+        await writer
+        admitted = await gate_task
+        assert not admitted
     finally:
         await harness.close()
 

@@ -820,35 +820,42 @@ class _OrchestratorBase:
         run row is written under the launch lock before the agent spawns) is
         re-checked against the *current* cap, so a lowered `max_concurrent`
         admits nothing new until occupancy falls below it, regardless of which
-        semaphore a queued task waited on. Running work is never killed."""
-        current = await self._current_binding_row(binding)
-        if current is None:
-            log.info(
-                "launch gate: binding %s no longer configured, aborting spawn",
-                binding.linear_team_key,
+        semaphore a queued task waited on. Running work is never killed.
+
+        Read under `_config_write_lock` — the same lock a config API write
+        holds for its whole transaction (SYM-189) — so a queued task can never
+        observe the previously-committed row while an operator's disable/cap
+        edit is mid-commit under WAL and slip a spawn in right after it lands
+        (SYM-193 review)."""
+        async with self._config_write_lock:
+            current = await self._current_binding_row(binding)
+            if current is None:
+                log.info(
+                    "launch gate: binding %s no longer configured, aborting spawn",
+                    binding.linear_team_key,
+                )
+                return False
+            if first_dispatch and not current.enabled:
+                log.info(
+                    "launch gate: binding %s is disabled, aborting first dispatch",
+                    binding.linear_team_key,
+                )
+                return False
+            occupancy = await db.runs.occupancy_for_binding_key(
+                self._conn,
+                _binding_storage_key(binding),
+                legacy_team_key=binding.linear_team_key,
+                legacy_github_repo=binding.github_repo,
             )
-            return False
-        if first_dispatch and not current.enabled:
-            log.info(
-                "launch gate: binding %s is disabled, aborting first dispatch",
-                binding.linear_team_key,
-            )
-            return False
-        occupancy = await db.runs.occupancy_for_binding_key(
-            self._conn,
-            _binding_storage_key(binding),
-            legacy_team_key=binding.linear_team_key,
-            legacy_github_repo=binding.github_repo,
-        )
-        if occupancy >= current.max_concurrent:
-            log.info(
-                "launch gate: binding %s at capacity (occupancy=%d, cap=%d), aborting spawn",
-                binding.linear_team_key,
-                occupancy,
-                current.max_concurrent,
-            )
-            return False
-        return True
+            if occupancy >= current.max_concurrent:
+                log.info(
+                    "launch gate: binding %s at capacity (occupancy=%d, cap=%d), aborting spawn",
+                    binding.linear_team_key,
+                    occupancy,
+                    current.max_concurrent,
+                )
+                return False
+            return True
 
     async def warmup(self) -> None:
         """One-time startup work: cache team workflow states, validate auth."""
