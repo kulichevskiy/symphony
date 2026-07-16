@@ -2777,19 +2777,22 @@ class _OrchestratorBase:
         which resolve a long-lived `LinearTracker` built once at boot/hot-add
         time from the ambient `LINEAR_API_KEY` — so a DB Linear connection
         made later in the UI never reached any actual Linear call (OAuth in
-        UI 4/7 review fix). Called once per tick: resolves DB-first, and only
-        touches the client header when the DB token actually changed, so a
-        provider with no DB connection (the resolver falls back to `None`
-        here — the tracker keeps its boot-time ambient key) costs one no-op
-        DB read per tick.
+        UI 4/7 review fix). Called once per tick: resolves DB-first with
+        fallback to the ambient `LINEAR_API_KEY`, and only touches the client
+        header when the resolved value actually changed — so a disconnect or
+        expiry reverts every tracker to the env key instead of clinging to
+        the dead DB token, and a provider with no DB connection costs one
+        no-op DB read per tick.
         """
-        linear_token = await self._credential_resolver.resolve("linear", fallback=None)
-        if not linear_token or linear_token == self._applied_linear_token:
+        linear_token = await self._credential_resolver.resolve(
+            "linear", fallback=self.config.linear_api_key
+        )
+        if linear_token == self._applied_linear_token:
             return
         for tracker in self._trackers.trackers_for_provider("linear"):
             set_api_key = getattr(tracker, "set_api_key", None)
             if set_api_key is not None:
-                set_api_key(linear_token)
+                set_api_key(linear_token or "")
         self._applied_linear_token = linear_token
 
     async def _resolve_run_credentials(self, binding: RepoBinding) -> RunCredentials:

@@ -738,9 +738,13 @@ def _linear_binding(*, team: str, repo: str, site: str = "default") -> RepoBindi
 class _FakeLinearTracker:
     def __init__(self) -> None:
         self.closed = False
+        self.api_keys: list[str] = []
 
     async def aclose(self) -> None:
         self.closed = True
+
+    def set_api_key(self, api_key: str) -> None:
+        self.api_keys.append(api_key)
 
 
 @pytest.mark.asyncio
@@ -793,6 +797,46 @@ async def test_hot_added_linear_tracker_aliased_as_default(
         assert registry.get(TrackerContext(provider="linear", site="acme")) is built[0]
         assert registry.get(TrackerContext()) is built[0]
         assert registry.resolve(TrackerContext()) is built[0]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_linear_disconnect_reverts_tracker_to_env_fallback(tmp_path: Path) -> None:
+    """A DB Linear connection applied to the tracker must not stick around
+    once the connection is gone. `Disconnect` (`db.oauth_connections.delete`)
+    and a failed liveness `Test` (`update_status` → `expired`) both make
+    `resolve` stop returning the DB token — the tracker must revert to the
+    ambient `LINEAR_API_KEY` on the next refresh instead of keeping the
+    stale/revoked DB token pinned until a restart (SYM-199 review fix)."""
+    cfg = Config(
+        workspace_root=tmp_path / "workspaces",
+        log_root=tmp_path / "logs",
+        db_path=tmp_path / "symphony.sqlite",
+        symphony_encryption_key="enc-key",
+        linear_api_key="env_key",
+        repos=[_linear_binding(team="ENG", repo="org/repo")],
+    )
+    conn = await db.connect(cfg.db_path)
+    try:
+        tracker = _FakeLinearTracker()
+        registry = TrackerRegistry()
+        registry.register("linear", "default", tracker)
+        orch = Orchestrator(cfg, registry, conn, tracker_factory=lambda _b: tracker)
+
+        from symphony.crypto import CredentialCipher
+
+        await db.oauth_connections.set_connection(
+            conn, provider="linear", credential="db_token", cipher=CredentialCipher("enc-key")
+        )
+
+        await orch._refresh_linear_tracker_credentials()  # noqa: SLF001
+        assert tracker.api_keys[-1] == "db_token"
+
+        await db.oauth_connections.delete(conn, "linear")
+
+        await orch._refresh_linear_tracker_credentials()  # noqa: SLF001
+        assert tracker.api_keys[-1] == "env_key"
     finally:
         await conn.close()
 
