@@ -869,6 +869,7 @@ class Reconciler:
                 status=review_run_status,
                 pid=None,
                 started_at=observed_at,
+                binding_key=_binding_storage_key(binding),
                 commit=False,
             )
             if remote_review_configured:

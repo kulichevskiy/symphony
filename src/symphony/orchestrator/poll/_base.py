@@ -748,6 +748,115 @@ class _OrchestratorBase:
             return None
         return self._binding_for_issue(issue, tracker_ctx=tracker_ctx)
 
+    def scheduled_slot_count_for_binding_key(self, key: BindingKey) -> int:
+        """In-memory scheduled dispatch/fix-run reservations for `key`.
+
+        The daemon reserves a slot (`_reserve_scheduled_slot`) before the run
+        row exists, so the drain guard must consult this — a delete racing a
+        scan could otherwise remove the binding a scheduled task is about to
+        start under (SYM-193). `key` is the binding natural-key tuple, the same
+        layout `_binding_key` produces."""
+        return self._scheduled_binding_counts.get(key, 0)
+
+    async def _current_binding_row(self, binding: RepoBinding) -> RepoBinding | None:
+        """The binding matching `binding`'s natural key, read fresh from the
+        config DB, or `None` if it's gone. The launch gate re-resolves the row
+        here — rather than off `self.config`, which only picks up an
+        operator's disable/cap edit on the next tick's `_reload_bindings` —
+        so a scheduled task sitting behind a semaphore long enough for the
+        edit to land still sees it immediately before spawn (SYM-193).
+
+        Falls back to `self.config.repos` when the DB doesn't own topology
+        (pre-migration YAML deployment, or a one-shot CLI dispatch that never
+        assembled from the DB) so that path keeps working unchanged. Never
+        falls back once `_reload_bindings_from_db` is set: the DB owns
+        topology past boot there, so a zero count means every binding was
+        deleted, not that the importer never ran, and the daemon's stale
+        `self.config.repos` must not revive it (SYM-193 review; mirrors
+        `_db_owns_topology`'s reasoning in `cli.py`)."""
+        key = _binding_key(binding)
+        stored = await db.config_bindings.get_by_natural_key(self._conn, key)
+        if stored is not None:
+            payload = {**stored.payload, "enabled": stored.enabled}
+            fresh = RepoBinding.model_validate(payload)
+            base = next(
+                (b for b in self.config.repos if _binding_key(b) == key),
+                None,
+            )
+            if base is not None:
+                # `stored.payload` is sparse and never resolved (SYM-188): its
+                # `env:` values are still the raw secret *names*, and it never
+                # ran through `apply_tracker_secret_defaults`. Keep the
+                # already-resolved values `self.config` has for these two
+                # fields — everything else (branch_prefix, base_branch,
+                # max_concurrent, enabled, ...) still comes fresh off the DB
+                # row (SYM-193 review).
+                fresh = fresh.model_copy(
+                    update={
+                        "env": base.env,
+                        "tracker_provider": base.tracker_provider,
+                        "tracker_site": base.tracker_site,
+                    }
+                )
+            return fresh
+        if await db.config_bindings.count(self._conn) > 0:
+            return None
+        if self._reload_bindings_from_db:
+            return None
+        for current in self.config.repos:
+            if _binding_key(current) == key:
+                return current
+        return None
+
+    async def _launch_gate_admits(self, binding: RepoBinding, *, first_dispatch: bool) -> bool:
+        """The single authoritative pre-spawn check (SYM-193).
+
+        Re-validates against the current binding row immediately before an
+        agent spawn. A first dispatch of an issue aborts when the binding is
+        disabled or gone; follow-up stages (fix-runs, review iterations,
+        acceptance, merge-conflict rebases) proceed — they are how in-flight
+        work drains. Either way, occupancy (live runs attributed to the
+        binding's stamped key — running plus launched-but-unfinished, since the
+        run row is written under the launch lock before the agent spawns) is
+        re-checked against the *current* cap, so a lowered `max_concurrent`
+        admits nothing new until occupancy falls below it, regardless of which
+        semaphore a queued task waited on. Running work is never killed.
+
+        Read under `_config_write_lock` — the same lock a config API write
+        holds for its whole transaction (SYM-189) — so a queued task can never
+        observe the previously-committed row while an operator's disable/cap
+        edit is mid-commit under WAL and slip a spawn in right after it lands
+        (SYM-193 review)."""
+        async with self._config_write_lock:
+            current = await self._current_binding_row(binding)
+            if current is None:
+                log.info(
+                    "launch gate: binding %s no longer configured, aborting spawn",
+                    binding.linear_team_key,
+                )
+                return False
+            if first_dispatch and not current.enabled:
+                log.info(
+                    "launch gate: binding %s is disabled, aborting first dispatch",
+                    binding.linear_team_key,
+                )
+                return False
+            occupancy = await db.runs.occupancy_for_binding_key(
+                self._conn,
+                _binding_storage_key(binding),
+                legacy_team_key=binding.linear_team_key,
+                legacy_github_repo=binding.github_repo,
+            )
+            if occupancy >= current.max_concurrent:
+                log.info(
+                    "launch gate: binding %s at capacity (occupancy=%d, cap=%d), aborting spawn",
+                    binding.linear_team_key,
+                    occupancy,
+                    current.max_concurrent,
+                )
+                return False
+            return True
+
     async def warmup(self) -> None:
         """One-time startup work: cache team workflow states, validate auth."""
         viewer_keys_by_ctx: dict[TrackerContext, list[str]] = {}
@@ -2209,6 +2318,7 @@ class _OrchestratorBase:
             status="running",
             pid=None,
             started_at=started_at,
+            binding_key=_binding_storage_key(binding),
         )
         created_review_run = inserted
         if not inserted:
@@ -2236,6 +2346,7 @@ class _OrchestratorBase:
                 status="running",
                 pid=None,
                 started_at=started_at,
+                binding_key=_binding_storage_key(binding),
             )
             created_review_run = True
         if created_review_run and pr_number is not None and post_codex_review:
@@ -2753,17 +2864,33 @@ class _OrchestratorBase:
                 if setup is not None and not await setup(workspace_path):
                     return False
 
+                # Launch gate: review-fix is a follow-up stage (drains
+                # in-flight work even on a disabled binding), but a lowered
+                # `max_concurrent` must still admit nothing new (SYM-193
+                # review). Held under `_dispatch_pause_lock` (the same lock
+                # `_dispatch_one` uses) so the gate's occupancy read and this
+                # insert move atomically. Skipped when `dispatch_capacity_held`
+                # — that means this fix-run is a continuation of a run
+                # (e.g. a merge-conflict rebase) that already holds this same
+                # occupancy slot, not a new spawn competing for one; gating it
+                # would double-count that slot against itself.
                 fix_run_id = str(uuid.uuid4())
-                inserted = await db.runs.create_if_no_active(
-                    self._conn,
-                    id=fix_run_id,
-                    issue_id=issue.id,
-                    stage="review_fix",
-                    status="running",
-                    pid=None,
-                    started_at=self._now().isoformat(),
-                    ignored_stages=ignored_stages,
-                )
+                async with self._dispatch_pause_lock:
+                    if not dispatch_capacity_held and not await self._launch_gate_admits(
+                        binding, first_dispatch=False
+                    ):
+                        return False
+                    inserted = await db.runs.create_if_no_active(
+                        self._conn,
+                        id=fix_run_id,
+                        issue_id=issue.id,
+                        stage="review_fix",
+                        status="running",
+                        pid=None,
+                        started_at=self._now().isoformat(),
+                        binding_key=_binding_storage_key(binding),
+                        ignored_stages=ignored_stages,
+                    )
                 if not inserted:
                     # Lost the race: another live review_fix already exists (SYM-152).
                     if on_dedup_loss is not None:
@@ -2817,6 +2944,7 @@ class _OrchestratorBase:
             status="running",
             pid=None,
             started_at=self._now().isoformat(),
+            binding_key=_binding_storage_key(binding),
         )
         role = binding.resolved_role("implement", self.config.roles)
         command = build_fix_runner_command(

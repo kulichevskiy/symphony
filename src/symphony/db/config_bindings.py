@@ -155,6 +155,26 @@ async def get(conn: aiosqlite.Connection, binding_id: int) -> StoredBinding | No
     return _row_to_binding(row) if row is not None else None
 
 
+async def get_by_natural_key(
+    conn: aiosqlite.Connection, key: tuple[str, str, str, str, str]
+) -> StoredBinding | None:
+    """One binding row by natural key, or `None` if it doesn't exist. Lets the
+    orchestrator's launch gate read the current `enabled`/payload straight from
+    the DB immediately before a spawn, instead of `self.config` — which only
+    picks up an operator's edit on the next tick's reload (SYM-193)."""
+    project_key, github_repo, issue_label, tracker_provider, tracker_site = key
+    cur = await conn.execute(
+        f"""
+        SELECT {_SELECT_COLUMNS} FROM config_bindings
+         WHERE project_key = ? AND github_repo = ? AND issue_label = ?
+           AND tracker_provider = ? AND tracker_site = ?
+        """,
+        (project_key, github_repo, issue_label, tracker_provider, tracker_site),
+    )
+    row = await cur.fetchone()
+    return _row_to_binding(row) if row is not None else None
+
+
 async def update(
     conn: aiosqlite.Connection,
     binding_id: int,

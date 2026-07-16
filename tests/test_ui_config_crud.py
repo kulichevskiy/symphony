@@ -7,6 +7,7 @@ stamping, secret redaction, and the options payload.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any
@@ -14,14 +15,51 @@ from typing import Any
 import httpx
 import pytest
 import respx
+from fastapi import FastAPI
 
 from symphony import db
 from symphony.app import create_app
 from symphony.config import Config
 from symphony.db import config_bindings
+from symphony.ui.config_crud import create_config_crud_router
 
 from .test_auth import JWKS_URI, _jwks, _settings, _token
 from .test_webhook import _Handler
+
+
+def _binding_key_str(rec: dict[str, Any]) -> str:
+    return json.dumps(
+        [
+            rec["project_key"],
+            rec["github_repo"],
+            rec["issue_label"],
+            rec["tracker_provider"],
+            rec["tracker_site"],
+        ],
+        separators=(",", ":"),
+    )
+
+
+def _drain_app(conn: Any, *, scheduled_slots: Any = None) -> FastAPI:
+    """A minimal app mounting only the CRUD router, so a test can inject a
+    `scheduled_slots` provider (the in-memory drain-guard input the daemon
+    supplies in production)."""
+
+    async def _provider() -> Any:
+        return conn
+
+    app = FastAPI()
+    app.include_router(
+        create_config_crud_router(
+            _provider,
+            config_provider=Config(
+                github_webhook_secret="test-global-secret",
+                linear_api_key="test-linear-key",
+            ),
+            scheduled_slots=scheduled_slots,
+        )
+    )
+    return app
 
 
 def _payload(**overrides: Any) -> dict[str, Any]:
@@ -220,10 +258,9 @@ async def test_same_scope_different_ready_state_same_repo_rolls_back(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_disabled_write_rejected(tmp_path: Path) -> None:
-    """`enabled: false` has no runtime effect until SYM-193 — the write path
-    rejects it outright rather than let an operator believe a binding is
-    disabled when the daemon still dispatches it (see effective_config.py)."""
+async def test_enabled_toggle_persists(tmp_path: Path) -> None:
+    """The `enabled` toggle is honored now that the binding lifecycle ships
+    (SYM-193): a disabled binding is created/updated and reads back disabled."""
     conn, db_path = await _open(tmp_path)
     try:
         app = _app(conn, db_path)
@@ -232,19 +269,25 @@ async def test_disabled_write_rejected(tmp_path: Path) -> None:
                 "/api/config/bindings",
                 json={"payload": _payload(), "enabled": False},
             )
-            assert created_disabled.status_code == 422
-            assert created_disabled.json()["detail"][0]["loc"] == ["enabled"]
+            assert created_disabled.status_code == 201, created_disabled.text
+            bid = created_disabled.json()["id"]
+            assert created_disabled.json()["enabled"] is False
 
-            created = await client.post("/api/config/bindings", json={"payload": _payload()})
-            assert created.status_code == 201, created.text
-            bid = created.json()["id"]
-
-            updated_disabled = await client.put(
+            # Re-enable via update.
+            reenabled = await client.put(
                 f"/api/config/bindings/{bid}",
-                json={"payload": _payload(), "version": 1, "enabled": False},
+                json={"payload": _payload(), "version": 1, "enabled": True},
             )
-            assert updated_disabled.status_code == 422
-            assert updated_disabled.json()["detail"][0]["loc"] == ["enabled"]
+            assert reenabled.status_code == 200, reenabled.text
+            assert reenabled.json()["enabled"] is True
+
+            # And disable again.
+            disabled = await client.put(
+                f"/api/config/bindings/{bid}",
+                json={"payload": _payload(), "version": 2, "enabled": False},
+            )
+            assert disabled.status_code == 200, disabled.text
+            assert disabled.json()["enabled"] is False
     finally:
         await conn.close()
 
@@ -1438,5 +1481,277 @@ async def test_binding_create_rejects_when_globals_change_during_validation(
             # Not persisted — no binding was created.
             listed = await client.get("/api/config/bindings")
             assert listed.json() == []
+    finally:
+        await conn.close()
+
+
+async def _create_binding(client: Any, **overrides: Any) -> dict[str, Any]:
+    resp = await client.post("/api/config/bindings", json={"payload": _payload(**overrides)})
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+async def _seed_issue(conn: Any, *, ident: str = "ENG-1") -> str:
+    return await db.issues.upsert(
+        conn,
+        id=f"issue-{ident}",
+        provider="linear",
+        site="default",
+        identifier=ident,
+        title="t",
+        team_key="ENG",
+    )
+
+
+@pytest.mark.asyncio
+async def test_drain_guard_blocks_delete_on_running_run(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            rec = await _create_binding(client)
+            issue_id = await _seed_issue(conn)
+            await db.runs.create(
+                conn,
+                id="run-1",
+                issue_id=issue_id,
+                stage="implement",
+                status="running",
+                pid=None,
+                started_at="2026-01-01T00:00:00Z",
+                binding_key=_binding_key_str(rec),
+            )
+            deleted = await client.delete(
+                f"/api/config/bindings/{rec['id']}?version={rec['version']}"
+            )
+            assert deleted.status_code == 409, deleted.text
+            assert deleted.json()["detail"]["blockers"]["running_runs"] == ["ENG-1"]
+
+            # The card list flags active work.
+            listed = await client.get("/api/config/bindings")
+            assert listed.json()[0]["active_work"] is True
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_guard_blocks_delete_on_open_pr(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            rec = await _create_binding(client)
+            issue_id = await _seed_issue(conn)
+            await db.issue_prs.upsert(
+                conn,
+                issue_id=issue_id,
+                github_repo="org/repo",
+                binding_key=_binding_key_str(rec),
+                pr_number=7,
+                pr_url="https://github.com/org/repo/pull/7",
+                created_at="2026-01-01T00:00:00Z",
+            )
+            deleted = await client.delete(
+                f"/api/config/bindings/{rec['id']}?version={rec['version']}"
+            )
+            assert deleted.status_code == 409, deleted.text
+            assert deleted.json()["detail"]["blockers"]["open_prs"] == ["ENG-1"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_guard_blocks_delete_on_legacy_running_run(tmp_path: Path) -> None:
+    """A run still live from before the `binding_key` column existed is
+    stamped at the migration's `''` default — the drain guard must still
+    attribute it (by team + repo) rather than let the delete through
+    (SYM-193 review)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            rec = await _create_binding(client)
+            issue_id = await _seed_issue(conn)
+            await db.runs.create(
+                conn,
+                id="run-1",
+                issue_id=issue_id,
+                stage="implement",
+                status="running",
+                pid=None,
+                started_at="2026-01-01T00:00:00Z",
+            )
+            deleted = await client.delete(
+                f"/api/config/bindings/{rec['id']}?version={rec['version']}"
+            )
+            assert deleted.status_code == 409, deleted.text
+            assert deleted.json()["detail"]["blockers"]["running_runs"] == ["ENG-1"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_guard_blocks_delete_on_legacy_open_pr(tmp_path: Path) -> None:
+    """An unmerged PR opened before the `binding_key` column existed is
+    stamped at the migration's `''` default — the drain guard must still
+    attribute it (by team + repo) rather than let the delete through
+    (SYM-193 review)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            rec = await _create_binding(client)
+            issue_id = await _seed_issue(conn)
+            await db.issue_prs.upsert(
+                conn,
+                issue_id=issue_id,
+                github_repo="org/repo",
+                pr_number=7,
+                pr_url="https://github.com/org/repo/pull/7",
+                created_at="2026-01-01T00:00:00Z",
+            )
+            deleted = await client.delete(
+                f"/api/config/bindings/{rec['id']}?version={rec['version']}"
+            )
+            assert deleted.status_code == 409, deleted.text
+            assert deleted.json()["detail"]["blockers"]["open_prs"] == ["ENG-1"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_guard_blocks_delete_on_operator_wait(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            rec = await _create_binding(client)
+            issue_id = await _seed_issue(conn)
+            # A parked wait references a (completed) run — the wait, not the
+            # run, is the blocker here.
+            await db.runs.create(
+                conn,
+                id="run-1",
+                issue_id=issue_id,
+                stage="implement",
+                status="failed",
+                pid=None,
+                started_at="2026-01-01T00:00:00Z",
+            )
+            await db.operator_waits.upsert(
+                conn,
+                issue_id=issue_id,
+                run_id="run-1",
+                kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+                linear_team_key="ENG",
+                github_repo="org/repo",
+                issue_label="",
+                created_at="2026-01-01T00:00:00Z",
+            )
+            deleted = await client.delete(
+                f"/api/config/bindings/{rec['id']}?version={rec['version']}"
+            )
+            assert deleted.status_code == 409, deleted.text
+            assert deleted.json()["detail"]["blockers"]["operator_waits"] == ["ENG-1"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_guard_blocks_delete_on_scheduled_slot(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        # The daemon reserves an in-memory scheduled slot before any run row
+        # exists; the drain guard must see it via the injected provider.
+        app = _drain_app(conn, scheduled_slots=lambda key: 1)
+        async with _client(app) as client:
+            rec = await _create_binding(client)
+            deleted = await client.delete(
+                f"/api/config/bindings/{rec['id']}?version={rec['version']}"
+            )
+            assert deleted.status_code == 409, deleted.text
+            assert deleted.json()["detail"]["blockers"]["scheduled_slots"] == 1
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_drain_guard_blocks_rename_and_branch_edit(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            rec = await _create_binding(client)
+            issue_id = await _seed_issue(conn)
+            await db.runs.create(
+                conn,
+                id="run-1",
+                issue_id=issue_id,
+                stage="implement",
+                status="running",
+                pid=None,
+                started_at="2026-01-01T00:00:00Z",
+                binding_key=_binding_key_str(rec),
+            )
+            # A natural-key change (github_repo) is guarded like a delete.
+            renamed = await client.put(
+                f"/api/config/bindings/{rec['id']}",
+                json={
+                    "payload": _payload(github_repo="org/other"),
+                    "version": rec["version"],
+                },
+            )
+            assert renamed.status_code == 409, renamed.text
+            assert renamed.json()["detail"]["blockers"]["running_runs"] == ["ENG-1"]
+
+            # A branch-affecting edit (branch_prefix) is guarded identically.
+            rebranch = await client.put(
+                f"/api/config/bindings/{rec['id']}",
+                json={
+                    "payload": _payload(branch_prefix="feature"),
+                    "version": rec["version"],
+                },
+            )
+            assert rebranch.status_code == 409, rebranch.text
+
+            # An ordinary edit (max_concurrent) is NOT drain-guarded.
+            tweaked = await client.put(
+                f"/api/config/bindings/{rec['id']}",
+                json={
+                    "payload": _payload(max_concurrent=9),
+                    "version": rec["version"],
+                },
+            )
+            assert tweaked.status_code == 200, tweaked.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_drained_binding_deletes_cleanly(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            rec = await _create_binding(client)
+            issue_id = await _seed_issue(conn)
+            # A *completed* run does not block (only live runs do).
+            await db.runs.create(
+                conn,
+                id="run-done",
+                issue_id=issue_id,
+                stage="implement",
+                status="completed",
+                pid=None,
+                started_at="2026-01-01T00:00:00Z",
+                binding_key=_binding_key_str(rec),
+            )
+            listed = await client.get("/api/config/bindings")
+            assert listed.json()[0]["active_work"] is False
+            deleted = await client.delete(
+                f"/api/config/bindings/{rec['id']}?version={rec['version']}"
+            )
+            assert deleted.status_code == 204, deleted.text
+            assert (await client.get("/api/config/bindings")).json() == []
     finally:
         await conn.close()

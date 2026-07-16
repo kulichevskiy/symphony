@@ -13,11 +13,12 @@ Every write:
     roles-matrix validators (family/effort cross-checks) exactly as boot does;
   * rejects legacy top-level role fields and env `key` names unknown to the
     server env (fail closed, listing the available names);
-  * rejects `enabled: false` outright, mirroring the importer
-    (`config_import.py`): the binding lifecycle (dispatch skip, launch gate,
-    drain guard) ships in SYM-193, and until then every DB row dispatches
-    regardless of this column, so persisting a disabled row would silently
-    keep dispatching it;
+  * accepts the `enabled` toggle (SYM-193): a disabled binding stops new
+    dispatch (scan skip + launch gate) while staying loaded so in-flight work
+    drains. DELETE and edits to the natural key or a branch-affecting field
+    (branch_prefix, base_branch) are drain-guarded — allowed only when the
+    binding has no running runs, tracked open PRs, parked operator waits, or
+    in-memory scheduled slots; otherwise a 409 with the blocker list;
   * rejects `webhook_enabled: true` with no resolvable secret (per-binding or
     the global `GITHUB_WEBHOOK_SECRET`) — the daemon's hot-reload path
     (`cli._live_github_webhook_settings`) swallows that misconfiguration by
@@ -55,6 +56,7 @@ stored row on write when the operator round-trips them untouched.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import warnings
@@ -79,7 +81,7 @@ from ..config import (
     _synthetic_matrix_validation_binding,
     binding_natural_key,
 )
-from ..db import config_bindings, config_globals
+from ..db import config_bindings, config_globals, issue_prs, operator_waits, runs
 
 _ROLES_ADAPTER: TypeAdapter[dict[RoleName, RoleConfig]] = TypeAdapter(dict[RoleName, RoleConfig])
 
@@ -294,19 +296,108 @@ def _validate_binding(payload: dict[str, Any], *, jira_base_url: str) -> RepoBin
     return binding
 
 
-def _reject_disabled_write(enabled: bool) -> None:
-    """Mirror the importer's refusal (`config_import.py`): the binding
-    lifecycle (dispatch skip, launch gate, drain guard) ships in SYM-193, and
-    until then `assemble_effective_config` dispatches every DB row as enabled
-    regardless of this column — so persisting `enabled: false` would silently
-    keep dispatching the row anyway."""
-    if not enabled:
-        raise _validation_error(
-            ["enabled"],
-            "disabling a binding has no effect yet; the binding lifecycle "
-            "(disable/drain) ships in SYM-193 and this build would dispatch "
-            "the row anyway — leave it enabled or delete it",
-        )
+# Branch-resolving fields: later stages resolve branches from the *current*
+# binding row after hot reload, so changing these mid-PR would point fix,
+# delivery, and reconciliation paths at a branch other than the dispatched one.
+# Edits to them are drain-guarded exactly like a natural-key change (SYM-193).
+_BRANCH_FIELDS: tuple[tuple[str, Any], ...] = (
+    ("branch_prefix", "symphony"),
+    ("base_branch", None),
+)
+
+
+def _binding_key_str(row: config_bindings.StoredBinding) -> str:
+    """The stored row's natural key as the JSON string runs/PRs are stamped
+    with (`_binding_storage_key`) — same components, same order, same compact
+    separators — so a drain query attributes work back to this binding."""
+    return json.dumps(
+        [
+            row.project_key,
+            row.github_repo,
+            row.issue_label,
+            row.tracker_provider,
+            row.tracker_site,
+        ],
+        separators=(",", ":"),
+    )
+
+
+def _row_natural_key(
+    row: config_bindings.StoredBinding,
+) -> tuple[str, str, str, str, str]:
+    return (
+        row.project_key,
+        row.github_repo,
+        row.issue_label,
+        row.tracker_provider,
+        row.tracker_site,
+    )
+
+
+async def _drain_blockers(
+    conn: aiosqlite.Connection,
+    row: config_bindings.StoredBinding,
+    *,
+    scheduled_slots: Callable[[tuple[str, str, str, str, str]], int] | None,
+) -> dict[str, Any] | None:
+    """The binding's active work that a DELETE / natural-key / branch edit
+    would orphan (SYM-193): running runs (attributed via the stamped key),
+    tracked open PRs, parked operator waits in its scope, and in-memory
+    scheduled dispatch/fix-run slots the daemon reserved before a run row
+    exists. Returns the blocker map, or `None` when the binding is drained."""
+    binding_key = _binding_key_str(row)
+    natural_key = _row_natural_key(row)
+    running = await runs.live_identifiers_for_binding_key(
+        conn,
+        binding_key,
+        legacy_team_key=row.project_key,
+        legacy_github_repo=row.github_repo,
+    )
+    open_prs = await issue_prs.open_identifiers_for_binding_key(
+        conn,
+        binding_key,
+        legacy_team_key=row.project_key,
+        legacy_github_repo=row.github_repo,
+    )
+    waits = await operator_waits.open_identifiers_for_natural_key(conn, natural_key)
+    scheduled = scheduled_slots(natural_key) if scheduled_slots is not None else 0
+    if running or open_prs or waits or scheduled:
+        return {
+            "running_runs": running,
+            "open_prs": open_prs,
+            "operator_waits": waits,
+            "scheduled_slots": scheduled,
+        }
+    return None
+
+
+def _drain_conflict(action: str, blockers: dict[str, Any]) -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "msg": (
+                f"cannot {action} a binding with active work; drain it first "
+                f"(finish or stop the blocking issues/PRs)"
+            ),
+            "blockers": blockers,
+        },
+    )
+
+
+def _branch_or_key_changed(
+    old: config_bindings.StoredBinding,
+    new_key: tuple[str, str, str, str, str],
+    new_payload: dict[str, Any],
+) -> bool:
+    """Whether an update changes the natural key or a branch-resolving field —
+    the edits the drain guard protects (a rename would strand parked work; a
+    branch change would repoint later stages off the dispatched branch)."""
+    if _row_natural_key(old) != new_key:
+        return True
+    for field, default in _BRANCH_FIELDS:
+        if old.payload.get(field, default) != new_payload.get(field, default):
+            return True
+    return False
 
 
 def _validate_webhook_secret(binding: RepoBinding, base: Config) -> None:
@@ -639,6 +730,7 @@ def create_config_crud_router(
     write_lock: Any = None,
     auth_dependency: Callable[..., Awaitable[dict[str, Any]]] | None = None,
     clock: Callable[[], datetime] | None = None,
+    scheduled_slots: Callable[[tuple[str, str, str, str, str]], int] | None = None,
 ) -> APIRouter:
     """Router mounting the binding CRUD + options endpoints under `/api/config`.
 
@@ -798,7 +890,13 @@ def create_config_crud_router(
     @router.get("/bindings")
     async def list_bindings() -> list[dict[str, Any]]:
         conn = await conn_provider()
-        return [_serialize(row) for row in await config_bindings.list_all(conn)]
+        out: list[dict[str, Any]] = []
+        for row in await config_bindings.list_all(conn):
+            # `active_work` drives the card's indicator and previews whether a
+            # delete/rename would be drain-blocked (SYM-193).
+            blockers = await _drain_blockers(conn, row, scheduled_slots=scheduled_slots)
+            out.append({**_serialize(row), "active_work": blockers is not None})
+        return out
 
     @router.get("/bindings/{binding_id}")
     async def get_binding(binding_id: int) -> dict[str, Any]:
@@ -813,7 +911,6 @@ def create_config_crud_router(
         body: BindingWrite = Body(...),  # noqa: B008
         updated_by: str = Depends(_updated_by),  # noqa: B008
     ) -> dict[str, Any]:
-        _reject_disabled_write(body.enabled)
         payload = _sanitize_payload(body.payload)
         base = _base_config()
         binding = _validate_binding(payload, jira_base_url=base.jira_base_url)
@@ -873,7 +970,6 @@ def create_config_crud_router(
     ) -> dict[str, Any]:
         if body.version is None:
             raise _validation_error(["version"], "version is required for an update")
-        _reject_disabled_write(body.enabled)
         payload = _sanitize_payload(body.payload)
         base = _base_config()
         conn = await conn_provider()
@@ -906,6 +1002,15 @@ def create_config_crud_router(
             conn, base, binding, exclude_id=binding_id
         )
         async with lock:
+            # Drain guard: a natural-key or branch-affecting edit would detach
+            # live work from the row it was dispatched under (a rename strands
+            # parked waits; a branch change repoints later stages), so it's
+            # allowed only for a drained binding (SYM-193). Ordinary edits
+            # (label-free field tweaks, enable/disable, cap changes) are exempt.
+            if _branch_or_key_changed(old, binding_natural_key(binding), payload):
+                blockers = await _drain_blockers(conn, old, scheduled_slots=scheduled_slots)
+                if blockers is not None:
+                    raise _drain_conflict("rename or re-point", blockers)
             # Same re-check as `create_binding` — see that comment.
             _reject_duplicate_selector(
                 binding, await _other_bindings(conn, base, exclude_id=binding_id)
@@ -955,6 +1060,15 @@ def create_config_crud_router(
     ) -> None:
         conn = await conn_provider()
         async with lock:
+            # Drain guard: refuse to delete a binding with active work, or the
+            # DELETE would orphan its open PRs / parked waits / in-flight runs
+            # (SYM-193). Checked inside the lock so a scan can't reserve a slot
+            # between the check and the delete.
+            existing = await config_bindings.get(conn, binding_id)
+            if existing is not None:
+                blockers = await _drain_blockers(conn, existing, scheduled_slots=scheduled_slots)
+                if blockers is not None:
+                    raise _drain_conflict("delete", blockers)
             try:
                 await config_bindings.delete(conn, binding_id, expected_version=version)
             except config_bindings.StaleVersionError as e:

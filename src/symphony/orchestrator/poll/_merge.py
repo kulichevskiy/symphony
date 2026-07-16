@@ -88,6 +88,7 @@ from ._base import (
     PARKED_CLOSED_UNMERGED_COMMENT,
     SlashHandlerFailure,
     _binding_key,
+    _binding_storage_key,
     _OrchestratorBase,
 )
 from ._git import (
@@ -387,14 +388,19 @@ class _MergeMixin(_OrchestratorBase):
                 async def clear_reconciled_merge_wait(_new_run_id: str) -> None:
                     await self._clear_operator_wait(wait.issue_id, wait.run_id)
 
-                self._schedule_merge(
-                    binding=binding,
-                    issue=issue,
-                    pr_number=pr.pr_number,
-                    pr_url=pr.pr_url,
-                    approved_head_sha=approved_head_sha,
-                    on_started=clear_reconciled_merge_wait,
-                )
+                # Reserved under `config_write_lock` so the drain guard's
+                # `scheduled_slots` sample can't miss this reservation
+                # (SYM-193 review; see `_review_fix_dispatch_slot` in
+                # `_dispatch.py`).
+                async with self._config_write_lock:
+                    self._schedule_merge(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=pr.pr_number,
+                        pr_url=pr.pr_url,
+                        approved_head_sha=approved_head_sha,
+                        on_started=clear_reconciled_merge_wait,
+                    )
             log.info(
                 "reconciled merge wait for %s via %s (reason=%s)",
                 issue.identifier,
@@ -639,7 +645,7 @@ class _MergeMixin(_OrchestratorBase):
         )
 
     async def _merge_required_check_terminal_run(
-        self, *, issue: LinearIssue, merge_run_id: str | None
+        self, *, binding: RepoBinding, issue: LinearIssue, merge_run_id: str | None
     ) -> db.runs.Run:
         run_id = merge_run_id or str(uuid.uuid4())
         started_at = self._now().isoformat()
@@ -652,6 +658,7 @@ class _MergeMixin(_OrchestratorBase):
                 status="running",
                 pid=None,
                 started_at=started_at,
+                binding_key=_binding_storage_key(binding),
             )
         return db.runs.Run(
             id=run_id,
@@ -967,6 +974,7 @@ class _MergeMixin(_OrchestratorBase):
                 if not binding.resolved_remote_review():
                     if _local_review_infra_failed(local_review_result):
                         run = await self._merge_required_check_terminal_run(
+                            binding=binding,
                             issue=issue,
                             merge_run_id=merge_run_id,
                         )
@@ -1014,6 +1022,7 @@ class _MergeMixin(_OrchestratorBase):
 
             if pending_local_only_needs_approval is not None:
                 run = await self._merge_required_check_terminal_run(
+                    binding=binding,
                     issue=issue,
                     merge_run_id=merge_run_id,
                 )
@@ -1624,13 +1633,16 @@ class _MergeMixin(_OrchestratorBase):
                     e,
                 )
 
-        self._schedule_merge(
-            binding=binding,
-            issue=issue,
-            pr_number=pr_number,
-            pr_url=pr_url,
-            on_started=on_merge_started,
-        )
+        # Reserved under `config_write_lock` — see `_review_fix_dispatch_slot`
+        # in `_dispatch.py` (SYM-193 review).
+        async with self._config_write_lock:
+            self._schedule_merge(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                on_started=on_merge_started,
+            )
 
     async def _parked_closed_unmerged_pr_for_event(
         self, event: GitHubWebhookEvent
@@ -2360,15 +2372,19 @@ class _MergeMixin(_OrchestratorBase):
                     return []
                 if await self._acceptance_infra_retry_backoff_active(candidate.issue_id):
                     return []
-                return [
-                    self._schedule_acceptance(
-                        binding=binding,
-                        issue=issue,
-                        pr_number=candidate.pr_number,
-                        pr_url=candidate.pr_url,
-                        pr_head_sha=head_sha,
-                    )
-                ]
+                # Reserved under `config_write_lock` — see
+                # `_review_fix_dispatch_slot` in `_dispatch.py` (SYM-193
+                # review).
+                async with self._config_write_lock:
+                    return [
+                        self._schedule_acceptance(
+                            binding=binding,
+                            issue=issue,
+                            pr_number=candidate.pr_number,
+                            pr_url=candidate.pr_url,
+                            pr_head_sha=head_sha,
+                        )
+                    ]
             if not binding.auto_merge:
                 await self._park_pr_for_manual_merge(
                     binding=binding,
@@ -2407,17 +2423,20 @@ class _MergeMixin(_OrchestratorBase):
 
                 on_started = clear_conflict_fix_marker
 
-            return [
-                self._schedule_merge(
-                    binding=binding,
-                    issue=issue,
-                    pr_number=candidate.pr_number,
-                    pr_url=candidate.pr_url,
-                    approved_head_sha=head_sha,
-                    skip_review=verdict.kind is not VerdictKind.APPROVED,
-                    on_started=on_started,
-                )
-            ]
+            # Reserved under `config_write_lock` — see
+            # `_review_fix_dispatch_slot` in `_dispatch.py` (SYM-193 review).
+            async with self._config_write_lock:
+                return [
+                    self._schedule_merge(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=candidate.pr_number,
+                        pr_url=candidate.pr_url,
+                        approved_head_sha=head_sha,
+                        skip_review=verdict.kind is not VerdictKind.APPROVED,
+                        on_started=on_started,
+                    )
+                ]
         elif verdict.merge_conflict:
             await db.issue_prs.clear_merge_conflict_fixed(
                 self._conn,
@@ -2673,6 +2692,7 @@ class _MergeMixin(_OrchestratorBase):
                     status="running",
                     pid=None,
                     started_at=self._now().isoformat(),
+                    binding_key=_binding_storage_key(binding),
                     ignored_stage="review",
                 )
                 if not inserted:
@@ -2734,17 +2754,26 @@ class _MergeMixin(_OrchestratorBase):
     ) -> str | None:
         run_id = str(uuid.uuid4())
         now = self._now().isoformat()
-        inserted = await db.runs.create_if_no_active(
-            self._conn,
-            id=run_id,
-            issue_id=issue.id,
-            stage="merge",
-            status="running",
-            pid=None,
-            started_at=now,
-            ignored_stage="review",
-            ignored_stages=("review_fix",) if skip_review else (),
-        )
+        # Launch gate: merge is a follow-up stage (drains in-flight work even
+        # on a disabled binding), but a lowered `max_concurrent` must still
+        # admit nothing new (SYM-193 review). Held under `_dispatch_pause_lock`
+        # (the same lock `_dispatch_one` uses) so the gate's occupancy read
+        # and this insert move atomically.
+        async with self._dispatch_pause_lock:
+            if not await self._launch_gate_admits(binding, first_dispatch=False):
+                return None
+            inserted = await db.runs.create_if_no_active(
+                self._conn,
+                id=run_id,
+                issue_id=issue.id,
+                stage="merge",
+                status="running",
+                pid=None,
+                started_at=now,
+                binding_key=_binding_storage_key(binding),
+                ignored_stage="review",
+                ignored_stages=("review_fix",) if skip_review else (),
+            )
         if not inserted:
             return None
 
@@ -3318,6 +3347,7 @@ class _MergeMixin(_OrchestratorBase):
                 status="running",
                 pid=None,
                 started_at=self._now().isoformat(),
+                binding_key=_binding_storage_key(binding),
                 ignored_stage="review",
             )
             if not inserted:

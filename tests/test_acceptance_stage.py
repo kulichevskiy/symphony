@@ -1199,6 +1199,74 @@ async def test_acceptance_reject_after_fix_opens_operator_wait(
 
 
 @pytest.mark.asyncio
+async def test_acceptance_fix_gated_by_launch_gate_over_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Acceptance fix-runs are code-mutating spawns, so the launch gate must
+    still veto one over a met cap — same as the other follow-up stages
+    (SYM-193 review)."""
+
+    async def no_fetch(_workspace_path: Path, _branch: str) -> None:
+        return None
+
+    async def remote_sha(_workspace_path: Path, _ref: str) -> str:
+        return "abc123"
+
+    monkeypatch.setattr(acceptance_module, "_git_fetch_branch", no_fetch)
+    monkeypatch.setattr(acceptance_module, "_workspace_ref_sha", remote_sha)
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding("code_only").model_copy(update={"max_concurrent": 1})
+        await _seed_review_candidate(conn, binding)
+        # A run for an unrelated issue already occupies the binding's sole slot.
+        await db.issues.upsert(conn, id="other", identifier="ENG-2", title="other", team_key="ENG")
+        await db.runs.create(
+            conn,
+            id="other-run",
+            issue_id="other",
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+            binding_key=_binding_storage_key(binding),
+        )
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws" / "org" / "eng-1")
+        workspace.release = MagicMock()
+
+        orch = Orchestrator(
+            Config(
+                repos=[binding],
+                log_root=tmp_path / "logs",
+                workspace_root=tmp_path / "ws",
+                db_path=tmp_path / "s.sqlite",
+            ),
+            AsyncMock(),
+            conn,
+            runner=MagicMock(),
+            gh=_github(),
+            workspace=workspace,
+        )
+
+        verdict = AcceptanceVerdict(kind="reject", criteria=[], cost=0.1, hero_screenshot_url="")
+        dispatched = await orch._dispatch_acceptance_fix_run(  # noqa: SLF001
+            binding=binding,
+            issue=_issue(),
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            pr_head_sha="abc123",
+            verdict=verdict,
+        )
+
+        assert dispatched is False
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert "acceptance_fix" not in [run.stage for run in history]
+        workspace.release.assert_called_once_with(binding, _issue())
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_acceptance_fix_without_new_commit_opens_operator_wait(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

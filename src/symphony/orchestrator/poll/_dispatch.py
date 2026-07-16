@@ -91,6 +91,14 @@ class _DispatchMixin(_OrchestratorBase):
 
     async def _scan_binding(self, binding: RepoBinding) -> list[asyncio.Task[None]]:
         scheduled: list[asyncio.Task[None]] = []
+        # Disabled binding: start no new issues and drop its tracker-queue lanes
+        # so the UI board reflects the pause. The binding stays loaded (and so
+        # visible to review monitors, merge polling, and operator-wait
+        # resolution, which all iterate `config.repos`), letting in-flight work
+        # drain to completion (SYM-193).
+        if not binding.enabled:
+            await self._clear_disabled_binding_lanes(binding)
+            return scheduled
         ready_state = binding.linear_states.ready
         waiting_state = binding.linear_states.waiting
         waiting_issues: list[LinearIssue] = []
@@ -158,6 +166,19 @@ class _DispatchMixin(_OrchestratorBase):
             if len(scheduled) >= capacity:
                 break
         return scheduled
+
+    async def _clear_disabled_binding_lanes(self, binding: RepoBinding) -> None:
+        """Drop a disabled binding's `tracker_queue` snapshot so its Ready/
+        Waiting lanes vanish from the UI board while it's paused (SYM-193).
+        `_prune_tracker_queue_scopes` can't do this — the scope is still
+        configured, just disabled — so replace the snapshot with no rows."""
+        await db.tracker_queue.replace_scan(
+            self._conn,
+            team_key=binding.linear_team_key,
+            scope=_queue_scope(binding),
+            rows=[],
+            seen_at=self._now().isoformat(),
+        )
 
     async def _persist_queue_snapshot(
         self,
@@ -328,7 +349,12 @@ class _DispatchMixin(_OrchestratorBase):
             yield
             return
 
-        self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
+        # Held only across the reservation itself, so it's serialized against
+        # the drain guard's `scheduled_slots` sample (config_crud holds the
+        # same lock across its whole check-then-write) without blocking this
+        # slot's semaphore wait on unrelated config writes (SYM-193 review).
+        async with self._config_write_lock:
+            self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
         try:
             async with self._review_fix_sem, review_binding_sem:
                 async with self._global_dispatch_sem, binding_sem:
@@ -395,7 +421,17 @@ class _DispatchMixin(_OrchestratorBase):
             if binding.linear_states.waiting is not None and is_blocked(issue):
                 await self._park_blocked_by_deps(binding, issue)
                 return None
-            return self._schedule_dispatch(binding, issue)
+            # Reserve while holding `config_write_lock` so the drain guard's
+            # `scheduled_slots` sample (taken under the same lock) can't miss
+            # a reservation that lands mid-check (SYM-193 review; see
+            # `_review_fix_dispatch_slot`). Re-resolve the binding row under
+            # the same lock: a branch_prefix/base_branch edit can win the lock
+            # after the Ready/PR checks above but before this reservation, and
+            # the stale `binding` would otherwise dispatch with the settings
+            # the edit just replaced (SYM-193 review).
+            async with self._config_write_lock:
+                current = await self._current_binding_row(binding) or binding
+                return self._schedule_dispatch(current, issue)
 
     async def _blocking_existing_pr(
         self,
@@ -628,6 +664,12 @@ class _DispatchMixin(_OrchestratorBase):
     ) -> RepoBinding | None:
         issue_labels = set(issue.labels)
         for binding in self.config.repos:
+            # A disabled binding starts no new work — the same pause
+            # `_scan_binding` applies to the poll scan, mirrored here so a
+            # Linear issue webhook can't route a first dispatch around it
+            # (SYM-193 review).
+            if not binding.enabled:
+                continue
             if tracker_ctx is not None and _tracker_context_for_binding(binding) != tracker_ctx:
                 continue
             if binding.linear_team_key != issue.team_key:

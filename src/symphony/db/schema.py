@@ -75,6 +75,8 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
         await conn.execute(
             "ALTER TABLE runs ADD COLUMN stage_done_announced_at TEXT NOT NULL DEFAULT ''"
         )
+    if "binding_key" not in run_cols:
+        await conn.execute("ALTER TABLE runs ADD COLUMN binding_key TEXT NOT NULL DEFAULT ''")
 
     cur = await conn.execute("PRAGMA table_info(comment_cursors)")
     cols = {row[1] for row in await cur.fetchall()}

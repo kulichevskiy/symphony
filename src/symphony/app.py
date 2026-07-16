@@ -237,6 +237,15 @@ def create_app(
         # `ui_db_path` (always passed alongside it by `cli._run`) to open the
         # dedicated connection; without one the router simply doesn't mount.
         if ui_db_owns_topology and config_write_pool is not None:
+
+            def _scheduled_slots(key: tuple[str, str, str, str, str]) -> int:
+                # The daemon reserves in-memory dispatch/fix-run slots before a
+                # run row exists; the drain guard must see them (SYM-193). The
+                # orchestrator is `handler` here; a non-orchestrator handler
+                # (some tests) simply reports zero reservations.
+                fn = getattr(handler, "scheduled_slot_count_for_binding_key", None)
+                return int(fn(key)) if fn is not None else 0
+
             app.include_router(
                 create_config_crud_router(
                     config_write_pool.connection,
@@ -244,6 +253,7 @@ def create_app(
                     write_lock=ui_config_write_lock,
                     auth_dependency=auth_dep,
                     clock=clock,
+                    scheduled_slots=_scheduled_slots,
                 ),
                 dependencies=api_dependencies,
             )

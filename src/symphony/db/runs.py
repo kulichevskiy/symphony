@@ -136,14 +136,15 @@ async def create(
     pid: int | None,
     started_at: str,
     cost_usd: float = 0.0,
+    binding_key: str = "",
     commit: bool = True,
 ) -> None:
     await conn.execute(
         """
-        INSERT INTO runs (id, issue_id, stage, status, pid, started_at, cost_usd)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO runs (id, issue_id, stage, status, pid, started_at, cost_usd, binding_key)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (id, issue_id, stage, status, pid, started_at, cost_usd),
+        (id, issue_id, stage, status, pid, started_at, cost_usd, binding_key),
     )
     if commit:
         await conn.commit()
@@ -159,6 +160,7 @@ async def create_if_no_active(
     pid: int | None,
     started_at: str,
     cost_usd: float = 0.0,
+    binding_key: str = "",
     ignored_stage: str | None = None,
     ignored_stages: tuple[str, ...] = (),
 ) -> bool:
@@ -188,8 +190,8 @@ async def create_if_no_active(
         dedupe_params = (*LIVE_STATUSES,)
     cur = await conn.execute(
         f"""
-        INSERT INTO runs (id, issue_id, stage, status, pid, started_at, cost_usd)
-        SELECT ?, ?, ?, ?, ?, ?, ?
+        INSERT INTO runs (id, issue_id, stage, status, pid, started_at, cost_usd, binding_key)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?
         WHERE NOT EXISTS (
             SELECT 1 FROM runs
             WHERE issue_id = ? AND status IN ({placeholders}){stage_filter}
@@ -203,6 +205,7 @@ async def create_if_no_active(
             pid,
             started_at,
             cost_usd,
+            binding_key,
             issue_id,
             *dedupe_params,
         ),
@@ -221,13 +224,14 @@ async def create_if_not_dispatched(
     pid: int | None,
     started_at: str,
     cost_usd: float = 0.0,
+    binding_key: str = "",
 ) -> bool:
     """Atomic dispatch dedupe: insert iff no live run exists."""
     placeholders = ",".join("?" * len(LIVE_STATUSES))
     cur = await conn.execute(
         f"""
-        INSERT INTO runs (id, issue_id, stage, status, pid, started_at, cost_usd)
-        SELECT ?, ?, ?, ?, ?, ?, ?
+        INSERT INTO runs (id, issue_id, stage, status, pid, started_at, cost_usd, binding_key)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?
         WHERE NOT EXISTS (
             SELECT 1 FROM runs WHERE issue_id = ? AND status IN ({placeholders})
         )
@@ -240,6 +244,7 @@ async def create_if_not_dispatched(
             pid,
             started_at,
             cost_usd,
+            binding_key,
             issue_id,
             *LIVE_STATUSES,
         ),
@@ -682,6 +687,92 @@ async def has_active(
     )
     row = await cur.fetchone()
     return row is not None
+
+
+async def occupancy_for_binding_key(
+    conn: aiosqlite.Connection,
+    binding_key: str,
+    *,
+    legacy_team_key: str,
+    legacy_github_repo: str,
+) -> int:
+    """The launch gate's authoritative binding occupancy: distinct issues with
+    live *dispatch-occupying* work under `binding_key`. Counted by distinct
+    issue so an issue's concurrent `implement`+`local_review` rows collapse to
+    one occupant, and passive `review` monitors are excluded — they never
+    consume dispatch capacity today (they don't take the per-binding
+    semaphore), so counting them would stall a binding whose issues are all in
+    review. Written under the launch lock before an agent spawns, so a
+    freshly-lowered `max_concurrent` admits nothing new until occupancy falls
+    below it, regardless of which semaphore a queued task waited on (SYM-193).
+
+    A DB upgraded with runs still live from before the `binding_key` column
+    existed leaves them stamped at the migration's `''` default, so an exact
+    match alone would undercount a binding's occupancy for those. Matched the
+    same way as `live_identifiers_for_binding_key`'s legacy fallback: team +
+    repo (the repo taken from the issue's PR row when one exists, else treated
+    as a match — a still-running first dispatch predates any PR)."""
+    placeholders = ",".join("?" * len(LIVE_STATUSES))
+    cur = await conn.execute(
+        f"""
+        SELECT COUNT(DISTINCT r.issue_id) FROM runs r
+          JOIN issues i ON i.id = r.issue_id
+          LEFT JOIN issue_prs p ON p.issue_id = r.issue_id
+         WHERE r.status IN ({placeholders}) AND r.stage != 'review'
+           AND (
+             r.binding_key = ?
+             OR (
+               r.binding_key = ''
+               AND i.team_key = ?
+               AND (p.github_repo IS NULL OR p.github_repo = ?)
+             )
+           )
+        """,
+        (*LIVE_STATUSES, binding_key, legacy_team_key, legacy_github_repo),
+    )
+    row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+async def live_identifiers_for_binding_key(
+    conn: aiosqlite.Connection,
+    binding_key: str,
+    *,
+    legacy_team_key: str,
+    legacy_github_repo: str,
+) -> list[str]:
+    """Issue identifiers of live runs dispatched under `binding_key` — the
+    drain guard's human-readable "running runs" blocker list (SYM-193).
+
+    A DB upgraded with runs still live from before the `binding_key` column
+    existed leaves them stamped at the migration's `''` default, so an exact
+    match alone would miss them. Those are also matched by team + repo (the
+    repo taken from the issue's PR row when one exists, else treated as a
+    match — a still-running first dispatch predates any PR) — an
+    approximation, since pre-`binding_key` history can't recover the issue
+    label, but a false-positive blocker is the safe direction (SYM-193
+    review)."""
+    placeholders = ",".join("?" * len(LIVE_STATUSES))
+    cur = await conn.execute(
+        f"""
+        SELECT DISTINCT i.identifier
+          FROM runs r
+          JOIN issues i ON i.id = r.issue_id
+          LEFT JOIN issue_prs p ON p.issue_id = r.issue_id
+         WHERE r.status IN ({placeholders})
+           AND (
+             r.binding_key = ?
+             OR (
+               r.binding_key = ''
+               AND i.team_key = ?
+               AND (p.github_repo IS NULL OR p.github_repo = ?)
+             )
+           )
+         ORDER BY i.identifier
+        """,
+        (*LIVE_STATUSES, binding_key, legacy_team_key, legacy_github_repo),
+    )
+    return [str(row["identifier"]) for row in await cur.fetchall()]
 
 
 async def has_live_stage(

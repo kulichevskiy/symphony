@@ -322,9 +322,9 @@ class RepoBinding(BaseModel):
     reconcile_enabled: bool = True
     # DB-only: stamped from the `config_bindings` row's `enabled` column
     # during effective-config assembly — never part of a YAML or DB payload
-    # itself. Carries NO runtime semantics yet: every loaded row is treated
-    # as enabled and the importer refuses `enabled: false` input. The binding
-    # lifecycle (dispatch skip + launch gate + drain guard) ships in SYM-193.
+    # itself. A disabled binding stays loaded (visible to review/merge pollers
+    # and operator-wait resolution) but starts no new issues: the dispatch scan
+    # skips it and the launch gate aborts a queued first dispatch (SYM-193).
     enabled: bool = True
     # Per-binding `{role: {agent, model}}` overrides. Deep-merged per field
     # over the global `Config.roles` default in `resolved_role`. An empty map

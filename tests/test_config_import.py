@@ -236,10 +236,10 @@ repos:
 
 
 @pytest.mark.asyncio
-async def test_import_refuses_disabled_binding(tmp_path: Path) -> None:
-    """`enabled: false` input is refused outright: this slice gives the
-    `enabled` column no runtime semantics (the lifecycle ships in SYM-193),
-    so silently storing a disabled row would dispatch it anyway."""
+async def test_import_stores_disabled_binding(tmp_path: Path) -> None:
+    """`enabled: false` input imports as a disabled row: the `enabled` column
+    has runtime semantics (dispatch skip, launch gate, drain guard —
+    SYM-193), so the importer no longer needs to refuse it."""
     conn = await db.connect(tmp_path / "state.sqlite")
     path = _write(
         tmp_path,
@@ -251,9 +251,10 @@ repos:
 {_STATES}
 """,
     )
-    with pytest.raises(ConfigImportError, match="SYM-193"):
-        await import_config(path, conn, now="t1")
-    assert await db.config_bindings.count(conn) == 0
+    await import_config(path, conn, now="t1")
+    rows = await db.config_bindings.list_all(conn)
+    assert len(rows) == 1
+    assert rows[0].enabled is False
     await conn.close()
 
 
