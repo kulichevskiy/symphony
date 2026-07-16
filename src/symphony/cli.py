@@ -440,9 +440,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     # doesn't need one either — the router itself no-ops
                     # (ignores every repo) when the resolved settings are
                     # `None`.
-                    lambda: _live_github_webhook_settings(
-                        orch.config, repo_secret_view.as_map()
-                    ),
+                    lambda: _live_github_webhook_settings(orch.config, repo_secret_view.as_map()),
                     ui_enabled=cfg.ui.enabled,
                     ui_db_path=cfg.db_path,
                     ui_log_root=cfg.log_root,

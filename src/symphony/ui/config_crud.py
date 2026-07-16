@@ -1261,9 +1261,7 @@ def create_config_crud_router(
             new_secret = await config_repo_secrets.get(conn, binding.github_repo)
         _apply_secret_to_view(secret_view, binding.github_repo, secret_action, secret_value)
         changes = _diff(old, payload, enabled=body.enabled, priority=body.priority)
-        _add_secret_flag(
-            changes, secret_action, had_secret=bool(old_secret and old_secret.secret)
-        )
+        _add_secret_flag(changes, secret_action, had_secret=bool(old_secret and old_secret.secret))
         _log.info("config binding %s updated by %s: %s", binding_id, updated_by, changes)
         return {**_serialize(row, new_secret), "warnings": wgs}
 
