@@ -14,7 +14,7 @@ from symphony import db
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.crypto import CredentialCipher
 from symphony.orchestrator.poll import Orchestrator
-from symphony.tracker import TrackerContext, TrackerRegistry
+from symphony.tracker import TrackerRegistry
 from tests.harness import Harness
 
 ENC_KEY = "deployment-secret"
