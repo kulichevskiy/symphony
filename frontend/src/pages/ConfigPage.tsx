@@ -17,6 +17,7 @@ import {
   type Connection,
   createBinding,
   deleteBinding,
+  disconnectConnection,
   type DrainBlockers,
   fetchBindings,
   fetchConfigOptions,
@@ -26,6 +27,8 @@ import {
   type FieldError,
   type RoleCell,
   type RolesMatrix,
+  startOAuth,
+  testConnection,
   updateBinding,
   updateRoles,
 } from "@/lib/api";
@@ -1312,8 +1315,68 @@ function connectionStatusClass(status: string): string {
   return "text-muted-foreground";
 }
 
-// Connect/Disconnect/Test are present but inert — wired in later slices.
-export function ConnectionCard({ connection }: { connection: Connection }) {
+// Providers with a wired redirect-OAuth flow. GitHub is the reference engine
+// (OAuth in UI 2/7); Linear and the CLI logins arrive in later slices, so their
+// buttons stay inert until then.
+const WIRED_PROVIDERS = new Set(["github"]);
+
+export function ConnectionCard({
+  connection,
+  onChanged,
+}: {
+  connection: Connection;
+  onChanged?: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [testResult, setTestResult] = useState<string | null>(null);
+  const wired = WIRED_PROVIDERS.has(connection.provider);
+  const connected =
+    connection.status === "connected" || connection.status === "expired";
+
+  async function connect() {
+    setBusy(true);
+    setError(null);
+    try {
+      const { authorize_url } = await startOAuth(connection.provider);
+      // Full-page navigation to the provider consent screen; it redirects back
+      // to the ungated callback, which stores the token and returns us here.
+      window.location.assign(authorize_url);
+    } catch {
+      setError("Couldn't start authorization — check the OAuth app config.");
+      setBusy(false);
+    }
+  }
+
+  async function disconnect() {
+    setBusy(true);
+    setError(null);
+    setTestResult(null);
+    try {
+      await disconnectConnection(connection.provider);
+      onChanged?.();
+    } catch {
+      setError("Couldn't disconnect.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runTest() {
+    setBusy(true);
+    setError(null);
+    setTestResult(null);
+    try {
+      const { status } = await testConnection(connection.provider);
+      setTestResult(status);
+      onChanged?.();
+    } catch {
+      setError("Couldn't reach the provider.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <Card className="p-5">
       <div className="flex items-center justify-between gap-2">
@@ -1328,25 +1391,55 @@ export function ConnectionCard({ connection }: { connection: Connection }) {
         </p>
       ) : null}
       <div className="mt-4 flex gap-2">
-        <Button type="button" disabled>
-          Connect
+        <Button type="button" onClick={connect} disabled={!wired || busy}>
+          {connected ? "Reconnect" : "Connect"}
         </Button>
-        <Button type="button" variant="secondary" disabled>
+        <Button
+          type="button"
+          variant="secondary"
+          onClick={disconnect}
+          disabled={!wired || busy || !connected}
+        >
           Disconnect
         </Button>
-        <Button type="button" variant="secondary" disabled>
+        <Button
+          type="button"
+          variant="secondary"
+          onClick={runTest}
+          disabled={!wired || busy || !connected}
+        >
           Test
         </Button>
       </div>
+      {testResult ? (
+        <p className="mt-2 text-xs text-muted-foreground" role="status">
+          Test: token is {testResult === "live" ? "live" : testResult}
+        </p>
+      ) : null}
+      {error ? (
+        <p className="mt-2 text-xs text-destructive" role="alert">
+          {error}
+        </p>
+      ) : null}
     </Card>
   );
 }
 
-export function ConnectionsPanel({ connections }: { connections: Connection[] }) {
+export function ConnectionsPanel({
+  connections,
+  onChanged,
+}: {
+  connections: Connection[];
+  onChanged?: () => void;
+}) {
   return (
     <div className="grid gap-4 sm:grid-cols-2">
       {connections.map((connection) => (
-        <ConnectionCard key={connection.provider} connection={connection} />
+        <ConnectionCard
+          key={connection.provider}
+          connection={connection}
+          onChanged={onChanged}
+        />
       ))}
     </div>
   );
@@ -1457,13 +1550,16 @@ export function ConfigPage() {
       <div className="mb-2 mt-6">
         <h2 className="text-lg font-semibold">Connections</h2>
         <p className="mt-0.5 text-sm text-muted-foreground">
-          Credentials for the providers Symphony talks to. Managing them from
-          here arrives in a later release.
+          Credentials for the providers Symphony talks to. Connect GitHub here;
+          the other providers arrive in later releases.
         </p>
       </div>
       {connections.data ? (
         <div className="mb-8">
-          <ConnectionsPanel connections={connections.data} />
+          <ConnectionsPanel
+            connections={connections.data}
+            onChanged={() => void connections.refetch()}
+          />
         </div>
       ) : connections.isLoading ? (
         <p className="mb-8 text-sm text-muted-foreground">Loading…</p>

@@ -562,6 +562,49 @@ export function fetchConnections(): Promise<Connection[]> {
   );
 }
 
+/** The provider consent URL minted by `start`; the SPA navigates to it (a
+ *  cross-origin 302 can't be read back out of `fetch`, so the URL is returned
+ *  as JSON — OAuth in UI 2/7). */
+export interface OAuthStart {
+  authorize_url: string;
+}
+
+export async function startOAuth(provider: string): Promise<OAuthStart> {
+  const response = await fetch(`/api/oauth/${provider}/start`, {
+    headers: { Accept: "application/json", ...(await authHeaders()) },
+  });
+  if (!response.ok) {
+    throw new ApiError("Failed to start authorization", response.status);
+  }
+  return (await response.json()) as OAuthStart;
+}
+
+export async function disconnectConnection(provider: string): Promise<void> {
+  const response = await fetch(`/api/oauth/${provider}/disconnect`, {
+    method: "POST",
+    headers: { Accept: "application/json", ...(await authHeaders()) },
+  });
+  if (!response.ok) {
+    throw new ApiError("Failed to disconnect", response.status);
+  }
+}
+
+/** Liveness ping result — `live` or `expired` from the provider `GET /user`. */
+export interface ConnectionTest {
+  status: string;
+}
+
+export async function testConnection(provider: string): Promise<ConnectionTest> {
+  const response = await fetch(`/api/oauth/${provider}/test`, {
+    method: "POST",
+    headers: { Accept: "application/json", ...(await authHeaders()) },
+  });
+  if (!response.ok) {
+    throw new ApiError("Failed to test connection", response.status);
+  }
+  return (await response.json()) as ConnectionTest;
+}
+
 export function fetchConfigOptions(): Promise<ConfigOptions> {
   return fetchJson<ConfigOptions>(
     "/api/config/options",

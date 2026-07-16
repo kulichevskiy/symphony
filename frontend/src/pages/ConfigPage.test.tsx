@@ -135,6 +135,81 @@ describe("ConnectionsPanel", () => {
     expect(html).toContain("Connected");
     expect(html).toContain("2026-08-01T00:00:00Z");
   });
+
+  it("navigates to the GitHub authorize URL when Connect is clicked", async () => {
+    const fetchMock = mockFetch(200, {
+      authorize_url: "https://github.com/login/oauth/authorize?state=xyz",
+    });
+    const assign = vi.fn();
+    const originalLocation = window.location;
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: { ...originalLocation, assign },
+    });
+    render(
+      <ConnectionsPanel
+        connections={[
+          { provider: "github", label: "GitHub", status: "not_connected", expires_at: null },
+        ]}
+        onChanged={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByText("Connect"));
+    await waitFor(() =>
+      expect(assign).toHaveBeenCalledWith(
+        "https://github.com/login/oauth/authorize?state=xyz",
+      ),
+    );
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/oauth/github/start");
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: originalLocation,
+    });
+  });
+
+  it("disconnects and refetches when Disconnect is clicked", async () => {
+    const fetchMock = mockFetch(200, { status: "not_connected" });
+    const onChanged = vi.fn();
+    render(
+      <ConnectionsPanel
+        connections={[
+          { provider: "github", label: "GitHub", status: "connected", expires_at: null },
+        ]}
+        onChanged={onChanged}
+      />,
+    );
+    fireEvent.click(screen.getByText("Disconnect"));
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/oauth/github/disconnect");
+    expect(init?.method).toBe("POST");
+  });
+
+  it("reports the Test result", async () => {
+    mockFetch(200, { status: "live" });
+    render(
+      <ConnectionsPanel
+        connections={[
+          { provider: "github", label: "GitHub", status: "connected", expires_at: null },
+        ]}
+        onChanged={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByText("Test"));
+    await waitFor(() => expect(screen.getByText(/live/i)).toBeTruthy());
+  });
+
+  it("leaves unwired providers' buttons disabled", () => {
+    render(
+      <ConnectionsPanel
+        connections={[
+          { provider: "linear", label: "Linear", status: "not_connected", expires_at: null },
+        ]}
+        onChanged={() => {}}
+      />,
+    );
+    expect((screen.getByText("Connect") as HTMLButtonElement).disabled).toBe(true);
+  });
 });
 
 describe("ConfigDetails", () => {

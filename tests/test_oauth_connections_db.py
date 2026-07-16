@@ -92,6 +92,39 @@ async def test_list_statuses_empty_on_fresh_db(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_delete_removes_the_row(tmp_path: Path) -> None:
+    conn = await _conn(tmp_path)
+    cipher = CredentialCipher("k")
+    try:
+        await db.oauth_connections.set_connection(
+            conn, provider="github", credential="gho_x", cipher=cipher
+        )
+        await db.oauth_connections.delete(conn, "github")
+        assert await db.oauth_connections.get_status(conn, "github") is None
+        # Idempotent — deleting a missing row is a no-op, not an error.
+        await db.oauth_connections.delete(conn, "github")
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_update_status_leaves_credential_intact(tmp_path: Path) -> None:
+    conn = await _conn(tmp_path)
+    cipher = CredentialCipher("k")
+    try:
+        await db.oauth_connections.set_connection(
+            conn, provider="github", credential="gho_x", cipher=cipher, status="connected"
+        )
+        await db.oauth_connections.update_status(conn, provider="github", status="expired")
+        status = await db.oauth_connections.get_status(conn, "github")
+        assert status is not None and status.status == "expired"
+        # The credential is untouched — a re-test could still read it.
+        assert await db.oauth_connections.get_credential(conn, "github", cipher) == "gho_x"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_set_replaces_existing_row(tmp_path: Path) -> None:
     conn = await _conn(tmp_path)
     cipher = CredentialCipher("k")

@@ -19,6 +19,7 @@ from uvicorn import Config as UvicornConfig
 
 from .auth import Auth0Settings, create_auth_config_router, create_auth_dependency
 from .config import Config
+from .crypto import CredentialCipher
 from .db.config_repo_secrets import RepoSecretView
 from .github.client import GitHub
 from .github.webhook import (
@@ -27,6 +28,7 @@ from .github.webhook import (
     create_github_webhook_router,
 )
 from .linear.client import Linear
+from .oauth import OAuthStateStore
 from .ui.api import CommandSink, PauseController, create_api_router
 from .ui.config_crud import create_config_crud_router
 from .ui.config_view import create_config_router
@@ -35,6 +37,7 @@ from .ui.db import ReadOnlyDbPool, WriteDbPool
 from .ui.external import ExternalSnapshotService, GitHubExternalClient
 from .ui.issues import create_issue_detail_router
 from .ui.live import create_live_stream_router
+from .ui.oauth import create_oauth_routers, github_provider
 from .ui.status import CanonicalState
 from .webhook import (
     LOOPBACK_HOST,
@@ -105,6 +108,7 @@ def create_app(
     ui_db_owns_topology: bool = True,
     ui_webhook_public_url: str | None = None,
     auth0_settings: Auth0Settings | None = None,
+    oauth_cipher: CredentialCipher | None = None,
     clock: Clock | None = None,
 ) -> FastAPI:
     # Publicly-exposed deployments (docker-compose.coolify.yml) set
@@ -131,6 +135,10 @@ def create_app(
         if ui_enabled and ui_db_owns_topology and ui_db_path is not None
         else None
     )
+    # Dedicated write connection for the OAuth callback/disconnect/test routes
+    # (the read-only `ui_pool` can't store a freshly-minted token). Independent
+    # of `ui_db_owns_topology` — connecting a provider doesn't touch bindings.
+    oauth_write_pool = WriteDbPool(ui_db_path) if ui_enabled and ui_db_path is not None else None
     external_service = ui_external_service
     if (
         external_service is None
@@ -155,10 +163,15 @@ def create_app(
                 await ui_pool.close()
             if config_write_pool is not None:
                 await config_write_pool.close()
+            if oauth_write_pool is not None:
+                await oauth_write_pool.close()
 
     app = FastAPI(
         lifespan=lifespan
-        if ui_pool is not None or external_service is not None or config_write_pool is not None
+        if ui_pool is not None
+        or external_service is not None
+        or config_write_pool is not None
+        or oauth_write_pool is not None
         else None
     )
     if external_service is not None:
@@ -224,6 +237,39 @@ def create_app(
                 create_connections_router(ui_pool),
                 dependencies=api_dependencies,
             )
+
+        # GitHub redirect-OAuth (OAuth in UI 2/7). `start`/`disconnect`/`test`
+        # are gated like the rest of `/api/*`; `callback` is mounted OUTSIDE the
+        # gate — a browser redirect from GitHub carries no bearer, so security
+        # rests on the single-use `state` + PKCE the engine enforces.
+        if oauth_write_pool is not None:
+            resolved = ui_external_config() if callable(ui_external_config) else ui_external_config
+            base_config = resolved if resolved is not None else Config()
+            # Not `CredentialCipher.from_env()`: Coolify mounts `.env` as a file
+            # and deliberately never injects it into os.environ (see
+            # docker-compose.coolify.yml), so reading process env directly would
+            # never see the key there. `base_config` is sourced from `Secrets`,
+            # which reads `.env` the same way `github_oauth_client_id` above does.
+            cipher = (
+                oauth_cipher
+                if oauth_cipher is not None
+                else CredentialCipher(base_config.symphony_encryption_key)
+            )
+            oauth_gated, oauth_public = create_oauth_routers(
+                oauth_write_pool.connection,
+                providers={
+                    "github": github_provider(
+                        base_config.github_oauth_client_id,
+                        base_config.github_oauth_client_secret,
+                    ),
+                },
+                cipher=cipher,
+                state_store=OAuthStateStore(),
+                clock=clock,
+                public_origin=base_config.symphony_oauth_public_origin or None,
+            )
+            app.include_router(oauth_gated, dependencies=api_dependencies)
+            app.include_router(oauth_public)
 
         # Read-only view of the loaded config (redacted). Gated like the other
         # /api routers; included before create_api_router's catch-all.

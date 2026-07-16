@@ -695,6 +695,26 @@ class Secrets(BaseSettings):
     auth0_domain: str = Field(default="", validation_alias="AUTH0_DOMAIN")
     auth0_client_id: str = Field(default="", validation_alias="AUTH0_CLIENT_ID")
     auth0_allowed_emails: str = Field(default="", validation_alias="AUTH0_ALLOWED_EMAILS")
+    # GitHub OAuth app for the Connections page redirect flow (OAuth in UI 2/7).
+    github_oauth_client_id: str = Field(default="", validation_alias="GITHUB_OAUTH_CLIENT_ID")
+    github_oauth_client_secret: str = Field(
+        default="", validation_alias="GITHUB_OAUTH_CLIENT_SECRET"
+    )
+    # Encryption key for UI-stored OAuth credentials (OAuth in UI 1/7+). Read
+    # via this `.env`-backed settings class rather than `os.environ` directly:
+    # the Coolify deployment mounts `.env` as a file and deliberately does NOT
+    # inject it into the container's process env (see docker-compose.coolify.yml).
+    symphony_encryption_key: str = Field(default="", validation_alias="SYMPHONY_ENCRYPTION_KEY")
+    # Public origin (scheme + host, e.g. `https://symphony.example.com`) this
+    # deployment is reachable at, for building OAuth redirect/callback URLs.
+    # Required behind a reverse proxy that terminates TLS upstream (e.g. the
+    # Coolify stack's Traefik → Caddy → daemon chain, see Caddyfile.coolify):
+    # the request the daemon sees is plain HTTP on loopback, so deriving the
+    # origin from the request would build an `http://127.0.0.1:...`-shaped URL
+    # that never matches the GitHub OAuth app's registered callback URL.
+    symphony_oauth_public_origin: str = Field(
+        default="", validation_alias="SYMPHONY_OAUTH_PUBLIC_ORIGIN"
+    )
     # Telegram push for attention-needed events (SYM-171). Both must be set to
     # enable notifications; either unset makes the notifier a no-op.
     telegram_bot_token: str = Field(default="", validation_alias="TELEGRAM_BOT_TOKEN")
@@ -813,9 +833,13 @@ class Config(BaseModel):
     auth0_domain: str = ""
     auth0_client_id: str = ""
     auth0_allowed_emails: str = ""
+    github_oauth_client_id: str = ""
+    github_oauth_client_secret: str = ""
     jira_webhook_secret: str = ""
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    symphony_encryption_key: str = ""
+    symphony_oauth_public_origin: str = ""
 
     def _reject_legacy_matrix_conflicts(self, binding: RepoBinding) -> None:
         """Fail if a legacy field and its matrix cell are both set.
@@ -999,8 +1023,12 @@ class Config(BaseModel):
                 "auth0_domain": secrets.auth0_domain,
                 "auth0_client_id": secrets.auth0_client_id,
                 "auth0_allowed_emails": secrets.auth0_allowed_emails,
+                "github_oauth_client_id": secrets.github_oauth_client_id,
+                "github_oauth_client_secret": secrets.github_oauth_client_secret,
                 "telegram_bot_token": secrets.telegram_bot_token,
                 "telegram_chat_id": secrets.telegram_chat_id,
+                "symphony_encryption_key": secrets.symphony_encryption_key,
+                "symphony_oauth_public_origin": secrets.symphony_oauth_public_origin,
             }
         )
         # Per-binding agent env: same `.env` file pydantic-settings reads,
