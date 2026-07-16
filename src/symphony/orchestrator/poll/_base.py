@@ -766,14 +766,42 @@ class _OrchestratorBase:
         so a scheduled task sitting behind a semaphore long enough for the
         edit to land still sees it immediately before spawn (SYM-193).
 
-        Falls back to `self.config.repos` when the DB owns no bindings yet
-        (pre-migration YAML topology, or a one-shot CLI dispatch that never
-        assembled from the DB) so that path keeps working unchanged."""
+        Falls back to `self.config.repos` when the DB doesn't own topology
+        (pre-migration YAML deployment, or a one-shot CLI dispatch that never
+        assembled from the DB) so that path keeps working unchanged. Never
+        falls back once `_reload_bindings_from_db` is set: the DB owns
+        topology past boot there, so a zero count means every binding was
+        deleted, not that the importer never ran, and the daemon's stale
+        `self.config.repos` must not revive it (SYM-193 review; mirrors
+        `_db_owns_topology`'s reasoning in `cli.py`)."""
         key = _binding_key(binding)
         stored = await db.config_bindings.get_by_natural_key(self._conn, key)
         if stored is not None:
-            return RepoBinding.model_validate({**stored.payload, "enabled": stored.enabled})
+            payload = {**stored.payload, "enabled": stored.enabled}
+            fresh = RepoBinding.model_validate(payload)
+            base = next(
+                (b for b in self.config.repos if _binding_key(b) == key),
+                None,
+            )
+            if base is not None:
+                # `stored.payload` is sparse and never resolved (SYM-188): its
+                # `env:` values are still the raw secret *names*, and it never
+                # ran through `apply_tracker_secret_defaults`. Keep the
+                # already-resolved values `self.config` has for these two
+                # fields — everything else (branch_prefix, base_branch,
+                # max_concurrent, enabled, ...) still comes fresh off the DB
+                # row (SYM-193 review).
+                fresh = fresh.model_copy(
+                    update={
+                        "env": base.env,
+                        "tracker_provider": base.tracker_provider,
+                        "tracker_site": base.tracker_site,
+                    }
+                )
+            return fresh
         if await db.config_bindings.count(self._conn) > 0:
+            return None
+        if self._reload_bindings_from_db:
             return None
         for current in self.config.repos:
             if _binding_key(current) == key:

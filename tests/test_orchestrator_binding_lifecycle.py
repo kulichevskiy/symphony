@@ -262,6 +262,59 @@ async def test_launch_gate_blocks_spawn_over_lowered_cap(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_current_binding_row_preserves_resolved_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The launch gate's fresh re-read must not clobber fields the sparse DB
+    payload never carries resolved — `env:` names are resolved to secrets at
+    load time, not stored resolved in `config_bindings` (SYM-193 review)."""
+    monkeypatch.setenv("MY_SECRET", "shh")
+    conn = await db.connect(tmp_path / "symphony.sqlite")
+    await _insert(conn, enabled=True, env={"FOO": "MY_SECRET"})
+    cfg = await assemble_effective_config(conn, _base(tmp_path))
+    await conn.close()
+    assert cfg.repos[0].env == {"FOO": "shh"}
+
+    harness = await Harness.create(tmp_path, config=cfg)
+    try:
+        await harness.warmup()
+        binding = harness.orch.config.repos[0]
+        current = await harness.orch._current_binding_row(binding)  # noqa: SLF001
+        assert current is not None
+        assert current.env == {"FOO": "shh"}
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_current_binding_row_does_not_revive_deleted_binding(
+    tmp_path: Path,
+) -> None:
+    """Once the DB owns topology, a binding deleted down to zero rows must
+    read as gone — not fall back to the daemon's stale `self.config.repos`,
+    which would silently revive it for scheduling/gate checks until the next
+    reload (SYM-193 review)."""
+    conn = await db.connect(tmp_path / "symphony.sqlite")
+    await _insert(conn, enabled=True)
+    cfg = await assemble_effective_config(conn, _base(tmp_path))
+    await conn.close()
+
+    harness = await Harness.create(tmp_path, config=cfg, reload_bindings=True)
+    try:
+        await harness.warmup()
+        binding = harness.orch.config.repos[0]
+
+        stored = (await db.config_bindings.list_all(harness.conn))[0]
+        await db.config_bindings.delete(harness.conn, stored.id, expected_version=stored.version)
+
+        # `self.config.repos` is stale (no reload ran yet) and still lists
+        # `binding`, but the DB owns topology and now has zero rows for it.
+        assert await harness.orch._current_binding_row(binding) is None  # noqa: SLF001
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
 async def test_review_monitor_does_not_count_against_cap(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "symphony.sqlite")
     await _insert(conn, enabled=True, max_concurrent=1)

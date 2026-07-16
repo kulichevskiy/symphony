@@ -1121,16 +1121,25 @@ class _AcceptanceMixin(_OrchestratorBase):
                 return False
 
             fix_run_id = str(uuid.uuid4())
-            await db.runs.create(
-                self._conn,
-                id=fix_run_id,
-                issue_id=issue.id,
-                stage="acceptance_fix",
-                status="running",
-                pid=None,
-                started_at=self._now().isoformat(),
-                binding_key=_binding_storage_key(binding),
-            )
+            # Launch gate: acceptance fix-runs are a follow-up stage (drain
+            # in-flight work even on a disabled binding), but a lowered
+            # `max_concurrent` must still admit nothing new (SYM-193 review).
+            # Held under `_dispatch_pause_lock` (the same lock `_dispatch_one`
+            # uses) so the gate's occupancy read and this insert move
+            # atomically.
+            async with self._dispatch_pause_lock:
+                if not await self._launch_gate_admits(binding, first_dispatch=False):
+                    return False
+                await db.runs.create(
+                    self._conn,
+                    id=fix_run_id,
+                    issue_id=issue.id,
+                    stage="acceptance_fix",
+                    status="running",
+                    pid=None,
+                    started_at=self._now().isoformat(),
+                    binding_key=_binding_storage_key(binding),
+                )
             self._dispatch_run_ids[issue.id] = fix_run_id
 
             try:
