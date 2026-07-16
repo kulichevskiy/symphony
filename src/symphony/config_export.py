@@ -5,7 +5,10 @@ parsing, so one format can't serve both — see docs/config-db-ui-design.md):
 
   * ``restore`` (default): a document fed back through the import script in
     ``--replace`` mode on a DB-backed build. Disabled bindings are emitted as
-    real YAML with ``enabled: false`` so the round-trip preserves them.
+    real YAML with ``enabled: false`` so the round-trip preserves them. The
+    install's actual ``db_path`` is stamped in too — the import script reads
+    ``db_path`` straight off this file (``Config.peek_db_path``), so an install
+    with a non-default path would otherwise import into the wrong DB.
   * ``downgrade``: a ``repos:``/``roles:`` section to paste into
     ``config.local.yaml`` on a pre-DB build whose loader still reads them.
     Disabled bindings are commented out with an explicit note — the pre-DB
@@ -28,6 +31,7 @@ per-key ``true`` the same way the loaded-config read view redacts them (see
 from __future__ import annotations
 
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any, Literal
 
 import yaml
@@ -111,10 +115,13 @@ _HEADERS: dict[ExportMode, list[str]] = {
     "restore": [
         "# Symphony config export — mode: restore",
         "# Feed back through `symphony config-import --config <this> --replace`.",
+        "# `db_path` below is this install's actual DB path (carried so the importer",
+        "# targets it even if the main config sets a non-default path) — do not edit it.",
         "# Webhook secret VALUES are never exported; bindings needing one carry a",
         f"# `webhook_secret: {WEBHOOK_SECRET_PLACEHOLDER}` placeholder — re-enter each by hand.",
         "# mcp_servers env/headers credential VALUES are never exported either; each",
-        "# redacted key carries `true` in place of the value — re-enter each by hand.",
+        "# redacted key carries `true` in place of the value — re-enter each by hand;",
+        "# the importer refuses to restore an un-edited `true` marker.",
     ],
     "downgrade": [
         "# Symphony config export — mode: downgrade",
@@ -134,11 +141,18 @@ def export_config(
     repos_with_secrets: set[str],
     *,
     mode: ExportMode = "restore",
+    db_path: Path | None = None,
 ) -> str:
     """Render the effective config as a YAML document. Bindings are ordered by
     ``priority`` then natural key (the same stable order dispatch uses and the
     importer stamps priority back from), so a restore reproduces routing
-    bit-for-bit."""
+    bit-for-bit.
+
+    ``db_path`` (restore mode only) is stamped into the document as a
+    top-level field so ``Config.peek_db_path`` — which ``config-import``
+    calls straight on this export file — resolves the install's actual DB
+    path rather than silently falling back to the default when the main
+    config sets a custom one."""
     ordered = sorted(
         rows,
         key=lambda r: (
@@ -151,6 +165,12 @@ def export_config(
         ),
     )
     lines = list(_HEADERS[mode])
+    if mode == "restore" and db_path is not None:
+        lines.append(
+            yaml.safe_dump(
+                {"db_path": str(db_path)}, sort_keys=False, default_flow_style=False
+            ).rstrip("\n")
+        )
     has_live_item = any(not (mode == "downgrade" and not r.enabled) for r in ordered)
     if not ordered:
         lines.append("repos: []")

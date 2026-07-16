@@ -564,6 +564,33 @@ repos:
 
 
 @pytest.mark.asyncio
+async def test_import_rejects_redacted_mcp_placeholder(tmp_path: Path) -> None:
+    """An un-edited restore export carries `true` in place of an `mcp_servers`
+    env/headers credential — unlike `webhook_secret`, there's no field to
+    skip, so the importer must refuse rather than install the literal `True`
+    as a broken credential (SYM-195 review)."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    path = _write(
+        tmp_path,
+        f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+    mcp_servers:
+      supabase:
+        command: npx
+        env:
+          API_KEY: true
+{_STATES}
+""",
+    )
+    with pytest.raises(ConfigImportError, match="mcp_servers.supabase.env.API_KEY"):
+        await import_config(path, conn, now="t1")
+    assert await db.config_bindings.count(conn) == 0
+    await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_failed_replace_does_not_delete_existing_bindings(tmp_path: Path) -> None:
     """A `--replace` import that fails partway (duplicate natural key across
     two unlabeled bindings on the same scope) must roll back the delete too —

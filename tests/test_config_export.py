@@ -80,3 +80,26 @@ def test_downgrade_all_disabled_repos_parses_empty_and_is_uncommentable() -> Non
     doc2 = yaml.safe_load("\n".join(edited))
     assert len(doc2["repos"]) == 1
     assert doc2["repos"][0]["max_concurrent"] == 4
+
+
+def test_restore_export_stamps_db_path() -> None:
+    """Restore mode carries the install's actual `db_path` so `config-import`'s
+    `Config.peek_db_path` targets it even when the main config sets a
+    non-default path (SYM-195 review)."""
+    from pathlib import Path
+
+    row = _row(payload={"max_concurrent": 4})
+    text = export_config([row], {}, set(), mode="restore", db_path=Path("/custom/state.sqlite"))
+    doc = yaml.safe_load(text)
+    assert doc["db_path"] == "/custom/state.sqlite"
+
+
+def test_downgrade_export_omits_db_path() -> None:
+    """`db_path` has no meaning for a pre-DB build's `config.local.yaml`, so
+    downgrade mode never emits it even when passed one (SYM-195 review)."""
+    from pathlib import Path
+
+    row = _row(payload={"max_concurrent": 4})
+    text = export_config([row], {}, set(), mode="downgrade", db_path=Path("/custom/state.sqlite"))
+    doc = yaml.safe_load(text)
+    assert "db_path" not in doc

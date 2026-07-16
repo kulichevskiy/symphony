@@ -967,13 +967,25 @@ def create_config_crud_router(
                 ["mode"], f"mode must be one of {', '.join(get_args(ExportMode))}"
             )
         conn = await conn_provider()
-        rows = await config_bindings.list_all(conn)
-        globals_row = await config_globals.get(conn)
-        global_roles = globals_row.roles if globals_row is not None else {}
-        repos_with_secrets = {
-            s.github_repo for s in await config_repo_secrets.list_all(conn) if s.secret
-        }
-        text = export_config(rows, global_roles, repos_with_secrets, mode=mode)  # type: ignore[arg-type]
+        # Shares `conn` with the write routes below, which run their read +
+        # write statements inside `lock` as one transaction; without the same
+        # lock here, the three reads below could interleave with a concurrent
+        # write's uncommitted statements on that connection and export a
+        # torn mix of old bindings/globals/secrets (SYM-195 review).
+        async with lock:
+            rows = await config_bindings.list_all(conn)
+            globals_row = await config_globals.get(conn)
+            global_roles = globals_row.roles if globals_row is not None else {}
+            repos_with_secrets = {
+                s.github_repo for s in await config_repo_secrets.list_all(conn) if s.secret
+            }
+        text = export_config(
+            rows,
+            global_roles,
+            repos_with_secrets,
+            mode=mode,  # type: ignore[arg-type]
+            db_path=_base_config().db_path,
+        )
         return Response(content=text, media_type="application/x-yaml")
 
     @router.get("/roles")

@@ -1542,6 +1542,37 @@ async def test_export_emits_webhook_secret_placeholder_not_value(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_export_restore_mode_stamps_custom_db_path(tmp_path: Path) -> None:
+    """Restore-mode export carries the install's actual `db_path` so
+    `config-import`'s `Config.peek_db_path` targets it instead of silently
+    falling back to the default when the main config sets a non-default path
+    (SYM-195 review)."""
+    import yaml
+
+    conn, db_path = await _open(tmp_path)
+    custom_db_path = tmp_path / "custom" / "state.sqlite"
+    try:
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_external_config=Config(
+                github_webhook_secret="test-global-secret",
+                linear_api_key="test-linear-key",
+                db_path=custom_db_path,
+            ),
+        )
+        async with _client(app) as client:
+            resp = await client.get("/api/config/export")
+            assert resp.status_code == 200, resp.text
+            doc = yaml.safe_load(resp.text)
+            assert doc["db_path"] == str(custom_db_path)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_export_rejects_unknown_mode(tmp_path: Path) -> None:
     conn, db_path = await _open(tmp_path)
     try:

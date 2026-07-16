@@ -35,7 +35,7 @@ from .config import (
     Secrets,
     binding_natural_key,
 )
-from .config_export import WEBHOOK_SECRET_PLACEHOLDER
+from .config_export import MCP_SECRET_SUBFIELDS, WEBHOOK_SECRET_PLACEHOLDER
 from .db.runs import LIVE_STATUSES
 
 _ALL_ROLES: tuple[RoleName, ...] = (
@@ -310,6 +310,33 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return yaml.safe_load(path.read_text()) or {}
 
 
+def _redacted_mcp_paths(raw_repo: dict[str, Any]) -> list[str]:
+    """Dotted `mcp_servers.<server>.<env|headers>.<key>` paths in `raw_repo`
+    still carrying the exported `true` redaction marker rather than a real
+    value. Unlike `webhook_secret` (a named field the importer can skip),
+    `mcp_servers` values are opaque JSON handed straight to the CLI
+    subprocess — storing the literal `True` would silently install a broken
+    credential instead of failing loudly, so these are refused rather than
+    skipped."""
+    mcp_servers = raw_repo.get("mcp_servers")
+    if not isinstance(mcp_servers, dict):
+        return []
+    paths: list[str] = []
+    for server_name, entry in mcp_servers.items():
+        if not isinstance(entry, dict):
+            continue
+        for sub in MCP_SECRET_SUBFIELDS:
+            sub_value = entry.get(sub)
+            if not isinstance(sub_value, dict):
+                continue
+            paths.extend(
+                f"mcp_servers.{server_name}.{sub}.{key}"
+                for key, value in sub_value.items()
+                if value is True
+            )
+    return paths
+
+
 async def import_config(
     path: Path,
     conn: aiosqlite.Connection,
@@ -341,6 +368,22 @@ async def import_config(
     # *key names*, not values.
     cfg = Config.model_validate(raw)
     raw_repos: list[dict[str, Any]] = list(raw.get("repos", []) or [])
+
+    # An un-edited restore export carries `true` placeholders in place of
+    # mcp_servers env/headers credential values; refuse rather than install
+    # them literally (SYM-195 review — mirrors the webhook-secret skip above,
+    # but as a refusal since there's no field to omit here).
+    redacted = {
+        f"{raw_repo.get('project_key')}/{raw_repo.get('github_repo')}": paths
+        for raw_repo in raw_repos
+        if (paths := _redacted_mcp_paths(raw_repo))
+    }
+    if redacted:
+        detail = "; ".join(f"{binding}: {', '.join(paths)}" for binding, paths in redacted.items())
+        raise ConfigImportError(
+            "refusing to import redacted mcp_servers credential placeholder(s) "
+            "— re-enter the real value by hand before restoring: " + detail
+        )
     # `model_validate` derives `tracker_site` with no global `jira_base_url`,
     # so a Jira binding relying on that global (no per-binding `base_url`)
     # would key on the "default" placeholder instead of the site it actually
