@@ -2706,6 +2706,17 @@ class _OrchestratorBase:
         )
         return cumulative_usage, final_kind, final_returncode, role
 
+    async def _resolve_github_token(self) -> str | None:
+        """The GitHub token to use for delivery (push + PR), DB-first.
+
+        Falls back to the ambient `GH_TOKEN` when no DB connection is
+        connected, so an instance mid-migration keeps delivering exactly as
+        before.
+        """
+        return await self._credential_resolver.resolve(
+            "github", fallback=os.environ.get("GH_TOKEN")
+        )
+
     async def _resolve_run_credentials(self, binding: RepoBinding) -> RunCredentials:
         """Resolve the run's creds DB-first, honoring the per-binding model.
 
@@ -2717,11 +2728,15 @@ class _OrchestratorBase:
         migration.
         """
         tracker_provider = binding.tracker_provider or binding.provider
-        linear_fallback = self.config.linear_api_key if tracker_provider == "linear" else None
-        return await self._credential_resolver.resolve_run_credentials(
-            github_fallback=os.environ.get("GH_TOKEN"),
-            linear_fallback=linear_fallback,
+        github_token = await self._credential_resolver.resolve(
+            "github", fallback=os.environ.get("GH_TOKEN")
         )
+        if tracker_provider != "linear":
+            return RunCredentials(github_token=github_token, linear_token=None)
+        linear_token = await self._credential_resolver.resolve(
+            "linear", fallback=self.config.linear_api_key
+        )
+        return RunCredentials(github_token=github_token, linear_token=linear_token)
 
     async def _run_stage_command(
         self,

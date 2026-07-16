@@ -23,7 +23,7 @@ import aiosqlite
 
 from ... import db
 from ...config import RepoBinding, ResolvedRole
-from ...github.client import GitHubError
+from ...github.client import GitHub, GitHubError
 from ...linear.client import LinearError
 from ...linear.templates import (
     CommentVars,
@@ -54,6 +54,8 @@ from ._base import (
 )
 from ._git import (
     _branch_ahead_of_base,
+    _clear_git_push_auth,
+    _configure_git_push_auth,
     _git_status_short,
     _workspace_commits_ahead,
     _workspace_diff_size,
@@ -1205,9 +1207,20 @@ class _LifecycleMixin(_OrchestratorBase):
                 await self._park_deliver_failed(msg, ctx=ctx)
                 return run_id
 
-        # 5. Push branch, open PR, post stage-transition comment.
+        # 5. Push branch, open PR, post stage-transition comment. The GitHub
+        # token is resolved DB-first (OAuth in UI 4/7) so delivery uses the
+        # connected UI credential instead of ambient `gh`/`git` auth once a
+        # binding's repo has a connected GitHub row.
+        github_token = await self._resolve_github_token()
+        gh = GitHub(token=github_token) if github_token else self._gh
         try:
-            await self._push_fn(workspace_path, branch)
+            if github_token:
+                await _configure_git_push_auth(workspace_path, github_token)
+            try:
+                await self._push_fn(workspace_path, branch)
+            finally:
+                if github_token:
+                    await _clear_git_push_auth(workspace_path)
         except Exception as e:  # noqa: BLE001
             log.warning("git push failed for %s: %s", issue.identifier, e)
             await self._park_deliver_failed(f"push failed: {e}", ctx=ctx, exc=e)
@@ -1215,7 +1228,7 @@ class _LifecycleMixin(_OrchestratorBase):
 
         pr_url: str = ""
         try:
-            pr_url = await self._gh.ensure_pr(
+            pr_url = await gh.ensure_pr(
                 title=build_pr_title(issue),
                 body="",
                 base=base_branch,

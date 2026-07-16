@@ -62,3 +62,31 @@ async def test_run_credentials_prefer_db_and_fall_back(tmp_path: Path) -> None:
         assert creds.linear_token == "env_linear_key"
     finally:
         await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_linear_credential_never_resolved_for_jira_tracked_binding(
+    tmp_path: Path,
+) -> None:
+    """A Jira-tracked binding must never see the Linear DB token, even when a
+    connected Linear row exists — the per-binding allowlist model requires
+    creds don't leak into a Jira-tracked binding's run."""
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        binding = harness.config.repos[0].model_copy(
+            update={
+                "provider": "jira",
+                "tracker_provider": "jira",
+                "base_url": "https://example.atlassian.net",
+            }
+        )
+        await db.oauth_connections.set_connection(
+            harness.conn,
+            provider="linear",
+            credential="lin_db_secret",
+            cipher=CredentialCipher(ENC_KEY),
+        )
+        creds = await harness.orch._resolve_run_credentials(binding)  # noqa: SLF001
+        assert creds.linear_token is None
+    finally:
+        await harness.close()

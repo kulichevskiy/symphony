@@ -149,6 +149,45 @@ async def test_runner_materializes_credentials_into_private_home_torn_down_after
 
 
 @pytest.mark.asyncio
+async def test_runner_cleans_up_cred_home_when_materialization_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # If materializing creds raises (disk full, permission error), the
+    # plaintext temp dir must not be left on disk and the run must not
+    # silently proceed without creds — the exception propagates.
+    import symphony.agent.runners.local as local_mod
+
+    created_homes: list[str] = []
+    real_mkdtemp = local_mod.tempfile.mkdtemp
+
+    def _tracking_mkdtemp(*args: object, **kwargs: object) -> str:
+        home = real_mkdtemp(*args, **kwargs)  # type: ignore[arg-type]
+        created_homes.append(home)
+        return home
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(local_mod.tempfile, "mkdtemp", _tracking_mkdtemp)
+    monkeypatch.setattr(local_mod, "materialize_credentials", _boom)
+
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-creds-fail",
+        workspace_path=tmp_path,
+        command=["true"],
+        stall_secs=10,
+        credentials=RunCredentials(github_token="gho_run"),
+    )
+    with pytest.raises(OSError, match="disk full"):
+        async for _ in runner.run(spec):
+            pass
+
+    assert len(created_homes) == 1
+    assert not _path_exists(Path(created_homes[0]))
+
+
+@pytest.mark.asyncio
 async def test_runner_does_not_stall_while_command_in_flight(tmp_path: Path) -> None:
     # Agent emits item.started for a command_execution, then is silent past
     # stall_secs while its tool runs, then emits item.completed and exits.

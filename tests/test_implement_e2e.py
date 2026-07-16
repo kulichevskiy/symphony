@@ -23,6 +23,7 @@ import pytest
 from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding
+from symphony.crypto import CredentialCipher
 from symphony.github.client import GitHubError
 from symphony.linear.client import LinearComment, LinearError, LinearIssue
 from symphony.linear.slash import SlashIntent, SlashKind
@@ -313,6 +314,138 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         assert history[1].status == "running"
         assert await db.runs.has_running_or_completed(conn, "iss-1") is True
         gh.pr_comment.assert_awaited_with(42, "@codex review", repo="org/repo")
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_delivery_uses_db_github_token_for_push_and_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OAuth in UI 4/7 acceptance: with a connected DB GitHub row, delivery
+    pushes and opens the PR with the DB token — not ambient `gh`/`git` auth."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.oauth_connections.set_connection(
+            conn,
+            provider="github",
+            credential="gho_db_secret",
+            cipher=CredentialCipher("enc-key"),
+        )
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+            symphony_encryption_key="enc-key",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_clone = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        # Captures the token seen at push time (read from the workspace's own
+        # git config, exactly as the real `_default_push` subprocess would
+        # see it) and the constructor args of every `GitHub(...)` built for
+        # delivery.
+        push_seen_auth: list[str] = []
+
+        async def _push_fn(path: Path, branch: str) -> None:
+            result = subprocess.run(
+                ["git", "config", "--local", "--get", "http.https://github.com/.extraheader"],
+                cwd=path,
+                capture_output=True,
+                text=True,
+            )
+            push_seen_auth.append(result.stdout.strip())
+
+        gh_ctor_calls: list[dict[str, object]] = []
+
+        class _RecordingGitHub:
+            def __init__(self, **kwargs: object) -> None:
+                gh_ctor_calls.append(kwargs)
+                self.ensure_pr = AsyncMock(
+                    return_value="https://github.com/org/repo/pull/42"
+                )
+                self.pr_comment = AsyncMock()
+
+        monkeypatch.setattr(
+            "symphony.orchestrator.poll._lifecycle.GitHub", _RecordingGitHub
+        )
+
+        result_line = json.dumps(
+            {
+                "type": "result",
+                "subtype": "success",
+                "result": "Implemented OAuth login and committed.\n\nSYMPHONY_DONE",
+                "total_cost_usd": 0.42,
+                "usage": {
+                    "input_tokens": 100,
+                    "cache_creation_input_tokens": 30,
+                    "cache_read_input_tokens": 40,
+                    "output_tokens": 50,
+                },
+            }
+        )
+        events = [
+            RunnerEvent(kind="started", pid=4242),
+            RunnerEvent(kind="stdout", line=json.dumps({"type": "system"})),
+            RunnerEvent(kind="stdout", line=result_line),
+            RunnerEvent(kind="exit", returncode=0),
+        ]
+        runner = _FakeRunner(events, commit_on_implement=True)
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=_push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, cfg.repos[0])
+
+        # Push happened while the workspace's local git config carried the
+        # DB token as a Basic auth header — never the injected fake `gh`'s
+        # ambient auth, and never `GH_TOKEN` in the process env.
+        assert len(push_seen_auth) == 1
+        assert push_seen_auth[0]
+        import base64 as _b64
+
+        expected = _b64.b64encode(b"x-access-token:gho_db_secret").decode()
+        assert expected in push_seen_auth[0]
+
+        # Torn down after push: the workspace's git config no longer carries it.
+        post_push = subprocess.run(
+            ["git", "config", "--local", "--get", "http.https://github.com/.extraheader"],
+            cwd=workspace_path,
+            capture_output=True,
+            text=True,
+        )
+        assert post_push.returncode != 0
+
+        # PR was opened via a GitHub client constructed with the DB token —
+        # not the test's injected `gh` (which has no DB creds wired in).
+        assert len(gh_ctor_calls) == 1
+        assert gh_ctor_calls[0]["token"] == "gho_db_secret"
+        gh.ensure_pr.assert_not_awaited()
     finally:
         await conn.close()
 

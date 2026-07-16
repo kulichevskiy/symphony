@@ -8,9 +8,55 @@ monkeypatches keep resolving.
 from __future__ import annotations
 
 import asyncio
+import base64
 from pathlib import Path
 
 from ...pipeline.local_review import DiffSize, parse_diff_numstat
+
+_PUSH_AUTH_CONFIG_KEY = "http.https://github.com/.extraheader"
+
+
+async def _configure_git_push_auth(workspace_path: Path, token: str) -> None:
+    """Point *workspace_path*'s local (non-global) git config at *token*.
+
+    Scoped to this one workspace's `.git/config`, so a concurrent run pushing
+    from a different workspace is unaffected. `x-access-token` is the GitHub
+    convention for a token-as-password Basic credential. Paired with
+    `_clear_git_push_auth`, called right after the push regardless of outcome.
+    """
+    basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "config",
+        "--local",
+        _PUSH_AUTH_CONFIG_KEY,
+        f"AUTHORIZATION: basic {basic}",
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"git config push auth failed: {stderr.decode(errors='replace').strip()}"
+        )
+
+
+async def _clear_git_push_auth(workspace_path: Path) -> None:
+    """Best-effort removal of the push-auth header set by `_configure_git_push_auth`."""
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "config",
+        "--local",
+        "--unset-all",
+        _PUSH_AUTH_CONFIG_KEY,
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    await proc.communicate()
 
 
 async def _default_push(workspace_path: Path, branch: str) -> None:

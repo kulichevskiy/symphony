@@ -135,8 +135,12 @@ class LocalRunner:
         cred_home: str | None = None
         if spec.credentials is not None and not spec.credentials.is_empty:
             cred_home = tempfile.mkdtemp(prefix="symphony-run-creds-")
-            os.chmod(cred_home, 0o700)
-            cred_env = materialize_credentials(spec.credentials, Path(cred_home))
+            try:
+                os.chmod(cred_home, 0o700)
+                cred_env = materialize_credentials(spec.credentials, Path(cred_home))
+            except Exception:
+                _remove_cred_home(cred_home)
+                raise
             env = {**env, **cred_env, **spec.env}
         try:
             proc = await asyncio.create_subprocess_exec(
