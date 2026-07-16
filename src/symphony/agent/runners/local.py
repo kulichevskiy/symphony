@@ -24,7 +24,7 @@ from collections.abc import AsyncIterator
 from contextlib import suppress
 from pathlib import Path
 
-from ...credentials import materialize_credentials
+from ...credentials import RunCredentials, materialize_credentials
 from ..runner import RunnerEvent, RunnerSpec
 
 _STREAM_DRAIN_SECS = 2.0
@@ -133,7 +133,18 @@ class LocalRunner:
         # a persistent volume file. spec.env still overrides (the per-binding
         # allowlist wins over a materialized default).
         cred_home: str | None = None
-        if spec.credentials is not None and not spec.credentials.is_empty:
+        credentials = spec.credentials
+        # A binding that supplies its own `GH_TOKEN` via `env:` wants that
+        # token used everywhere — not just by env-reading consumers like
+        # `gh`. Without this, materializing the DB/volume-resolved GitHub
+        # token below still writes a `.git-credentials` file + credential
+        # helper (`GIT_CONFIG_GLOBAL`) for it, so plain `git push` would
+        # silently authenticate with the *other* token regardless of the
+        # binding's override (SYM-199 review fix). Drop it from the bundle
+        # instead so materialization defers entirely to the binding's env.
+        if credentials is not None and "GH_TOKEN" in spec.env:
+            credentials = RunCredentials(github_token=None, linear_token=credentials.linear_token)
+        if credentials is not None and not credentials.is_empty:
             cred_home = tempfile.mkdtemp(prefix="symphony-run-creds-")
             try:
                 os.chmod(cred_home, 0o700)
@@ -141,7 +152,7 @@ class LocalRunner:
                     Path(env["GIT_CONFIG_GLOBAL"]) if "GIT_CONFIG_GLOBAL" in env else None
                 )
                 cred_env = materialize_credentials(
-                    spec.credentials, Path(cred_home), prior_gitconfig=prior_gitconfig
+                    credentials, Path(cred_home), prior_gitconfig=prior_gitconfig
                 )
             except Exception:
                 _remove_cred_home(cred_home)

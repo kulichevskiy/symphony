@@ -9,15 +9,45 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import os
 from pathlib import Path
 
 from ...pipeline.local_review import DiffSize, parse_diff_numstat
 
 _DEFAULT_PUSH_AUTH_HOST = "github.com"
 
+# Per-workspace push-auth header, held in process memory only (OAuth in UI
+# 4/7 review fix). Never written to the workspace's `.git/config` — a daemon
+# kill between `_configure_git_push_auth` and `_clear_git_push_auth` would
+# otherwise leave the plaintext GitHub token on disk indefinitely. Keyed by
+# workspace path, mirroring the old config's per-workspace scoping so a
+# concurrent run pushing from a different workspace is unaffected.
+_push_auth_env: dict[Path, dict[str, str]] = {}
+
 
 def _push_auth_config_key(host: str) -> str:
     return f"http.https://{host}/.extraheader"
+
+
+def _push_auth_subprocess_env(workspace_path: Path) -> dict[str, str] | None:
+    """The subprocess env to merge in for a push from *workspace_path*.
+
+    Encodes the pending config pairs via git's `GIT_CONFIG_COUNT` /
+    `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` env-var protocol (git
+    >=2.31), which applies only to the child process — never touching the
+    workspace's `.git/config` file. `None` when no auth is configured, so
+    callers pass `env=None` and the subprocess inherits the parent
+    environment exactly as before.
+    """
+    extra = _push_auth_env.get(workspace_path)
+    if not extra:
+        return None
+    env = dict(os.environ)
+    env["GIT_CONFIG_COUNT"] = str(len(extra))
+    for i, (key, value) in enumerate(extra.items()):
+        env[f"GIT_CONFIG_KEY_{i}"] = key
+        env[f"GIT_CONFIG_VALUE_{i}"] = value
+    return env
 
 
 async def _push_auth_host(workspace_path: Path) -> str | None:
@@ -62,67 +92,32 @@ async def _push_auth_host(workspace_path: Path) -> str | None:
 
 
 async def _configure_git_push_auth(workspace_path: Path, token: str) -> None:
-    """Point *workspace_path*'s local (non-global) git config at *token*.
+    """Hold *token* as a push-auth header for *workspace_path*, in memory only.
 
-    Scoped to this one workspace's `.git/config`, so a concurrent run pushing
-    from a different workspace is unaffected. `x-access-token` is the GitHub
-    convention for a token-as-password Basic credential. Paired with
-    `_clear_git_push_auth`, called right after the push regardless of outcome.
-    A no-op when `origin` is an SSH remote (see `_push_auth_host`).
+    Kept in `_push_auth_env` rather than written to `.git/config` — a
+    plaintext GitHub token must never touch a persistent file (OAuth in UI
+    4/7 review fix). `x-access-token` is the GitHub convention for a
+    token-as-password Basic credential. Paired with `_clear_git_push_auth`,
+    called right after the push regardless of outcome. A no-op when `origin`
+    is an SSH remote (see `_push_auth_host`).
     """
     host = await _push_auth_host(workspace_path)
     if host is None:
         return
     basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
-    proc = await asyncio.create_subprocess_exec(
-        "git",
-        "config",
-        "--local",
-        _push_auth_config_key(host),
-        f"AUTHORIZATION: basic {basic}",
-        cwd=str(workspace_path),
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-        stdin=asyncio.subprocess.DEVNULL,
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"git config push auth failed: {stderr.decode(errors='replace').strip()}"
-        )
+    _push_auth_env[workspace_path] = {
+        _push_auth_config_key(host): f"AUTHORIZATION: basic {basic}",
+    }
 
 
 async def _clear_git_push_auth(workspace_path: Path) -> None:
-    """Best-effort removal of the push-auth header set by `_configure_git_push_auth`.
+    """Remove the push-auth header set by `_configure_git_push_auth`.
 
     Called unconditionally before every push (OAuth in UI 4/7 review fix), so
-    a workspace that doesn't exist yet (or any other OS-level failure
-    starting `git`) must not raise — there is no header to clear either way.
-    Clears both the current `origin`-derived host key and the default host
-    key unconditionally, so a header written by an older build (hardcoded to
-    the default host) or left behind after a binding's host changed is still
-    cleaned up.
+    a workspace whose entry is already absent is simply a no-op — there is
+    no header to clear either way.
     """
-    host = await _push_auth_host(workspace_path)
-    keys = {_push_auth_config_key(_DEFAULT_PUSH_AUTH_HOST)}
-    if host is not None:
-        keys.add(_push_auth_config_key(host))
-    for key in keys:
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "git",
-                "config",
-                "--local",
-                "--unset-all",
-                key,
-                cwd=str(workspace_path),
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                stdin=asyncio.subprocess.DEVNULL,
-            )
-            await proc.communicate()
-        except OSError:
-            pass
+    _push_auth_env.pop(workspace_path, None)
 
 
 async def _default_push(workspace_path: Path, branch: str) -> None:
@@ -136,6 +131,7 @@ async def _default_push(workspace_path: Path, branch: str) -> None:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         stdin=asyncio.subprocess.DEVNULL,
+        env=_push_auth_subprocess_env(workspace_path),
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:
@@ -154,6 +150,7 @@ async def _default_force_push(workspace_path: Path, branch: str) -> None:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         stdin=asyncio.subprocess.DEVNULL,
+        env=_push_auth_subprocess_env(workspace_path),
     )
     _, stderr = await proc.communicate()
     if proc.returncode != 0:

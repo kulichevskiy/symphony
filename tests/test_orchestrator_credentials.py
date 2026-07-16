@@ -13,6 +13,8 @@ import pytest
 from symphony import db
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.crypto import CredentialCipher
+from symphony.orchestrator.poll import Orchestrator
+from symphony.tracker import TrackerContext, TrackerRegistry
 from tests.harness import Harness
 
 ENC_KEY = "deployment-secret"
@@ -90,3 +92,71 @@ async def test_linear_credential_never_resolved_for_jira_tracked_binding(
         assert creds.linear_token is None
     finally:
         await harness.close()
+
+
+class _FakeLinearTracker:
+    """`viewer_team_keys`/`team_states` raise until `set_api_key` is called —
+    modelling the real client's unauthenticated-request failure — so a
+    `warmup()` that queries the tracker before applying the DB-resolved
+    token surfaces as a hard failure here instead of a silent auth gap."""
+
+    def __init__(self) -> None:
+        self.api_keys: list[str] = []
+
+    def set_api_key(self, api_key: str) -> None:
+        self.api_keys.append(api_key)
+
+    async def viewer_team_keys(self) -> list[str]:
+        if not self.api_keys:
+            raise AssertionError("viewer_team_keys called before set_api_key")
+        return ["ENG"]
+
+    async def team_states(self, team_key: str) -> dict[str, str]:
+        if not self.api_keys:
+            raise AssertionError("team_states called before set_api_key")
+        return {"Todo": "state-todo", "In Progress": "state-inprog", "Needs Approval": "state-r"}
+
+
+@pytest.mark.asyncio
+async def test_warmup_applies_db_linear_token_before_querying_trackers(
+    tmp_path: Path,
+) -> None:
+    """`run()` calls `warmup()` before the first `_tick` — the only place
+    `_refresh_linear_tracker_credentials` otherwise runs. A DB Linear
+    connection with no `LINEAR_API_KEY` fallback must still authenticate
+    `warmup`'s own tracker calls (SYM-199 review fix)."""
+    cfg = Config(
+        workspace_root=tmp_path / "workspaces",
+        log_root=tmp_path / "logs",
+        db_path=tmp_path / "symphony.sqlite",
+        symphony_encryption_key=ENC_KEY,
+        repos=[
+            RepoBinding(
+                linear_team_key="ENG",
+                github_repo="org/repo",
+                linear_states=LinearStates(
+                    ready="Todo",
+                    in_progress="In Progress",
+                    code_review="Needs Approval",
+                ),
+            )
+        ],
+    )
+    conn = await db.connect(cfg.db_path)
+    try:
+        await db.oauth_connections.set_connection(
+            conn,
+            provider="linear",
+            credential="lin_db_secret",
+            cipher=CredentialCipher(ENC_KEY),
+        )
+        tracker = _FakeLinearTracker()
+        registry = TrackerRegistry()
+        registry.register("linear", "default", tracker)
+        orch = Orchestrator(cfg, registry, conn)
+
+        await orch.warmup()
+
+        assert tracker.api_keys == ["Bearer lin_db_secret"]
+    finally:
+        await conn.close()

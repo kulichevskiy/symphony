@@ -1,6 +1,12 @@
 """Push-auth header config derives its host from `origin` (OAuth in UI 4/7
 review fix): a hardcoded `github.com` doesn't apply to GHE remotes, and
-`http.extraHeader` is a no-op against an SSH remote."""
+`http.extraHeader` is a no-op against an SSH remote.
+
+Held in process memory only, never written to `.git/config` (OAuth in UI 4/7
+review fix: a daemon kill between configure/clear must not leave the
+plaintext token on disk) — assert against the subprocess env `git push`
+would actually receive, not the workspace's persisted config file.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +15,11 @@ from pathlib import Path
 
 import pytest
 
-from symphony.orchestrator.poll._git import _clear_git_push_auth, _configure_git_push_auth
+from symphony.orchestrator.poll._git import (
+    _clear_git_push_auth,
+    _configure_git_push_auth,
+    _push_auth_subprocess_env,
+)
 
 
 async def _git(cwd: Path, *args: str) -> None:
@@ -39,6 +49,14 @@ async def _get_config(cwd: Path, key: str) -> str:
     return stdout.decode().strip() if proc.returncode == 0 else ""
 
 
+def _configured_headers(cwd: Path) -> dict[str, str]:
+    env = _push_auth_subprocess_env(cwd)
+    if env is None:
+        return {}
+    count = int(env.get("GIT_CONFIG_COUNT", "0"))
+    return {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(count)}
+
+
 @pytest.mark.asyncio
 async def test_configure_uses_ghe_host_from_origin(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
@@ -48,12 +66,14 @@ async def test_configure_uses_ghe_host_from_origin(tmp_path: Path) -> None:
 
     await _configure_git_push_auth(repo, "tok")
 
-    assert await _get_config(repo, "http.https://github.com/.extraheader") == ""
-    header = await _get_config(repo, "http.https://ghe.example.com/.extraheader")
+    headers = _configured_headers(repo)
+    assert "http.https://github.com/.extraheader" not in headers
+    header = headers.get("http.https://ghe.example.com/.extraheader", "")
     assert "basic" in header.lower()
+    assert await _get_config(repo, "http.https://ghe.example.com/.extraheader") == ""
 
     await _clear_git_push_auth(repo)
-    assert await _get_config(repo, "http.https://ghe.example.com/.extraheader") == ""
+    assert _configured_headers(repo) == {}
 
 
 @pytest.mark.asyncio
@@ -65,7 +85,7 @@ async def test_configure_is_noop_for_ssh_remote(tmp_path: Path) -> None:
 
     await _configure_git_push_auth(repo, "tok")
 
-    assert await _get_config(repo, "http.https://github.com/.extraheader") == ""
+    assert _configured_headers(repo) == {}
 
 
 @pytest.mark.asyncio
@@ -76,8 +96,9 @@ async def test_configure_defaults_to_github_com_without_origin(tmp_path: Path) -
 
     await _configure_git_push_auth(repo, "tok")
 
-    header = await _get_config(repo, "http.https://github.com/.extraheader")
+    header = _configured_headers(repo).get("http.https://github.com/.extraheader", "")
     assert "basic" in header.lower()
+    assert await _get_config(repo, "http.https://github.com/.extraheader") == ""
 
     await _clear_git_push_auth(repo)
-    assert await _get_config(repo, "http.https://github.com/.extraheader") == ""
+    assert _configured_headers(repo) == {}

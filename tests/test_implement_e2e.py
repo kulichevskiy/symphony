@@ -358,25 +358,20 @@ async def test_delivery_uses_db_github_token_for_push_and_pr(
         gh.repo_clone = AsyncMock()
         gh.repo_default_branch = AsyncMock(return_value="trunk")
 
-        # Captures the token seen at push time (read from the workspace's own
-        # git config, exactly as the real `_default_push` subprocess would
-        # see it) and the constructor args of every `GitHub(...)` built for
-        # delivery.
+        # Captures the token seen at push time (read from the in-memory
+        # push-auth env the real `_default_push` subprocess would receive —
+        # never written to the workspace's `.git/config`, OAuth in UI 4/7
+        # review fix) and the constructor args of every `GitHub(...)` built
+        # for delivery.
+        from symphony.orchestrator.poll._git import _push_auth_subprocess_env  # noqa: PLC0415
+
         push_seen_auth: list[str] = []
 
         async def _push_fn(path: Path, branch: str) -> None:
-            proc = await asyncio.create_subprocess_exec(
-                "git",
-                "config",
-                "--local",
-                "--get",
-                "http.https://github.com/.extraheader",
-                cwd=path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await proc.communicate()
-            push_seen_auth.append(stdout.decode().strip())
+            env = _push_auth_subprocess_env(path) or {}
+            count = int(env.get("GIT_CONFIG_COUNT", "0"))
+            headers = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(count)}
+            push_seen_auth.append(headers.get("http.https://github.com/.extraheader", ""))
 
         gh_ctor_calls: list[dict[str, object]] = []
 
@@ -434,19 +429,8 @@ async def test_delivery_uses_db_github_token_for_push_and_pr(
         expected = _b64.b64encode(b"x-access-token:gho_db_secret").decode()
         assert expected in push_seen_auth[0]
 
-        # Torn down after push: the workspace's git config no longer carries it.
-        post_push = await asyncio.create_subprocess_exec(
-            "git",
-            "config",
-            "--local",
-            "--get",
-            "http.https://github.com/.extraheader",
-            cwd=workspace_path,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        await post_push.communicate()
-        assert post_push.returncode != 0
+        # Torn down after push: no push-auth env remains for the workspace.
+        assert _push_auth_subprocess_env(workspace_path) is None
 
         # Every GitHub API call during this run — base-branch lookup, PR
         # open, review request — went through a client built with the DB

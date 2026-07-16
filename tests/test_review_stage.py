@@ -782,21 +782,15 @@ async def test_red_ci_fix_run_repush_and_codex_reping_use_db_github_token(
         gh.pr_view = AsyncMock(side_effect=AssertionError("ambient gh.pr_view used"))
         gh.pr_comment = AsyncMock(side_effect=AssertionError("ambient gh.pr_comment used"))
 
+        from symphony.orchestrator.poll._git import _push_auth_subprocess_env  # noqa: PLC0415
+
         push_seen_auth: list[str] = []
 
         async def _push_fn(path: Path, branch: str) -> None:
-            proc = await asyncio.create_subprocess_exec(
-                "git",
-                "config",
-                "--local",
-                "--get",
-                "http.https://github.com/.extraheader",
-                cwd=path,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await proc.communicate()
-            push_seen_auth.append(stdout.decode().strip())
+            env = _push_auth_subprocess_env(path) or {}
+            count = int(env.get("GIT_CONFIG_COUNT", "0"))
+            headers = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(count)}
+            push_seen_auth.append(headers.get("http.https://github.com/.extraheader", ""))
 
         gh_ctor_calls: list[dict[str, object]] = []
 

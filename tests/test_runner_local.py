@@ -149,6 +149,35 @@ async def test_runner_materializes_credentials_into_private_home_torn_down_after
 
 
 @pytest.mark.asyncio
+async def test_runner_binding_gh_token_overrides_materialized_git_credential_helper(
+    tmp_path: Path,
+) -> None:
+    # A binding that supplies its own GH_TOKEN via `env:` must win for *every*
+    # consumer, not just env-reading ones like `gh`. Without dropping the
+    # resolved github_token from the materialized bundle, `GIT_CONFIG_GLOBAL`
+    # still points at a credential helper backed by the *other* token, so a
+    # plain `git` HTTPS operation would silently authenticate with it instead
+    # of the binding's override (SYM-199 review fix).
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-binding-token",
+        workspace_path=tmp_path,
+        command=[
+            "sh",
+            "-c",
+            'printf "%s\\n" "$GH_TOKEN"; printf "%s\\n" "${GIT_CONFIG_GLOBAL:-<unset>}"',
+        ],
+        stall_secs=10,
+        env={"GH_TOKEN": "binding_own_token"},
+        credentials=RunCredentials(github_token="gho_run", linear_token="lin_run"),
+    )
+    events = [ev async for ev in runner.run(spec)]
+    stdout = [e.line for e in events if e.kind == "stdout"]
+    assert stdout[0] == "binding_own_token"
+    assert stdout[1] == "<unset>"
+
+
+@pytest.mark.asyncio
 async def test_runner_preserves_global_git_identity_with_materialized_creds(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
