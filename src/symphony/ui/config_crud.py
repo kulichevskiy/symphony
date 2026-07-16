@@ -1207,10 +1207,19 @@ def create_config_crud_router(
             # binding version conflict (below) rolls back the secret write too.
             # Same fallback as `create_binding`: an omitted version must not
             # skip the 409 conflict check (SYM-194 review).
+            # On a rename, `body.webhook_secret_version` was read by the client
+            # against `old.github_repo`, not the new target repo — it is not a
+            # valid lock token here. Ignore it and use the freshly-read
+            # new-repo version instead (SYM-194 review: fail-open 409 bypass).
+            is_rename = binding.github_repo != old.github_repo
             update_expected_version = (
-                body.webhook_secret_version
-                if body.webhook_secret_version is not None
-                else (old_secret.version if old_secret is not None else 0)
+                (old_secret.version if old_secret is not None else 0)
+                if is_rename
+                else (
+                    body.webhook_secret_version
+                    if body.webhook_secret_version is not None
+                    else (old_secret.version if old_secret is not None else 0)
+                )
             )
             await _write_repo_secret(
                 conn,

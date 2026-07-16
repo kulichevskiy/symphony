@@ -679,6 +679,73 @@ async def test_repo_secret_version_conflict_on_update_with_omitted_version(
 
 
 @pytest.mark.asyncio
+async def test_rename_onto_repo_with_secret_uses_target_version(tmp_path: Path) -> None:
+    """A save that both renames `github_repo` and sets the secret must gate the
+    write on the *target* repo's freshly-read version, not the client's
+    `webhook_secret_version` (loaded for the old repo before the rename). Org/a
+    is advanced to version 2 while org/b sits untouched at version 1: the
+    stale client-held version 2 must not spuriously 409 against org/b's real
+    version 1, and org/b's actual version must still gate the write (SYM-194
+    review)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            a = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(github_repo="org/a", webhook_secret="a1")},
+            )
+            assert a.status_code == 201, a.text
+            a = await client.put(
+                f"/api/config/bindings/{a.json()['id']}",
+                json={
+                    "payload": _payload(github_repo="org/a", webhook_secret="a2"),
+                    "version": a.json()["version"],
+                    "webhook_secret_version": 1,
+                },
+            )
+            assert a.status_code == 200, a.text
+            assert a.json()["webhook_secret_version"] == 2
+
+            b = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(github_repo="org/b", issue_label="bug")},
+            )
+            assert b.status_code == 201, b.text
+            assert b.json()["webhook_secret_version"] == 0
+
+            # Rename binding `a` onto org/b while replacing the secret,
+            # carrying org/a's version (2) — stale for org/b (version-less,
+            # i.e. 0). Before the fix this 409'd against org/b's real state.
+            renamed = await client.put(
+                f"/api/config/bindings/{a.json()['id']}",
+                json={
+                    "payload": _payload(github_repo="org/b", webhook_secret="b1"),
+                    "version": a.json()["version"],
+                    "webhook_secret_version": 2,
+                },
+            )
+            assert renamed.status_code == 200, renamed.text
+            assert renamed.json()["webhook_secret_version"] == 1
+
+            # The rename really did advance org/b's secret to version 1 (not
+            # skip the check): a write still carrying org/b's pre-rename
+            # version (0) is now stale and must 409, proving the lock wasn't
+            # defeated.
+            conflict = await client.put(
+                f"/api/config/bindings/{b.json()['id']}",
+                json={
+                    "payload": _payload(github_repo="org/b", issue_label="bug", webhook_secret="c1"),
+                    "version": b.json()["version"],
+                    "webhook_secret_version": 0,
+                },
+            )
+            assert conflict.status_code == 409, conflict.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_repo_secret_explicit_clear(tmp_path: Path) -> None:
     """Omit keeps; an explicit clear marker removes the secret (SYM-194)."""
     conn, db_path = await _open(tmp_path)
