@@ -199,11 +199,40 @@ describe("ConnectionsPanel", () => {
     await waitFor(() => expect(screen.getByText(/live/i)).toBeTruthy());
   });
 
-  it("leaves unwired providers' buttons disabled", () => {
+  it("navigates to the Linear authorize URL when Connect is clicked", async () => {
+    const fetchMock = mockFetch(200, {
+      authorize_url: "https://linear.app/oauth/authorize?state=xyz",
+    });
+    const assign = vi.fn();
+    const originalLocation = window.location;
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: { ...originalLocation, assign },
+    });
     render(
       <ConnectionsPanel
         connections={[
           { provider: "linear", label: "Linear", status: "not_connected", expires_at: null },
+        ]}
+        onChanged={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByText("Connect"));
+    await waitFor(() =>
+      expect(assign).toHaveBeenCalledWith("https://linear.app/oauth/authorize?state=xyz"),
+    );
+    expect(fetchMock.mock.calls[0][0]).toBe("/api/oauth/linear/start");
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: originalLocation,
+    });
+  });
+
+  it("leaves unwired providers' buttons disabled", () => {
+    render(
+      <ConnectionsPanel
+        connections={[
+          { provider: "claude", label: "Claude", status: "not_connected", expires_at: null },
         ]}
         onChanged={() => {}}
       />,

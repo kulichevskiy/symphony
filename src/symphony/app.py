@@ -37,7 +37,7 @@ from .ui.db import ReadOnlyDbPool, WriteDbPool
 from .ui.external import ExternalSnapshotService, GitHubExternalClient
 from .ui.issues import create_issue_detail_router
 from .ui.live import create_live_stream_router
-from .ui.oauth import create_oauth_routers, github_provider
+from .ui.oauth import create_oauth_routers, github_provider, linear_provider
 from .ui.status import CanonicalState
 from .webhook import (
     LOOPBACK_HOST,
@@ -238,10 +238,11 @@ def create_app(
                 dependencies=api_dependencies,
             )
 
-        # GitHub redirect-OAuth (OAuth in UI 2/7). `start`/`disconnect`/`test`
-        # are gated like the rest of `/api/*`; `callback` is mounted OUTSIDE the
-        # gate — a browser redirect from GitHub carries no bearer, so security
-        # rests on the single-use `state` + PKCE the engine enforces.
+        # Redirect-OAuth for GitHub (2/7) and Linear (3/7) on one engine.
+        # `start`/`disconnect`/`test` are gated like the rest of `/api/*`;
+        # `callback` is mounted OUTSIDE the gate — a browser redirect from the
+        # provider carries no bearer, so security rests on the single-use
+        # `state` + PKCE the engine enforces.
         if oauth_write_pool is not None:
             resolved = ui_external_config() if callable(ui_external_config) else ui_external_config
             base_config = resolved if resolved is not None else Config()
@@ -261,6 +262,10 @@ def create_app(
                     "github": github_provider(
                         base_config.github_oauth_client_id,
                         base_config.github_oauth_client_secret,
+                    ),
+                    "linear": linear_provider(
+                        base_config.linear_oauth_client_id,
+                        base_config.linear_oauth_client_secret,
                     ),
                 },
                 cipher=cipher,

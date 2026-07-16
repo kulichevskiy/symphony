@@ -33,6 +33,8 @@ def _cfg() -> Config:
         linear_api_key="test-linear-key",
         github_oauth_client_id="gh-client-id",
         github_oauth_client_secret="gh-client-secret",
+        linear_oauth_client_id="lin-client-id",
+        linear_oauth_client_secret="lin-client-secret",
     )
 
 
@@ -285,6 +287,126 @@ async def test_test_marks_expired_when_undecryptable(tmp_path: Path) -> None:
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "expired"
         status = await db.oauth_connections.get_status(conn, "github")
+        assert status is not None and status.status == "expired"
+    finally:
+        await conn.close()
+
+
+async def _mint_linear_state(client: httpx.AsyncClient) -> str:
+    resp = await client.get("/api/oauth/linear/start")
+    url = resp.json()["authorize_url"]
+    return parse_qs(urlparse(url).query)["state"][0]
+
+
+@pytest.mark.asyncio
+async def test_linear_start_returns_authorize_url(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.get("/api/oauth/linear/start")
+        assert resp.status_code == 200, resp.text
+        url = resp.json()["authorize_url"]
+        parsed = urlparse(url)
+        assert parsed.netloc == "linear.app"
+        q = parse_qs(parsed.query)
+        assert q["client_id"] == ["lin-client-id"]
+        assert q["scope"] == ["read write"]
+        assert q["code_challenge_method"] == ["S256"]
+        assert q["redirect_uri"] == ["http://test/api/oauth/linear/callback"]
+        assert q["state"]  # a state was minted
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_linear_start_503_when_not_configured(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        # GitHub configured, Linear not — the Linear card must still 503 legibly.
+        cfg = Config(
+            linear_api_key="k",
+            github_oauth_client_id="gh",
+            github_oauth_client_secret="gh",
+        )
+        app = _app(conn, db_path, cfg=cfg)
+        async with _client(app) as client:
+            resp = await client.get("/api/oauth/linear/start")
+        assert resp.status_code == 503
+        assert "LINEAR_OAUTH_CLIENT_ID" in resp.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_linear_callback_stores_encrypted_token(tmp_path: Path) -> None:
+    respx.post("https://api.linear.app/oauth/token").mock(
+        return_value=httpx.Response(200, json={"access_token": "lin_oauth_live"})
+    )
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            state = await _mint_linear_state(client)
+            resp = await client.get(f"/api/oauth/linear/callback?code=the-code&state={state}")
+        assert resp.status_code == 302
+        assert "/ui/config" in resp.headers["location"]
+        assert "lin_oauth_live" not in resp.text
+        assert "lin_oauth_live" not in str(resp.headers)
+        status = await db.oauth_connections.get_status(conn, "linear")
+        assert status is not None and status.status == "connected"
+        assert (
+            await db.oauth_connections.get_credential(conn, "linear", CredentialCipher(_KEY))
+            == "lin_oauth_live"
+        )
+        cur = await conn.execute(
+            "SELECT credential FROM oauth_connections WHERE provider = 'linear'"
+        )
+        raw = (await cur.fetchone())["credential"]
+        assert b"lin_oauth_live" not in raw
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_linear_test_reports_live_via_viewer(tmp_path: Path) -> None:
+    route = respx.post("https://api.linear.app/graphql").mock(
+        return_value=httpx.Response(200, json={"data": {"viewer": {"id": "u1"}}})
+    )
+    conn, db_path = await _open(tmp_path)
+    try:
+        await db.oauth_connections.set_connection(
+            conn, provider="linear", credential="lin_live", cipher=CredentialCipher(_KEY)
+        )
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.post("/api/oauth/linear/test")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "live"
+        sent = route.calls.last.request
+        assert b"viewer" in sent.content
+        assert sent.headers["authorization"] == "Bearer lin_live"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_linear_test_reports_expired(tmp_path: Path) -> None:
+    respx.post("https://api.linear.app/graphql").mock(return_value=httpx.Response(401))
+    conn, db_path = await _open(tmp_path)
+    try:
+        await db.oauth_connections.set_connection(
+            conn, provider="linear", credential="lin_dead", cipher=CredentialCipher(_KEY)
+        )
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.post("/api/oauth/linear/test")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "expired"
+        status = await db.oauth_connections.get_status(conn, "linear")
         assert status is not None and status.status == "expired"
     finally:
         await conn.close()

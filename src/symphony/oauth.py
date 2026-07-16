@@ -22,6 +22,7 @@ import secrets
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import urlencode
 
 import httpx
@@ -43,7 +44,11 @@ class OAuthError(Exception):
 @dataclass(frozen=True)
 class OAuthProvider:
     """Everything the engine needs for one provider. `test_url` is the endpoint
-    the Connections page's *Test* button pings with the stored token."""
+    the Connections page's *Test* button pings with the stored token.
+
+    `test_body` carries the request body for providers whose liveness probe is a
+    POST (e.g. Linear's GraphQL `viewer` query) — `None` means the probe is a
+    bare GET (GitHub's `/user`)."""
 
     provider: str
     authorize_url: str
@@ -52,6 +57,7 @@ class OAuthProvider:
     client_id: str
     client_secret: str
     scopes: tuple[str, ...]
+    test_body: dict[str, Any] | None = None
 
     @property
     def configured(self) -> bool:
