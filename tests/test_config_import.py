@@ -3,10 +3,15 @@
 Asserts legacy resolution (incl. the codex-reviewer inheritance case), priority
 stamped from YAML order, full Claude model IDs normalized/preserved, sparse
 legacy-free payloads, and double-import refusal without the replace flag.
+
+SYM-195 adds the cutover binding-key backfill (unambiguous run/PR rows stamped;
+ambiguous rows refused unless an explicit mapping is passed) and the
+export→import round-trip through replace mode.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -318,6 +323,323 @@ repos:
     assert impl.agent == "codex" and impl.model == "gpt-5.1-codex-max"
     assert binding.resolved_role("fix", cfg.roles).agent == "codex"
     assert binding.resolved_role("review_find", cfg.roles).agent == "claude"
+    await conn.close()
+
+
+def _storage_key(*parts: str) -> str:
+    return json.dumps(list(parts), separators=(",", ":"))
+
+
+async def _seed_active_work(
+    conn,  # type: ignore[no-untyped-def]
+    *,
+    identifier: str,
+    team_key: str,
+    github_repo: str | None,
+) -> str:
+    issue_id = await db.issues.upsert(
+        conn, id=identifier, identifier=identifier, title="t", team_key=team_key
+    )
+    await db.runs.create(
+        conn,
+        id=f"run-{identifier}",
+        issue_id=issue_id,
+        stage="implement",
+        status="running",
+        pid=123,
+        started_at="t0",
+    )
+    if github_repo is not None:
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=issue_id,
+            github_repo=github_repo,
+            pr_number=1,
+            pr_url="u",
+            created_at="t0",
+        )
+    return issue_id
+
+
+@pytest.mark.asyncio
+async def test_backfill_unambiguous_run_and_pr(tmp_path: Path) -> None:
+    """A cutover with a single candidate binding stamps its natural key onto
+    still-active runs and open-PR rows that carry an empty binding key."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    issue_id = await _seed_active_work(
+        conn, identifier="ENG-1", team_key="ENG", github_repo="org/api"
+    )
+    path = _write(
+        tmp_path,
+        f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+{_STATES}
+""",
+    )
+    result = await import_config(path, conn, now="t1")
+    assert result.runs_backfilled == 1
+    assert result.prs_backfilled == 1
+    expected = _storage_key("ENG", "org/api", "", "linear", "default")
+    run = await conn.execute_fetchall(
+        "SELECT binding_key FROM runs WHERE issue_id = ?", (issue_id,)
+    )
+    assert run[0]["binding_key"] == expected
+    pr = await conn.execute_fetchall(
+        "SELECT binding_key FROM issue_prs WHERE issue_id = ?", (issue_id,)
+    )
+    assert pr[0]["binding_key"] == expected
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_run_ignores_merged_pr_history(tmp_path: Path) -> None:
+    """A live run with no current PR must not resolve its repo from an older
+    merged PR — that history is stale once the issue moves on, so with two
+    same-team bindings on different repos the row is ambiguous and refused
+    rather than silently narrowed to the merged PR's old repo (SYM-195
+    review)."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    issue_id = await _seed_active_work(
+        conn, identifier="ENG-1", team_key="ENG", github_repo="org/api"
+    )
+    await db.issue_prs.mark_merged(conn, issue_id=issue_id, github_repo="org/api", merged_at="t1")
+    path = _write(
+        tmp_path,
+        f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+{_STATES}
+  - linear_team_key: ENG
+    github_repo: org/other
+{_STATES}
+""",
+    )
+    with pytest.raises(ConfigImportError, match="ENG-1"):
+        await import_config(path, conn, now="t1")
+    assert await db.config_bindings.count(conn) == 0
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_ambiguous_refused_with_list(tmp_path: Path) -> None:
+    """Two bindings on one repo (labeled + catch-all) make the row's binding
+    ambiguous; the importer refuses the whole cutover, listing the row, rather
+    than guessing from the issue's mutable labels — and the delete/insert roll
+    back, so the DB is untouched."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    await _seed_active_work(conn, identifier="ENG-1", team_key="ENG", github_repo="org/api")
+    path = _write(
+        tmp_path,
+        f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+    issue_label: urgent
+{_STATES}
+  - linear_team_key: ENG
+    github_repo: org/api
+{_STATES}
+""",
+    )
+    with pytest.raises(ConfigImportError, match="ENG-1"):
+        await import_config(path, conn, now="t1")
+    # Rolled back: no bindings landed.
+    assert await db.config_bindings.count(conn) == 0
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_explicit_mapping_honored(tmp_path: Path) -> None:
+    """An explicit issue→binding mapping resolves an otherwise-ambiguous row."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    issue_id = await _seed_active_work(
+        conn, identifier="ENG-1", team_key="ENG", github_repo="org/api"
+    )
+    path = _write(
+        tmp_path,
+        f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+    issue_label: urgent
+{_STATES}
+  - linear_team_key: ENG
+    github_repo: org/api
+{_STATES}
+""",
+    )
+    result = await import_config(
+        path,
+        conn,
+        now="t1",
+        issue_bindings={"ENG-1": ["ENG", "org/api", "urgent", "linear", "default"]},
+    )
+    assert result.runs_backfilled == 1
+    assert result.prs_backfilled == 1
+    expected = _storage_key("ENG", "org/api", "urgent", "linear", "default")
+    pr = await conn.execute_fetchall(
+        "SELECT binding_key FROM issue_prs WHERE issue_id = ?", (issue_id,)
+    )
+    assert pr[0]["binding_key"] == expected
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_backfill_mapping_outside_candidates_rejected(tmp_path: Path) -> None:
+    """A mapping entry naming a binding outside the row's own
+    team/provider/site/repo candidates is a stale or mistyped natural key, not
+    a disambiguation of this row — the importer refuses rather than trusting
+    it and stamping the row with an unrelated binding."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    await _seed_active_work(conn, identifier="ENG-1", team_key="ENG", github_repo="org/api")
+    path = _write(
+        tmp_path,
+        f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+    issue_label: urgent
+{_STATES}
+  - linear_team_key: ENG
+    github_repo: org/api
+{_STATES}
+  - linear_team_key: WEB
+    github_repo: org/web
+{_STATES}
+""",
+    )
+    with pytest.raises(ConfigImportError, match="ENG-1"):
+        await import_config(
+            path,
+            conn,
+            now="t1",
+            issue_bindings={"ENG-1": ["WEB", "org/web", "", "linear", "default"]},
+        )
+    # Rolled back: no bindings landed, and nothing was stamped with the
+    # out-of-scope binding's key.
+    assert await db.config_bindings.count(conn) == 0
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_role_pin_equal_to_global_survives_reimport(tmp_path: Path) -> None:
+    """A binding-level `roles` pin that happens to equal the global cell at
+    reimport time must survive as an explicit pin rather than collapse into
+    inherit — otherwise it silently starts tracking the global matrix the
+    next time an operator edits it (SYM-195 review)."""
+    body = f"""
+roles:
+  implement:
+    model: sonnet
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+    roles:
+      implement:
+        model: sonnet
+{_STATES}
+"""
+    conn, _result, rows, _g = await _import(tmp_path, body)
+    assert rows[0].payload["roles"] == {"implement": {"model": "sonnet"}}
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_round_trip_export_restore(tmp_path: Path) -> None:
+    """export (restore) → import (replace) reproduces the DB config exactly,
+    including a disabled binding, priorities, and the global roles matrix."""
+    from symphony.config_export import export_config
+
+    body = f"""
+roles:
+  review_find:
+    agent: codex
+    model: gpt-5.1-codex-max
+repos:
+  - linear_team_key: WEB
+    github_repo: org/web
+    max_concurrent: 4
+{_STATES}
+  - linear_team_key: ENG
+    github_repo: org/api
+    enabled: false
+{_STATES}
+"""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    path = _write(tmp_path, body)
+    await import_config(path, conn, now="t1")
+    before = await db.config_bindings.list_all(conn)
+    before_globals = await db.config_globals.get(conn)
+
+    rows = await db.config_bindings.list_all(conn)
+    yaml_text = export_config(
+        rows,
+        before_globals.roles if before_globals else {},
+        set(),
+        mode="restore",
+    )
+    export_path = tmp_path / "export.yaml"
+    export_path.write_text(yaml_text)
+    await import_config(export_path, conn, replace=True, now="t2")
+
+    after = await db.config_bindings.list_all(conn)
+    after_globals = await db.config_globals.get(conn)
+    assert [(r.project_key, r.payload, r.enabled, r.priority) for r in after] == [
+        (r.project_key, r.payload, r.enabled, r.priority) for r in before
+    ]
+    assert after_globals.roles == before_globals.roles  # type: ignore[union-attr]
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_import_skips_webhook_secret_placeholder(tmp_path: Path) -> None:
+    """An un-edited restore export carries the export placeholder, not a real
+    secret — importing it must not persist the placeholder as a real webhook
+    secret (SYM-195)."""
+    from symphony.config_export import WEBHOOK_SECRET_PLACEHOLDER
+
+    conn, _result, _rows, _globals_row = await _import(
+        tmp_path,
+        f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+    webhook_secret: {WEBHOOK_SECRET_PLACEHOLDER}
+{_STATES}
+""",
+    )
+    secret = await db.config_repo_secrets.get(conn, "org/api")
+    assert secret is None
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_import_rejects_redacted_mcp_placeholder(tmp_path: Path) -> None:
+    """An un-edited restore export carries `true` in place of an `mcp_servers`
+    env/headers credential — unlike `webhook_secret`, there's no field to
+    skip, so the importer must refuse rather than install the literal `True`
+    as a broken credential (SYM-195 review)."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    path = _write(
+        tmp_path,
+        f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+    mcp_servers:
+      supabase:
+        command: npx
+        env:
+          API_KEY: true
+{_STATES}
+""",
+    )
+    with pytest.raises(ConfigImportError, match="mcp_servers.supabase.env.API_KEY"):
+        await import_config(path, conn, now="t1")
+    assert await db.config_bindings.count(conn) == 0
     await conn.close()
 
 

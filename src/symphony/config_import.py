@@ -17,6 +17,7 @@ Payloads are sparse and legacy-free by construction.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -34,6 +35,8 @@ from .config import (
     Secrets,
     binding_natural_key,
 )
+from .config_export import MCP_SECRET_SUBFIELDS, WEBHOOK_SECRET_PLACEHOLDER
+from .db.runs import LIVE_STATUSES
 
 _ALL_ROLES: tuple[RoleName, ...] = (
     "implement",
@@ -52,6 +55,163 @@ class ConfigImportError(RuntimeError):
 class ImportResult:
     bindings: int
     replaced: bool
+    runs_backfilled: int = 0
+    prs_backfilled: int = 0
+
+
+def _storage_key(binding: RepoBinding) -> str:
+    """The binding's natural key as the JSON string runs/PRs are stamped with
+    (`_binding_storage_key`) — same components, same order, same compact
+    separators."""
+    return json.dumps(list(binding_natural_key(binding)), separators=(",", ":"))
+
+
+def _candidates(
+    bindings: list[RepoBinding],
+    *,
+    team: str,
+    provider: str,
+    site: str,
+    repo: str | None,
+) -> list[RepoBinding]:
+    """Bindings that could own an issue in `team`/`provider`/`site` (and `repo`
+    when known). More than one means the row is ambiguous — the label that
+    would disambiguate is not recoverable from the run/PR row, and the issue's
+    current tracker labels are mutable, so it is never guessed."""
+    out: list[RepoBinding] = []
+    for b in bindings:
+        if b.project_key != team or b.tracker_provider != provider or b.tracker_site != site:
+            continue
+        if repo is not None and b.github_repo != repo:
+            continue
+        out.append(b)
+    return out
+
+
+def _resolve_binding(
+    candidates: list[RepoBinding],
+    mapping: dict[str, Any],
+    identifier: str,
+) -> RepoBinding | None:
+    """The binding to stamp a row with: the sole candidate when unambiguous, or
+    the operator's explicit `issue→natural-key` mapping entry otherwise — the
+    mapping entry must itself be one of `candidates` (a natural key for some
+    other team/provider/site/repo is a stale or mistyped entry, not a
+    disambiguation of *this* row, so it's rejected rather than trusted).
+    Returns `None` when the row can't be attributed without guessing."""
+    if len(candidates) == 1:
+        return candidates[0]
+    target = mapping.get(identifier)
+    if target is not None:
+        want = tuple(target)
+        for b in candidates:
+            if binding_natural_key(b) == want:
+                return b
+    return None
+
+
+async def _issue_repo(conn: aiosqlite.Connection, issue_id: str) -> str | None:
+    """The single GitHub repo an issue has a currently-open PR in, or `None`
+    when there is none or more than one (leaving the repo dimension
+    unconstrained). Merged PRs are excluded — an issue reopened for a new run
+    in a different repo would otherwise resolve to its old, no-longer-current
+    repo (SYM-195 review)."""
+    cur = await conn.execute(
+        "SELECT DISTINCT github_repo FROM issue_prs WHERE issue_id = ? AND merged_at IS NULL",
+        (issue_id,),
+    )
+    repos = [str(row[0]) for row in await cur.fetchall()]
+    return repos[0] if len(repos) == 1 else None
+
+
+async def _backfill_binding_keys(
+    conn: aiosqlite.Connection,
+    bindings: list[RepoBinding],
+    *,
+    issue_bindings: dict[str, Any] | None,
+) -> tuple[int, int]:
+    """Stamp the dispatched binding key onto still-active run rows AND open-PR
+    rows that carry an empty binding key (older-schema rows recovered only by
+    team+repo, ambiguous once a repo has multiple label/catch-all bindings).
+
+    Automatic only when unambiguous (one candidate binding). Ambiguous rows are
+    never guessed from the issue's mutable tracker labels — a wrong key would
+    let the real binding be deleted or route follow-ups to the wrong repo.
+    Instead the importer refuses the cutover, listing the unattributable rows,
+    unless the operator supplies an explicit `issue→binding` mapping (or drains
+    them first). Runs inside the import transaction, so a refusal rolls the
+    whole cutover back."""
+    mapping = issue_bindings or {}
+    refused: list[str] = []
+    runs_done = 0
+    prs_done = 0
+
+    placeholders = ",".join("?" * len(LIVE_STATUSES))
+    cur = await conn.execute(
+        f"""
+        SELECT r.id AS run_id, r.issue_id AS issue_id, i.identifier AS identifier,
+               i.team_key AS team_key, i.provider AS provider, i.site AS site
+          FROM runs r
+          JOIN issues i ON i.id = r.issue_id
+         WHERE r.binding_key = '' AND r.status IN ({placeholders})
+        """,
+        LIVE_STATUSES,
+    )
+    for row in await cur.fetchall():
+        repo = await _issue_repo(conn, str(row["issue_id"]))
+        cands = _candidates(
+            bindings,
+            team=str(row["team_key"]),
+            provider=str(row["provider"]),
+            site=str(row["site"]),
+            repo=repo,
+        )
+        binding = _resolve_binding(cands, mapping, str(row["identifier"]))
+        if binding is None:
+            refused.append(f"run {row['issue_id']} ({row['identifier']})")
+            continue
+        await conn.execute(
+            "UPDATE runs SET binding_key = ? WHERE id = ? AND binding_key = ''",
+            (_storage_key(binding), row["run_id"]),
+        )
+        runs_done += 1
+
+    cur = await conn.execute(
+        """
+        SELECT p.issue_id AS issue_id, p.github_repo AS github_repo,
+               i.identifier AS identifier, i.team_key AS team_key,
+               i.provider AS provider, i.site AS site
+          FROM issue_prs p
+          JOIN issues i ON i.id = p.issue_id
+         WHERE p.binding_key = '' AND p.merged_at IS NULL
+        """
+    )
+    for row in await cur.fetchall():
+        cands = _candidates(
+            bindings,
+            team=str(row["team_key"]),
+            provider=str(row["provider"]),
+            site=str(row["site"]),
+            repo=str(row["github_repo"]),
+        )
+        binding = _resolve_binding(cands, mapping, str(row["identifier"]))
+        if binding is None:
+            refused.append(f"PR {row['issue_id']} @ {row['github_repo']} ({row['identifier']})")
+            continue
+        await conn.execute(
+            "UPDATE issue_prs SET binding_key = ? WHERE issue_id = ? AND github_repo = ? "
+            "AND binding_key = ''",
+            (_storage_key(binding), row["issue_id"], row["github_repo"]),
+        )
+        prs_done += 1
+
+    if refused:
+        raise ConfigImportError(
+            "cannot attribute in-flight work to a single binding (ambiguous or "
+            "unmatched): " + "; ".join(sorted(refused)) + ". Drain these rows "
+            "first, or pass an explicit issue→binding mapping."
+        )
+    return runs_done, prs_done
 
 
 def normalize_claude_model(model: str | None) -> str | None:
@@ -91,6 +251,7 @@ def _baseline_model(
 
 
 def _sparse_matrix(
+    explicit: dict[str, Any],
     operator: RepoBinding,
     base: RepoBinding,
     global_roles: dict[RoleName, RoleConfig],
@@ -99,9 +260,20 @@ def _sparse_matrix(
     roles and the legacy/matrix-free baseline. A cell is emitted only when the
     operator's config actually moved it off the value the reloaded binding
     would otherwise resolve to; equal cells stay absent (true inherit), keeping
-    the payload sparse and the binding open to future global edits."""
+    the payload sparse and the binding open to future global edits.
+
+    A role already present in `explicit` (the YAML's own `roles:` block, e.g.
+    round-tripped from a restore export) is kept verbatim instead: it's an
+    intentional pin, not a legacy-field artifact, so comparing it against the
+    baseline and dropping it when it happens to equal the current global cell
+    would silently start tracking future global edits instead of staying
+    pinned (SYM-195 review). Only roles absent from `explicit` — i.e. reached
+    solely through legacy top-level fields — go through the comparison."""
     matrix: dict[str, dict[str, Any]] = {}
     for name in _ALL_ROLES:
+        if name in explicit:
+            matrix[name] = explicit[name]
+            continue
         op = operator.resolved_role(name, global_roles)
         baseline = base.resolved_role(name, global_roles)
         cell: dict[str, Any] = {}
@@ -140,7 +312,9 @@ def build_payload(
         # the payload never re-fires the field's deprecation warning on load.
         payload.setdefault("local_review", operator.local_review)
         payload.setdefault("remote_review", operator.remote_review)
-    matrix = _sparse_matrix(operator, _base_binding(raw_repo), global_roles)
+    matrix = _sparse_matrix(
+        raw_repo.get("roles") or {}, operator, _base_binding(raw_repo), global_roles
+    )
     if matrix:
         payload["roles"] = matrix
     return payload
@@ -154,6 +328,33 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     return yaml.safe_load(path.read_text()) or {}
 
 
+def _redacted_mcp_paths(raw_repo: dict[str, Any]) -> list[str]:
+    """Dotted `mcp_servers.<server>.<env|headers>.<key>` paths in `raw_repo`
+    still carrying the exported `true` redaction marker rather than a real
+    value. Unlike `webhook_secret` (a named field the importer can skip),
+    `mcp_servers` values are opaque JSON handed straight to the CLI
+    subprocess — storing the literal `True` would silently install a broken
+    credential instead of failing loudly, so these are refused rather than
+    skipped."""
+    mcp_servers = raw_repo.get("mcp_servers")
+    if not isinstance(mcp_servers, dict):
+        return []
+    paths: list[str] = []
+    for server_name, entry in mcp_servers.items():
+        if not isinstance(entry, dict):
+            continue
+        for sub in MCP_SECRET_SUBFIELDS:
+            sub_value = entry.get(sub)
+            if not isinstance(sub_value, dict):
+                continue
+            paths.extend(
+                f"mcp_servers.{server_name}.{sub}.{key}"
+                for key, value in sub_value.items()
+                if value is True
+            )
+    return paths
+
+
 async def import_config(
     path: Path,
     conn: aiosqlite.Connection,
@@ -161,6 +362,7 @@ async def import_config(
     replace: bool = False,
     updated_by: str = "importer",
     now: str = "",
+    issue_bindings: dict[str, Any] | None = None,
 ) -> ImportResult:
     """Import `path`'s YAML topology into the DB. Idempotency is guarded: a
     second import without `replace=True` raises `ConfigImportError`."""
@@ -184,6 +386,22 @@ async def import_config(
     # *key names*, not values.
     cfg = Config.model_validate(raw)
     raw_repos: list[dict[str, Any]] = list(raw.get("repos", []) or [])
+
+    # An un-edited restore export carries `true` placeholders in place of
+    # mcp_servers env/headers credential values; refuse rather than install
+    # them literally (SYM-195 review — mirrors the webhook-secret skip above,
+    # but as a refusal since there's no field to omit here).
+    redacted = {
+        f"{raw_repo.get('project_key')}/{raw_repo.get('github_repo')}": paths
+        for raw_repo in raw_repos
+        if (paths := _redacted_mcp_paths(raw_repo))
+    }
+    if redacted:
+        detail = "; ".join(f"{binding}: {', '.join(paths)}" for binding, paths in redacted.items())
+        raise ConfigImportError(
+            "refusing to import redacted mcp_servers credential placeholder(s) "
+            "— re-enter the real value by hand before restoring: " + detail
+        )
     # `model_validate` derives `tracker_site` with no global `jira_base_url`,
     # so a Jira binding relying on that global (no per-binding `base_url`)
     # would key on the "default" placeholder instead of the site it actually
@@ -221,7 +439,10 @@ async def import_config(
         # (last non-empty wins); the value never re-enters a binding payload.
         repo_secrets: dict[str, str] = {}
         for binding in cfg.repos:
-            if binding.webhook_secret:
+            # An un-edited restore export carries the export placeholder, not a
+            # real secret — skip it so verification stays cleanly unset (and
+            # fails loudly) rather than trusting a bogus value (SYM-195).
+            if binding.webhook_secret and binding.webhook_secret != WEBHOOK_SECRET_PLACEHOLDER:
                 repo_secrets[binding.github_repo] = binding.webhook_secret
         for github_repo, secret in repo_secrets.items():
             await db.config_repo_secrets.set_secret(
@@ -241,8 +462,21 @@ async def import_config(
             version=1,
             commit=False,
         )
+
+        # Cutover backfill: stamp the dispatched binding key onto still-active
+        # runs and open PRs so the drain guard and follow-up pollers can
+        # attribute them. Refuses (rolling back the whole import) on any row it
+        # can't attribute without guessing (SYM-195).
+        runs_done, prs_done = await _backfill_binding_keys(
+            conn, list(cfg.repos), issue_bindings=issue_bindings
+        )
     except Exception:
         await conn.rollback()
         raise
     await conn.commit()
-    return ImportResult(bindings=len(cfg.repos), replaced=replace)
+    return ImportResult(
+        bindings=len(cfg.repos),
+        replaced=replace,
+        runs_backfilled=runs_done,
+        prs_backfilled=prs_done,
+    )

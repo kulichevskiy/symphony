@@ -511,13 +511,40 @@ async def _run(config_path: Path, *, once: bool) -> None:
     is_flag=True,
     help="Overwrite existing bindings (restore path). Without it, a second import is refused.",
 )
-def config_import_cmd(config_path: Path, replace: bool) -> None:
+@click.option(
+    "--issue-bindings",
+    "issue_bindings_path",
+    type=click.Path(path_type=Path, exists=True, dir_okay=False),
+    default=None,
+    help=(
+        "JSON file mapping issue identifier → binding natural key "
+        "([project_key, github_repo, issue_label, provider, site]) to attribute "
+        "in-flight work the importer can't disambiguate automatically."
+    ),
+)
+def config_import_cmd(config_path: Path, replace: bool, issue_bindings_path: Path | None) -> None:
     """One-off: import YAML repo bindings + roles matrix into the config DB."""
+    import json
+
     _setup_logging()
-    asyncio.run(_config_import(config_path, replace=replace))
+    issue_bindings = None
+    if issue_bindings_path is not None:
+        try:
+            issue_bindings = json.loads(issue_bindings_path.read_text())
+        except json.JSONDecodeError as e:
+            click.echo(f"invalid --issue-bindings JSON: {e}", err=True)
+            sys.exit(2)
+        if not isinstance(issue_bindings, dict):
+            click.echo(
+                "--issue-bindings must be a JSON object mapping identifier -> binding key", err=True
+            )
+            sys.exit(2)
+    asyncio.run(_config_import(config_path, replace=replace, issue_bindings=issue_bindings))
 
 
-async def _config_import(config_path: Path, *, replace: bool) -> None:
+async def _config_import(
+    config_path: Path, *, replace: bool, issue_bindings: dict[str, Any] | None = None
+) -> None:
     from datetime import UTC, datetime
 
     from .config_import import ConfigImportError, import_config
@@ -528,7 +555,9 @@ async def _config_import(config_path: Path, *, replace: bool) -> None:
     conn = await db.connect(db_path)
     try:
         now = datetime.now(UTC).isoformat()
-        result = await import_config(config_path, conn, replace=replace, now=now)
+        result = await import_config(
+            config_path, conn, replace=replace, now=now, issue_bindings=issue_bindings
+        )
     except ConfigImportError as e:
         click.echo(str(e), err=True)
         sys.exit(2)
@@ -536,6 +565,11 @@ async def _config_import(config_path: Path, *, replace: bool) -> None:
         await conn.close()
     verb = "replaced" if result.replaced else "imported"
     click.echo(f"{verb} {result.bindings} binding(s) into {db_path}")
+    if result.runs_backfilled or result.prs_backfilled:
+        click.echo(
+            f"backfilled binding keys onto {result.runs_backfilled} run(s) "
+            f"and {result.prs_backfilled} open PR(s)"
+        )
 
 
 @main.command()

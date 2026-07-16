@@ -75,7 +75,7 @@ from datetime import UTC, datetime
 from typing import Any, get_args
 
 import aiosqlite
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from ..agent.claude_models import _resolve_alias_model_id, fetch_claude_effort_capabilities
@@ -91,6 +91,12 @@ from ..config import (
     _synthetic_matrix_validation_binding,
     binding_natural_key,
 )
+from ..config_export import (
+    MCP_SECRET_SUBFIELDS,
+    ExportMode,
+    export_config,
+)
+from ..config_export import redact_mcp_servers as _redact_mcp_servers
 from ..db import (
     config_bindings,
     config_globals,
@@ -107,10 +113,6 @@ _log = logging.getLogger(__name__)
 
 # Fields whose *values* must never leave the process or reach the daemon log.
 _SECRET_FIELDS = frozenset({"webhook_secret"})
-
-# Sub-fields of an `mcp_servers` entry that may carry literal credential
-# material: a stdio server's `env`, or an http/sse server's auth `headers`.
-_MCP_SECRET_SUBFIELDS = frozenset({"env", "headers"})
 
 # Control keys owned by dedicated columns, never part of the sparse payload.
 _CONTROL_KEYS = frozenset({"enabled", "priority", "version", "id"})
@@ -175,24 +177,6 @@ def _sanitize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in payload.items() if k not in _CONTROL_KEYS}
 
 
-def _redact_mcp_servers(mcp_servers: dict[str, Any]) -> dict[str, Any]:
-    """Replace each server's secret-bearing sub-field values with `True` (key
-    names only, never values) so a GET response — or the daemon log — never
-    carries a literal `mcp_servers` credential."""
-    redacted: dict[str, Any] = {}
-    for name, entry in mcp_servers.items():
-        if not isinstance(entry, dict):
-            redacted[name] = entry
-            continue
-        out = dict(entry)
-        for sub in _MCP_SECRET_SUBFIELDS:
-            sub_value = out.get(sub)
-            if isinstance(sub_value, dict):
-                out[sub] = {k: True for k in sub_value}
-        redacted[name] = out
-    return redacted
-
-
 def _restore_mcp_secrets(old_servers: Any, new_servers: dict[str, Any]) -> dict[str, Any]:
     """Undo `_redact_mcp_servers` on write: a sub-field value of exactly
     `True` means the operator round-tripped the redacted GET payload
@@ -208,7 +192,7 @@ def _restore_mcp_secrets(old_servers: Any, new_servers: dict[str, Any]) -> dict[
         old_entry = old_servers.get(name)
         old_entry = old_entry if isinstance(old_entry, dict) else {}
         out = dict(entry)
-        for sub in _MCP_SECRET_SUBFIELDS:
+        for sub in MCP_SECRET_SUBFIELDS:
             sub_value = out.get(sub)
             if not isinstance(sub_value, dict):
                 continue
@@ -970,6 +954,39 @@ def create_config_crud_router(
             # sets a per-binding `webhook_secret`.
             "github_webhook_secret_configured": bool(_base_config().github_webhook_secret),
         }
+
+    @router.get("/export")
+    async def export_bindings(mode: str = Query("restore")) -> Response:
+        """YAML backup of every binding + the global roles matrix (SYM-195).
+        ``restore`` (default) round-trips through the import script in replace
+        mode; ``downgrade`` is a paste-back section for a pre-DB build (disabled
+        bindings commented out). Webhook secret *values* never appear — a repo
+        with a secret gets an explicit placeholder to re-enter by hand."""
+        if mode not in get_args(ExportMode):
+            raise _validation_error(
+                ["mode"], f"mode must be one of {', '.join(get_args(ExportMode))}"
+            )
+        conn = await conn_provider()
+        # Shares `conn` with the write routes below, which run their read +
+        # write statements inside `lock` as one transaction; without the same
+        # lock here, the three reads below could interleave with a concurrent
+        # write's uncommitted statements on that connection and export a
+        # torn mix of old bindings/globals/secrets (SYM-195 review).
+        async with lock:
+            rows = await config_bindings.list_all(conn)
+            globals_row = await config_globals.get(conn)
+            global_roles = globals_row.roles if globals_row is not None else {}
+            repos_with_secrets = {
+                s.github_repo for s in await config_repo_secrets.list_all(conn) if s.secret
+            }
+        text = export_config(
+            rows,
+            global_roles,
+            repos_with_secrets,
+            mode=mode,  # type: ignore[arg-type]
+            db_path=_base_config().db_path,
+        )
+        return Response(content=text, media_type="application/x-yaml")
 
     @router.get("/roles")
     async def get_roles() -> dict[str, Any]:

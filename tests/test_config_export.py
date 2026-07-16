@@ -1,0 +1,134 @@
+"""Unit tests for `config_export` (SYM-195 review fixes).
+
+Covers the reviewer findings from the second pass: MCP credential redaction,
+and a valid-and-uncommentable `repos:` shape when every downgrade-mode binding
+is disabled.
+"""
+
+from __future__ import annotations
+
+import yaml
+
+from symphony.config_export import export_config
+from symphony.db.config_bindings import StoredBinding
+
+
+def _row(*, payload: dict, enabled: bool = True, priority: int = 0, **kw) -> StoredBinding:
+    defaults = dict(
+        id=1,
+        version=1,
+        enabled=enabled,
+        priority=priority,
+        updated_at="",
+        updated_by="",
+        project_key="ENG",
+        github_repo="org/api",
+        issue_label="",
+        tracker_provider="linear",
+        tracker_site="default",
+    )
+    defaults.update(kw)
+    return StoredBinding(payload=payload, **defaults)
+
+
+def test_export_redacts_mcp_credentials() -> None:
+    """A binding's `mcp_servers` `env`/`headers` credentials must never appear
+    in the exported YAML — only a per-key `true` marker (SYM-195 review)."""
+    row = _row(
+        payload={
+            "mcp_servers": {
+                "supabase": {
+                    "command": "npx",
+                    "env": {"API_KEY": "literal-secret-value"},
+                    "headers": {"Authorization": "Bearer literal-token"},
+                }
+            }
+        }
+    )
+    for mode in ("restore", "downgrade"):
+        text = export_config([row], {}, set(), mode=mode)
+        assert "literal-secret-value" not in text
+        assert "literal-token" not in text
+        doc = yaml.safe_load(text)
+        server = doc["repos"][0]["mcp_servers"]["supabase"]
+        assert server["env"] == {"API_KEY": True}
+        assert server["headers"] == {"Authorization": True}
+
+
+def test_downgrade_all_disabled_repos_parses_empty_and_is_uncommentable() -> None:
+    """When every binding is disabled in downgrade mode, the exported
+    `repos:` must still parse as an empty list as-is, and uncommenting a
+    single disabled entry must still produce valid YAML (SYM-195 review)."""
+    rows = [
+        _row(payload={"max_concurrent": 4}, enabled=False, priority=0, github_repo="org/api"),
+        _row(payload={"issue_label": "urgent"}, enabled=False, priority=1, github_repo="org/web"),
+    ]
+    text = export_config(rows, {}, set(), mode="downgrade")
+    doc = yaml.safe_load(text)
+    assert doc["repos"] == []
+
+    lines = text.splitlines()
+    start = lines.index("repos: [")
+    end = lines.index("]", start)
+    commented = lines[start + 1 : end]
+    assert len(commented) == 2
+    assert all(ln.startswith("#") for ln in commented)
+
+    # Uncommenting exactly one entry must still parse, with only that binding live.
+    uncommented = commented[0].lstrip("#")
+    edited = lines[: start + 1] + [uncommented, commented[1]] + lines[end:]
+    doc2 = yaml.safe_load("\n".join(edited))
+    assert len(doc2["repos"]) == 1
+    assert doc2["repos"][0]["max_concurrent"] == 4
+
+
+def test_export_stamps_resolved_tracker_site_for_global_jira_url() -> None:
+    """A Jira binding with no explicit per-binding `base_url` has its
+    `tracker_site` resolved from the global `JIRA_BASE_URL` at write time —
+    the export must carry that resolved value explicitly, or a later restore
+    would re-derive it from whatever `JIRA_BASE_URL` happens to be set at
+    import time and land on a different natural key (SYM-195 review)."""
+    row = _row(
+        payload={"provider": "jira"},
+        tracker_provider="jira",
+        tracker_site="https://mycompany.atlassian.net",
+    )
+    for mode in ("restore", "downgrade"):
+        doc = yaml.safe_load(export_config([row], {}, set(), mode=mode))
+        assert doc["repos"][0]["tracker_site"] == "https://mycompany.atlassian.net"
+
+
+def test_export_omits_tracker_site_when_base_url_explicit() -> None:
+    """A Jira binding with an explicit per-binding `base_url` already
+    round-trips its site through that field — no redundant `tracker_site`
+    stamp needed."""
+    row = _row(
+        payload={"provider": "jira", "base_url": "https://other.atlassian.net"},
+        tracker_provider="jira",
+        tracker_site="https://other.atlassian.net",
+    )
+    doc = yaml.safe_load(export_config([row], {}, set(), mode="restore"))
+    assert "tracker_site" not in doc["repos"][0]
+
+
+def test_restore_export_stamps_db_path() -> None:
+    """Restore mode carries the install's actual `db_path` so `config-import`'s
+    `Config.peek_db_path` targets it even when the main config sets a
+    non-default path (SYM-195 review)."""
+    from pathlib import Path
+
+    row = _row(payload={"max_concurrent": 4})
+    text = export_config([row], {}, set(), mode="restore", db_path=Path("/custom/state.sqlite"))
+    doc = yaml.safe_load(text)
+    assert doc["db_path"] == "/custom/state.sqlite"
+
+
+def test_downgrade_export_omits_db_path() -> None:
+    """`db_path` has no meaning for a pre-DB build's `config.local.yaml`, so
+    downgrade mode never emits it even when passed one (SYM-195 review)."""
+    from pathlib import Path
+
+    row = _row(payload={"max_concurrent": 4})
+    text = export_config([row], {}, set(), mode="downgrade", db_path=Path("/custom/state.sqlite"))
+    doc = yaml.safe_load(text)
+    assert "db_path" not in doc
