@@ -114,6 +114,16 @@ class TrackerRegistry:
         risks reading (and later closing) a different context's tracker."""
         return self._trackers.get((ctx.provider, ctx.site, ctx.project_key))
 
+    def trackers_for_provider(self, provider: str) -> list[IssueTracker]:
+        """Every distinct registered tracker for *provider* (deduped by
+        identity — a single-tracker deployment registers the same client
+        under multiple contexts)."""
+        seen: list[IssueTracker] = []
+        for (registered_provider, _, _), tracker in self._trackers.items():
+            if registered_provider == provider and not any(tracker is t for t in seen):
+                seen.append(tracker)
+        return seen
+
     def has_tracker(self, tracker: IssueTracker) -> bool:
         """Whether `tracker` is still registered under any context, including
         ones registered directly (e.g. at boot) rather than tracked as a

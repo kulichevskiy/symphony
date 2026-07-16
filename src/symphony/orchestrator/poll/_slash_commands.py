@@ -611,7 +611,8 @@ class _SlashCommandsMixin(_OrchestratorBase):
             return
         tracker = self.tracker(binding)
         try:
-            await self._gh.pr_merge(
+            gh = await self._gh_client()
+            await gh.pr_merge(
                 pr.pr_number,
                 strategy=binding.merge_strategy,
                 auto=False,

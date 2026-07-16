@@ -84,6 +84,10 @@ def _make_orch(cfg: Config, linear: AsyncMock, conn: object) -> Orchestrator:
         workspace=workspace,
         push_fn=push_fn,
     )
+    # `_push_fn` on the orchestrator is now a DB-token-resolving wrapper
+    # around this mock (OAuth in UI 4/7 review fix) — tests that need to
+    # assert on push calls directly use this handle instead.
+    orch._push_fn_mock = push_fn  # type: ignore[attr-defined]  # noqa: SLF001
     orch._states = {  # noqa: SLF001
         "ENG": {
             "Todo": "state-todo",
@@ -1323,7 +1327,7 @@ async def test_review_failed_retry_skips_codex_when_remote_review_disabled(
 
         orch._gh.pr_comment.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
         orch._run_local_review_phase.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
-        orch._push_fn.assert_awaited_once_with(  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._push_fn_mock.assert_awaited_once_with(  # type: ignore[attr-defined]  # noqa: SLF001
             Path("/dev/null"), "symphony/eng-1"
         )
         # The monitor restarts only after the local reviewer approves.
@@ -1355,7 +1359,9 @@ async def test_review_failed_retry_reparks_when_local_only_push_fails(
         orch = _make_orch(cfg, linear, conn)
         orch._gh.pr_comment = AsyncMock()  # type: ignore[attr-defined]  # noqa: SLF001
         orch._schedule_review_poll = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
-        orch._push_fn.side_effect = RuntimeError("non-fast-forward")  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._push_fn_mock.side_effect = RuntimeError(  # type: ignore[attr-defined]  # noqa: SLF001
+            "non-fast-forward"
+        )
         orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
             return_value=LoopResult(
                 outcome=LoopOutcome.APPROVED,
@@ -1377,7 +1383,7 @@ async def test_review_failed_retry_reparks_when_local_only_push_fails(
         )
 
         orch._gh.pr_comment.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
-        orch._push_fn.assert_awaited_once_with(  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._push_fn_mock.assert_awaited_once_with(  # type: ignore[attr-defined]  # noqa: SLF001
             Path("/dev/null"), "symphony/eng-1"
         )
         orch._schedule_review_poll.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
@@ -1429,7 +1435,7 @@ async def test_review_failed_retry_reparks_when_local_only_review_fails(
 
         orch._gh.pr_comment.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
         orch._run_local_review_phase.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
-        orch._push_fn.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch._push_fn_mock.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
         orch._schedule_review_poll.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is not None

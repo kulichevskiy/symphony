@@ -44,19 +44,27 @@ async def _configure_git_push_auth(workspace_path: Path, token: str) -> None:
 
 
 async def _clear_git_push_auth(workspace_path: Path) -> None:
-    """Best-effort removal of the push-auth header set by `_configure_git_push_auth`."""
-    proc = await asyncio.create_subprocess_exec(
-        "git",
-        "config",
-        "--local",
-        "--unset-all",
-        _PUSH_AUTH_CONFIG_KEY,
-        cwd=str(workspace_path),
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-        stdin=asyncio.subprocess.DEVNULL,
-    )
-    await proc.communicate()
+    """Best-effort removal of the push-auth header set by `_configure_git_push_auth`.
+
+    Called unconditionally before every push (OAuth in UI 4/7 review fix), so
+    a workspace that doesn't exist yet (or any other OS-level failure
+    starting `git`) must not raise — there is no header to clear either way.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "config",
+            "--local",
+            "--unset-all",
+            _PUSH_AUTH_CONFIG_KEY,
+            cwd=str(workspace_path),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+        await proc.communicate()
+    except OSError:
+        pass
 
 
 async def _default_push(workspace_path: Path, branch: str) -> None:

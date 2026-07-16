@@ -443,7 +443,8 @@ class _DispatchMixin(_OrchestratorBase):
             return pr, False
 
         try:
-            view = await self._gh.pr_view(pr.pr_number, repo=binding.github_repo)
+            gh = await self._gh_client()
+            view = await gh.pr_view(pr.pr_number, repo=binding.github_repo)
         except GitHubError as e:
             log.warning(
                 "could not verify existing PR before ready dispatch for %s#%d: %s",

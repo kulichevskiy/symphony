@@ -89,6 +89,8 @@ from ...workspace import Workspace
 from ..reconciler import Reconciler
 from ._git import (
     _branch_ahead_of_base,
+    _clear_git_push_auth,
+    _configure_git_push_auth,
     _default_force_push,
     _default_push,
     _git_status_short,
@@ -304,6 +306,7 @@ class _OrchestratorBase:
     _binding_keys: frozenset[BindingKey] | None
     _stale_tracker_contexts: set[TrackerContext]
     _hot_added_trackers: dict[TrackerContext, IssueTracker]
+    _applied_linear_token: str | None
     _conn: aiosqlite.Connection
     _shutdown: asyncio.Event
     _wake: asyncio.Event
@@ -450,13 +453,23 @@ class _OrchestratorBase:
         self._credential_resolver = CredentialResolver(
             conn, CredentialCipher(config.symphony_encryption_key)
         )
+        # Last Linear token applied to registered trackers via
+        # `_refresh_linear_tracker_credentials`, so a tick only touches the
+        # client's header when the DB token actually changed.
+        self._applied_linear_token: str | None = None
         self._workspace: Workspace = (
             workspace
             if workspace is not None
             else Workspace(root=config.workspace_root, clone_fn=self._gh.repo_clone)
         )
-        self._push_fn: PushFn = push_fn if push_fn is not None else _default_push
-        self._force_push_fn: PushFn = (
+        # Wrapped so every push call site — delivery, review re-push,
+        # force-push, merge/acceptance push — resolves the DB token and
+        # configures/clears push auth consistently, instead of only the
+        # delivery call site doing it by hand (OAuth in UI 4/7 review fix).
+        self._push_fn: PushFn = self._wrap_push_with_auth(
+            push_fn if push_fn is not None else _default_push
+        )
+        self._force_push_fn: PushFn = self._wrap_push_with_auth(
             force_push_fn if force_push_fn is not None else _default_force_push
         )
         self._clock = clock
@@ -1026,6 +1039,10 @@ class _OrchestratorBase:
         # hot-added binding's tracker is registered before `_scan_binding`
         # resolves it.
         await self._react_to_binding_set()
+        try:
+            await self._refresh_linear_tracker_credentials()
+        except Exception:  # noqa: BLE001 — must not kill the loop
+            log.exception("Linear tracker credential refresh failed")
         await self._restore_operator_waits()
         self._merged_linear_state_reconcile_ticks += 1
         if (
@@ -2399,7 +2416,8 @@ class _OrchestratorBase:
         pr_number: int,
     ) -> None:
         try:
-            await self._gh.pr_comment(
+            gh = await self._gh_client()
+            await gh.pr_comment(
                 pr_number,
                 "@codex review",
                 repo=binding.github_repo,
@@ -2706,6 +2724,41 @@ class _OrchestratorBase:
         )
         return cumulative_usage, final_kind, final_returncode, role
 
+    def _wrap_push_with_auth(self, push_fn: PushFn) -> PushFn:
+        """Wrap *push_fn* so every push resolves the DB token and manages
+        the workspace's push-auth header itself.
+
+        The header is cleared unconditionally before every push attempt —
+        not just when a new token is configured — so a header left behind
+        by a killed prior run (or a run that resolved no DB token this time)
+        can never be silently reused (OAuth in UI 4/7 review fix).
+        """
+
+        async def _push(workspace_path: Path, branch: str) -> None:
+            github_token = await self._resolve_github_token()
+            await _clear_git_push_auth(workspace_path)
+            if github_token:
+                await _configure_git_push_auth(workspace_path, github_token)
+            try:
+                await push_fn(workspace_path, branch)
+            finally:
+                if github_token:
+                    await _clear_git_push_auth(workspace_path)
+
+        return _push
+
+    async def _gh_client(self) -> GitHubClient:
+        """A GitHub client using the DB-resolved token when available.
+
+        Every `self._gh_client()` call site (pushes aside — those go through
+        `_push_fn`/`_force_push_fn`) resolves the same DB-first token as
+        delivery, so merge/comment/view/checks calls stay consistent with
+        the push+PR the DB token already made (OAuth in UI 4/7 review fix).
+        Falls back to the ambient `self._gh` when no DB connection exists.
+        """
+        github_token = await self._resolve_github_token()
+        return GitHub(token=github_token) if github_token else self._gh
+
     async def _resolve_github_token(self) -> str | None:
         """The GitHub token to use for delivery (push + PR), DB-first.
 
@@ -2716,6 +2769,28 @@ class _OrchestratorBase:
         return await self._credential_resolver.resolve(
             "github", fallback=os.environ.get("GH_TOKEN")
         )
+
+    async def _refresh_linear_tracker_credentials(self) -> None:
+        """Point every registered Linear tracker at the DB-connected token.
+
+        Every Linear read/write goes through `self.tracker()`/`self.linear`,
+        which resolve a long-lived `LinearTracker` built once at boot/hot-add
+        time from the ambient `LINEAR_API_KEY` — so a DB Linear connection
+        made later in the UI never reached any actual Linear call (OAuth in
+        UI 4/7 review fix). Called once per tick: resolves DB-first, and only
+        touches the client header when the DB token actually changed, so a
+        provider with no DB connection (the resolver falls back to `None`
+        here — the tracker keeps its boot-time ambient key) costs one no-op
+        DB read per tick.
+        """
+        linear_token = await self._credential_resolver.resolve("linear", fallback=None)
+        if not linear_token or linear_token == self._applied_linear_token:
+            return
+        for tracker in self._trackers.trackers_for_provider("linear"):
+            set_api_key = getattr(tracker, "set_api_key", None)
+            if set_api_key is not None:
+                set_api_key(linear_token)
+        self._applied_linear_token = linear_token
 
     async def _resolve_run_credentials(self, binding: RepoBinding) -> RunCredentials:
         """Resolve the run's creds DB-first, honoring the per-binding model.

@@ -23,7 +23,7 @@ import aiosqlite
 
 from ... import db
 from ...config import RepoBinding, ResolvedRole
-from ...github.client import GitHub, GitHubError
+from ...github.client import GitHubError
 from ...linear.client import LinearError
 from ...linear.templates import (
     CommentVars,
@@ -54,8 +54,6 @@ from ._base import (
 )
 from ._git import (
     _branch_ahead_of_base,
-    _clear_git_push_auth,
-    _configure_git_push_auth,
     _git_status_short,
     _workspace_commits_ahead,
     _workspace_diff_size,
@@ -710,7 +708,8 @@ class _LifecycleMixin(_OrchestratorBase):
         if binding.base_branch is not None:
             return binding.base_branch
         try:
-            return await self._gh.repo_default_branch(binding.github_repo)
+            gh = await self._gh_client()
+            return await gh.repo_default_branch(binding.github_repo)
         except GitHubError as e:
             log.warning(
                 "repo_default_branch failed for %s; falling back to gh default: %s",
@@ -1210,17 +1209,12 @@ class _LifecycleMixin(_OrchestratorBase):
         # 5. Push branch, open PR, post stage-transition comment. The GitHub
         # token is resolved DB-first (OAuth in UI 4/7) so delivery uses the
         # connected UI credential instead of ambient `gh`/`git` auth once a
-        # binding's repo has a connected GitHub row.
-        github_token = await self._resolve_github_token()
-        gh = GitHub(token=github_token) if github_token else self._gh
+        # binding's repo has a connected GitHub row. `_push_fn` resolves and
+        # configures/clears the push-auth header itself; `_gh_client` resolves
+        # the same token for the PR API calls below.
+        gh = await self._gh_client()
         try:
-            if github_token:
-                await _configure_git_push_auth(workspace_path, github_token)
-            try:
-                await self._push_fn(workspace_path, branch)
-            finally:
-                if github_token:
-                    await _clear_git_push_auth(workspace_path)
+            await self._push_fn(workspace_path, branch)
         except Exception as e:  # noqa: BLE001
             log.warning("git push failed for %s: %s", issue.identifier, e)
             await self._park_deliver_failed(f"push failed: {e}", ctx=ctx, exc=e)
@@ -1462,7 +1456,8 @@ class _LifecycleMixin(_OrchestratorBase):
             base_branch = binding.base_branch
             if base_branch is None:
                 try:
-                    base_branch = await self._gh.repo_default_branch(binding.github_repo)
+                    gh = await self._gh_client()
+                    base_branch = await gh.repo_default_branch(binding.github_repo)
                 except GitHubError as e:
                     log.warning(
                         "repo_default_branch failed during local review on %s: %s; "
@@ -1713,7 +1708,8 @@ class _LifecycleMixin(_OrchestratorBase):
             f"- strategy: `{binding.review_strategy}`\n"
         )
         try:
-            await self._gh.pr_comment(pr_number, body, repo=binding.github_repo)
+            gh = await self._gh_client()
+            await gh.pr_comment(pr_number, body, repo=binding.github_repo)
         except GitHubError as e:
             log.warning(
                 "could not post local-review PR summary on %s#%d: %s",

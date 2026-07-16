@@ -735,6 +735,136 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
 
 
 @pytest.mark.asyncio
+async def test_red_ci_fix_run_repush_and_codex_reping_use_db_github_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OAuth in UI 4/7 acceptance: a review-fix re-push and its `@codex
+    review` re-ping both use the connected DB GitHub token, with no
+    `GH_TOKEN` in env and no ambient `gh` auth (review fix — push auth was
+    previously only wired for the first delivery push, and `self._gh` API
+    calls were never DB-token-aware at all)."""
+    from symphony.crypto import CredentialCipher
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.oauth_connections.set_connection(
+            conn,
+            provider="github",
+            credential="gho_db_secret",
+            cipher=CredentialCipher("enc-key"),
+        )
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding(agent="codex", codex_model="gpt-5.1-codex-max")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+            symphony_encryption_key="enc-key",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        advance_head(workspace_path)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        # Ambient `gh` — must never be called once a DB GitHub row is
+        # connected; any call on it fails the test loudly instead of
+        # silently using stale/ambient auth.
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(side_effect=AssertionError("ambient gh.pr_checks used"))
+        gh.pr_view = AsyncMock(side_effect=AssertionError("ambient gh.pr_view used"))
+        gh.pr_comment = AsyncMock(side_effect=AssertionError("ambient gh.pr_comment used"))
+
+        push_seen_auth: list[str] = []
+
+        async def _push_fn(path: Path, branch: str) -> None:
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "config",
+                "--local",
+                "--get",
+                "http.https://github.com/.extraheader",
+                cwd=path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _ = await proc.communicate()
+            push_seen_auth.append(stdout.decode().strip())
+
+        gh_ctor_calls: list[dict[str, object]] = []
+
+        class _RecordingGitHub:
+            def __init__(self, **kwargs: object) -> None:
+                gh_ctor_calls.append(kwargs)
+                self.pr_checks = AsyncMock(
+                    return_value=PRChecks(
+                        [
+                            CheckRun(
+                                name="lint",
+                                state="FAILURE",
+                                bucket="fail",
+                                link="https://github.com/org/repo/actions/runs/1/jobs/2",
+                            )
+                        ]
+                    )
+                )
+                self.pr_view = AsyncMock(
+                    return_value={"headRefOid": "head-sha", "mergeable": "MERGEABLE"}
+                )
+                self.check_log_tail = AsyncMock(return_value="ruff found a lint failure")
+                self.pr_comment = AsyncMock()
+                self.pr_issue_comments = AsyncMock(return_value=[])
+
+        monkeypatch.setattr("symphony.orchestrator.poll._base.GitHub", _RecordingGitHub)
+
+        runner = _FakeRunner(
+            [
+                RunnerEvent(kind="started", pid=999),
+                RunnerEvent(kind="exit", returncode=0),
+            ]
+        )
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=_push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _poll_review_and_wait(orch)
+
+        # The re-push happened while the workspace's local git config
+        # carried the DB token as a Basic auth header.
+        assert len(push_seen_auth) == 1
+        assert push_seen_auth[0]
+        import base64 as _b64
+
+        expected = _b64.b64encode(b"x-access-token:gho_db_secret").decode()
+        assert expected in push_seen_auth[0]
+
+        # `@codex review` re-ping and every other GitHub read/write in this
+        # run went through a client built with the DB token.
+        assert gh_ctor_calls
+        assert all(kwargs["token"] == "gho_db_secret" for kwargs in gh_ctor_calls)
+        gh.pr_checks.assert_not_awaited()
+        gh.pr_view.assert_not_awaited()
+        gh.pr_comment.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_red_ci_local_only_reruns_local_review_before_push(
     tmp_path: Path,
 ) -> None:

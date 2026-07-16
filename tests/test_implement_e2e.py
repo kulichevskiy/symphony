@@ -385,8 +385,9 @@ async def test_delivery_uses_db_github_token_for_push_and_pr(
                 gh_ctor_calls.append(kwargs)
                 self.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
                 self.pr_comment = AsyncMock()
+                self.repo_default_branch = AsyncMock(return_value="trunk")
 
-        monkeypatch.setattr("symphony.orchestrator.poll._lifecycle.GitHub", _RecordingGitHub)
+        monkeypatch.setattr("symphony.orchestrator.poll._base.GitHub", _RecordingGitHub)
 
         result_line = json.dumps(
             {
@@ -447,11 +448,14 @@ async def test_delivery_uses_db_github_token_for_push_and_pr(
         await post_push.communicate()
         assert post_push.returncode != 0
 
-        # PR was opened via a GitHub client constructed with the DB token —
-        # not the test's injected `gh` (which has no DB creds wired in).
-        assert len(gh_ctor_calls) == 1
-        assert gh_ctor_calls[0]["token"] == "gho_db_secret"
+        # Every GitHub API call during this run — base-branch lookup, PR
+        # open, review request — went through a client built with the DB
+        # token, not the test's injected `gh` (which has no DB creds wired
+        # in).
+        assert gh_ctor_calls
+        assert all(kwargs["token"] == "gho_db_secret" for kwargs in gh_ctor_calls)
         gh.ensure_pr.assert_not_awaited()
+        gh.repo_default_branch.assert_not_awaited()
     finally:
         await conn.close()
 
