@@ -518,7 +518,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
     default=None,
     help=(
         "JSON file mapping issue identifier → binding natural key "
-        '([project_key, github_repo, issue_label, provider, site]) to attribute '
+        "([project_key, github_repo, issue_label, provider, site]) to attribute "
         "in-flight work the importer can't disambiguate automatically."
     ),
 )
