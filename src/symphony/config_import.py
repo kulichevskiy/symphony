@@ -90,19 +90,21 @@ def _candidates(
 
 def _resolve_binding(
     candidates: list[RepoBinding],
-    bindings: list[RepoBinding],
     mapping: dict[str, Any],
     identifier: str,
 ) -> RepoBinding | None:
     """The binding to stamp a row with: the sole candidate when unambiguous, or
-    the operator's explicit `issue→natural-key` mapping entry otherwise.
+    the operator's explicit `issue→natural-key` mapping entry otherwise — the
+    mapping entry must itself be one of `candidates` (a natural key for some
+    other team/provider/site/repo is a stale or mistyped entry, not a
+    disambiguation of *this* row, so it's rejected rather than trusted).
     Returns `None` when the row can't be attributed without guessing."""
     if len(candidates) == 1:
         return candidates[0]
     target = mapping.get(identifier)
     if target is not None:
         want = tuple(target)
-        for b in bindings:
+        for b in candidates:
             if binding_natural_key(b) == want:
                 return b
     return None
@@ -160,7 +162,7 @@ async def _backfill_binding_keys(
             site=str(row["site"]),
             repo=repo,
         )
-        binding = _resolve_binding(cands, bindings, mapping, str(row["identifier"]))
+        binding = _resolve_binding(cands, mapping, str(row["identifier"]))
         if binding is None:
             refused.append(f"run {row['issue_id']} ({row['identifier']})")
             continue
@@ -188,7 +190,7 @@ async def _backfill_binding_keys(
             site=str(row["site"]),
             repo=str(row["github_repo"]),
         )
-        binding = _resolve_binding(cands, bindings, mapping, str(row["identifier"]))
+        binding = _resolve_binding(cands, mapping, str(row["identifier"]))
         if binding is None:
             refused.append(f"PR {row['issue_id']} @ {row['github_repo']} ({row['identifier']})")
             continue

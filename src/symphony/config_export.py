@@ -18,7 +18,11 @@ restore) and emit write-only webhook secrets as an explicit placeholder — neve
 the stored value (the no-secrets-in-responses contract holds everywhere). The
 affected bindings are marked and the operator re-enters each by hand. The
 importer treats the placeholder as absence, so an un-edited restore never
-installs a bogus secret (see ``config_import``).
+installs a bogus secret (see ``config_import``). ``mcp_servers`` entries carry
+their own literal credentials (a stdio server's ``env``, an http/sse server's
+auth ``headers``) with no such name-indirection — those are redacted to
+per-key ``true`` the same way the loaded-config read view redacts them (see
+``ui.config_crud``), and re-entered by hand the same way.
 """
 
 from __future__ import annotations
@@ -35,15 +39,44 @@ from .db.config_bindings import StoredBinding
 # fails verification loudly) instead of installing this literal string.
 WEBHOOK_SECRET_PLACEHOLDER = "__REPLACE_WITH_WEBHOOK_SECRET__"
 
+# Sub-fields of an `mcp_servers` entry that may carry literal credential
+# material: a stdio server's `env`, or an http/sse server's auth `headers`.
+# Shared with `ui.config_crud`, which redacts the same fields for `GET`
+# responses — one definition of "what counts as an mcp credential".
+MCP_SECRET_SUBFIELDS = frozenset({"env", "headers"})
+
 ExportMode = Literal["restore", "downgrade"]
+
+
+def redact_mcp_servers(mcp_servers: dict[str, Any]) -> dict[str, Any]:
+    """Replace each server's secret-bearing sub-field values with `True` (key
+    names only, never values) so an export — or a `GET` response — never
+    carries a literal `mcp_servers` credential."""
+    redacted: dict[str, Any] = {}
+    for name, entry in mcp_servers.items():
+        if not isinstance(entry, dict):
+            redacted[name] = entry
+            continue
+        out = dict(entry)
+        for sub in MCP_SECRET_SUBFIELDS:
+            sub_value = out.get(sub)
+            if isinstance(sub_value, dict):
+                out[sub] = {k: True for k in sub_value}
+        redacted[name] = out
+    return redacted
 
 
 def _binding_dict(row: StoredBinding, *, mode: ExportMode, needs_secret: bool) -> dict[str, Any]:
     """The YAML mapping for one binding: its sparse operator-set payload, plus
     an ``enabled: false`` flag (restore mode only — downgrade comments the whole
     binding out instead) and a webhook-secret placeholder when the repo has one
-    set."""
+    set. `mcp_servers` credentials (a stdio server's `env`, an http/sse
+    server's auth `headers`) are redacted the same way as the loaded-config
+    read view — never the stored value."""
     out: dict[str, Any] = dict(row.payload)
+    mcp_servers = out.get("mcp_servers")
+    if isinstance(mcp_servers, dict):
+        out["mcp_servers"] = redact_mcp_servers(mcp_servers)
     if mode == "restore" and not row.enabled:
         out["enabled"] = False
     if needs_secret:
@@ -62,12 +95,26 @@ def _binding_block(d: dict[str, Any], *, commented: bool) -> str:
     return "\n".join(lines)
 
 
+def _binding_flow_line(d: dict[str, Any]) -> str:
+    """One binding as a single-line flow-style mapping, comma-terminated, for
+    the all-disabled-downgrade `repos: [...]` shape below — a block-style item
+    can't be commented out under a `repos: []` scalar (YAML has already closed
+    the value there), but a flow item on its own line inside `[...]` can, and
+    uncommenting it individually still parses."""
+    dumped = yaml.safe_dump(
+        d, sort_keys=False, default_flow_style=True, allow_unicode=True, width=float("inf")
+    ).strip()
+    return f"#{dumped},"
+
+
 _HEADERS: dict[ExportMode, list[str]] = {
     "restore": [
         "# Symphony config export — mode: restore",
         "# Feed back through `symphony config-import --config <this> --replace`.",
         "# Webhook secret VALUES are never exported; bindings needing one carry a",
         f"# `webhook_secret: {WEBHOOK_SECRET_PLACEHOLDER}` placeholder — re-enter each by hand.",
+        "# mcp_servers env/headers credential VALUES are never exported either; each",
+        "# redacted key carries `true` in place of the value — re-enter each by hand.",
     ],
     "downgrade": [
         "# Symphony config export — mode: downgrade",
@@ -75,6 +122,8 @@ _HEADERS: dict[ExportMode, list[str]] = {
         "# NOTE: disabled bindings are commented out — the pre-DB build has no `enabled`",
         "# semantics and would silently re-enable them. Uncomment deliberately to restore.",
         "# Webhook secret VALUES are never exported; re-enter each placeholder by hand.",
+        "# mcp_servers env/headers credential VALUES are never exported either; each",
+        "# redacted key carries `true` in place of the value — re-enter each by hand.",
     ],
 }
 
@@ -102,15 +151,26 @@ def export_config(
         ),
     )
     lines = list(_HEADERS[mode])
-    # A downgrade with every binding disabled leaves only commented list items
-    # under `repos:`, which YAML would read as null — emit an explicit `[]` then
-    # so the document still parses as a valid (empty) `repos:` list.
     has_live_item = any(not (mode == "downgrade" and not r.enabled) for r in ordered)
-    lines.append("repos:" if has_live_item else "repos: []")
-    for row in ordered:
-        commented = mode == "downgrade" and not row.enabled
-        d = _binding_dict(row, mode=mode, needs_secret=row.github_repo in repos_with_secrets)
-        lines.append(_binding_block(d, commented=commented))
+    if not ordered:
+        lines.append("repos: []")
+    elif has_live_item:
+        lines.append("repos:")
+        for row in ordered:
+            commented = mode == "downgrade" and not row.enabled
+            d = _binding_dict(row, mode=mode, needs_secret=row.github_repo in repos_with_secrets)
+            lines.append(_binding_block(d, commented=commented))
+    else:
+        # Downgrade with every binding disabled: a block-style item commented
+        # out under `repos: []` can never be validly uncommented (the value is
+        # already closed at `[]`) — use a flow-style `repos: [...]` instead, so
+        # each commented entry lives on its own line inside the brackets and
+        # uncommenting it individually keeps the document valid.
+        lines.append("repos: [")
+        for row in ordered:
+            d = _binding_dict(row, mode=mode, needs_secret=row.github_repo in repos_with_secrets)
+            lines.append(_binding_flow_line(d))
+        lines.append("]")
     roles_doc = yaml.safe_dump(
         {"roles": global_roles or {}}, sort_keys=False, default_flow_style=False, allow_unicode=True
     ).rstrip("\n")

@@ -458,6 +458,43 @@ repos:
 
 
 @pytest.mark.asyncio
+async def test_backfill_mapping_outside_candidates_rejected(tmp_path: Path) -> None:
+    """A mapping entry naming a binding outside the row's own
+    team/provider/site/repo candidates is a stale or mistyped natural key, not
+    a disambiguation of this row — the importer refuses rather than trusting
+    it and stamping the row with an unrelated binding."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    await _seed_active_work(conn, identifier="ENG-1", team_key="ENG", github_repo="org/api")
+    path = _write(
+        tmp_path,
+        f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+    issue_label: urgent
+{_STATES}
+  - linear_team_key: ENG
+    github_repo: org/api
+{_STATES}
+  - linear_team_key: WEB
+    github_repo: org/web
+{_STATES}
+""",
+    )
+    with pytest.raises(ConfigImportError, match="ENG-1"):
+        await import_config(
+            path,
+            conn,
+            now="t1",
+            issue_bindings={"ENG-1": ["WEB", "org/web", "", "linear", "default"]},
+        )
+    # Rolled back: no bindings landed, and nothing was stamped with the
+    # out-of-scope binding's key.
+    assert await db.config_bindings.count(conn) == 0
+    await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_round_trip_export_restore(tmp_path: Path) -> None:
     """export (restore) → import (replace) reproduces the DB config exactly,
     including a disabled binding, priorities, and the global roles matrix."""

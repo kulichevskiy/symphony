@@ -91,7 +91,12 @@ from ..config import (
     _synthetic_matrix_validation_binding,
     binding_natural_key,
 )
-from ..config_export import ExportMode, export_config
+from ..config_export import (
+    MCP_SECRET_SUBFIELDS,
+    ExportMode,
+    export_config,
+)
+from ..config_export import redact_mcp_servers as _redact_mcp_servers
 from ..db import (
     config_bindings,
     config_globals,
@@ -108,10 +113,6 @@ _log = logging.getLogger(__name__)
 
 # Fields whose *values* must never leave the process or reach the daemon log.
 _SECRET_FIELDS = frozenset({"webhook_secret"})
-
-# Sub-fields of an `mcp_servers` entry that may carry literal credential
-# material: a stdio server's `env`, or an http/sse server's auth `headers`.
-_MCP_SECRET_SUBFIELDS = frozenset({"env", "headers"})
 
 # Control keys owned by dedicated columns, never part of the sparse payload.
 _CONTROL_KEYS = frozenset({"enabled", "priority", "version", "id"})
@@ -176,24 +177,6 @@ def _sanitize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in payload.items() if k not in _CONTROL_KEYS}
 
 
-def _redact_mcp_servers(mcp_servers: dict[str, Any]) -> dict[str, Any]:
-    """Replace each server's secret-bearing sub-field values with `True` (key
-    names only, never values) so a GET response — or the daemon log — never
-    carries a literal `mcp_servers` credential."""
-    redacted: dict[str, Any] = {}
-    for name, entry in mcp_servers.items():
-        if not isinstance(entry, dict):
-            redacted[name] = entry
-            continue
-        out = dict(entry)
-        for sub in _MCP_SECRET_SUBFIELDS:
-            sub_value = out.get(sub)
-            if isinstance(sub_value, dict):
-                out[sub] = {k: True for k in sub_value}
-        redacted[name] = out
-    return redacted
-
-
 def _restore_mcp_secrets(old_servers: Any, new_servers: dict[str, Any]) -> dict[str, Any]:
     """Undo `_redact_mcp_servers` on write: a sub-field value of exactly
     `True` means the operator round-tripped the redacted GET payload
@@ -209,7 +192,7 @@ def _restore_mcp_secrets(old_servers: Any, new_servers: dict[str, Any]) -> dict[
         old_entry = old_servers.get(name)
         old_entry = old_entry if isinstance(old_entry, dict) else {}
         out = dict(entry)
-        for sub in _MCP_SECRET_SUBFIELDS:
+        for sub in MCP_SECRET_SUBFIELDS:
             sub_value = out.get(sub)
             if not isinstance(sub_value, dict):
                 continue
