@@ -268,7 +268,7 @@ async def _write_repo_secret(
     github_repo: str,
     action: str | None,
     value: str,
-    body: BindingWrite,
+    expected_version: int | None,
     updated_by: str,
     clock: Callable[[], datetime] | None,
 ) -> None:
@@ -281,7 +281,7 @@ async def _write_repo_secret(
             conn,
             github_repo=github_repo,
             secret=value,
-            expected_version=body.webhook_secret_version,
+            expected_version=expected_version,
             updated_at=_now_iso(clock),
             updated_by=updated_by,
             commit=False,
@@ -831,6 +831,14 @@ def _diff(
     """Field-level diff for the daemon log. Secret-bearing fields log only a
     set/cleared/changed flag, never a value."""
     old_payload = old.payload if old is not None else {}
+    # A legacy row from before the repo-scoped secret table (SYM-190..193)
+    # can still carry `webhook_secret` in its stored payload; the schema
+    # migration drains that into `config_repo_secrets`, but strip it here too
+    # so a row that hasn't been through the migration yet can never mis-log a
+    # spurious "cleared" for a value the operator never touched (SYM-194
+    # review) — `webhook_secret`'s own set/cleared/changed flag comes from
+    # `_add_secret_flag`, not this per-field diff.
+    old_payload = {k: v for k, v in old_payload.items() if k != "webhook_secret"}
     changes: dict[str, Any] = {}
     for key in sorted(set(old_payload) | set(new)):
         before, after = old_payload.get(key), new.get(key)
@@ -1083,8 +1091,27 @@ def create_config_crud_router(
             # flushes both. A conflict or a duplicate rolls the whole thing back
             # (SYM-194). Placed after the reject checks above so a rejection
             # never leaves a pending secret write holding the write lock.
+            #
+            # A create has no prior binding for the client to have loaded a
+            # repo-secret version from, so `body.webhook_secret_version`
+            # defaults to `None` — unlike `update_binding`, trusting that
+            # default here would let a second binding on an already-secreted
+            # repo silently overwrite it with no 409 (SYM-194 review). Fall
+            # back to the version this request just read, so the create path
+            # shares the same optimistic-lock contract as update.
+            create_expected_version = (
+                body.webhook_secret_version
+                if body.webhook_secret_version is not None
+                else (old_secret.version if old_secret is not None else 0)
+            )
             await _write_repo_secret(
-                conn, binding.github_repo, secret_action, secret_value, body, updated_by, clock
+                conn,
+                binding.github_repo,
+                secret_action,
+                secret_value,
+                create_expected_version,
+                updated_by,
+                clock,
             )
             try:
                 new_id = await config_bindings.insert(
@@ -1175,7 +1202,13 @@ def create_config_crud_router(
             # Secret + binding in one transaction — see `create_binding`. A
             # binding version conflict (below) rolls back the secret write too.
             await _write_repo_secret(
-                conn, binding.github_repo, secret_action, secret_value, body, updated_by, clock
+                conn,
+                binding.github_repo,
+                secret_action,
+                secret_value,
+                body.webhook_secret_version,
+                updated_by,
+                clock,
             )
             try:
                 row = await config_bindings.update(

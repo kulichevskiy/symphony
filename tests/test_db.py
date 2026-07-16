@@ -7,6 +7,7 @@ so we also incidentally cover persistence-across-reconnect.
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -207,6 +208,102 @@ async def test_runs_schema_has_usage_columns_and_migrates_existing_rows(
     assert row["output_tokens"] == 0
     assert row["cache_write_tokens"] == 0
     assert row["cache_read_tokens"] == 0
+
+
+@pytest.mark.asyncio
+async def test_migrate_backfills_legacy_binding_payload_webhook_secret_into_repo_secrets(
+    tmp_path: Path,
+) -> None:
+    """A binding created under the interim CRUD (SYM-190..193, before the
+    repo-scoped secret table existed) stores `webhook_secret` inside
+    `config_bindings.payload`. The schema migration must drain it into
+    `config_repo_secrets` and strip it from the payload — otherwise the first
+    routine edit silently drops the secret with nothing landing in the repo
+    table (SYM-194 review)."""
+    p = tmp_path / "state.sqlite"
+    conn = await db.connect(p)
+    try:
+        await conn.execute(
+            """
+            INSERT INTO config_bindings (
+                payload, version, enabled, priority, updated_at, updated_by,
+                project_key, github_repo, issue_label, tracker_provider, tracker_site
+            ) VALUES (?, 1, 1, 0, '', '', 'ENG', 'org/repo', '', 'linear', 'default')
+            """,
+            (
+                json.dumps(
+                    {
+                        "github_repo": "org/repo",
+                        "max_concurrent": 4,
+                        "webhook_secret": "legacy-secret",
+                    },
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    conn = await db.connect(p)
+    try:
+        row = await db.config_bindings.get_by_natural_key(
+            conn, ("ENG", "org/repo", "", "linear", "default")
+        )
+        assert row is not None
+        assert "webhook_secret" not in row.payload
+        assert row.payload["max_concurrent"] == 4
+
+        secret = await db.config_repo_secrets.get(conn, "org/repo")
+        assert secret is not None
+        assert secret.secret == "legacy-secret"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_backfill_is_idempotent_and_never_clobbers_a_real_secret(
+    tmp_path: Path,
+) -> None:
+    """A second boot after the backfill already ran must be a no-op, and must
+    never overwrite a repo secret an operator already set through the UI
+    after the first migration (SYM-194 review)."""
+    p = tmp_path / "state.sqlite"
+    conn = await db.connect(p)
+    try:
+        await conn.execute(
+            """
+            INSERT INTO config_bindings (
+                payload, version, enabled, priority, updated_at, updated_by,
+                project_key, github_repo, issue_label, tracker_provider, tracker_site
+            ) VALUES (?, 1, 1, 0, '', '', 'ENG', 'org/repo', '', 'linear', 'default')
+            """,
+            (
+                json.dumps(
+                    {"github_repo": "org/repo", "webhook_secret": "legacy-secret"},
+                    separators=(",", ":"),
+                ),
+            ),
+        )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    conn = await db.connect(p)
+    try:
+        await db.config_repo_secrets.set_secret(
+            conn, github_repo="org/repo", secret="operator-set-secret", expected_version=1
+        )
+    finally:
+        await conn.close()
+
+    conn = await db.connect(p)
+    try:
+        secret = await db.config_repo_secrets.get(conn, "org/repo")
+        assert secret is not None
+        assert secret.secret == "operator-set-secret"
+    finally:
+        await conn.close()
 
 
 @pytest.mark.asyncio

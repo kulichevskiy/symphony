@@ -7,6 +7,7 @@ stamping, secret redaction, and the options payload.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -562,6 +563,45 @@ async def test_repo_secret_version_conflict_across_bindings(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
+async def test_repo_secret_version_conflict_on_create(tmp_path: Path) -> None:
+    """A create has no prior binding to have loaded a repo-secret version
+    from, so `webhook_secret_version` is normally omitted (`None`) on a
+    create request. That must not fall back to an unconditional overwrite of
+    an already-secreted repo: two concurrent creates racing to set the same
+    repo's secret must still serialize under the shared secret's optimistic
+    lock, same as two tabs editing existing bindings (SYM-194 review)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            seed = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_secret="a")},
+            )
+            assert seed.status_code == 201, seed.text
+            assert seed.json()["webhook_secret_version"] == 1
+
+            # Two more bindings on the SAME repo (distinct labels), each
+            # racing to replace the shared secret with no explicit
+            # `webhook_secret_version` — neither client loaded one, since
+            # neither is editing an existing binding.
+            results = await asyncio.gather(
+                client.post(
+                    "/api/config/bindings",
+                    json={"payload": _payload(issue_label="one", webhook_secret="b")},
+                ),
+                client.post(
+                    "/api/config/bindings",
+                    json={"payload": _payload(issue_label="two", webhook_secret="c")},
+                ),
+            )
+            statuses = sorted(r.status_code for r in results)
+            assert statuses == [201, 409], [r.text for r in results]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_repo_secret_explicit_clear(tmp_path: Path) -> None:
     """Omit keeps; an explicit clear marker removes the secret (SYM-194)."""
     conn, db_path = await _open(tmp_path)
@@ -745,6 +785,44 @@ async def test_diff_logged_without_secret_values(
     assert "webhook_secret" in text  # the flag, not the value
     assert "max_concurrent" in text
     assert "mcp_servers" in text  # which servers changed, not their contents
+
+
+def test_diff_never_reports_legacy_payload_secret_as_cleared() -> None:
+    """A binding row from before the repo-scoped secret table (SYM-190..193)
+    can still carry `webhook_secret` in its stored payload if it somehow
+    reaches `_diff` before the schema migration strips it. The per-field diff
+    must never report that as a spurious "cleared" for a value the operator
+    never touched — `_add_secret_flag` (fed from the real secret-table state)
+    owns `webhook_secret`'s audit flag, not this generic field diff
+    (SYM-194 review)."""
+    from symphony.db import config_bindings
+    from symphony.ui import config_crud
+
+    old = config_bindings.StoredBinding(
+        id=1,
+        payload={
+            "github_repo": "org/repo",
+            "project_key": "ENG",
+            "webhook_secret": "legacy-value-should-never-log",
+            "max_concurrent": 4,
+        },
+        version=1,
+        enabled=True,
+        priority=0,
+        updated_at="",
+        updated_by="",
+        project_key="ENG",
+        github_repo="org/repo",
+        issue_label="",
+        tracker_provider="linear",
+        tracker_site="default",
+    )
+    new_payload = {"github_repo": "org/repo", "project_key": "ENG", "max_concurrent": 5}
+
+    changes = config_crud._diff(old, new_payload, enabled=True, priority=0)
+
+    assert "webhook_secret" not in changes
+    assert changes["max_concurrent"] == {"from": 4, "to": 5}
 
 
 @pytest.mark.asyncio

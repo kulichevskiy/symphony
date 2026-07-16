@@ -6,6 +6,7 @@ Foreign-key enforcement is per-connection in SQLite, so we issue
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import aiosqlite
@@ -196,4 +197,43 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
                    'linear'
                )
             """
+        )
+
+    # Bindings created under the interim CRUD (SYM-190..193, before the
+    # repo-scoped secret table existed) still carry `webhook_secret` inside
+    # `config_bindings.payload`. Drain any such value into
+    # `config_repo_secrets` and strip it from the payload so the field can
+    # never mis-log as a spurious "cleared" on the binding's first routine
+    # edit (SYM-194 review). Idempotent: once a payload's `webhook_secret` key
+    # is gone, later runs find nothing to do.
+    cur = await conn.execute("SELECT id, payload, github_repo FROM config_bindings")
+    for row in await cur.fetchall():
+        try:
+            payload = json.loads(row["payload"])
+        except json.JSONDecodeError:
+            continue
+        if "webhook_secret" not in payload:
+            continue
+        secret = payload.pop("webhook_secret", None)
+        await conn.execute(
+            "UPDATE config_bindings SET payload = ? WHERE id = ?",
+            (json.dumps(payload, separators=(",", ":")), row["id"]),
+        )
+        if not secret:
+            continue
+        github_repo = str(row["github_repo"])
+        existing = await conn.execute(
+            "SELECT 1 FROM config_repo_secrets WHERE github_repo = ?", (github_repo,)
+        )
+        if await existing.fetchone() is not None:
+            # A real repo-secret row already exists (e.g. an earlier binding
+            # on this repo already migrated, or the operator already set one
+            # through the UI) — never clobber it with a stale legacy value.
+            continue
+        await conn.execute(
+            """
+            INSERT INTO config_repo_secrets (github_repo, secret, version, updated_at, updated_by)
+            VALUES (?, ?, 1, '', 'migration')
+            """,
+            (github_repo, secret),
         )
