@@ -91,15 +91,22 @@ class CredentialResolver:
         )
 
 
-def materialize_credentials(creds: RunCredentials, home_dir: Path) -> dict[str, str]:
+def materialize_credentials(
+    creds: RunCredentials, home_dir: Path, *, prior_gitconfig: Path | None = None
+) -> dict[str, str]:
     """Write `creds` into `home_dir` (a private, torn-down run directory) and
     return the env additions the run needs.
 
     The GitHub token becomes both a git credential store (helper + credentials
     file, referenced via `GIT_CONFIG_GLOBAL` so `HOME` is never clobbered) and
-    `GH_TOKEN`/`GH_ENTERPRISE_TOKEN` for `gh`. The Linear token becomes
-    `LINEAR_API_KEY`, the bearer the Linear client already sends. An empty
-    bundle writes nothing and returns no env.
+    `GH_TOKEN`/`GH_ENTERPRISE_TOKEN` for `gh`. `GIT_CONFIG_GLOBAL` *replaces*
+    (not supplements) the process's normal global gitconfig, so the written
+    file `[include]`s `prior_gitconfig` (the pre-existing `GIT_CONFIG_GLOBAL`,
+    or `~/.gitconfig` if unset) to keep resolving `user.name`/`user.email` and
+    any other global settings — git silently ignores an `[include]` path that
+    doesn't exist. The Linear token becomes `LINEAR_API_KEY`, the bearer the
+    Linear client already sends. An empty bundle writes nothing and returns no
+    env.
     """
     env: dict[str, str] = {}
     if creds.github_token:
@@ -110,9 +117,12 @@ def materialize_credentials(creds: RunCredentials, home_dir: Path) -> dict[str, 
             f"https://x-access-token:{creds.github_token}@github.com\n", encoding="utf-8"
         )
         cred_file.chmod(0o600)
+        include_path = prior_gitconfig or (Path.home() / ".gitconfig")
         gitconfig = home_dir / ".gitconfig"
         gitconfig.write_text(
-            f"[credential]\n\thelper = store --file={cred_file}\n", encoding="utf-8"
+            f"[include]\n\tpath = {include_path}\n"
+            f"[credential]\n\thelper = store --file={cred_file}\n",
+            encoding="utf-8",
         )
         env["GIT_CONFIG_GLOBAL"] = str(gitconfig)
         # `gh` splits auth by host: GH_TOKEN for github.com / *.ghe.com,

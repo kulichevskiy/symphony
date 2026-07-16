@@ -130,6 +130,26 @@ def test_materialize_writes_git_credential_store_and_env(tmp_path: Path) -> None
     assert "HOME" not in env
 
 
+def test_materialize_includes_prior_gitconfig_so_identity_still_resolves(
+    tmp_path: Path,
+) -> None:
+    # GIT_CONFIG_GLOBAL replaces (not supplements) the process's normal global
+    # gitconfig, so the written file must `[include]` the pre-existing one —
+    # else the container's global user.name/user.email (no auto-detect in a
+    # headless container) is silently dropped on every run with a GitHub
+    # connection.
+    prior = tmp_path / "prior-gitconfig"
+    prior.write_text("[user]\n\tname = Symphony\n\temail = symphony@localhost\n", encoding="utf-8")
+    home = tmp_path / "creds"
+    home.mkdir()
+    env = materialize_credentials(
+        RunCredentials(github_token="gho_x"), home, prior_gitconfig=prior
+    )
+    gitconfig_text = Path(env["GIT_CONFIG_GLOBAL"]).read_text()
+    assert f"path = {prior}" in gitconfig_text
+    assert "helper = store" in gitconfig_text
+
+
 def test_materialize_linear_only_writes_no_git_store(tmp_path: Path) -> None:
     home = tmp_path / "creds"
     home.mkdir()

@@ -149,6 +149,46 @@ async def test_runner_materializes_credentials_into_private_home_torn_down_after
 
 
 @pytest.mark.asyncio
+async def test_runner_preserves_global_git_identity_with_materialized_creds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Materializing creds replaces GIT_CONFIG_GLOBAL for the run. If that
+    # doesn't also preserve the pre-existing global config, the container's
+    # `user.name`/`user.email` (set --global in the Dockerfile, no auto-detect
+    # in the headless container) is silently dropped and `git commit` either
+    # mis-attributes or fails outright the moment a GitHub connection exists.
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    (fake_home / ".gitconfig").write_text(
+        "[user]\n\tname = Symphony\n\temail = symphony@localhost\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "file.txt").write_text("hi", encoding="utf-8")
+
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-identity",
+        workspace_path=repo,
+        command=[
+            "sh",
+            "-c",
+            "git init -q && git add file.txt && git commit -q -m test "
+            "&& git log -1 --format='%an <%ae>'",
+        ],
+        stall_secs=10,
+        credentials=RunCredentials(github_token="gho_run"),
+    )
+    events = [ev async for ev in runner.run(spec)]
+    stdout = [e.line for e in events if e.kind == "stdout"]
+    exits = [e for e in events if e.kind == "exit"]
+    assert exits and exits[0].returncode == 0
+    assert stdout[-1] == "Symphony <symphony@localhost>"
+
+
+@pytest.mark.asyncio
 async def test_runner_cleans_up_cred_home_when_materialization_fails(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
