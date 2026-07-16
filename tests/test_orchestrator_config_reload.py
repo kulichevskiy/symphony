@@ -831,7 +831,7 @@ async def test_linear_disconnect_reverts_tracker_to_env_fallback(tmp_path: Path)
         )
 
         await orch._refresh_linear_tracker_credentials()  # noqa: SLF001
-        assert tracker.api_keys[-1] == "db_token"
+        assert tracker.api_keys[-1] == "Bearer db_token"
 
         await db.oauth_connections.delete(conn, "linear")
 
@@ -873,13 +873,13 @@ async def test_refresh_applies_db_token_to_tracker_hot_added_after_first_refresh
         )
 
         await orch._refresh_linear_tracker_credentials()  # noqa: SLF001
-        assert tracker1.api_keys[-1] == "db_token"
+        assert tracker1.api_keys[-1] == "Bearer db_token"
 
         tracker2 = _FakeLinearTracker()
         registry.register("linear", "acme", tracker2)
 
         await orch._refresh_linear_tracker_credentials()  # noqa: SLF001
-        assert tracker2.api_keys == ["db_token"], (
+        assert tracker2.api_keys == ["Bearer db_token"], (
             f"tracker2 saw {tracker2.api_keys}, not the DB token"
         )
     finally:

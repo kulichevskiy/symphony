@@ -2790,9 +2790,14 @@ class _OrchestratorBase:
         no-op DB read per tick. A tracker hot-added after the token was
         already applied still gets it (tracked by identity), even when the
         resolved value itself hasn't changed since the last tick.
+
+        `resolve_linear_auth_header` returns the exact header value to set —
+        `Bearer <token>` when it came from the DB (an OAuth access token),
+        unprefixed when it's the env `LINEAR_API_KEY` PAT fallback — since a
+        bare token string alone can't tell `set_api_key` which format applies.
         """
-        linear_token = await self._credential_resolver.resolve(
-            "linear", fallback=self.config.linear_api_key
+        linear_token = await self._credential_resolver.resolve_linear_auth_header(
+            fallback=self.config.linear_api_key
         )
         token_changed = linear_token != self._applied_linear_token
         if token_changed:
@@ -2822,8 +2827,8 @@ class _OrchestratorBase:
         )
         if tracker_provider != "linear":
             return RunCredentials(github_token=github_token, linear_token=None)
-        linear_token = await self._credential_resolver.resolve(
-            "linear", fallback=self.config.linear_api_key
+        linear_token = await self._credential_resolver.resolve_linear_auth_header(
+            fallback=self.config.linear_api_key
         )
         return RunCredentials(github_token=github_token, linear_token=linear_token)
 

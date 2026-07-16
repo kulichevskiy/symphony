@@ -87,6 +87,35 @@ async def test_resolve_falls_back_on_decrypt_error(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_resolve_linear_auth_header_prefixes_db_token_with_bearer(tmp_path: Path) -> None:
+    conn = await _conn(tmp_path)
+    cipher = CredentialCipher("k")
+    try:
+        await db.oauth_connections.set_connection(
+            conn, provider="linear", credential="lin_oauth_token", cipher=cipher
+        )
+        resolver = CredentialResolver(conn, cipher)
+        # DB-stored Linear token is an OAuth access token — must be sent as Bearer.
+        assert (
+            await resolver.resolve_linear_auth_header(fallback="env_key")
+            == "Bearer lin_oauth_token"
+        )
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_linear_auth_header_leaves_fallback_pat_unprefixed(tmp_path: Path) -> None:
+    conn = await _conn(tmp_path)
+    try:
+        resolver = CredentialResolver(conn, CredentialCipher("k"))
+        # env/volume fallback is a personal API key — no Bearer prefix.
+        assert await resolver.resolve_linear_auth_header(fallback="env_key") == "env_key"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_resolve_run_credentials_bundles_both(tmp_path: Path) -> None:
     conn = await _conn(tmp_path)
     cipher = CredentialCipher("k")

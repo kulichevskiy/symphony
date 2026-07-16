@@ -39,6 +39,9 @@ class RunCredentials:
     inherits whatever the ambient env/volume already provides for that provider."""
 
     github_token: str | None = None
+    # Already the full `Authorization` header value (`Bearer <token>` for a
+    # DB-resolved OAuth token, unprefixed for an env/volume PAT fallback) —
+    # see `CredentialResolver.resolve_linear_auth_header`.
     linear_token: str | None = None
 
     @property
@@ -61,13 +64,37 @@ class CredentialResolver:
         `fallback`. A decrypt/key error is treated as "no usable DB connection"
         and falls back so a rotated key never takes the instance down mid-run.
         """
+        value, _ = await self._resolve_with_source(provider, fallback=fallback)
+        return value
+
+    async def resolve_linear_auth_header(self, *, fallback: str | None = None) -> str | None:
+        """The `Authorization` header value Linear calls should use, DB-first.
+
+        A DB-connected Linear token is an OAuth access token and must be sent
+        as `Bearer <token>` (`linear/client.py`'s own contract, matching the
+        working UI probe in `oauth.py`); the env/volume fallback is a personal
+        API key and must stay unprefixed. `resolve()` alone can't make this
+        call — it returns a bare string with no record of which source it
+        came from — so this formats the header directly from the resolved
+        source.
+        """
+        value, from_db = await self._resolve_with_source("linear", fallback=fallback)
+        if value and from_db:
+            return f"Bearer {value}"
+        return value
+
+    async def _resolve_with_source(
+        self, provider: str, *, fallback: str | None
+    ) -> tuple[str | None, bool]:
+        """`(value, from_db)` — `from_db` is True only when `value` came from
+        a decrypted `oauth_connections` row, not the fallback."""
         try:
             status = await db.oauth_connections.get_status(self._conn, provider)
         except Exception:  # noqa: BLE001 — a DB read hiccup must not break the run
             log.warning("oauth_connections status read failed for %s; using fallback", provider)
-            return fallback
+            return fallback, False
         if status is None or status.status != "connected":
-            return fallback
+            return fallback, False
         try:
             credential = await db.oauth_connections.get_credential(
                 self._conn, provider, self._cipher
@@ -78,8 +105,10 @@ class CredentialResolver:
                 "falling back to env/volume",
                 provider,
             )
-            return fallback
-        return credential or fallback
+            return fallback, False
+        if credential:
+            return credential, True
+        return fallback, False
 
     async def resolve_run_credentials(
         self, *, github_fallback: str | None = None, linear_fallback: str | None = None
@@ -87,7 +116,7 @@ class CredentialResolver:
         """Resolve the providers a run materializes (GitHub + Linear) into a bundle."""
         return RunCredentials(
             github_token=await self.resolve("github", fallback=github_fallback),
-            linear_token=await self.resolve("linear", fallback=linear_fallback),
+            linear_token=await self.resolve_linear_auth_header(fallback=linear_fallback),
         )
 
 
@@ -104,9 +133,11 @@ def materialize_credentials(
     file `[include]`s `prior_gitconfig` (the pre-existing `GIT_CONFIG_GLOBAL`,
     or `~/.gitconfig` if unset) to keep resolving `user.name`/`user.email` and
     any other global settings — git silently ignores an `[include]` path that
-    doesn't exist. The Linear token becomes `LINEAR_API_KEY`, the bearer the
-    Linear client already sends. An empty bundle writes nothing and returns no
-    env.
+    doesn't exist. The Linear token becomes `LINEAR_API_KEY`: already the exact
+    `Authorization` header value the Linear client should send verbatim (see
+    `RunCredentials.linear_token`) — `Bearer <token>` for a DB-resolved OAuth
+    token, unprefixed for an env/volume PAT fallback. An empty bundle writes
+    nothing and returns no env.
     """
     env: dict[str, str] = {}
     if creds.github_token:
