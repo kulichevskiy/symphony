@@ -262,7 +262,7 @@ def create_oauth_routers(
                     body = resp.json()
                 except ValueError:
                     body = {}
-                live = bool(body.get("data", {}).get("viewer")) and not body.get("errors")
+                live = (not body.get("errors")) and bool((body.get("data") or {}).get("viewer"))
         else:
             live = resp.status_code == 200
         await db.oauth_connections.update_status(
