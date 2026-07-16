@@ -527,7 +527,13 @@ def _branch_or_key_changed(
     return False
 
 
-def _validate_webhook_secret(binding: RepoBinding, base: Config, *, has_secret: bool) -> None:
+def _validate_webhook_secret(
+    binding: RepoBinding,
+    base: Config,
+    *,
+    has_secret: bool,
+    other_repo_bindings: list[RepoBinding],
+) -> None:
     """Fail closed at save time: a `webhook_enabled` binding with no
     resolvable secret (the repo's own webhook secret — the resulting state
     after this save — or the global `GITHUB_WEBHOOK_SECRET`) makes
@@ -535,8 +541,23 @@ def _validate_webhook_secret(binding: RepoBinding, base: Config, *, has_secret: 
     daemon's next hot reload and silently disable *every* repo's webhook
     verification, not just this one. `has_secret` is the repo's secret state
     *after* the pending write (set/kept-non-empty → True, cleared/never-set →
-    False), since the secret now lives in the repo-scoped table (SYM-194)."""
-    if binding.webhook_enabled and not has_secret and not base.github_webhook_secret:
+    False), since the secret now lives in the repo-scoped table (SYM-194).
+
+    The secret is repo-scoped, not binding-scoped, so this must fail even when
+    `binding` itself doesn't need it: a *sibling* binding on the same
+    `github_repo` (`other_repo_bindings`, from `_other_bindings`) with
+    `webhook_enabled` still depends on it, and `cli._github_webhook_settings`
+    gates on `webhook_enabled` alone — not the binding's own `enabled` flag —
+    so a disabled-but-webhook_enabled sibling counts too (SYM-194 review:
+    clearing/renaming away a repo's secret from an unrelated sibling
+    stranded every enabled repo's webhook verification)."""
+    if has_secret or base.github_webhook_secret:
+        return
+    sibling_needs_secret = any(
+        other.github_repo == binding.github_repo and other.webhook_enabled
+        for other in other_repo_bindings
+    )
+    if binding.webhook_enabled or sibling_needs_secret:
         raise _validation_error(
             ["webhook_secret"],
             "webhook_enabled requires a webhook_secret when no global "
@@ -1071,7 +1092,15 @@ def create_config_crud_router(
         conn = await conn_provider()
         old_secret = await config_repo_secrets.get(conn, binding.github_repo)
         has_secret = _resulting_has_secret(secret_action, old_secret)
-        _validate_webhook_secret(binding, base, has_secret=has_secret)
+        # Repo-scoped, not binding-scoped (SYM-194 review): a sibling on the
+        # same `github_repo` may still need this secret even though `binding`
+        # itself doesn't.
+        _validate_webhook_secret(
+            binding,
+            base,
+            has_secret=has_secret,
+            other_repo_bindings=await _other_bindings(conn, base, exclude_id=None),
+        )
         _validate_tracker_credentials(binding, base)
         # Assembly + validation (including the external Models-API capability
         # check, up to the full 30s httpx timeout) runs before the lock is
@@ -1177,7 +1206,15 @@ def create_config_crud_router(
         # (SYM-194 review).
         old_secret = await config_repo_secrets.get(conn, binding.github_repo)
         has_secret = _resulting_has_secret(secret_action, old_secret)
-        _validate_webhook_secret(binding, base, has_secret=has_secret)
+        # Repo-scoped, not binding-scoped (SYM-194 review): a sibling on the
+        # same `github_repo` may still need this secret even though `binding`
+        # itself doesn't.
+        _validate_webhook_secret(
+            binding,
+            base,
+            has_secret=has_secret,
+            other_repo_bindings=await _other_bindings(conn, base, exclude_id=binding_id),
+        )
         _validate_tracker_credentials(binding, base)
         # Assembly + validation (including the external Models-API capability
         # check, up to the full 30s httpx timeout) runs before the lock is

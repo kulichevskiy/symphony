@@ -307,6 +307,48 @@ async def test_migrate_backfill_is_idempotent_and_never_clobbers_a_real_secret(
 
 
 @pytest.mark.asyncio
+async def test_migrate_backfill_collapses_two_bindings_on_one_repo_last_non_empty_wins(
+    tmp_path: Path,
+) -> None:
+    """Two legacy bindings can share a `github_repo`, each with its own stored
+    `webhook_secret`. The migration must resolve that collision the same way
+    `config_import.import_config` documents (last-non-empty-wins, by
+    insertion order) rather than depending on an unordered row scan — else the
+    two cutover paths could persist different secrets for the same repo
+    (SYM-194 review)."""
+    p = tmp_path / "state.sqlite"
+    conn = await db.connect(p)
+    try:
+        for issue_label, secret in (("", "first-secret"), ("bug", "second-secret")):
+            await conn.execute(
+                """
+                INSERT INTO config_bindings (
+                    payload, version, enabled, priority, updated_at, updated_by,
+                    project_key, github_repo, issue_label, tracker_provider, tracker_site
+                ) VALUES (?, 1, 1, 0, '', '', 'ENG', 'org/repo', ?, 'linear', 'default')
+                """,
+                (
+                    json.dumps(
+                        {"github_repo": "org/repo", "webhook_secret": secret},
+                        separators=(",", ":"),
+                    ),
+                    issue_label,
+                ),
+            )
+        await conn.commit()
+    finally:
+        await conn.close()
+
+    conn = await db.connect(p)
+    try:
+        secret = await db.config_repo_secrets.get(conn, "org/repo")
+        assert secret is not None
+        assert secret.secret == "second-secret"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_runs_add_usage_accumulates_all_buckets(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

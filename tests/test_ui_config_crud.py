@@ -633,6 +633,45 @@ async def test_webhook_enabled_rename_validates_against_new_repos_secret(
 
 
 @pytest.mark.asyncio
+async def test_webhook_secret_clear_fails_closed_for_enabled_sibling(tmp_path: Path) -> None:
+    """The repo secret is shared across every binding on one `github_repo`:
+    clearing it from a `webhook_enabled=False` binding must still fail closed
+    when an enabled sibling on the same repo depends on it — else that
+    sibling's webhook verification silently disables app-wide on the next hot
+    reload (SYM-194 review)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path, github_webhook_secret="")
+        async with _client(app) as client:
+            enabled = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_enabled=True, webhook_secret="s3cr3t")},
+            )
+            assert enabled.status_code == 201, enabled.text
+
+            sibling = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(issue_label="other", webhook_enabled=False)},
+            )
+            assert sibling.status_code == 201, sibling.text
+            assert sibling.json()["webhook_secret_set"] is True
+
+            cleared = await client.put(
+                f"/api/config/bindings/{sibling.json()['id']}",
+                json={
+                    "payload": _payload(issue_label="other", webhook_enabled=False),
+                    "version": sibling.json()["version"],
+                    "webhook_secret_clear": True,
+                    "webhook_secret_version": sibling.json()["webhook_secret_version"],
+                },
+            )
+            assert cleared.status_code == 422, cleared.text
+            assert cleared.json()["detail"][0]["loc"] == ["webhook_secret"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_repo_secret_version_conflict_on_update_with_omitted_version(
     tmp_path: Path,
 ) -> None:
