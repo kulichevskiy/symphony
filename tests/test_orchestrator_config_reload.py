@@ -842,6 +842,51 @@ async def test_linear_disconnect_reverts_tracker_to_env_fallback(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_refresh_applies_db_token_to_tracker_hot_added_after_first_refresh(
+    tmp_path: Path,
+) -> None:
+    """A Linear tracker hot-added on a later tick, after the DB token was
+    already applied to the trackers registered at that point, must still
+    receive the DB token even though the resolved value hasn't changed since
+    the previous refresh — a scalar value-equality short-circuit on the
+    resolved token would skip it and leave it on the ambient env key
+    (SYM-199 review fix)."""
+    cfg = Config(
+        workspace_root=tmp_path / "workspaces",
+        log_root=tmp_path / "logs",
+        db_path=tmp_path / "symphony.sqlite",
+        symphony_encryption_key="enc-key",
+        linear_api_key="env_key",
+        repos=[_linear_binding(team="ENG", repo="org/repo")],
+    )
+    conn = await db.connect(cfg.db_path)
+    try:
+        tracker1 = _FakeLinearTracker()
+        registry = TrackerRegistry()
+        registry.register("linear", "default", tracker1)
+        orch = Orchestrator(cfg, registry, conn, tracker_factory=lambda _b: tracker1)
+
+        from symphony.crypto import CredentialCipher
+
+        await db.oauth_connections.set_connection(
+            conn, provider="linear", credential="db_token", cipher=CredentialCipher("enc-key")
+        )
+
+        await orch._refresh_linear_tracker_credentials()  # noqa: SLF001
+        assert tracker1.api_keys[-1] == "db_token"
+
+        tracker2 = _FakeLinearTracker()
+        registry.register("linear", "acme", tracker2)
+
+        await orch._refresh_linear_tracker_credentials()  # noqa: SLF001
+        assert tracker2.api_keys == ["db_token"], (
+            f"tracker2 saw {tracker2.api_keys}, not the DB token"
+        )
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_removed_binding_closes_and_unregisters_hot_added_tracker(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

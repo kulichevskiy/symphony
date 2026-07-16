@@ -307,6 +307,7 @@ class _OrchestratorBase:
     _stale_tracker_contexts: set[TrackerContext]
     _hot_added_trackers: dict[TrackerContext, IssueTracker]
     _applied_linear_token: str | None
+    _linear_token_applied_to: set[int]
     _conn: aiosqlite.Connection
     _shutdown: asyncio.Event
     _wake: asyncio.Event
@@ -457,6 +458,10 @@ class _OrchestratorBase:
         # `_refresh_linear_tracker_credentials`, so a tick only touches the
         # client's header when the DB token actually changed.
         self._applied_linear_token: str | None = None
+        # Identities of trackers that already carry `_applied_linear_token`,
+        # so a tracker hot-added after the token was applied still gets it
+        # even though the resolved value itself is unchanged.
+        self._linear_token_applied_to: set[int] = set()
         self._workspace: Workspace = (
             workspace
             if workspace is not None
@@ -2782,17 +2787,23 @@ class _OrchestratorBase:
         header when the resolved value actually changed — so a disconnect or
         expiry reverts every tracker to the env key instead of clinging to
         the dead DB token, and a provider with no DB connection costs one
-        no-op DB read per tick.
+        no-op DB read per tick. A tracker hot-added after the token was
+        already applied still gets it (tracked by identity), even when the
+        resolved value itself hasn't changed since the last tick.
         """
         linear_token = await self._credential_resolver.resolve(
             "linear", fallback=self.config.linear_api_key
         )
-        if linear_token == self._applied_linear_token:
-            return
+        token_changed = linear_token != self._applied_linear_token
+        if token_changed:
+            self._linear_token_applied_to.clear()
         for tracker in self._trackers.trackers_for_provider("linear"):
+            if id(tracker) in self._linear_token_applied_to:
+                continue
             set_api_key = getattr(tracker, "set_api_key", None)
             if set_api_key is not None:
                 set_api_key(linear_token or "")
+            self._linear_token_applied_to.add(id(tracker))
         self._applied_linear_token = linear_token
 
     async def _resolve_run_credentials(self, binding: RepoBinding) -> RunCredentials:
