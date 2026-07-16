@@ -20,6 +20,7 @@ import asyncio
 # --- imports merged from the pre-split poll/__init__.py (SYM-151) ---
 import json
 import logging
+import os
 import re
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -45,6 +46,8 @@ from ...agent.prompt import implement_prompt
 from ...agent.runner import Runner, RunnerSpec
 from ...agent.runners.local import LocalRunner
 from ...config import Config, RepoBinding, ResolvedRole, binding_natural_key
+from ...credentials import CredentialResolver, RunCredentials
+from ...crypto import CredentialCipher
 from ...effective_config import ConfigBootError, assemble_effective_config
 from ...github.client import GitHub, GitHubClient, GitHubError
 from ...github.webhook import GitHubWebhookEvent
@@ -441,6 +444,12 @@ class _OrchestratorBase:
         self._dispatch_pause_lock = asyncio.Lock()
         self._gh: GitHubClient = gh if gh is not None else GitHub()
         self._runner: Runner = runner if runner is not None else LocalRunner()
+        # Resolves each run's creds DB-first (OAuth in UI 4/7). A provider with
+        # no connected `oauth_connections` row falls back to the env/volume
+        # value below, so migration is per-provider and zero-downtime.
+        self._credential_resolver = CredentialResolver(
+            conn, CredentialCipher(config.symphony_encryption_key)
+        )
         self._workspace: Workspace = (
             workspace
             if workspace is not None
@@ -2697,6 +2706,23 @@ class _OrchestratorBase:
         )
         return cumulative_usage, final_kind, final_returncode, role
 
+    async def _resolve_run_credentials(self, binding: RepoBinding) -> RunCredentials:
+        """Resolve the run's creds DB-first, honoring the per-binding model.
+
+        The GitHub token materializes for every run (Symphony always pushes to
+        GitHub); the Linear token only when this binding actually tracks in
+        Linear — so creds don't leak into a Jira-tracked binding's run. Each
+        provider falls back to the ambient env/volume value when it has no
+        connected DB row, keeping the current instance running through
+        migration.
+        """
+        tracker_provider = binding.tracker_provider or binding.provider
+        linear_fallback = self.config.linear_api_key if tracker_provider == "linear" else None
+        return await self._credential_resolver.resolve_run_credentials(
+            github_fallback=os.environ.get("GH_TOKEN"),
+            linear_fallback=linear_fallback,
+        )
+
     async def _run_stage_command(
         self,
         *,
@@ -2720,6 +2746,7 @@ class _OrchestratorBase:
             command_secs=self.config.command_timeout_secs,
             wall_clock_secs=self.config.wall_clock_timeout_secs,
             stage=stage,
+            credentials=await self._resolve_run_credentials(binding),
         )
 
         log_path = self.config.log_root / f"{run_id}.log"
@@ -3018,6 +3045,7 @@ class _OrchestratorBase:
             command_secs=self.config.command_timeout_secs,
             wall_clock_secs=self.config.wall_clock_timeout_secs,
             stage=stage,
+            credentials=await self._resolve_run_credentials(binding),
         )
 
         log_path = self.config.log_root / f"{run_id}.log"

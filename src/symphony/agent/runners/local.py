@@ -18,9 +18,13 @@ import json
 import logging
 import os
 import re
+import shutil
+import tempfile
 from collections.abc import AsyncIterator
 from contextlib import suppress
+from pathlib import Path
 
+from ...credentials import materialize_credentials
 from ..runner import RunnerEvent, RunnerSpec
 
 _STREAM_DRAIN_SECS = 2.0
@@ -124,6 +128,16 @@ class LocalRunner:
         # allowlist) still overrides.
         inherited = {k: v for k, v in os.environ.items() if not k.startswith("SYMPHONY_")}
         env = {**inherited, **spec.env}
+        # Materialize DB-resolved creds into a private home for this run only
+        # (OAuth in UI 4/7). Torn down in `finally` and on spawn failure — never
+        # a persistent volume file. spec.env still overrides (the per-binding
+        # allowlist wins over a materialized default).
+        cred_home: str | None = None
+        if spec.credentials is not None and not spec.credentials.is_empty:
+            cred_home = tempfile.mkdtemp(prefix="symphony-run-creds-")
+            os.chmod(cred_home, 0o700)
+            cred_env = materialize_credentials(spec.credentials, Path(cred_home))
+            env = {**env, **cred_env, **spec.env}
         try:
             proc = await asyncio.create_subprocess_exec(
                 *spec.command,
@@ -138,6 +152,7 @@ class LocalRunner:
                 limit=_SUBPROCESS_BUFFER_LIMIT,
             )
         except (OSError, FileNotFoundError) as e:
+            _remove_cred_home(cred_home)
             yield RunnerEvent(kind="spawn_failed", error=f"{type(e).__name__}: {e}")
             return
 
@@ -333,6 +348,7 @@ class LocalRunner:
                 yield RunnerEvent(kind="exit", returncode=proc.returncode)
         finally:
             self._active.pop(spec.run_id, None)
+            _remove_cred_home(cred_home)
 
     async def kill(self, run_id: str) -> None:
         proc = self._active.get(run_id)
@@ -350,6 +366,13 @@ class LocalRunner:
                 _kill_process_group(proc.pid)
             with suppress(Exception):
                 await proc.wait()
+
+
+def _remove_cred_home(cred_home: str | None) -> None:
+    """Tear down a run's materialized credential home. Best-effort — a cleanup
+    hiccup must never propagate out of a finished run."""
+    if cred_home is not None:
+        shutil.rmtree(cred_home, ignore_errors=True)
 
 
 def _pid_alive(pid: int | None) -> bool:

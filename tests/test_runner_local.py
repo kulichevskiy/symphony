@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os.path
 import sys
 from pathlib import Path
 
@@ -16,6 +17,12 @@ import pytest
 
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.agent.runners.local import LocalRunner
+from symphony.credentials import RunCredentials
+
+
+def _path_exists(path: Path) -> bool:
+    # Sync helper so the filesystem check isn't flagged inside an async test.
+    return os.path.exists(path)
 
 
 @pytest.mark.asyncio
@@ -109,6 +116,36 @@ async def test_runner_kills_on_stall(tmp_path: Path) -> None:
         if ev.kind in ("exit", "stall_timeout"):
             break
     assert "stall_timeout" in kinds
+
+
+@pytest.mark.asyncio
+async def test_runner_materializes_credentials_into_private_home_torn_down_after(
+    tmp_path: Path,
+) -> None:
+    # A run with resolved credentials gets a private, torn-down credential home:
+    # GH_TOKEN + a git credential store are visible to the subprocess for the
+    # duration of the run, then removed — never a persistent volume file.
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-creds",
+        workspace_path=tmp_path,
+        command=[
+            "sh",
+            "-c",
+            'printf "%s\\n" "$GH_TOKEN"; printf "%s\\n" "$GIT_CONFIG_GLOBAL"; '
+            'cat "$GIT_CONFIG_GLOBAL"',
+        ],
+        stall_secs=10,
+        credentials=RunCredentials(github_token="gho_run", linear_token="lin_run"),
+    )
+    events = [ev async for ev in runner.run(spec)]
+    stdout = [e.line for e in events if e.kind == "stdout"]
+    assert stdout[0] == "gho_run"
+    gitconfig = Path(stdout[1])
+    assert "helper = store" in "\n".join(stdout[2:])
+    # Torn down after the run — the private home no longer exists on disk.
+    assert not _path_exists(gitconfig)
+    assert not _path_exists(gitconfig.parent)
 
 
 @pytest.mark.asyncio
