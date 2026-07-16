@@ -117,6 +117,37 @@ async def test_binding_inserted_mid_run_is_scanned_next_tick(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_repo_secret_view_refreshed_alongside_binding_reload(tmp_path: Path) -> None:
+    """`config-import` writes secret rows directly to the DB, bypassing the
+    CRUD write path that otherwise hot-swaps the webhook verifier's
+    `RepoSecretView`. A DB-owned daemon already running must still pick that
+    secret up on its next tick's binding reload, not just when a UI save
+    triggers it (SYM-194 review fix)."""
+    conn = await db.connect(tmp_path / "symphony.sqlite")
+    await _insert(conn, team="ENG")
+    cfg = await assemble_effective_config(conn, _base(tmp_path))
+    await conn.close()
+
+    harness = await Harness.create(tmp_path, config=cfg, reload_bindings=True)
+    try:
+        view = db.config_repo_secrets.RepoSecretView()
+        harness.orch._repo_secret_view = view  # noqa: SLF001
+        await harness.warmup()
+        assert view.as_map() == {}
+
+        # Simulate `config-import` writing a secret directly to the DB while
+        # this daemon is already running.
+        await db.config_repo_secrets.set_secret(
+            harness.conn, github_repo=REPO, secret="s3cr3t", expected_version=0
+        )
+        await harness.step()
+
+        assert view.as_map() == {REPO: "s3cr3t"}
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
 async def test_binding_removed_mid_run_prunes_its_queue_scope(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "symphony.sqlite")
     await _insert(conn, team="ENG", repo="org/eng", priority=0, max_concurrent=0)

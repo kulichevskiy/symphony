@@ -125,6 +125,28 @@ async def test_list_all_map(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_reload_picks_up_rows_written_by_another_connection(tmp_path: Path) -> None:
+    """A `RepoSecretView` built at boot must reflect a secret row written later
+    by a different connection (e.g. `config-import` writing directly to the
+    DB) without losing its identity, since callers (the webhook verifier
+    closure) hold a reference to the original object (SYM-194 review fix)."""
+    db_path = tmp_path / "state.sqlite"
+    conn_a = await db.connect(db_path)
+    conn_b = await db.connect(db_path)
+    try:
+        view = await db.config_repo_secrets.load_view(conn_a)
+        assert view.as_map() == {}
+        await db.config_repo_secrets.set_secret(
+            conn_b, github_repo="org/repo", secret="s3cr3t", expected_version=0
+        )
+        await view.reload(conn_a)
+        assert view.as_map() == {"org/repo": "s3cr3t"}
+    finally:
+        await conn_a.close()
+        await conn_b.close()
+
+
+@pytest.mark.asyncio
 async def test_concurrent_writers_only_one_wins(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn_a = await db.connect(db_path)

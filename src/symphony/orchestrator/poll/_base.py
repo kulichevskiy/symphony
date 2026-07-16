@@ -371,6 +371,7 @@ class _OrchestratorBase:
         clock: Callable[[], datetime] | None = None,
         reload_bindings_from_db: bool = False,
         tracker_factory: Callable[[RepoBinding], IssueTracker] | None = None,
+        repo_secret_view: db.config_repo_secrets.RepoSecretView | None = None,
     ) -> None:
         self.config = config
         if isinstance(tracker_or_registry, TrackerRegistry):
@@ -403,6 +404,13 @@ class _OrchestratorBase:
         # assembly at the start of every poll. Off for YAML/single-tracker
         # deployments and the test harness, whose config is fixed at boot.
         self._reload_bindings_from_db = reload_bindings_from_db
+        # Live webhook-secret view the app's verifier resolves from on every
+        # request. `config-import` writes secret rows directly to the DB
+        # while a DB-owned daemon is already running, never routing through
+        # the CRUD write path that otherwise hot-swaps this view — refresh it
+        # alongside every binding reload so an imported repo's secret doesn't
+        # need a restart to verify against (SYM-194 review fix).
+        self._repo_secret_view = repo_secret_view
         # Serializes a config write's multi-row transaction against the tick's
         # binding reload on the shared connection, so a reload never observes an
         # uncommitted save (the write path itself lands in a later slice). The
@@ -998,6 +1006,11 @@ class _OrchestratorBase:
                 await self._reload_bindings()
             except Exception:  # noqa: BLE001 — must not kill the loop
                 log.exception("binding reload failed")
+            if self._repo_secret_view is not None:
+                try:
+                    await self._repo_secret_view.reload(self._conn)
+                except Exception:  # noqa: BLE001 — must not kill the loop
+                    log.exception("repo secret view reload failed")
         # React to the current binding set — the first tick always fires (prunes
         # stale `tracker_queue` scopes, registers boot trackers), later ticks
         # only when a reload changed the set. Runs before the scan loop so a

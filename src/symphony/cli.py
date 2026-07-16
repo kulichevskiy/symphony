@@ -387,12 +387,22 @@ async def _run(config_path: Path, *, once: bool) -> None:
             def _hot_add_tracker(binding: RepoBinding) -> IssueTracker:
                 return for_binding(binding, reload_secrets)
 
+            # Live view of per-repo webhook secrets, built from the DB and
+            # hot-swapped by the config write path so a secret set/replaced/
+            # cleared through the UI reaches the verifier without a restart
+            # (SYM-194). Loaded before the orchestrator so it can also be
+            # refreshed on every binding reload tick — otherwise a secret row
+            # written by `config-import` directly into the DB (not through the
+            # CRUD hot-swap path) would need a restart to verify against on an
+            # already-running DB-owned daemon (SYM-194 review fix).
+            repo_secret_view = await db.config_repo_secrets.load_view(conn)
             orch = Orchestrator(
                 cfg,
                 trackers,
                 conn,
                 reload_bindings_from_db=db_owns_topology,
                 tracker_factory=_hot_add_tracker if db_owns_topology else None,
+                repo_secret_view=repo_secret_view if db_owns_topology else None,
             )
             await reconcile(conn, trackers, bindings=cfg.repos)
             if once:
@@ -403,11 +413,6 @@ async def _run(config_path: Path, *, once: bool) -> None:
                 return
             webhook_server: object | None = None
             webhook_task: asyncio.Task[None] | None = None
-            # Live view of per-repo webhook secrets, built from the DB and
-            # hot-swapped by the config write path so a secret set/replaced/
-            # cleared through the UI reaches the verifier without a restart
-            # (SYM-194).
-            repo_secret_view = await db.config_repo_secrets.load_view(conn)
             github_webhook_settings = _github_webhook_settings(cfg, repo_secret_view.as_map())
             # A DB-owned topology can hot-enable a repo's webhook (or add a
             # binding needing one) at any later tick — the boot-time booleans

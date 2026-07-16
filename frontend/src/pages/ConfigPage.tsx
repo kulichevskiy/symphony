@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { type ReactNode, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useState } from "react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
@@ -515,6 +515,16 @@ export function BindingForm({
   const [saving, setSaving] = useState(false);
   const [clearSecret, setClearSecret] = useState(false);
 
+  // The loaded `webhook_secret_set`/version describe the *original* repo's
+  // secret. Once the operator retargets this binding to a different repo,
+  // that state no longer applies — hide the clear control and drop any
+  // pending clear so save doesn't act on the wrong repo's secret.
+  const repoChanged =
+    Boolean(binding) && str(get(payload, "github_repo")) !== binding?.github_repo;
+  useEffect(() => {
+    if (repoChanged) setClearSecret(false);
+  }, [repoChanged]);
+
   function patch(next: Record<string, unknown>) {
     setPayload(next);
     setRaw(JSON.stringify(next, null, 2));
@@ -809,9 +819,13 @@ export function BindingForm({
               }}
               aria-label="webhook_secret"
               disabled={clearSecret}
-              placeholder={binding?.webhook_secret_set ? "set — leave blank to keep" : ""}
+              placeholder={
+                binding?.webhook_secret_set && !repoChanged
+                  ? "set — leave blank to keep"
+                  : ""
+              }
             />
-            {binding?.webhook_secret_set ? (
+            {binding?.webhook_secret_set && !repoChanged ? (
               <label className="flex items-center gap-1 text-xs text-muted-foreground">
                 <input
                   type="checkbox"

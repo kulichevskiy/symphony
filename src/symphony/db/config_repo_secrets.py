@@ -63,6 +63,16 @@ class RepoSecretView:
         """The current repo→secret map, for building `GitHubWebhookSettings`."""
         return dict(self._secrets)
 
+    async def reload(self, conn: aiosqlite.Connection) -> None:
+        """Repopulate this view in place from the DB's current rows.
+
+        Unlike `load_view`, this keeps the caller's object identity — needed
+        so a tick's binding reload can pick up secret rows written outside the
+        CRUD hot-swap path (e.g. `config-import` writing directly to the DB
+        while the daemon is already running) without losing the reference the
+        webhook verifier closure already holds (SYM-194 review fix)."""
+        self._secrets = {row.github_repo: row.secret for row in await list_all(conn) if row.secret}
+
 
 async def load_view(conn: aiosqlite.Connection) -> RepoSecretView:
     """Build a `RepoSecretView` from the DB's current repo-secret rows."""

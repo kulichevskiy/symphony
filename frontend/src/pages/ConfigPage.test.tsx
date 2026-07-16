@@ -231,6 +231,29 @@ describe("BindingForm", () => {
     expect(screen.queryByLabelText("webhook_secret_clear")).toBeNull();
   });
 
+  it("hides the clear-secret checkbox and drops a pending clear once github_repo is edited", async () => {
+    const fetchMock = mockFetch(200, record({ version: 5 }));
+    const onSaved = vi.fn();
+    render(
+      <BindingForm
+        binding={record({ webhook_secret_set: true, webhook_secret_version: 3 })}
+        options={OPTIONS}
+        onSaved={onSaved}
+        onCancel={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText("webhook_secret_clear"));
+    fireEvent.change(screen.getByLabelText("github_repo"), {
+      target: { value: "org/other-repo" },
+    });
+    expect(screen.queryByLabelText("webhook_secret_clear")).toBeNull();
+
+    fireEvent.click(screen.getByText("Save"));
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    const sent = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+    expect(sent.webhook_secret_clear).toBe(false);
+  });
+
   it("sends the loaded repo-secret version when replacing an existing secret", async () => {
     const fetchMock = mockFetch(200, record({ version: 5, webhook_secret_set: true }));
     const onSaved = vi.fn();
