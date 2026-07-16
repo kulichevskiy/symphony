@@ -77,9 +77,7 @@ async def test_rotated_key_read_is_reauthorize_error(tmp_path: Path) -> None:
             cipher=CredentialCipher("old-key"),
         )
         with pytest.raises(CredentialDecryptError):
-            await db.oauth_connections.get_credential(
-                conn, "claude", CredentialCipher("new-key")
-            )
+            await db.oauth_connections.get_credential(conn, "claude", CredentialCipher("new-key"))
     finally:
         await conn.close()
 
