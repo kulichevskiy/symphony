@@ -115,3 +115,32 @@ async def set_connection(
     )
     if commit:
         await conn.commit()
+
+
+async def update_status(
+    conn: aiosqlite.Connection,
+    *,
+    provider: str,
+    status: str,
+    updated_at: str = "",
+    updated_by: str = "",
+    commit: bool = True,
+) -> None:
+    """Flip a connection's `status` (e.g. `connected`→`expired` after a failed
+    liveness `Test`) without touching the encrypted credential column. A no-op
+    if the provider has no row."""
+    await conn.execute(
+        "UPDATE oauth_connections SET status = ?, updated_at = ?, updated_by = ? "
+        "WHERE provider = ?",
+        (status, updated_at, updated_by, provider),
+    )
+    if commit:
+        await conn.commit()
+
+
+async def delete(conn: aiosqlite.Connection, provider: str, *, commit: bool = True) -> None:
+    """Drop the provider's row entirely — `Disconnect` clears the connection, so
+    the encrypted credential is gone, not merely marked disconnected. Idempotent."""
+    await conn.execute("DELETE FROM oauth_connections WHERE provider = ?", (provider,))
+    if commit:
+        await conn.commit()
