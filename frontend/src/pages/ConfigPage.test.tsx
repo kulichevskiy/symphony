@@ -531,7 +531,7 @@ describe("BindingsPanel", () => {
     expect(body.priority).toBe(1);
   });
 
-  it("excludes disabled rows from the reorder write set", async () => {
+  it("includes disabled rows in the reorder write set", async () => {
     const fetchMock = mockFetch(200, record());
     const onChanged = vi.fn();
     render(
@@ -540,7 +540,7 @@ describe("BindingsPanel", () => {
           record({ id: 1, priority: 0, version: 2, github_repo: "org/aaa" }),
           record({
             id: 2,
-            priority: 0,
+            priority: 1,
             version: 3,
             enabled: false,
             github_repo: "org/other",
@@ -552,10 +552,12 @@ describe("BindingsPanel", () => {
     );
     fireEvent.click(screen.getByLabelText("move down 1"));
     await waitFor(() => expect(onChanged).toHaveBeenCalled());
-    // Both rows renumber, but the disabled one must not be written — the
-    // backend 422s any write carrying `enabled: false`.
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // Disabled rows are valid config now (SYM-193) and the drain guard
+    // exempts priority-only edits, so both rows renumber and both writes go
+    // out — otherwise the disabled row's stale priority snaps back on refetch.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchMock.mock.calls[0][0]).toBe("/api/config/bindings/1");
+    expect(fetchMock.mock.calls[1][0]).toBe("/api/config/bindings/2");
   });
 
   it("threads globalRoles down into the binding's role matrix editor", () => {

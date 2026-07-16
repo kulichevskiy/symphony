@@ -2819,18 +2819,33 @@ class _OrchestratorBase:
                 if setup is not None and not await setup(workspace_path):
                     return False
 
+                # Launch gate: review-fix is a follow-up stage (drains
+                # in-flight work even on a disabled binding), but a lowered
+                # `max_concurrent` must still admit nothing new (SYM-193
+                # review). Held under `_dispatch_pause_lock` (the same lock
+                # `_dispatch_one` uses) so the gate's occupancy read and this
+                # insert move atomically. Skipped when `dispatch_capacity_held`
+                # — that means this fix-run is a continuation of a run
+                # (e.g. a merge-conflict rebase) that already holds this same
+                # occupancy slot, not a new spawn competing for one; gating it
+                # would double-count that slot against itself.
                 fix_run_id = str(uuid.uuid4())
-                inserted = await db.runs.create_if_no_active(
-                    self._conn,
-                    id=fix_run_id,
-                    issue_id=issue.id,
-                    stage="review_fix",
-                    status="running",
-                    pid=None,
-                    started_at=self._now().isoformat(),
-                    binding_key=_binding_storage_key(binding),
-                    ignored_stages=ignored_stages,
-                )
+                async with self._dispatch_pause_lock:
+                    if not dispatch_capacity_held and not await self._launch_gate_admits(
+                        binding, first_dispatch=False
+                    ):
+                        return False
+                    inserted = await db.runs.create_if_no_active(
+                        self._conn,
+                        id=fix_run_id,
+                        issue_id=issue.id,
+                        stage="review_fix",
+                        status="running",
+                        pid=None,
+                        started_at=self._now().isoformat(),
+                        binding_key=_binding_storage_key(binding),
+                        ignored_stages=ignored_stages,
+                    )
                 if not inserted:
                     # Lost the race: another live review_fix already exists (SYM-152).
                     if on_dedup_loss is not None:

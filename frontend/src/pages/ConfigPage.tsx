@@ -1049,13 +1049,14 @@ export function BindingsPanel({
     // Renumber against the new positions so the swap is never a no-op (e.g.
     // every new binding defaults to priority 0) — a plain value swap between
     // two equal priorities writes nothing and the sort order never changes.
-    // Disabled rows are excluded: the backend rejects any write carrying
-    // `enabled: false` (the lifecycle guard ships in SYM-193), so renumbering
-    // one would 422 the whole reorder even though its priority display value
-    // never actually changes anything today.
+    // Disabled rows are valid config now (SYM-193) and the drain guard
+    // exempts ordinary edits like priority, so they participate in the write
+    // set too — otherwise moving a disabled row (or swapping an enabled row
+    // across one) leaves its old priority in place and the list can snap
+    // back or tie-sort incorrectly after refetch.
     const writes = ordered
       .map((b) => ({ b, priority: moved.findIndex((m) => m.id === b.id) }))
-      .filter(({ b, priority }) => b.enabled && b.priority !== priority);
+      .filter(({ b, priority }) => b.priority !== priority);
 
     try {
       for (const { b, priority } of writes) {

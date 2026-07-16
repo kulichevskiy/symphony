@@ -424,9 +424,14 @@ class _DispatchMixin(_OrchestratorBase):
             # Reserve while holding `config_write_lock` so the drain guard's
             # `scheduled_slots` sample (taken under the same lock) can't miss
             # a reservation that lands mid-check (SYM-193 review; see
-            # `_review_fix_dispatch_slot`).
+            # `_review_fix_dispatch_slot`). Re-resolve the binding row under
+            # the same lock: a branch_prefix/base_branch edit can win the lock
+            # after the Ready/PR checks above but before this reservation, and
+            # the stale `binding` would otherwise dispatch with the settings
+            # the edit just replaced (SYM-193 review).
             async with self._config_write_lock:
-                return self._schedule_dispatch(binding, issue)
+                current = self._current_binding_row(binding) or binding
+                return self._schedule_dispatch(current, issue)
 
     async def _blocking_existing_pr(
         self,

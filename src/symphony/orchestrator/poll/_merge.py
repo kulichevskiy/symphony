@@ -2751,18 +2751,26 @@ class _MergeMixin(_OrchestratorBase):
     ) -> str | None:
         run_id = str(uuid.uuid4())
         now = self._now().isoformat()
-        inserted = await db.runs.create_if_no_active(
-            self._conn,
-            id=run_id,
-            issue_id=issue.id,
-            stage="merge",
-            status="running",
-            pid=None,
-            started_at=now,
-            binding_key=_binding_storage_key(binding),
-            ignored_stage="review",
-            ignored_stages=("review_fix",) if skip_review else (),
-        )
+        # Launch gate: merge is a follow-up stage (drains in-flight work even
+        # on a disabled binding), but a lowered `max_concurrent` must still
+        # admit nothing new (SYM-193 review). Held under `_dispatch_pause_lock`
+        # (the same lock `_dispatch_one` uses) so the gate's occupancy read
+        # and this insert move atomically.
+        async with self._dispatch_pause_lock:
+            if not await self._launch_gate_admits(binding, first_dispatch=False):
+                return None
+            inserted = await db.runs.create_if_no_active(
+                self._conn,
+                id=run_id,
+                issue_id=issue.id,
+                stage="merge",
+                status="running",
+                pid=None,
+                started_at=now,
+                binding_key=_binding_storage_key(binding),
+                ignored_stage="review",
+                ignored_stages=("review_fix",) if skip_review else (),
+            )
         if not inserted:
             return None
 

@@ -633,21 +633,26 @@ class _AcceptanceMixin(_OrchestratorBase):
     ) -> str | None:
         # Launch gate: acceptance is a follow-up stage (drains in-flight work
         # even on a disabled binding), but a lowered `max_concurrent` must
-        # still admit nothing new (SYM-193 review).
-        if not await self._launch_gate_admits(binding, first_dispatch=False):
-            return None
+        # still admit nothing new (SYM-193 review). Held under
+        # `_dispatch_pause_lock` (the same lock `_dispatch_one` uses) so the
+        # gate's occupancy read and this insert move atomically — two
+        # acceptance tasks queued for the same binding can't both pass a
+        # stale count before either writes its run row.
         run_id = str(uuid.uuid4())
-        inserted = await db.runs.create_if_no_active(
-            self._conn,
-            id=run_id,
-            issue_id=issue.id,
-            stage="acceptance",
-            status="running",
-            pid=None,
-            started_at=self._now().isoformat(),
-            binding_key=_binding_storage_key(binding),
-            ignored_stage="review",
-        )
+        async with self._dispatch_pause_lock:
+            if not await self._launch_gate_admits(binding, first_dispatch=False):
+                return None
+            inserted = await db.runs.create_if_no_active(
+                self._conn,
+                id=run_id,
+                issue_id=issue.id,
+                stage="acceptance",
+                status="running",
+                pid=None,
+                started_at=self._now().isoformat(),
+                binding_key=_binding_storage_key(binding),
+                ignored_stage="review",
+            )
         if not inserted:
             return None
 
