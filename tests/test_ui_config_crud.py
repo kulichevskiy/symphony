@@ -735,7 +735,9 @@ async def test_rename_onto_repo_with_secret_uses_target_version(tmp_path: Path) 
             conflict = await client.put(
                 f"/api/config/bindings/{b.json()['id']}",
                 json={
-                    "payload": _payload(github_repo="org/b", issue_label="bug", webhook_secret="c1"),
+                    "payload": _payload(
+                        github_repo="org/b", issue_label="bug", webhook_secret="c1"
+                    ),
                     "version": b.json()["version"],
                     "webhook_secret_version": 0,
                 },
