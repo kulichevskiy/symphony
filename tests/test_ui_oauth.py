@@ -84,6 +84,44 @@ async def test_start_returns_github_authorize_url(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_start_uses_configured_public_origin(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        cfg = _cfg().model_copy(
+            update={"symphony_oauth_public_origin": "https://symphony.example.com"}
+        )
+        app = _app(conn, db_path, cfg=cfg)
+        async with _client(app) as client:
+            resp = await client.get("/api/oauth/github/start")
+        assert resp.status_code == 200, resp.text
+        q = parse_qs(urlparse(resp.json()["authorize_url"]).query)
+        assert q["redirect_uri"] == ["https://symphony.example.com/api/oauth/github/callback"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_callback_redirect_uses_configured_public_origin(tmp_path: Path) -> None:
+    respx.post("https://github.com/login/oauth/access_token").mock(
+        return_value=httpx.Response(200, json={"access_token": "gho_secret_live"})
+    )
+    conn, db_path = await _open(tmp_path)
+    try:
+        cfg = _cfg().model_copy(
+            update={"symphony_oauth_public_origin": "https://symphony.example.com"}
+        )
+        app = _app(conn, db_path, cfg=cfg)
+        async with _client(app) as client:
+            state = await _mint_state(client)
+            resp = await client.get(f"/api/oauth/github/callback?code=the-code&state={state}")
+        assert resp.status_code == 302
+        assert resp.headers["location"] == "https://symphony.example.com/ui/config?connected=github"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_start_503_when_not_configured(tmp_path: Path) -> None:
     conn, db_path = await _open(tmp_path)
     try:
@@ -229,6 +267,25 @@ async def test_test_reports_live(tmp_path: Path) -> None:
             resp = await client.post("/api/oauth/github/test")
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "live"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_test_marks_expired_when_undecryptable(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        # Stored with a key the running app no longer has (rotated/corrupt).
+        await db.oauth_connections.set_connection(
+            conn, provider="github", credential="gho_x", cipher=CredentialCipher("old-secret")
+        )
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.post("/api/oauth/github/test")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "expired"
+        status = await db.oauth_connections.get_status(conn, "github")
+        assert status is not None and status.status == "expired"
     finally:
         await conn.close()
 

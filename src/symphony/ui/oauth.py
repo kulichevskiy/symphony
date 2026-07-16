@@ -73,9 +73,12 @@ def _now_iso(clock: Callable[[], datetime] | None) -> str:
     return now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _spa_redirect(request: Request, params: str) -> RedirectResponse:
-    """302 back into the SPA on the same origin as this request."""
-    base = str(request.base_url).rstrip("/")
+def _spa_redirect(request: Request, params: str, public_origin: str | None) -> RedirectResponse:
+    """302 back into the SPA, on the deployment's public origin if configured
+    (behind a reverse proxy that terminates TLS upstream of this process — see
+    Caddyfile.coolify), else derived from the request (local/dev, where the
+    daemon is reached directly)."""
+    base = public_origin.rstrip("/") if public_origin else str(request.base_url).rstrip("/")
     return RedirectResponse(f"{base}{_SPA_CONNECTIONS_PATH}?{params}", status_code=302)
 
 
@@ -86,9 +89,19 @@ def create_oauth_routers(
     cipher: CredentialCipher,
     state_store: OAuthStateStore,
     clock: Callable[[], datetime] | None = None,
+    public_origin: str | None = None,
 ) -> tuple[APIRouter, APIRouter]:
     """Build `(gated_router, public_router)`. The caller mounts the first behind
-    the Auth0 dependency and the second outside it."""
+    the Auth0 dependency and the second outside it.
+
+    `public_origin`, when set, overrides the request-derived scheme/host used
+    for the GitHub `redirect_uri` and the post-callback SPA redirect — required
+    behind a reverse proxy that terminates TLS upstream (the request this
+    process sees is plain HTTP on loopback), where deriving from the request
+    would build a URL that never matches the GitHub OAuth app's registered
+    callback and the redirect back into the SPA could resolve to the wrong
+    origin.
+    """
     gated = APIRouter(prefix="/api/oauth")
     public = APIRouter(prefix="/api/oauth")
 
@@ -99,6 +112,8 @@ def create_oauth_routers(
         return provider
 
     def _callback_uri(request: Request, name: str) -> str:
+        if public_origin:
+            return f"{public_origin.rstrip('/')}/api/oauth/{name}/callback"
         return str(request.url_for("oauth_callback", provider=name))
 
     @gated.get("/{provider}/start")
@@ -138,7 +153,7 @@ def create_oauth_routers(
     ) -> RedirectResponse:
         cfg = _provider(provider)
         if error:
-            return _spa_redirect(request, f"error={provider}")
+            return _spa_redirect(request, f"error={provider}", public_origin)
         # Reject a missing/unknown/replayed state before touching the provider:
         # the single-use store popped a valid one on `start`, so a replay or a
         # forged callback finds nothing.
@@ -156,7 +171,7 @@ def create_oauth_routers(
             )
         except OAuthError:
             _log.warning("oauth callback: %s token exchange failed", provider)
-            return _spa_redirect(request, f"error={provider}")
+            return _spa_redirect(request, f"error={provider}", public_origin)
         conn = await conn_provider()
         await db.oauth_connections.set_connection(
             conn,
@@ -168,7 +183,7 @@ def create_oauth_routers(
             updated_by="oauth",
         )
         _log.info("oauth connection established for %s", provider)
-        return _spa_redirect(request, f"connected={provider}")
+        return _spa_redirect(request, f"connected={provider}", public_origin)
 
     @gated.post("/{provider}/disconnect")
     async def oauth_disconnect(provider: str) -> dict[str, str]:
@@ -184,7 +199,19 @@ def create_oauth_routers(
         try:
             token = await db.oauth_connections.get_credential(conn, provider, cipher)
         except (CredentialDecryptError, CredentialKeyMissingError):
-            token = None
+            # `get_credential` only raises when a row exists (it returns `None`
+            # early otherwise) — the connection is real but unusable (key
+            # rotated/corrupt, or never configured), so reflect that as
+            # `expired` rather than reporting a 404 "not connected" that would
+            # hide the stale row from the card.
+            await db.oauth_connections.update_status(
+                conn,
+                provider=provider,
+                status="expired",
+                updated_at=_now_iso(clock),
+                updated_by="oauth",
+            )
+            return {"status": "expired"}
         if not token:
             raise HTTPException(status_code=404, detail=f"{provider} is not connected")
         async with httpx.AsyncClient() as client:

@@ -245,7 +245,16 @@ def create_app(
         if oauth_write_pool is not None:
             resolved = ui_external_config() if callable(ui_external_config) else ui_external_config
             base_config = resolved if resolved is not None else Config()
-            cipher = oauth_cipher if oauth_cipher is not None else CredentialCipher.from_env()
+            # Not `CredentialCipher.from_env()`: Coolify mounts `.env` as a file
+            # and deliberately never injects it into os.environ (see
+            # docker-compose.coolify.yml), so reading process env directly would
+            # never see the key there. `base_config` is sourced from `Secrets`,
+            # which reads `.env` the same way `github_oauth_client_id` above does.
+            cipher = (
+                oauth_cipher
+                if oauth_cipher is not None
+                else CredentialCipher(base_config.symphony_encryption_key)
+            )
             oauth_gated, oauth_public = create_oauth_routers(
                 oauth_write_pool.connection,
                 providers={
@@ -257,6 +266,7 @@ def create_app(
                 cipher=cipher,
                 state_store=OAuthStateStore(),
                 clock=clock,
+                public_origin=base_config.symphony_oauth_public_origin or None,
             )
             app.include_router(oauth_gated, dependencies=api_dependencies)
             app.include_router(oauth_public)
