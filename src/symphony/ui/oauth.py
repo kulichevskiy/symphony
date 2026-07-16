@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import aiosqlite
 import httpx
@@ -35,6 +35,7 @@ from ..oauth import (
     OAuthError,
     OAuthProvider,
     OAuthStateStore,
+    TokenResponse,
     build_authorize_url,
     exchange_code,
     generate_pkce,
@@ -71,12 +72,16 @@ def github_provider(client_id: str, client_secret: str) -> OAuthProvider:
 # Linear OAuth endpoints + minimal scopes: `read`/`write` cover reading and
 # mutating issues (the credential the resolver in 4/7 swaps in for
 # LINEAR_API_KEY). `Test` pings the GraphQL `viewer` query — a POST, unlike
-# GitHub's GET probe, so it rides `OAuthProvider.test_body`.
+# GitHub's GET probe, so it rides `OAuthProvider.test_body`. `actor=app`
+# attributes issues/comments Symphony creates to the app rather than the
+# authorizing operator — Linear's default `actor=user` is for interactive
+# use, not agents/service accounts (Linear OAuth docs).
 _LINEAR_AUTHORIZE_URL = "https://linear.app/oauth/authorize"
 _LINEAR_TOKEN_URL = "https://api.linear.app/oauth/token"
 _LINEAR_TEST_URL = "https://api.linear.app/graphql"
 _LINEAR_SCOPES = ("read", "write")
 _LINEAR_VIEWER_QUERY = {"query": "{ viewer { id } }"}
+_LINEAR_AUTHORIZE_EXTRA_PARAMS = {"actor": "app"}
 
 
 def linear_provider(client_id: str, client_secret: str) -> OAuthProvider:
@@ -93,12 +98,23 @@ def linear_provider(client_id: str, client_secret: str) -> OAuthProvider:
         scopes=_LINEAR_SCOPES,
         test_body=_LINEAR_VIEWER_QUERY,
         scope_separator=",",
+        authorize_extra_params=_LINEAR_AUTHORIZE_EXTRA_PARAMS,
     )
 
 
 def _now_iso(clock: Callable[[], datetime] | None) -> str:
     now = clock() if clock is not None else datetime.now(UTC)
     return now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _expires_at_iso(clock: Callable[[], datetime] | None, token: TokenResponse) -> str | None:
+    """`token.expires_in` (seconds from now, e.g. Linear's 24h) as an absolute
+    timestamp, or `None` for a provider whose token doesn't expire."""
+    if token.expires_in is None:
+        return None
+    now = clock() if clock is not None else datetime.now(UTC)
+    expires = now + timedelta(seconds=token.expires_in)
+    return expires.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _spa_redirect(request: Request, params: str, public_origin: str | None) -> RedirectResponse:
@@ -205,9 +221,11 @@ def create_oauth_routers(
         await db.oauth_connections.set_connection(
             conn,
             provider=provider,
-            credential=token,
+            credential=token.access_token,
             cipher=cipher,
+            refresh_token=token.refresh_token,
             status="connected",
+            expires_at=_expires_at_iso(clock, token),
             updated_at=_now_iso(clock),
             updated_by="oauth",
         )

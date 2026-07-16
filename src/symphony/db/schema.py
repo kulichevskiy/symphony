@@ -244,3 +244,11 @@ async def _migrate(conn: aiosqlite.Connection) -> None:
             """,
             (github_repo, secret),
         )
+
+    # Providers whose token exchange returns a `refresh_token` (Linear's
+    # access token expires in 24h) need it preserved alongside the access
+    # token — added after oauth_connections shipped in SYM-196.
+    cur = await conn.execute("PRAGMA table_info(oauth_connections)")
+    oauth_cols = {row[1] for row in await cur.fetchall()}
+    if "refresh_token" not in oauth_cols:
+        await conn.execute("ALTER TABLE oauth_connections ADD COLUMN refresh_token BLOB")

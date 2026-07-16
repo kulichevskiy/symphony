@@ -46,6 +46,36 @@ async def test_round_trips_encrypted_payload(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_refresh_token_round_trips_when_present(tmp_path: Path) -> None:
+    conn = await _conn(tmp_path)
+    cipher = CredentialCipher("deployment-secret")
+    try:
+        await db.oauth_connections.set_connection(
+            conn,
+            provider="linear",
+            credential="lin_access",
+            cipher=cipher,
+            refresh_token="lin_refresh",
+        )
+        assert await db.oauth_connections.get_refresh_token(conn, "linear", cipher) == "lin_refresh"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_refresh_token_is_none_when_absent(tmp_path: Path) -> None:
+    conn = await _conn(tmp_path)
+    cipher = CredentialCipher("deployment-secret")
+    try:
+        await db.oauth_connections.set_connection(
+            conn, provider="github", credential="gho_x", cipher=cipher
+        )
+        assert await db.oauth_connections.get_refresh_token(conn, "github", cipher) is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_stored_bytes_are_ciphertext_not_plaintext(tmp_path: Path) -> None:
     conn = await _conn(tmp_path)
     cipher = CredentialCipher("deployment-secret")

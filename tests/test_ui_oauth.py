@@ -314,6 +314,7 @@ async def test_linear_start_returns_authorize_url(tmp_path: Path) -> None:
         assert q["scope"] == ["read,write"]
         assert q["code_challenge_method"] == ["S256"]
         assert q["redirect_uri"] == ["http://test/api/oauth/linear/callback"]
+        assert q["actor"] == ["app"]
         assert q["state"]  # a state was minted
     finally:
         await conn.close()
@@ -342,7 +343,14 @@ async def test_linear_start_503_when_not_configured(tmp_path: Path) -> None:
 @respx.mock
 async def test_linear_callback_stores_encrypted_token(tmp_path: Path) -> None:
     respx.post("https://api.linear.app/oauth/token").mock(
-        return_value=httpx.Response(200, json={"access_token": "lin_oauth_live"})
+        return_value=httpx.Response(
+            200,
+            json={
+                "access_token": "lin_oauth_live",
+                "refresh_token": "lin_oauth_refresh",
+                "expires_in": 86399,
+            },
+        )
     )
     conn, db_path = await _open(tmp_path)
     try:
@@ -354,17 +362,26 @@ async def test_linear_callback_stores_encrypted_token(tmp_path: Path) -> None:
         assert "/ui/config" in resp.headers["location"]
         assert "lin_oauth_live" not in resp.text
         assert "lin_oauth_live" not in str(resp.headers)
+        assert "lin_oauth_refresh" not in resp.text
         status = await db.oauth_connections.get_status(conn, "linear")
         assert status is not None and status.status == "connected"
+        assert status.expires_at is not None
         assert (
             await db.oauth_connections.get_credential(conn, "linear", CredentialCipher(_KEY))
             == "lin_oauth_live"
         )
-        cur = await conn.execute(
-            "SELECT credential FROM oauth_connections WHERE provider = 'linear'"
+        # The refresh token is preserved (not discarded) so a future resolver
+        # (OAuth in UI 4/7) can use it once the access token expires (24h).
+        assert (
+            await db.oauth_connections.get_refresh_token(conn, "linear", CredentialCipher(_KEY))
+            == "lin_oauth_refresh"
         )
-        raw = (await cur.fetchone())["credential"]
-        assert b"lin_oauth_live" not in raw
+        cur = await conn.execute(
+            "SELECT credential, refresh_token FROM oauth_connections WHERE provider = 'linear'"
+        )
+        row = await cur.fetchone()
+        assert b"lin_oauth_live" not in row["credential"]
+        assert b"lin_oauth_refresh" not in row["refresh_token"]
     finally:
         await conn.close()
 

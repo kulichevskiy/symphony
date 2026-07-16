@@ -81,37 +81,56 @@ async def get_credential(
     return cipher.decrypt(bytes(row["credential"]))
 
 
+async def get_refresh_token(
+    conn: aiosqlite.Connection, provider: str, cipher: CredentialCipher
+) -> str | None:
+    """Decrypt and return the provider's stored refresh token, or `None` if
+    there is no row or the provider's token exchange never returned one
+    (e.g. GitHub). Same decrypt-error contract as `get_credential`."""
+    cur = await conn.execute(
+        "SELECT refresh_token FROM oauth_connections WHERE provider = ?", (provider,)
+    )
+    row = await cur.fetchone()
+    if row is None or row["refresh_token"] is None:
+        return None
+    return cipher.decrypt(bytes(row["refresh_token"]))
+
+
 async def set_connection(
     conn: aiosqlite.Connection,
     *,
     provider: str,
     credential: str,
     cipher: CredentialCipher,
+    refresh_token: str | None = None,
     status: str = "connected",
     expires_at: str | None = None,
     updated_at: str = "",
     updated_by: str = "",
     commit: bool = True,
 ) -> None:
-    """Encrypt `credential` and upsert the provider's row.
+    """Encrypt `credential` (and `refresh_token`, if the provider's token
+    exchange returned one) and upsert the provider's row.
 
     `commit=False` lets a caller fold this into a larger atomic transaction it
     commits itself.
     """
     encrypted = cipher.encrypt(credential)
+    encrypted_refresh = cipher.encrypt(refresh_token) if refresh_token is not None else None
     await conn.execute(
         """
         INSERT INTO oauth_connections
-            (provider, credential, status, expires_at, updated_at, updated_by)
-        VALUES (?, ?, ?, ?, ?, ?)
+            (provider, credential, refresh_token, status, expires_at, updated_at, updated_by)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(provider) DO UPDATE SET
             credential = excluded.credential,
+            refresh_token = excluded.refresh_token,
             status = excluded.status,
             expires_at = excluded.expires_at,
             updated_at = excluded.updated_at,
             updated_by = excluded.updated_by
         """,
-        (provider, encrypted, status, expires_at, updated_at, updated_by),
+        (provider, encrypted, encrypted_refresh, status, expires_at, updated_at, updated_by),
     )
     if commit:
         await conn.commit()
