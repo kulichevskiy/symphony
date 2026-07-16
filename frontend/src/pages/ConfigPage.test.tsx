@@ -74,6 +74,9 @@ function record(overrides: Partial<BindingRecord> = {}): BindingRecord {
     tracker_provider: "linear",
     tracker_site: "default",
     webhook_secret_set: false,
+    webhook_secret_version: 0,
+    webhook_secret_updated_at: "",
+    webhook_secret_updated_by: "",
     payload: { project_key: "ENG", github_repo: "org/repo", states: { ready: "Todo" } },
     ...overrides,
   };
@@ -193,6 +196,104 @@ describe("BindingForm", () => {
     const sent = JSON.parse(init?.body as string);
     expect(sent.version).toBe(4);
     expect(sent.payload.max_concurrent).toBe(6);
+  });
+
+  it("offers a clear-secret checkbox only when a secret is already set, and sends the loaded version", async () => {
+    const fetchMock = mockFetch(200, record({ version: 5, webhook_secret_set: true }));
+    const onSaved = vi.fn();
+    render(
+      <BindingForm
+        binding={record({ webhook_secret_set: true, webhook_secret_version: 3 })}
+        options={OPTIONS}
+        onSaved={onSaved}
+        onCancel={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText("webhook_secret_clear"));
+    fireEvent.click(screen.getByText("Save"));
+
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    const sent = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+    expect(sent.webhook_secret_clear).toBe(true);
+    expect(sent.webhook_secret_version).toBe(3);
+    expect(sent.payload.webhook_secret).toBeUndefined();
+  });
+
+  it("has no clear-secret checkbox when no secret is set yet", () => {
+    render(
+      <BindingForm
+        binding={record({ webhook_secret_set: false })}
+        options={OPTIONS}
+        onSaved={() => {}}
+        onCancel={() => {}}
+      />,
+    );
+    expect(screen.queryByLabelText("webhook_secret_clear")).toBeNull();
+  });
+
+  it("hides the clear-secret checkbox and drops a pending clear once github_repo is edited", async () => {
+    const fetchMock = mockFetch(200, record({ version: 5 }));
+    const onSaved = vi.fn();
+    render(
+      <BindingForm
+        binding={record({ webhook_secret_set: true, webhook_secret_version: 3 })}
+        options={OPTIONS}
+        onSaved={onSaved}
+        onCancel={() => {}}
+      />,
+    );
+    fireEvent.click(screen.getByLabelText("webhook_secret_clear"));
+    fireEvent.change(screen.getByLabelText("github_repo"), {
+      target: { value: "org/other-repo" },
+    });
+    expect(screen.queryByLabelText("webhook_secret_clear")).toBeNull();
+
+    fireEvent.click(screen.getByText("Save"));
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    const sent = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+    expect(sent.webhook_secret_clear).toBe(false);
+  });
+
+  it("sends the loaded repo-secret version when replacing an existing secret", async () => {
+    const fetchMock = mockFetch(200, record({ version: 5, webhook_secret_set: true }));
+    const onSaved = vi.fn();
+    render(
+      <BindingForm
+        binding={record({ webhook_secret_set: true, webhook_secret_version: 3 })}
+        options={OPTIONS}
+        onSaved={onSaved}
+        onCancel={() => {}}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("webhook_secret"), {
+      target: { value: "new-secret" },
+    });
+    fireEvent.click(screen.getByText("Save"));
+
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    const sent = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+    expect(sent.payload.webhook_secret).toBe("new-secret");
+    expect(sent.webhook_secret_version).toBe(3);
+  });
+
+  it("does not send a repo-secret version on an edit that doesn't touch the secret", async () => {
+    const fetchMock = mockFetch(200, record({ version: 5, webhook_secret_set: true }));
+    const onSaved = vi.fn();
+    render(
+      <BindingForm
+        binding={record({ webhook_secret_set: true, webhook_secret_version: 3 })}
+        options={OPTIONS}
+        onSaved={onSaved}
+        onCancel={() => {}}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("max_concurrent"), { target: { value: "6" } });
+    fireEvent.click(screen.getByText("Save"));
+
+    await waitFor(() => expect(onSaved).toHaveBeenCalled());
+    const sent = JSON.parse(fetchMock.mock.calls[0][1]?.body as string);
+    expect(sent.webhook_secret_version).toBeUndefined();
+    expect(sent.webhook_secret_clear).toBe(false);
   });
 
   it("has no enabled toggle in the drawer and preserves the binding's state", async () => {

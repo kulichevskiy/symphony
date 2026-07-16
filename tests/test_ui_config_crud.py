@@ -7,6 +7,7 @@ stamping, secret redaction, and the options payload.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -20,7 +21,7 @@ from fastapi import FastAPI
 from symphony import db
 from symphony.app import create_app
 from symphony.config import Config
-from symphony.db import config_bindings
+from symphony.db import config_bindings, config_repo_secrets
 from symphony.ui.config_crud import create_config_crud_router
 
 from .test_auth import JWKS_URI, _jwks, _settings, _token
@@ -488,6 +489,406 @@ async def test_webhook_secret_survives_edit_of_redacted_payload(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_repo_secret_metadata_in_response(tmp_path: Path) -> None:
+    """The response carries the repo-secret set flag, its own `version`, and
+    updated metadata — never the value (SYM-194)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            created = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_secret="s3cr3t")},
+            )
+            assert created.status_code == 201, created.text
+            rec = created.json()
+            assert rec["webhook_secret_set"] is True
+            assert rec["webhook_secret_version"] == 1
+            assert rec["webhook_secret_updated_by"] == "local"
+            assert "s3cr3t" not in created.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_repo_secret_version_conflict_across_bindings(tmp_path: Path) -> None:
+    """The repo secret is shared across a repo's bindings, so its own `version`
+    guards concurrent edits: two tabs editing *different* bindings of the same
+    repo conflict on the shared secret (SYM-194 acceptance)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            b1 = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_secret="a")},
+            )
+            assert b1.status_code == 201, b1.text
+            assert b1.json()["webhook_secret_version"] == 1
+
+            # A second binding on the SAME repo (distinct label — not a
+            # duplicate selector) sees the shared secret at version 1.
+            b2 = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(issue_label="bug")},
+            )
+            assert b2.status_code == 201, b2.text
+            assert b2.json()["webhook_secret_version"] == 1
+
+            # Tab A replaces the secret from binding 1 → version 2.
+            put1 = await client.put(
+                f"/api/config/bindings/{b1.json()['id']}",
+                json={
+                    "payload": _payload(webhook_secret="b"),
+                    "version": b1.json()["version"],
+                    "webhook_secret_version": 1,
+                },
+            )
+            assert put1.status_code == 200, put1.text
+            assert put1.json()["webhook_secret_version"] == 2
+
+            # Tab B still holds version 1 and tries to replace it from binding
+            # 2 → conflict on the shared repo secret.
+            put2 = await client.put(
+                f"/api/config/bindings/{b2.json()['id']}",
+                json={
+                    "payload": _payload(issue_label="bug", webhook_secret="c"),
+                    "version": b2.json()["version"],
+                    "webhook_secret_version": 1,
+                },
+            )
+            assert put2.status_code == 409, put2.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_repo_secret_version_conflict_on_create(tmp_path: Path) -> None:
+    """A create has no prior binding to have loaded a repo-secret version
+    from, so `webhook_secret_version` is normally omitted (`None`) on a
+    create request. That must not fall back to an unconditional overwrite of
+    an already-secreted repo: two concurrent creates racing to set the same
+    repo's secret must still serialize under the shared secret's optimistic
+    lock, same as two tabs editing existing bindings (SYM-194 review)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            seed = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_secret="a")},
+            )
+            assert seed.status_code == 201, seed.text
+            assert seed.json()["webhook_secret_version"] == 1
+
+            # Two more bindings on the SAME repo (distinct labels), each
+            # racing to replace the shared secret with no explicit
+            # `webhook_secret_version` — neither client loaded one, since
+            # neither is editing an existing binding.
+            results = await asyncio.gather(
+                client.post(
+                    "/api/config/bindings",
+                    json={"payload": _payload(issue_label="one", webhook_secret="b")},
+                ),
+                client.post(
+                    "/api/config/bindings",
+                    json={"payload": _payload(issue_label="two", webhook_secret="c")},
+                ),
+            )
+            statuses = sorted(r.status_code for r in results)
+            assert statuses == [201, 409], [r.text for r in results]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_webhook_enabled_rename_validates_against_new_repos_secret(
+    tmp_path: Path,
+) -> None:
+    """A rename (`github_repo` change) must validate `webhook_enabled` against
+    the *target* repo's secret, not the repo being renamed away from — else a
+    rename onto an unsecured repo with no global fallback saves cleanly with
+    verification silently disabled (SYM-194 review)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path, github_webhook_secret="")
+        async with _client(app) as client:
+            created = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_enabled=True, webhook_secret="s3cr3t")},
+            )
+            assert created.status_code == 201, created.text
+
+            renamed = await client.put(
+                f"/api/config/bindings/{created.json()['id']}",
+                json={
+                    "payload": _payload(github_repo="org/other", webhook_enabled=True),
+                    "version": created.json()["version"],
+                },
+            )
+            assert renamed.status_code == 422, renamed.text
+            assert renamed.json()["detail"][0]["loc"] == ["webhook_secret"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_webhook_secret_clear_fails_closed_for_enabled_sibling(tmp_path: Path) -> None:
+    """The repo secret is shared across every binding on one `github_repo`:
+    clearing it from a `webhook_enabled=False` binding must still fail closed
+    when an enabled sibling on the same repo depends on it — else that
+    sibling's webhook verification silently disables app-wide on the next hot
+    reload (SYM-194 review)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path, github_webhook_secret="")
+        async with _client(app) as client:
+            enabled = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_enabled=True, webhook_secret="s3cr3t")},
+            )
+            assert enabled.status_code == 201, enabled.text
+
+            sibling = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(issue_label="other", webhook_enabled=False)},
+            )
+            assert sibling.status_code == 201, sibling.text
+            assert sibling.json()["webhook_secret_set"] is True
+
+            cleared = await client.put(
+                f"/api/config/bindings/{sibling.json()['id']}",
+                json={
+                    "payload": _payload(issue_label="other", webhook_enabled=False),
+                    "version": sibling.json()["version"],
+                    "webhook_secret_clear": True,
+                    "webhook_secret_version": sibling.json()["webhook_secret_version"],
+                },
+            )
+            assert cleared.status_code == 422, cleared.text
+            assert cleared.json()["detail"][0]["loc"] == ["webhook_secret"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_repo_secret_version_conflict_on_update_with_omitted_version(
+    tmp_path: Path,
+) -> None:
+    """Mirrors `test_repo_secret_version_conflict_on_create`: an update that
+    omits `webhook_secret_version` must not fall back to an unconditional
+    overwrite of the shared repo secret — it has to share create's
+    optimistic-lock contract (SYM-194 review)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            b1 = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_secret="a")},
+            )
+            assert b1.status_code == 201, b1.text
+            b2 = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(issue_label="bug")},
+            )
+            assert b2.status_code == 201, b2.text
+
+            # Both tabs race to replace the shared secret with no explicit
+            # `webhook_secret_version` — before the fix, this drove
+            # `set_secret` into its unconditional-overwrite branch and both
+            # writes would land.
+            results = await asyncio.gather(
+                client.put(
+                    f"/api/config/bindings/{b1.json()['id']}",
+                    json={"payload": _payload(webhook_secret="b"), "version": b1.json()["version"]},
+                ),
+                client.put(
+                    f"/api/config/bindings/{b2.json()['id']}",
+                    json={
+                        "payload": _payload(issue_label="bug", webhook_secret="c"),
+                        "version": b2.json()["version"],
+                    },
+                ),
+            )
+            statuses = sorted(r.status_code for r in results)
+            assert statuses == [200, 409], [r.text for r in results]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_update_rechecks_repo_secret_state_under_the_lock(
+    tmp_path: Path,
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """An update that doesn't touch the secret (preserve-on-omit) never calls
+    `_write_repo_secret` at all, so nothing else re-validates the
+    `webhook_enabled` fail-closed invariant against the secret's *current*
+    state. If another writer clears the repo's only secret while this update's
+    (network-bound) capability check is in flight, the pre-lock read is stale
+    by the time this write would commit — the in-lock recheck must catch that
+    and 422 rather than let a webhook_enabled binding with no secret land
+    (SYM-194 review)."""
+    conn, db_path = await _open(tmp_path)
+    original_get = config_repo_secrets.get
+    calls = {"n": 0}
+
+    async def _get(c: Any, github_repo: str) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 2:
+            # Simulate another tab clearing this repo's secret between the
+            # pre-lock read and the in-lock recheck.
+            await config_repo_secrets.set_secret(
+                c,
+                github_repo=github_repo,
+                secret="",
+                expected_version=1,
+                updated_at="t",
+                updated_by="other-tab",
+                commit=True,
+            )
+        return await original_get(c, github_repo)
+
+    try:
+        app = _app(conn, db_path, github_webhook_secret="")
+        async with _client(app) as client:
+            created = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_enabled=True, webhook_secret="s3cr3t")},
+            )
+            assert created.status_code == 201, created.text
+
+            monkeypatch.setattr("symphony.ui.config_crud.config_repo_secrets.get", _get)
+            updated = await client.put(
+                f"/api/config/bindings/{created.json()['id']}",
+                json={
+                    "payload": _payload(webhook_enabled=True),
+                    "version": created.json()["version"],
+                },
+            )
+            assert updated.status_code == 422, updated.text
+            assert updated.json()["detail"][0]["loc"] == ["webhook_secret"]
+
+            # Not persisted — a reread still shows the original version.
+            reread = await client.get("/api/config/bindings")
+            assert reread.json()[0]["version"] == created.json()["version"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_rename_onto_repo_with_secret_uses_target_version(tmp_path: Path) -> None:
+    """A save that both renames `github_repo` and sets the secret must gate the
+    write on the *target* repo's freshly-read version, not the client's
+    `webhook_secret_version` (loaded for the old repo before the rename). Org/a
+    is advanced to version 2 while org/b sits untouched at version 1: the
+    stale client-held version 2 must not spuriously 409 against org/b's real
+    version 1, and org/b's actual version must still gate the write (SYM-194
+    review)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            a = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(github_repo="org/a", webhook_secret="a1")},
+            )
+            assert a.status_code == 201, a.text
+            a = await client.put(
+                f"/api/config/bindings/{a.json()['id']}",
+                json={
+                    "payload": _payload(github_repo="org/a", webhook_secret="a2"),
+                    "version": a.json()["version"],
+                    "webhook_secret_version": 1,
+                },
+            )
+            assert a.status_code == 200, a.text
+            assert a.json()["webhook_secret_version"] == 2
+
+            b = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(github_repo="org/b", issue_label="bug")},
+            )
+            assert b.status_code == 201, b.text
+            assert b.json()["webhook_secret_version"] == 0
+
+            # Rename binding `a` onto org/b while replacing the secret,
+            # carrying org/a's version (2) — stale for org/b (version-less,
+            # i.e. 0). Before the fix this 409'd against org/b's real state.
+            renamed = await client.put(
+                f"/api/config/bindings/{a.json()['id']}",
+                json={
+                    "payload": _payload(github_repo="org/b", webhook_secret="b1"),
+                    "version": a.json()["version"],
+                    "webhook_secret_version": 2,
+                },
+            )
+            assert renamed.status_code == 200, renamed.text
+            assert renamed.json()["webhook_secret_version"] == 1
+
+            # The rename really did advance org/b's secret to version 1 (not
+            # skip the check): a write still carrying org/b's pre-rename
+            # version (0) is now stale and must 409, proving the lock wasn't
+            # defeated.
+            conflict = await client.put(
+                f"/api/config/bindings/{b.json()['id']}",
+                json={
+                    "payload": _payload(
+                        github_repo="org/b", issue_label="bug", webhook_secret="c1"
+                    ),
+                    "version": b.json()["version"],
+                    "webhook_secret_version": 0,
+                },
+            )
+            assert conflict.status_code == 409, conflict.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_repo_secret_explicit_clear(tmp_path: Path) -> None:
+    """Omit keeps; an explicit clear marker removes the secret (SYM-194)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            created = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_secret="s3cr3t")},
+            )
+            bid = created.json()["id"]
+            assert created.json()["webhook_secret_set"] is True
+
+            # Ordinary edit that omits the secret → kept.
+            got = await client.get(f"/api/config/bindings/{bid}")
+            kept = await client.put(
+                f"/api/config/bindings/{bid}",
+                json={
+                    "payload": {**got.json()["payload"], "max_concurrent": 7},
+                    "version": got.json()["version"],
+                },
+            )
+            assert kept.status_code == 200, kept.text
+            assert kept.json()["webhook_secret_set"] is True
+
+            # Explicit clear marker → removed.
+            cleared = await client.put(
+                f"/api/config/bindings/{bid}",
+                json={
+                    "payload": {**kept.json()["payload"]},
+                    "version": kept.json()["version"],
+                    "webhook_secret_clear": True,
+                    "webhook_secret_version": kept.json()["webhook_secret_version"],
+                },
+            )
+            assert cleared.status_code == 200, cleared.text
+            assert cleared.json()["webhook_secret_set"] is False
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_mcp_server_secrets_redacted_on_read(tmp_path: Path) -> None:
     """`mcp_servers` has no `resolve_env`-style name indirection (unlike the
     top-level `env` field), so an operator embeds literal credentials
@@ -629,6 +1030,44 @@ async def test_diff_logged_without_secret_values(
     assert "webhook_secret" in text  # the flag, not the value
     assert "max_concurrent" in text
     assert "mcp_servers" in text  # which servers changed, not their contents
+
+
+def test_diff_never_reports_legacy_payload_secret_as_cleared() -> None:
+    """A binding row from before the repo-scoped secret table (SYM-190..193)
+    can still carry `webhook_secret` in its stored payload if it somehow
+    reaches `_diff` before the schema migration strips it. The per-field diff
+    must never report that as a spurious "cleared" for a value the operator
+    never touched — `_add_secret_flag` (fed from the real secret-table state)
+    owns `webhook_secret`'s audit flag, not this generic field diff
+    (SYM-194 review)."""
+    from symphony.db import config_bindings
+    from symphony.ui import config_crud
+
+    old = config_bindings.StoredBinding(
+        id=1,
+        payload={
+            "github_repo": "org/repo",
+            "project_key": "ENG",
+            "webhook_secret": "legacy-value-should-never-log",
+            "max_concurrent": 4,
+        },
+        version=1,
+        enabled=True,
+        priority=0,
+        updated_at="",
+        updated_by="",
+        project_key="ENG",
+        github_repo="org/repo",
+        issue_label="",
+        tracker_provider="linear",
+        tracker_site="default",
+    )
+    new_payload = {"github_repo": "org/repo", "project_key": "ENG", "max_concurrent": 5}
+
+    changes = config_crud._diff(old, new_payload, enabled=True, priority=0)
+
+    assert "webhook_secret" not in changes
+    assert changes["max_concurrent"] == {"from": 4, "to": 5}
 
 
 @pytest.mark.asyncio

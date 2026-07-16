@@ -172,19 +172,31 @@ def _auth0_settings(cfg: Config) -> Auth0Settings | None:
         raise click.ClickException(str(exc)) from exc
 
 
-def _github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
+def _github_webhook_settings(
+    cfg: Config, repo_secrets: Mapping[str, str] | None = None
+) -> GitHubWebhookSettings | None:
     enabled_bindings = [binding for binding in cfg.repos if binding.webhook_enabled]
-    repo_secrets = {
-        binding.github_repo: binding.webhook_secret
-        for binding in enabled_bindings
-        if binding.webhook_secret
-    }
-    if not enabled_bindings and not cfg.github_webhook_secret and not repo_secrets:
+    # Repo webhook secrets come from the DB-owned repo-secret view (SYM-194),
+    # hot-swapped by the config write path. A legacy YAML topology (not yet
+    # imported) still carries the secret on the binding itself, so merge those
+    # in as a fallback for any repo the view doesn't cover — back-compat for
+    # the pre-cutover daemon. Build the legacy fallback first and let the view
+    # overwrite it per-repo: iterating `cfg.repos` in order and overwriting on
+    # each match (rather than keeping only the first) preserves the pre-SYM-194
+    # dict-comprehension's tie-break — the *last* binding wins — for a legacy
+    # topology with multiple bindings on one repo that disagree on the secret
+    # (SYM-194 review).
+    merged: dict[str, str] = {}
+    for binding in cfg.repos:
+        if binding.webhook_secret:
+            merged[binding.github_repo] = binding.webhook_secret
+    merged.update(repo_secrets or {})
+    if not enabled_bindings and not cfg.github_webhook_secret and not merged:
         return None
     try:
         return GitHubWebhookSettings(
             secret=cfg.github_webhook_secret,
-            repo_secrets=repo_secrets,
+            repo_secrets=merged,
             enabled_repos=frozenset(binding.github_repo for binding in enabled_bindings),
             dedupe_ttl_secs=cfg.webhook_dedupe_ttl_secs,
         )
@@ -192,7 +204,9 @@ def _github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
         raise click.ClickException(str(e)) from e
 
 
-def _live_github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
+def _live_github_webhook_settings(
+    cfg: Config, repo_secrets: Mapping[str, str] | None = None
+) -> GitHubWebhookSettings | None:
     """Like `_github_webhook_settings`, but for the per-request callable a
     DB-owned topology passes to the webhook router (SYM-189): a hot-reloaded
     edit that adds/enables a repo without a secret while
@@ -201,7 +215,7 @@ def _live_github_webhook_settings(cfg: Config) -> GitHubWebhookSettings | None:
     boot. The router already treats a `None` settings provider as "disable
     every repo"; do that here too instead of crashing the request."""
     try:
-        return _github_webhook_settings(cfg)
+        return _github_webhook_settings(cfg, repo_secrets)
     except click.ClickException as e:
         logging.getLogger(__name__).warning(
             "live github webhook settings invalid, disabling all repos until fixed: %s", e
@@ -373,12 +387,22 @@ async def _run(config_path: Path, *, once: bool) -> None:
             def _hot_add_tracker(binding: RepoBinding) -> IssueTracker:
                 return for_binding(binding, reload_secrets)
 
+            # Live view of per-repo webhook secrets, built from the DB and
+            # hot-swapped by the config write path so a secret set/replaced/
+            # cleared through the UI reaches the verifier without a restart
+            # (SYM-194). Loaded before the orchestrator so it can also be
+            # refreshed on every binding reload tick — otherwise a secret row
+            # written by `config-import` directly into the DB (not through the
+            # CRUD hot-swap path) would need a restart to verify against on an
+            # already-running DB-owned daemon (SYM-194 review fix).
+            repo_secret_view = await db.config_repo_secrets.load_view(conn)
             orch = Orchestrator(
                 cfg,
                 trackers,
                 conn,
                 reload_bindings_from_db=db_owns_topology,
                 tracker_factory=_hot_add_tracker if db_owns_topology else None,
+                repo_secret_view=repo_secret_view if db_owns_topology else None,
             )
             await reconcile(conn, trackers, bindings=cfg.repos)
             if once:
@@ -389,7 +413,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                 return
             webhook_server: object | None = None
             webhook_task: asyncio.Task[None] | None = None
-            github_webhook_settings = _github_webhook_settings(cfg)
+            github_webhook_settings = _github_webhook_settings(cfg, repo_secret_view.as_map())
             # A DB-owned topology can hot-enable a repo's webhook (or add a
             # binding needing one) at any later tick — the boot-time booleans
             # above can't see that yet, so a headless (`ui.enabled=False`)
@@ -427,7 +451,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     # doesn't need one either — the router itself no-ops
                     # (ignores every repo) when the resolved settings are
                     # `None`.
-                    lambda: _live_github_webhook_settings(orch.config),
+                    lambda: _live_github_webhook_settings(orch.config, repo_secret_view.as_map()),
                     ui_enabled=cfg.ui.enabled,
                     ui_db_path=cfg.db_path,
                     ui_log_root=cfg.log_root,
@@ -441,6 +465,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
                     ui_command_sink=orch,
                     ui_pause_controller=orch,
                     ui_config_write_lock=orch.config_write_lock,
+                    ui_repo_secret_view=repo_secret_view,
                     ui_db_owns_topology=db_owns_topology,
                     ui_webhook_public_url=os.environ.get("SYMPHONY_WEBHOOK_PUBLIC_URL"),
                     auth0_settings=_auth0_settings(cfg) if cfg.ui.enabled else None,

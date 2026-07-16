@@ -60,6 +60,29 @@ repos:
 
 
 @pytest.mark.asyncio
+async def test_webhook_secrets_land_in_repo_secret_table(tmp_path: Path) -> None:
+    """Per-binding YAML webhook secrets move into the repo-scoped table so
+    verification survives cutover, and never remain in the (legacy-free,
+    secret-free) binding payload (SYM-194)."""
+    conn, _result, rows, _g = await _import(
+        tmp_path,
+        f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+    webhook_enabled: true
+    webhook_secret: yaml-secret
+{_STATES}
+""",
+    )
+    assert "webhook_secret" not in rows[0].payload
+    sec = await db.config_repo_secrets.get(conn, "org/api")
+    assert sec is not None and sec.secret == "yaml-secret"
+    assert sec.version == 1
+    await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_payload_is_sparse_and_legacy_free(tmp_path: Path) -> None:
     conn, _result, rows, _g = await _import(
         tmp_path,

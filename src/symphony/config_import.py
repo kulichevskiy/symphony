@@ -125,11 +125,14 @@ def build_payload(
     """Sparse, legacy-free payload for one binding: the operator-set non-role
     fields verbatim, plus the consolidated roles matrix (if any). `enabled` is
     excluded — it lives in its own `config_bindings` column, not the payload
-    (see the caller, which stamps that column from `binding.enabled`)."""
+    (see the caller, which stamps that column from `binding.enabled`).
+    `webhook_secret` is excluded too — it moves to the repo-scoped secret table
+    (SYM-194), never a binding payload."""
     payload = {
         k: v
         for k, v in raw_repo.items()
-        if k not in _LEGACY_ROLE_FIELDS and k not in ("roles", "review_strategy", "enabled")
+        if k not in _LEGACY_ROLE_FIELDS
+        and k not in ("roles", "review_strategy", "enabled", "webhook_secret")
     }
     if "review_strategy" in raw_repo:
         # Deprecated enum, already resolved into `operator.local_review` /
@@ -197,6 +200,7 @@ async def import_config(
     try:
         if replace:
             await conn.execute("DELETE FROM config_bindings")
+            await conn.execute("DELETE FROM config_repo_secrets")
 
         for priority, (raw_repo, binding) in enumerate(zip(raw_repos, cfg.repos, strict=True)):
             payload = build_payload(raw_repo, binding, cfg.roles)
@@ -206,6 +210,25 @@ async def import_config(
                 key=binding_natural_key(binding),
                 enabled=binding.enabled,
                 priority=priority,
+                updated_at=now,
+                updated_by=updated_by,
+                commit=False,
+            )
+
+        # Per-binding YAML webhook secrets move into the repo-scoped table so
+        # verification survives cutover without manual re-entry (SYM-194). The
+        # secret is per repo, so two bindings on one repo collapse to one row
+        # (last non-empty wins); the value never re-enters a binding payload.
+        repo_secrets: dict[str, str] = {}
+        for binding in cfg.repos:
+            if binding.webhook_secret:
+                repo_secrets[binding.github_repo] = binding.webhook_secret
+        for github_repo, secret in repo_secrets.items():
+            await db.config_repo_secrets.set_secret(
+                conn,
+                github_repo=github_repo,
+                secret=secret,
+                expected_version=0,
                 updated_at=now,
                 updated_by=updated_by,
                 commit=False,
