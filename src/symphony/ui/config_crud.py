@@ -75,7 +75,7 @@ from datetime import UTC, datetime
 from typing import Any, get_args
 
 import aiosqlite
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from ..agent.claude_models import _resolve_alias_model_id, fetch_claude_effort_capabilities
@@ -91,6 +91,7 @@ from ..config import (
     _synthetic_matrix_validation_binding,
     binding_natural_key,
 )
+from ..config_export import ExportMode, export_config
 from ..db import (
     config_bindings,
     config_globals,
@@ -970,6 +971,27 @@ def create_config_crud_router(
             # sets a per-binding `webhook_secret`.
             "github_webhook_secret_configured": bool(_base_config().github_webhook_secret),
         }
+
+    @router.get("/export")
+    async def export_bindings(mode: str = Query("restore")) -> Response:
+        """YAML backup of every binding + the global roles matrix (SYM-195).
+        ``restore`` (default) round-trips through the import script in replace
+        mode; ``downgrade`` is a paste-back section for a pre-DB build (disabled
+        bindings commented out). Webhook secret *values* never appear — a repo
+        with a secret gets an explicit placeholder to re-enter by hand."""
+        if mode not in get_args(ExportMode):
+            raise _validation_error(
+                ["mode"], f"mode must be one of {', '.join(get_args(ExportMode))}"
+            )
+        conn = await conn_provider()
+        rows = await config_bindings.list_all(conn)
+        globals_row = await config_globals.get(conn)
+        global_roles = globals_row.roles if globals_row is not None else {}
+        repos_with_secrets = {
+            s.github_repo for s in await config_repo_secrets.list_all(conn) if s.secret
+        }
+        text = export_config(rows, global_roles, repos_with_secrets, mode=mode)  # type: ignore[arg-type]
+        return Response(content=text, media_type="application/x-yaml")
 
     @router.get("/roles")
     async def get_roles() -> dict[str, Any]:

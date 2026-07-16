@@ -1451,6 +1451,109 @@ async def test_roles_put_diversity_warning_non_blocking(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_export_restore_mode_round_trips_through_yaml(tmp_path: Path) -> None:
+    """`GET /api/config/export` (restore default) emits a YAML doc that parses
+    back to the same bindings + global matrix, with a disabled binding kept as
+    real YAML (`enabled: false`)."""
+    import yaml
+
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            a = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(github_repo="org/a"), "priority": 0},
+            )
+            assert a.status_code == 201, a.text
+            b = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(github_repo="org/b"), "enabled": False, "priority": 1},
+            )
+            assert b.status_code == 201, b.text
+            await client.put(
+                "/api/config/roles",
+                json={"roles": {"implement": {"agent": "codex"}}, "version": 0},
+            )
+
+            resp = await client.get("/api/config/export")
+            assert resp.status_code == 200, resp.text
+            doc = yaml.safe_load(resp.text)
+            assert doc["roles"] == {"implement": {"agent": "codex"}}
+            by_repo = {r["github_repo"]: r for r in doc["repos"]}
+            assert "enabled" not in by_repo["org/a"]
+            assert by_repo["org/b"]["enabled"] is False
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_export_downgrade_comments_disabled_bindings(tmp_path: Path) -> None:
+    """Downgrade mode comments disabled bindings out (the pre-DB build has no
+    `enabled` semantics); the remaining document still parses as valid
+    `repos:`/`roles:`."""
+    import yaml
+
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            await client.post(
+                "/api/config/bindings", json={"payload": _payload(github_repo="org/a")}
+            )
+            await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(github_repo="org/b"), "enabled": False},
+            )
+            resp = await client.get("/api/config/export?mode=downgrade")
+            assert resp.status_code == 200, resp.text
+            doc = yaml.safe_load(resp.text)
+            repos = [r["github_repo"] for r in (doc["repos"] or [])]
+            assert repos == ["org/a"]  # disabled org/b commented out
+            assert "org/b" in resp.text  # ...but present as a comment
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_export_emits_webhook_secret_placeholder_not_value(tmp_path: Path) -> None:
+    """Both modes emit a placeholder (never the stored value) for a repo whose
+    webhook secret is set, marking that binding as needing re-entry."""
+    import yaml
+
+    from symphony.config_export import WEBHOOK_SECRET_PLACEHOLDER
+
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            created = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload(webhook_secret="super-secret", webhook_enabled=True)},
+            )
+            assert created.status_code == 201, created.text
+            resp = await client.get("/api/config/export")
+            assert "super-secret" not in resp.text
+            assert WEBHOOK_SECRET_PLACEHOLDER in resp.text
+            doc = yaml.safe_load(resp.text)
+            assert doc["repos"][0]["webhook_secret"] == WEBHOOK_SECRET_PLACEHOLDER
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_export_rejects_unknown_mode(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.get("/api/config/export?mode=bogus")
+            assert resp.status_code == 422
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_effort_with_inherited_model_saves(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """An effort override with no explicit model saves — it is family-checked
     against the resolved role — as long as that role resolves a codex agent,
