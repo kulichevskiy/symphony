@@ -394,6 +394,36 @@ repos:
 
 
 @pytest.mark.asyncio
+async def test_backfill_run_ignores_merged_pr_history(tmp_path: Path) -> None:
+    """A live run with no current PR must not resolve its repo from an older
+    merged PR — that history is stale once the issue moves on, so with two
+    same-team bindings on different repos the row is ambiguous and refused
+    rather than silently narrowed to the merged PR's old repo (SYM-195
+    review)."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    issue_id = await _seed_active_work(
+        conn, identifier="ENG-1", team_key="ENG", github_repo="org/api"
+    )
+    await db.issue_prs.mark_merged(conn, issue_id=issue_id, github_repo="org/api", merged_at="t1")
+    path = _write(
+        tmp_path,
+        f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+{_STATES}
+  - linear_team_key: ENG
+    github_repo: org/other
+{_STATES}
+""",
+    )
+    with pytest.raises(ConfigImportError, match="ENG-1"):
+        await import_config(path, conn, now="t1")
+    assert await db.config_bindings.count(conn) == 0
+    await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_backfill_ambiguous_refused_with_list(tmp_path: Path) -> None:
     """Two bindings on one repo (labeled + catch-all) make the row's binding
     ambiguous; the importer refuses the whole cutover, listing the row, rather
@@ -491,6 +521,29 @@ repos:
     # Rolled back: no bindings landed, and nothing was stamped with the
     # out-of-scope binding's key.
     assert await db.config_bindings.count(conn) == 0
+    await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_role_pin_equal_to_global_survives_reimport(tmp_path: Path) -> None:
+    """A binding-level `roles` pin that happens to equal the global cell at
+    reimport time must survive as an explicit pin rather than collapse into
+    inherit — otherwise it silently starts tracking the global matrix the
+    next time an operator edits it (SYM-195 review)."""
+    body = f"""
+roles:
+  implement:
+    model: sonnet
+repos:
+  - linear_team_key: ENG
+    github_repo: org/api
+    roles:
+      implement:
+        model: sonnet
+{_STATES}
+"""
+    conn, _result, rows, _g = await _import(tmp_path, body)
+    assert rows[0].payload["roles"] == {"implement": {"model": "sonnet"}}
     await conn.close()
 
 

@@ -76,11 +76,19 @@ def _binding_dict(row: StoredBinding, *, mode: ExportMode, needs_secret: bool) -
     binding out instead) and a webhook-secret placeholder when the repo has one
     set. `mcp_servers` credentials (a stdio server's `env`, an http/sse
     server's auth `headers`) are redacted the same way as the loaded-config
-    read view — never the stored value."""
+    read view — never the stored value.
+
+    A Jira binding with no explicit per-binding `base_url` has its
+    `tracker_site` resolved from the global `JIRA_BASE_URL` at write time; that
+    resolved value — not a recipe to re-derive it — is stamped in explicitly,
+    since re-deriving from whatever `JIRA_BASE_URL` happens to be set at import
+    time would silently change the natural key if it moved since export."""
     out: dict[str, Any] = dict(row.payload)
     mcp_servers = out.get("mcp_servers")
     if isinstance(mcp_servers, dict):
         out["mcp_servers"] = redact_mcp_servers(mcp_servers)
+    if row.tracker_provider == "jira" and "base_url" not in out:
+        out["tracker_site"] = row.tracker_site
     if mode == "restore" and not row.enabled:
         out["enabled"] = False
     if needs_secret:

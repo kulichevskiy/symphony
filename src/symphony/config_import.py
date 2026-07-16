@@ -111,10 +111,14 @@ def _resolve_binding(
 
 
 async def _issue_repo(conn: aiosqlite.Connection, issue_id: str) -> str | None:
-    """The single GitHub repo an issue has an open/known PR in, or `None` when
-    there is none or more than one (leaving the repo dimension unconstrained)."""
+    """The single GitHub repo an issue has a currently-open PR in, or `None`
+    when there is none or more than one (leaving the repo dimension
+    unconstrained). Merged PRs are excluded — an issue reopened for a new run
+    in a different repo would otherwise resolve to its old, no-longer-current
+    repo (SYM-195 review)."""
     cur = await conn.execute(
-        "SELECT DISTINCT github_repo FROM issue_prs WHERE issue_id = ?", (issue_id,)
+        "SELECT DISTINCT github_repo FROM issue_prs WHERE issue_id = ? AND merged_at IS NULL",
+        (issue_id,),
     )
     repos = [str(row[0]) for row in await cur.fetchall()]
     return repos[0] if len(repos) == 1 else None
@@ -247,6 +251,7 @@ def _baseline_model(
 
 
 def _sparse_matrix(
+    explicit: dict[str, Any],
     operator: RepoBinding,
     base: RepoBinding,
     global_roles: dict[RoleName, RoleConfig],
@@ -255,9 +260,20 @@ def _sparse_matrix(
     roles and the legacy/matrix-free baseline. A cell is emitted only when the
     operator's config actually moved it off the value the reloaded binding
     would otherwise resolve to; equal cells stay absent (true inherit), keeping
-    the payload sparse and the binding open to future global edits."""
+    the payload sparse and the binding open to future global edits.
+
+    A role already present in `explicit` (the YAML's own `roles:` block, e.g.
+    round-tripped from a restore export) is kept verbatim instead: it's an
+    intentional pin, not a legacy-field artifact, so comparing it against the
+    baseline and dropping it when it happens to equal the current global cell
+    would silently start tracking future global edits instead of staying
+    pinned (SYM-195 review). Only roles absent from `explicit` — i.e. reached
+    solely through legacy top-level fields — go through the comparison."""
     matrix: dict[str, dict[str, Any]] = {}
     for name in _ALL_ROLES:
+        if name in explicit:
+            matrix[name] = explicit[name]
+            continue
         op = operator.resolved_role(name, global_roles)
         baseline = base.resolved_role(name, global_roles)
         cell: dict[str, Any] = {}
@@ -296,7 +312,9 @@ def build_payload(
         # the payload never re-fires the field's deprecation warning on load.
         payload.setdefault("local_review", operator.local_review)
         payload.setdefault("remote_review", operator.remote_review)
-    matrix = _sparse_matrix(operator, _base_binding(raw_repo), global_roles)
+    matrix = _sparse_matrix(
+        raw_repo.get("roles") or {}, operator, _base_binding(raw_repo), global_roles
+    )
     if matrix:
         payload["roles"] = matrix
     return payload

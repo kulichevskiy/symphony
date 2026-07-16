@@ -82,6 +82,35 @@ def test_downgrade_all_disabled_repos_parses_empty_and_is_uncommentable() -> Non
     assert doc2["repos"][0]["max_concurrent"] == 4
 
 
+def test_export_stamps_resolved_tracker_site_for_global_jira_url() -> None:
+    """A Jira binding with no explicit per-binding `base_url` has its
+    `tracker_site` resolved from the global `JIRA_BASE_URL` at write time —
+    the export must carry that resolved value explicitly, or a later restore
+    would re-derive it from whatever `JIRA_BASE_URL` happens to be set at
+    import time and land on a different natural key (SYM-195 review)."""
+    row = _row(
+        payload={"provider": "jira"},
+        tracker_provider="jira",
+        tracker_site="https://mycompany.atlassian.net",
+    )
+    for mode in ("restore", "downgrade"):
+        doc = yaml.safe_load(export_config([row], {}, set(), mode=mode))
+        assert doc["repos"][0]["tracker_site"] == "https://mycompany.atlassian.net"
+
+
+def test_export_omits_tracker_site_when_base_url_explicit() -> None:
+    """A Jira binding with an explicit per-binding `base_url` already
+    round-trips its site through that field — no redundant `tracker_site`
+    stamp needed."""
+    row = _row(
+        payload={"provider": "jira", "base_url": "https://other.atlassian.net"},
+        tracker_provider="jira",
+        tracker_site="https://other.atlassian.net",
+    )
+    doc = yaml.safe_load(export_config([row], {}, set(), mode="restore"))
+    assert "tracker_site" not in doc["repos"][0]
+
+
 def test_restore_export_stamps_db_path() -> None:
     """Restore mode carries the install's actual `db_path` so `config-import`'s
     `Config.peek_db_path` targets it even when the main config sets a
