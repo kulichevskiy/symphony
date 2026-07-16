@@ -30,6 +30,7 @@ from .linear.client import Linear
 from .ui.api import CommandSink, PauseController, create_api_router
 from .ui.config_crud import create_config_crud_router
 from .ui.config_view import create_config_router
+from .ui.connections import create_connections_router
 from .ui.db import ReadOnlyDbPool, WriteDbPool
 from .ui.external import ExternalSnapshotService, GitHubExternalClient
 from .ui.issues import create_issue_detail_router
@@ -217,6 +218,12 @@ def create_app(
                     create_live_stream_router(ui_pool, log_root=ui_log_root),
                     dependencies=api_dependencies,
                 )
+            # Read-only Connections page: per-provider status from the encrypted
+            # `oauth_connections` store (credential material never served).
+            app.include_router(
+                create_connections_router(ui_pool),
+                dependencies=api_dependencies,
+            )
 
         # Read-only view of the loaded config (redacted). Gated like the other
         # /api routers; included before create_api_router's catch-all.

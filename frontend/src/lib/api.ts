@@ -545,6 +545,23 @@ export class ConfigWriteError extends ApiError {
   }
 }
 
+/** One provider card on the Connections page (OAuth in UI 1/7). Read-only:
+ *  credential material is never served — only status + optional expiry. */
+export interface Connection {
+  provider: string;
+  label: string;
+  status: "connected" | "expired" | "not_connected" | string;
+  expires_at: string | null;
+}
+
+export function fetchConnections(): Promise<Connection[]> {
+  return fetchJson<Connection[]>(
+    "/api/connections",
+    "Connections not found",
+    "Failed to load connections",
+  );
+}
+
 export function fetchConfigOptions(): Promise<ConfigOptions> {
   return fetchJson<ConfigOptions>(
     "/api/config/options",

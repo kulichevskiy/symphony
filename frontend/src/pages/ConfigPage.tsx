@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
@@ -13,12 +14,14 @@ import {
   ConfigWriteError,
   type ConfigOptions,
   type ConfigView,
+  type Connection,
   createBinding,
   deleteBinding,
   type DrainBlockers,
   fetchBindings,
   fetchConfigOptions,
   fetchConfigView,
+  fetchConnections,
   fetchRoles,
   type FieldError,
   type RoleCell,
@@ -1291,6 +1294,64 @@ export function GlobalRolesCard({
   );
 }
 
+// --- Connections (OAuth in UI 1/7) -----------------------------------------
+
+const CONNECTION_STATUS_LABEL: Record<string, string> = {
+  connected: "Connected",
+  expired: "Expired",
+  not_connected: "Not connected",
+};
+
+function connectionStatusClass(status: string): string {
+  if (status === "connected") {
+    return "border-transparent bg-emerald-500/10 text-emerald-600 dark:text-emerald-400";
+  }
+  if (status === "expired") {
+    return "border-transparent bg-amber-500/10 text-amber-600 dark:text-amber-400";
+  }
+  return "text-muted-foreground";
+}
+
+// Connect/Disconnect/Test are present but inert — wired in later slices.
+export function ConnectionCard({ connection }: { connection: Connection }) {
+  return (
+    <Card className="p-5">
+      <div className="flex items-center justify-between gap-2">
+        <h3 className="font-medium">{connection.label}</h3>
+        <Badge className={connectionStatusClass(connection.status)}>
+          {CONNECTION_STATUS_LABEL[connection.status] ?? connection.status}
+        </Badge>
+      </div>
+      {connection.expires_at ? (
+        <p className="mt-1 text-xs text-muted-foreground">
+          Expires {connection.expires_at}
+        </p>
+      ) : null}
+      <div className="mt-4 flex gap-2">
+        <Button type="button" disabled>
+          Connect
+        </Button>
+        <Button type="button" variant="secondary" disabled>
+          Disconnect
+        </Button>
+        <Button type="button" variant="secondary" disabled>
+          Test
+        </Button>
+      </div>
+    </Card>
+  );
+}
+
+export function ConnectionsPanel({ connections }: { connections: Connection[] }) {
+  return (
+    <div className="grid gap-4 sm:grid-cols-2">
+      {connections.map((connection) => (
+        <ConnectionCard key={connection.provider} connection={connection} />
+      ))}
+    </div>
+  );
+}
+
 export function ConfigPage() {
   const view = useQuery({
     queryKey: ["config"],
@@ -1319,6 +1380,11 @@ export function ConfigPage() {
     queryFn: fetchRoles,
     staleTime: Infinity,
     retry: retryUnlessNotFound,
+  });
+  const connections = useQuery({
+    queryKey: ["connections"],
+    queryFn: fetchConnections,
+    staleTime: Infinity,
   });
 
   function refetchAll() {
@@ -1387,6 +1453,25 @@ export function ConfigPage() {
           Failed to load bindings
         </div>
       ) : null}
+
+      <div className="mb-2 mt-6">
+        <h2 className="text-lg font-semibold">Connections</h2>
+        <p className="mt-0.5 text-sm text-muted-foreground">
+          Credentials for the providers Symphony talks to. Managing them from
+          here arrives in a later release.
+        </p>
+      </div>
+      {connections.data ? (
+        <div className="mb-8">
+          <ConnectionsPanel connections={connections.data} />
+        </div>
+      ) : connections.isLoading ? (
+        <p className="mb-8 text-sm text-muted-foreground">Loading…</p>
+      ) : (
+        <div className="mb-8 rounded-md border border-border p-6 text-sm text-muted-foreground">
+          Failed to load connections
+        </div>
+      )}
 
       <div className="mb-2 mt-6">
         <h2 className="text-lg font-semibold">Resolved role matrix</h2>
