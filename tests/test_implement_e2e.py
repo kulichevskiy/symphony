@@ -365,13 +365,18 @@ async def test_delivery_uses_db_github_token_for_push_and_pr(
         push_seen_auth: list[str] = []
 
         async def _push_fn(path: Path, branch: str) -> None:
-            result = subprocess.run(
-                ["git", "config", "--local", "--get", "http.https://github.com/.extraheader"],
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "config",
+                "--local",
+                "--get",
+                "http.https://github.com/.extraheader",
                 cwd=path,
-                capture_output=True,
-                text=True,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            push_seen_auth.append(result.stdout.strip())
+            stdout, _ = await proc.communicate()
+            push_seen_auth.append(stdout.decode().strip())
 
         gh_ctor_calls: list[dict[str, object]] = []
 
@@ -433,12 +438,17 @@ async def test_delivery_uses_db_github_token_for_push_and_pr(
         assert expected in push_seen_auth[0]
 
         # Torn down after push: the workspace's git config no longer carries it.
-        post_push = subprocess.run(
-            ["git", "config", "--local", "--get", "http.https://github.com/.extraheader"],
+        post_push = await asyncio.create_subprocess_exec(
+            "git",
+            "config",
+            "--local",
+            "--get",
+            "http.https://github.com/.extraheader",
             cwd=workspace_path,
-            capture_output=True,
-            text=True,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
+        await post_push.communicate()
         assert post_push.returncode != 0
 
         # PR was opened via a GitHub client constructed with the DB token —

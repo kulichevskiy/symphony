@@ -137,7 +137,9 @@ class LocalRunner:
             cred_home = tempfile.mkdtemp(prefix="symphony-run-creds-")
             try:
                 os.chmod(cred_home, 0o700)
-                prior_gitconfig = Path(env["GIT_CONFIG_GLOBAL"]) if "GIT_CONFIG_GLOBAL" in env else None
+                prior_gitconfig = (
+                    Path(env["GIT_CONFIG_GLOBAL"]) if "GIT_CONFIG_GLOBAL" in env else None
+                )
                 cred_env = materialize_credentials(
                     spec.credentials, Path(cred_home), prior_gitconfig=prior_gitconfig
                 )
