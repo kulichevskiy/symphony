@@ -555,6 +555,11 @@ class _OrchestratorBase:
             self._trackers,
             self._gh,
             clock=clock,
+            # Same DB-first resolver poll dispatch uses, so reconciler PR
+            # comments/views/lookups pick up a DB GitHub connection instead
+            # of only ever using the ambient client (OAuth in UI 4/7 review
+            # fix).
+            gh_client_factory=self._gh_client,
         )
         self._reconcile_task: asyncio.Task[None] | None = None
         self._merge_wait_reconcile_task: asyncio.Task[None] | None = None
