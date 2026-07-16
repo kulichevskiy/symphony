@@ -465,7 +465,7 @@ class _OrchestratorBase:
         self._workspace: Workspace = (
             workspace
             if workspace is not None
-            else Workspace(root=config.workspace_root, clone_fn=self._gh.repo_clone)
+            else Workspace(root=config.workspace_root, clone_fn=self._clone_with_resolved_auth)
         )
         # Wrapped so every push call site — delivery, review re-push,
         # force-push, merge/acceptance push — resolves the DB token and
@@ -2751,6 +2751,18 @@ class _OrchestratorBase:
                     await _clear_git_push_auth(workspace_path)
 
         return _push
+
+    async def _clone_with_resolved_auth(self, repo: str, dest: Path) -> None:
+        """Clone `repo` using the DB-resolved GitHub token when available.
+
+        `Workspace` is built once at daemon start with this as its `clone_fn`,
+        so a deployment with only a DB GitHub OAuth connection (no ambient
+        `gh` login, no `GH_TOKEN`) can still clone — otherwise every dispatch
+        for that binding would fail at the very first workspace acquire
+        (OAuth in UI 4/7 review fix). Mirrors `_gh_client`.
+        """
+        client = await self._gh_client()
+        await client.repo_clone(repo, dest)
 
     async def _gh_client(self) -> GitHubClient:
         """A GitHub client using the DB-resolved token when available.

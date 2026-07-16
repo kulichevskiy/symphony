@@ -461,6 +461,49 @@ async def test_delivery_uses_db_github_token_for_push_and_pr(
 
 
 @pytest.mark.asyncio
+async def test_workspace_clone_uses_db_github_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OAuth in UI 4/7 review fix: a deployment with only a DB GitHub
+    connection (no ambient `gh` login, no `GH_TOKEN`) must still be able to
+    clone a fresh workspace — not just push to one that already exists."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.oauth_connections.set_connection(
+            conn,
+            provider="github",
+            credential="gho_db_secret",
+            cipher=CredentialCipher("enc-key"),
+        )
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+            symphony_encryption_key="enc-key",
+        )
+        linear = AsyncMock()
+
+        gh_ctor_calls: list[dict[str, object]] = []
+
+        class _RecordingGitHub:
+            def __init__(self, **kwargs: object) -> None:
+                gh_ctor_calls.append(kwargs)
+                self.repo_clone = AsyncMock()
+
+        monkeypatch.setattr("symphony.orchestrator.poll._base.GitHub", _RecordingGitHub)
+
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock())
+
+        await orch._clone_with_resolved_auth("org/repo", tmp_path / "dest")  # noqa: SLF001
+
+        assert gh_ctor_calls
+        assert gh_ctor_calls[-1]["token"] == "gho_db_secret"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_start_review_stage_writes_review_state_before_live_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

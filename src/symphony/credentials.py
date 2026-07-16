@@ -152,7 +152,12 @@ def materialize_credentials(
         gitconfig = home_dir / ".gitconfig"
         gitconfig.write_text(
             f"[include]\n\tpath = {include_path}\n"
-            f"[credential]\n\thelper = store --file={cred_file}\n",
+            # `helper =` (empty) resets the helper list git accumulated from
+            # the included file, so an inherited helper (e.g. a global
+            # credential manager) can't answer first and shadow the token
+            # below — git tries helpers in file order and stops at the first
+            # one that returns a match.
+            f"[credential]\n\thelper =\n\thelper = store --file={cred_file}\n",
             encoding="utf-8",
         )
         env["GIT_CONFIG_GLOBAL"] = str(gitconfig)

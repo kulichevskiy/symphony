@@ -13,7 +13,52 @@ from pathlib import Path
 
 from ...pipeline.local_review import DiffSize, parse_diff_numstat
 
-_PUSH_AUTH_CONFIG_KEY = "http.https://github.com/.extraheader"
+_DEFAULT_PUSH_AUTH_HOST = "github.com"
+
+
+def _push_auth_config_key(host: str) -> str:
+    return f"http.https://{host}/.extraheader"
+
+
+async def _push_auth_host(workspace_path: Path) -> str | None:
+    """The host to scope the push-auth header to, derived from `origin`.
+
+    Handles the documented `[HOST/]OWNER/REPO` binding form (e.g. a GHE
+    remote like `ghe.example.com/org/repo`), whose `origin` is not
+    `github.com` — a hardcoded host would silently fail to authenticate
+    those pushes. Falls back to the default host when `origin` can't be
+    read (workspace not yet a git repo, no remote configured) so existing
+    single-host deployments are unaffected. Returns ``None`` only when
+    `origin` is unambiguously an SSH remote (the documented
+    `gh auth login --git-protocol ssh` flow, README.md:48) — `http.extraHeader`
+    does not apply to that transport, so injecting it would be a no-op.
+
+    Never raises: a workspace dir that doesn't exist yet (or any other
+    OS-level failure starting `git`) degrades to the default host, matching
+    `_clear_git_push_auth`'s existing best-effort contract.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "remote",
+            "get-url",
+            "origin",
+            cwd=str(workspace_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await proc.communicate()
+    except OSError:
+        return _DEFAULT_PUSH_AUTH_HOST
+    if proc.returncode != 0:
+        return _DEFAULT_PUSH_AUTH_HOST
+    url = stdout.decode(errors="replace").strip()
+    if url.startswith("https://"):
+        return url[len("https://") :].split("/", 1)[0] or _DEFAULT_PUSH_AUTH_HOST
+    if url.startswith("git@") or url.startswith("ssh://"):
+        return None
+    return _DEFAULT_PUSH_AUTH_HOST
 
 
 async def _configure_git_push_auth(workspace_path: Path, token: str) -> None:
@@ -23,13 +68,17 @@ async def _configure_git_push_auth(workspace_path: Path, token: str) -> None:
     from a different workspace is unaffected. `x-access-token` is the GitHub
     convention for a token-as-password Basic credential. Paired with
     `_clear_git_push_auth`, called right after the push regardless of outcome.
+    A no-op when `origin` is an SSH remote (see `_push_auth_host`).
     """
+    host = await _push_auth_host(workspace_path)
+    if host is None:
+        return
     basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
     proc = await asyncio.create_subprocess_exec(
         "git",
         "config",
         "--local",
-        _PUSH_AUTH_CONFIG_KEY,
+        _push_auth_config_key(host),
         f"AUTHORIZATION: basic {basic}",
         cwd=str(workspace_path),
         stdout=asyncio.subprocess.DEVNULL,
@@ -49,22 +98,31 @@ async def _clear_git_push_auth(workspace_path: Path) -> None:
     Called unconditionally before every push (OAuth in UI 4/7 review fix), so
     a workspace that doesn't exist yet (or any other OS-level failure
     starting `git`) must not raise — there is no header to clear either way.
+    Clears both the current `origin`-derived host key and the default host
+    key unconditionally, so a header written by an older build (hardcoded to
+    the default host) or left behind after a binding's host changed is still
+    cleaned up.
     """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "config",
-            "--local",
-            "--unset-all",
-            _PUSH_AUTH_CONFIG_KEY,
-            cwd=str(workspace_path),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-            stdin=asyncio.subprocess.DEVNULL,
-        )
-        await proc.communicate()
-    except OSError:
-        pass
+    host = await _push_auth_host(workspace_path)
+    keys = {_push_auth_config_key(_DEFAULT_PUSH_AUTH_HOST)}
+    if host is not None:
+        keys.add(_push_auth_config_key(host))
+    for key in keys:
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git",
+                "config",
+                "--local",
+                "--unset-all",
+                key,
+                cwd=str(workspace_path),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.DEVNULL,
+            )
+            await proc.communicate()
+        except OSError:
+            pass
 
 
 async def _default_push(workspace_path: Path, branch: str) -> None:

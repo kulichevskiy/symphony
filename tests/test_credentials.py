@@ -175,6 +175,24 @@ def test_materialize_includes_prior_gitconfig_so_identity_still_resolves(
     assert "helper = store" in gitconfig_text
 
 
+def test_materialize_clears_inherited_credential_helper(tmp_path: Path) -> None:
+    # A run's ambient global gitconfig may already declare a credential
+    # helper (e.g. a host credential manager). `[include]` pulls that
+    # helper in *before* our store, so without an explicit reset git tries
+    # the inherited helper first and may never reach the DB token below.
+    prior = tmp_path / "prior-gitconfig"
+    prior.write_text("[credential]\n\thelper = some-other-manager\n", encoding="utf-8")
+    home = tmp_path / "creds"
+    home.mkdir()
+    env = materialize_credentials(RunCredentials(github_token="gho_x"), home, prior_gitconfig=prior)
+    gitconfig_text = Path(env["GIT_CONFIG_GLOBAL"]).read_text()
+    # An empty `helper =` line resets the accumulated helper list before
+    # ours is added, so `some-other-manager` never runs.
+    reset_index = gitconfig_text.index("helper =\n")
+    store_index = gitconfig_text.index("helper = store")
+    assert reset_index < store_index
+
+
 def test_materialize_linear_only_writes_no_git_store(tmp_path: Path) -> None:
     home = tmp_path / "creds"
     home.mkdir()
