@@ -486,6 +486,44 @@ async def test_linear_test_reports_expired_on_200_with_non_dict_body(tmp_path: P
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_linear_test_reports_expired_on_200_with_non_dict_data(tmp_path: Path) -> None:
+    respx.post("https://api.linear.app/graphql").mock(
+        return_value=httpx.Response(200, json={"data": [{"viewer": 1}]})
+    )
+    conn, db_path = await _open(tmp_path)
+    try:
+        await db.oauth_connections.set_connection(
+            conn, provider="linear", credential="lin_dead", cipher=CredentialCipher(_KEY)
+        )
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.post("/api/oauth/linear/test")
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "expired"
+        status = await db.oauth_connections.get_status(conn, "linear")
+        assert status is not None and status.status == "expired"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_linear_disconnect_clears_connection(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        await db.oauth_connections.set_connection(
+            conn, provider="linear", credential="lin_x", cipher=CredentialCipher(_KEY)
+        )
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.post("/api/oauth/linear/disconnect")
+        assert resp.status_code in (200, 204)
+        assert await db.oauth_connections.get_status(conn, "linear") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_test_reports_expired(tmp_path: Path) -> None:
     respx.get("https://api.github.com/user").mock(return_value=httpx.Response(401))
     conn, db_path = await _open(tmp_path)
