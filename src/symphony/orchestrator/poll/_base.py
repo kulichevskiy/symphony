@@ -2818,7 +2818,9 @@ class _OrchestratorBase:
         """
         github_token = await self._resolve_github_token(repo=repo)
         client = GitHub(token=github_token) if github_token else self._gh
-        clone_target = f"https://github.com/{'/'.join(repo.split('/')[-2:])}" if github_token else repo
+        clone_target = (
+            f"https://github.com/{'/'.join(repo.split('/')[-2:])}" if github_token else repo
+        )
         await client.repo_clone(clone_target, dest)
 
     async def _fetch_with_resolved_auth(self, repo: str, workspace_path: Path) -> None:
