@@ -153,11 +153,11 @@ async def test_runner_binding_gh_token_overrides_materialized_git_credential_hel
     tmp_path: Path,
 ) -> None:
     # A binding that supplies its own GH_TOKEN via `env:` must win for *every*
-    # consumer, not just env-reading ones like `gh`. Without dropping the
-    # resolved github_token from the materialized bundle, `GIT_CONFIG_GLOBAL`
-    # still points at a credential helper backed by the *other* token, so a
-    # plain `git` HTTPS operation would silently authenticate with it instead
-    # of the binding's override (SYM-199 review fix).
+    # consumer, not just env-reading ones like `gh` — including the git
+    # credential helper materialized from the DB/volume-resolved token. Not
+    # materializing anything would leave `git push` on whatever the ambient
+    # host state already provides, silently ignoring the binding's override;
+    # instead the binding's own token gets materialized (SYM-199 review fix).
     runner = LocalRunner()
     spec = RunnerSpec(
         run_id="r-binding-token",
@@ -165,7 +165,8 @@ async def test_runner_binding_gh_token_overrides_materialized_git_credential_hel
         command=[
             "sh",
             "-c",
-            'printf "%s\\n" "$GH_TOKEN"; printf "%s\\n" "${GIT_CONFIG_GLOBAL:-<unset>}"',
+            'printf "%s\\n" "$GH_TOKEN"; printf "%s\\n" "${GIT_CONFIG_GLOBAL:-<unset>}"; '
+            'cat "$(dirname "$GIT_CONFIG_GLOBAL")/.git-credentials"',
         ],
         stall_secs=10,
         env={"GH_TOKEN": "binding_own_token"},
@@ -174,7 +175,9 @@ async def test_runner_binding_gh_token_overrides_materialized_git_credential_hel
     events = [ev async for ev in runner.run(spec)]
     stdout = [e.line for e in events if e.kind == "stdout"]
     assert stdout[0] == "binding_own_token"
-    assert stdout[1] == "<unset>"
+    assert stdout[1] != "<unset>"
+    assert "binding_own_token" in stdout[2]
+    assert "gho_run" not in stdout[2]
 
 
 @pytest.mark.asyncio

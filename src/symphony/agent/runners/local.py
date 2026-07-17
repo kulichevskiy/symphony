@@ -138,12 +138,14 @@ class LocalRunner:
         # token used everywhere — not just by env-reading consumers like
         # `gh`. Without this, materializing the DB/volume-resolved GitHub
         # token below still writes a `.git-credentials` file + credential
-        # helper (`GIT_CONFIG_GLOBAL`) for it, so plain `git push` would
-        # silently authenticate with the *other* token regardless of the
-        # binding's override (SYM-199 review fix). Drop it from the bundle
-        # instead so materialization defers entirely to the binding's env.
+        # helper (`GIT_CONFIG_GLOBAL`) built from the *other* token, so plain
+        # `git push` would silently authenticate with it regardless of the
+        # binding's override (SYM-199 review fix). Materialize the binding's
+        # own token instead so git and `gh` agree.
         if credentials is not None and "GH_TOKEN" in spec.env:
-            credentials = RunCredentials(github_token=None, linear_token=credentials.linear_token)
+            credentials = RunCredentials(
+                github_token=spec.env["GH_TOKEN"], linear_token=credentials.linear_token
+            )
         if credentials is not None and not credentials.is_empty:
             cred_home = tempfile.mkdtemp(prefix="symphony-run-creds-")
             try:
@@ -152,7 +154,10 @@ class LocalRunner:
                     Path(env["GIT_CONFIG_GLOBAL"]) if "GIT_CONFIG_GLOBAL" in env else None
                 )
                 cred_env = materialize_credentials(
-                    credentials, Path(cred_home), prior_gitconfig=prior_gitconfig
+                    credentials,
+                    Path(cred_home),
+                    prior_gitconfig=prior_gitconfig,
+                    github_host=spec.github_host,
                 )
             except Exception:
                 _remove_cred_home(cred_home)

@@ -46,7 +46,7 @@ from ...agent.prompt import implement_prompt
 from ...agent.runner import Runner, RunnerSpec
 from ...agent.runners.local import LocalRunner
 from ...config import Config, RepoBinding, ResolvedRole, binding_natural_key
-from ...credentials import CredentialResolver, RunCredentials
+from ...credentials import CredentialResolver, RunCredentials, github_host_for_repo
 from ...crypto import CredentialCipher
 from ...effective_config import ConfigBootError, assemble_effective_config
 from ...github.client import GitHub, GitHubClient, GitHubError
@@ -2803,6 +2803,31 @@ class _OrchestratorBase:
             "github", fallback=os.environ.get("GH_TOKEN")
         )
 
+    def _linear_trackers(self) -> list[IssueTracker]:
+        """Every distinct registered tracker for a `provider="linear"` binding,
+        across every site *and* every `tracker_provider` alias in use.
+
+        `self._trackers` keys registrations by `tracker_provider` (which
+        defaults to `"linear"` but a binding may set it to something else,
+        e.g. `"linear-alt"` for a second Linear workspace) — plain
+        `trackers_for_provider("linear")` therefore misses an aliased
+        binding's client, so it never got the refreshed DB/env token
+        (SYM-199 review fix). Collect the literal `"linear"` key plus every
+        alias any current Linear-provider binding actually uses, and merge
+        `trackers_for_provider` across all of them.
+        """
+        aliases = {"linear"} | {
+            binding.tracker_provider
+            for binding in self.config.repos
+            if binding.provider == "linear"
+        }
+        seen: list[IssueTracker] = []
+        for alias in aliases:
+            for tracker in self._trackers.trackers_for_provider(alias):
+                if not any(tracker is t for t in seen):
+                    seen.append(tracker)
+        return seen
+
     async def _refresh_linear_tracker_credentials(self) -> None:
         """Point every registered Linear tracker at the DB-connected token.
 
@@ -2830,7 +2855,7 @@ class _OrchestratorBase:
         token_changed = linear_token != self._applied_linear_token
         if token_changed:
             self._linear_token_applied_to.clear()
-        for tracker in self._trackers.trackers_for_provider("linear"):
+        for tracker in self._linear_trackers():
             if id(tracker) in self._linear_token_applied_to:
                 continue
             set_api_key = getattr(tracker, "set_api_key", None)
@@ -2843,17 +2868,19 @@ class _OrchestratorBase:
         """Resolve the run's creds DB-first, honoring the per-binding model.
 
         The GitHub token materializes for every run (Symphony always pushes to
-        GitHub); the Linear token only when this binding actually tracks in
-        Linear — so creds don't leak into a Jira-tracked binding's run. Each
-        provider falls back to the ambient env/volume value when it has no
-        connected DB row, keeping the current instance running through
-        migration.
+        GitHub); the Linear token only when this binding's tracker is actually
+        Linear — so creds don't leak into a Jira-tracked binding's run. Gated
+        on `binding.provider`, not `tracker_provider`: a binding can register
+        its Linear tracker under a custom `tracker_provider` alias (e.g. for a
+        second Linear workspace), and that alias must not be mistaken for a
+        non-Linear provider (SYM-199 review fix). Each provider falls back to
+        the ambient env/volume value when it has no connected DB row, keeping
+        the current instance running through migration.
         """
-        tracker_provider = binding.tracker_provider or binding.provider
         github_token = await self._credential_resolver.resolve(
             "github", fallback=os.environ.get("GH_TOKEN")
         )
-        if tracker_provider != "linear":
+        if binding.provider != "linear":
             return RunCredentials(github_token=github_token, linear_token=None)
         linear_token = await self._credential_resolver.resolve_linear_auth_header(
             fallback=self.config.linear_api_key
@@ -2884,6 +2911,7 @@ class _OrchestratorBase:
             wall_clock_secs=self.config.wall_clock_timeout_secs,
             stage=stage,
             credentials=await self._resolve_run_credentials(binding),
+            github_host=github_host_for_repo(binding.github_repo),
         )
 
         log_path = self.config.log_root / f"{run_id}.log"
@@ -3183,6 +3211,7 @@ class _OrchestratorBase:
             wall_clock_secs=self.config.wall_clock_timeout_secs,
             stage=stage,
             credentials=await self._resolve_run_credentials(binding),
+            github_host=github_host_for_repo(binding.github_repo),
         )
 
         log_path = self.config.log_root / f"{run_id}.log"

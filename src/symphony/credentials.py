@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 import aiosqlite
@@ -47,6 +48,17 @@ class RunCredentials:
     @property
     def is_empty(self) -> bool:
         return not self.github_token and not self.linear_token
+
+
+def _is_expired(expires_at: str) -> bool:
+    """Whether `expires_at` (the `%Y-%m-%dT%H:%M:%SZ` format `oauth.py` writes)
+    is in the past. An unparseable value is treated as not-expired rather than
+    forcing a fallback on a format we don't recognize."""
+    try:
+        deadline = datetime.strptime(expires_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+    except ValueError:
+        return False
+    return datetime.now(UTC) >= deadline
 
 
 class CredentialResolver:
@@ -95,6 +107,11 @@ class CredentialResolver:
             return fallback, False
         if status is None or status.status != "connected":
             return fallback, False
+        if status.expires_at is not None and _is_expired(status.expires_at):
+            log.warning(
+                "%s connection expired at %s; using fallback", provider, status.expires_at
+            )
+            return fallback, False
         try:
             credential = await db.oauth_connections.get_credential(
                 self._conn, provider, self._cipher
@@ -120,8 +137,20 @@ class CredentialResolver:
         )
 
 
+def github_host_for_repo(repo: str) -> str:
+    """The GitHub host a `[HOST/]OWNER/REPO` binding pushes to (see
+    `GitHub._api_repo`'s parsing of the same format) — `github.com` when no
+    host segment is present."""
+    parts = repo.split("/")
+    return parts[0] if len(parts) == 3 else "github.com"
+
+
 def materialize_credentials(
-    creds: RunCredentials, home_dir: Path, *, prior_gitconfig: Path | None = None
+    creds: RunCredentials,
+    home_dir: Path,
+    *,
+    prior_gitconfig: Path | None = None,
+    github_host: str = "github.com",
 ) -> dict[str, str]:
     """Write `creds` into `home_dir` (a private, torn-down run directory) and
     return the env additions the run needs.
@@ -145,7 +174,7 @@ def materialize_credentials(
         # `x-access-token` as the username is the GitHub convention; the token
         # is what authenticates. `store` matches by host on push.
         cred_file.write_text(
-            f"https://x-access-token:{creds.github_token}@github.com\n", encoding="utf-8"
+            f"https://x-access-token:{creds.github_token}@{github_host}\n", encoding="utf-8"
         )
         cred_file.chmod(0o600)
         include_path = prior_gitconfig or (Path.home() / ".gitconfig")

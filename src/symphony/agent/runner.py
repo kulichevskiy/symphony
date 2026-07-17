@@ -49,6 +49,12 @@ class RunnerSpec:
     # UI-stored connection instead of the ambient env/volume. `None` (the
     # default) leaves the run on whatever the inherited env already provides.
     credentials: RunCredentials | None = None
+    # The GitHub host the materialized git credential store scopes to
+    # (`credentials.github_token` otherwise; irrelevant when unset). Comes
+    # from the binding's `[HOST/]OWNER/REPO` `github_repo` — a GHE binding's
+    # host isn't `github.com`, and a credential store written for the wrong
+    # host never matches on push (SYM-199 review fix).
+    github_host: str = "github.com"
 
 
 @dataclass
