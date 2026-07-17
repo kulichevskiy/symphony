@@ -108,9 +108,7 @@ class CredentialResolver:
         if status is None or status.status != "connected":
             return fallback, False
         if status.expires_at is not None and _is_expired(status.expires_at):
-            log.warning(
-                "%s connection expired at %s; using fallback", provider, status.expires_at
-            )
+            log.warning("%s connection expired at %s; using fallback", provider, status.expires_at)
             return fallback, False
         try:
             credential = await db.oauth_connections.get_credential(
