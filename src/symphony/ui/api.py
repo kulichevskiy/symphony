@@ -1278,11 +1278,14 @@ def create_api_router(
         try:
             conn = await ui_db_pool.connection()
             request_now = now()
-            # Done scope defaults to a rolling now-24h window when the request
-            # gives no explicit lower bound. Explicit `from` (day string) wins.
+            # Done scope defaults to a rolling now-24h window unless the request
+            # gives an explicit date bound. Any explicit `from`/`to` is an
+            # override (the archive-page seam) — including a `to`-only historical
+            # query, which must not inherit the now-24h lower bound and come back
+            # empty.
             done_since = (
                 _utc_iso(request_now - DONE_SCOPE_DEFAULT_WINDOW)
-                if is_done and date_from is None
+                if is_done and date_from is None and date_to is None
                 else None
             )
             query, params = _list_issues_query(

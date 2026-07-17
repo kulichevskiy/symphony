@@ -3643,15 +3643,21 @@ async def test_api_issues_done_scope_defaults_to_last_24h(tmp_path: Path) -> Non
         async with await _client(app) as client:
             default = await client.get("/api/issues?scope=done")
             override = await client.get("/api/issues?scope=done&from=2026-05-10&to=2026-05-17")
+            to_only = await client.get("/api/issues?scope=done&to=2026-05-16")
     finally:
         await conn.close()
 
-    # No `from` → only the issue completed within the last 24h is returned.
+    # No date bound → only the issue completed within the last 24h is returned.
     assert default.status_code == 200
     assert [i["identifier"] for i in default.json()] == ["ENG-1"]
     # Explicit `from` overrides the 24h default and surfaces the older done issue.
     assert override.status_code == 200
     assert [i["identifier"] for i in override.json()] == ["ENG-1", "ENG-2"]
+    # A `to`-only historical query is also an override: it must NOT inherit the
+    # now-24h lower bound (which would empty it). Upper bound < 05-17 keeps the
+    # older ENG-2 (merged 05-16) and excludes the fresh ENG-1 (merged 05-17).
+    assert to_only.status_code == 200
+    assert [i["identifier"] for i in to_only.json()] == ["ENG-2"]
 
 
 @pytest.mark.asyncio
