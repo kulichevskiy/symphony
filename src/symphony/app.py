@@ -269,7 +269,10 @@ def create_app(
                     oauth_write_pool.connection,
                     cipher=cipher,
                     registry=PendingLoginRegistry(),
-                    login_factory=claude_login_factory or (lambda: SubprocessClaudeLogin()),
+                    login_factory=(
+                        claude_login_factory
+                        or (lambda: SubprocessClaudeLogin(credentials_path=claude_credentials_path))
+                    ),
                     clock=clock,
                     credentials_path=claude_credentials_path,
                 ),

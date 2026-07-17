@@ -81,9 +81,11 @@ class PendingLoginRegistry:
 
     Entries expire after `ttl_secs` (default `_PENDING_LOGIN_TTL_SECS`): if the
     operator closes the tab, refreshes mid-login, or never pastes a code back,
-    the subprocess would otherwise run forever. `add` opportunistically sweeps
-    expired entries (closing their subprocess) so a login nobody finished
-    doesn't leak indefinitely; `pop` also refuses an entry past its deadline."""
+    the subprocess would otherwise run forever. `add` arms an event-loop timer
+    that closes the entry once its deadline passes even if no further request
+    ever touches the registry (the close-tab case); `add` also opportunistically
+    sweeps and `pop` refuses a past-deadline entry, so eviction still holds in a
+    sync context with no running loop (unit tests with a faked clock)."""
 
     def __init__(
         self,
@@ -93,6 +95,7 @@ class PendingLoginRegistry:
         clock: Callable[[], float] | None = None,
     ) -> None:
         self._pending: dict[str, tuple[ClaudeLoginProcess, float]] = {}
+        self._timers: dict[str, asyncio.TimerHandle] = {}
         self._id_factory = id_factory or (lambda: secrets.token_urlsafe(_SESSION_ENTROPY_BYTES))
         self._ttl_secs = ttl_secs
         self._clock = clock or time.monotonic
@@ -101,12 +104,14 @@ class PendingLoginRegistry:
         self._evict_expired()
         session_id = self._id_factory()
         self._pending[session_id] = (process, self._clock() + self._ttl_secs)
+        self._arm_timer(session_id)
         return session_id
 
     def pop(self, session_id: str) -> ClaudeLoginProcess | None:
         """Return and remove the handle for `session_id` (single-use), or `None`
         if it is unknown, already consumed, or expired."""
         entry = self._pending.pop(session_id, None)
+        self._cancel_timer(session_id)
         if entry is None:
             return None
         process, deadline = entry
@@ -118,6 +123,7 @@ class PendingLoginRegistry:
     async def discard(self, session_id: str) -> None:
         """Drop and tear down an abandoned/failed login."""
         entry = self._pending.pop(session_id, None)
+        self._cancel_timer(session_id)
         if entry is not None:
             await entry[0].close()
 
@@ -125,9 +131,32 @@ class PendingLoginRegistry:
         now = self._clock()
         expired = [sid for sid, (_, deadline) in self._pending.items() if now >= deadline]
         for sid in expired:
-            process, _ = self._pending.pop(sid)
-            log.info("pending Claude login session %s expired unsubmitted; closing it", sid)
-            self._schedule_close(process)
+            self._expire(sid)
+
+    def _expire(self, session_id: str) -> None:
+        """Drop `session_id` if still pending and close its subprocess. Runs both
+        from the armed timer (close-tab case) and the opportunistic sweep."""
+        self._cancel_timer(session_id)
+        entry = self._pending.pop(session_id, None)
+        if entry is None:
+            return
+        log.info("pending Claude login session %s expired unsubmitted; closing it", session_id)
+        self._schedule_close(entry[0])
+
+    def _arm_timer(self, session_id: str) -> None:
+        """Schedule `_expire(session_id)` on the running loop after the TTL, so an
+        abandoned session closes with no later add/pop. No-ops without a running
+        loop (sync unit tests) — the sweep/`pop` deadline checks cover that."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._timers[session_id] = loop.call_later(self._ttl_secs, self._expire, session_id)
+
+    def _cancel_timer(self, session_id: str) -> None:
+        handle = self._timers.pop(session_id, None)
+        if handle is not None:
+            handle.cancel()
 
     @staticmethod
     def _schedule_close(process: ClaudeLoginProcess) -> None:
@@ -149,11 +178,14 @@ def default_claude_credentials_path() -> Path:
 
 
 def read_claude_credential(path: Path) -> str | None:
-    """The raw contents of Claude's credentials file, or `None` if it doesn't
-    exist. Returned verbatim so a write-back can restore it byte-for-byte."""
+    """The raw contents of Claude's credentials file, or `None` if it's missing
+    or unreadable. Returned verbatim so a write-back can restore it
+    byte-for-byte. An unreadable file (bad permissions, stale dir on the auth
+    volume) is treated as absent so best-effort restore/write-back callers get
+    to run their own recovery instead of raising before their `try` blocks."""
     try:
         return path.read_text(encoding="utf-8")
-    except FileNotFoundError:
+    except OSError:
         return None
 
 

@@ -94,6 +94,19 @@ async def test_registry_add_sweeps_expired_sessions() -> None:
     assert registry.pop("s1") is None
 
 
+@pytest.mark.asyncio
+async def test_registry_timer_closes_abandoned_session() -> None:
+    # Close-tab case: a session that is never popped must still be closed by the
+    # armed event-loop timer — no later add/pop happens to trigger a sweep. Real
+    # clock + tiny TTL so the loop timer actually fires within the test.
+    registry = PendingLoginRegistry(id_factory=iter(["s1"]).__next__, ttl_secs=0.01)
+    proc = _FakeLogin("https://claude.ai/oauth", "{}")
+    registry.add(proc)
+    await asyncio.sleep(0.05)
+    assert proc.closed is True
+    assert registry.pop("s1") is None
+
+
 def test_read_claude_credential_missing_returns_none(tmp_path: Path) -> None:
     assert read_claude_credential(tmp_path / "nope.json") is None
 
