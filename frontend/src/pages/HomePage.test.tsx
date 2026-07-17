@@ -646,9 +646,9 @@ function doneIssuesResponse(count: number): IssueSummary[] {
 function stubBodyFor(url: string): unknown {
   if (url.includes("/api/issues")) {
     if (url.includes("scope=done")) {
-      const limit = Number(new URL(url, "http://localhost").searchParams.get("limit") ?? "50");
-      // First page is full (implies more); a bumped limit is satisfied in full.
-      return doneIssuesResponse(Math.min(limit, 60));
+      // The done list is now server-scoped to the last 24h; the client sends no
+      // `limit`, so a fixed set stands in for "what the backend returned".
+      return doneIssuesResponse(5);
     }
     return [];
   }
@@ -688,13 +688,13 @@ function stubFetch() {
   });
 }
 
-describe("HomePage done pagination", () => {
+describe("HomePage done list (last 24h)", () => {
   afterEach(() => {
     cleanup();
     vi.unstubAllGlobals();
   });
 
-  it("shows Load more when the done page is full, and fetches a bigger page on click", async () => {
+  it("fetches the done list without paging or a date window, and never shows Load more", async () => {
     const fetchMock = stubFetch();
     vi.stubGlobal("fetch", fetchMock);
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -709,31 +709,29 @@ describe("HomePage done pagination", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Table" }));
-    await waitFor(() => expect(screen.getByText("Load more")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("VIB-0")).toBeTruthy());
 
-    fireEvent.click(screen.getByText("Load more"));
-    await waitFor(() =>
-      expect(
-        fetchMock.mock.calls.some((call) => {
-          const url = typeof call[0] === "string" ? call[0] : call[0].toString();
-          // HomePage over-fetches by one (101, not 100) to tell an exact page
-          // boundary apart from genuinely having more.
-          return url.includes("scope=done") && url.includes("limit=101");
-        }),
-      ).toBe(true),
-    );
-    // The bigger page (60 rows) satisfies the request — no further "Load more".
-    await waitFor(() => expect(screen.queryByText("Load more")).toBeFalsy());
+    // Backend owns the window: the done request carries no `limit` (paging gone)
+    // and no `from`/`to` (the global date filter no longer drives this list).
+    const doneCalls = fetchMock.mock.calls
+      .map((call) => (typeof call[0] === "string" ? call[0] : call[0].toString()))
+      .filter((url) => url.includes("scope=done"));
+    expect(doneCalls.length).toBeGreaterThan(0);
+    for (const url of doneCalls) {
+      expect(url).not.toContain("limit=");
+      expect(url).not.toContain("from=");
+      expect(url).not.toContain("to=");
+    }
+    // No paging affordance, and the section is labelled as the last-24h scope.
+    expect(screen.queryByText("Load more")).toBeFalsy();
+    expect(screen.getAllByText(/last 24h/).length).toBeGreaterThan(0);
   });
 
-  it("hides Load more at an exact page boundary (no genuine next page)", async () => {
+  it("shows the empty-state copy when nothing completed in the last 24h", async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = typeof input === "string" ? input : input.toString();
-      // Exactly 50 done issues total — a full `doneLimit` page with nothing
-      // beyond it, regardless of the requested (over-fetched) limit.
-      const body = url.includes("/api/issues") && url.includes("scope=done")
-        ? doneIssuesResponse(50)
-        : stubBodyFor(url);
+      const body =
+        url.includes("/api/issues") && url.includes("scope=done") ? [] : stubBodyFor(url);
       return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body) } as Response);
     });
     vi.stubGlobal("fetch", fetchMock);
@@ -749,7 +747,8 @@ describe("HomePage done pagination", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: "Table" }));
-    await waitFor(() => expect(screen.getByText("VIB-49")).toBeTruthy());
-    expect(screen.queryByText("Load more")).toBeFalsy();
+    await waitFor(() =>
+      expect(screen.getByText("Nothing completed in the last 24h")).toBeTruthy(),
+    );
   });
 });

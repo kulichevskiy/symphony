@@ -3600,8 +3600,58 @@ async def test_api_issues_done_scope_window_and_completed_at(tmp_path: Path) -> 
 
     # Wider window includes both, newest first.
     assert [i["identifier"] for i in mo.json()] == ["ENG-1", "ENG-2"]
-    # No window → all-time done, both kept.
-    assert [i["identifier"] for i in allt.json()] == ["ENG-1", "ENG-2"]
+    # No window → rolling now-24h default. UI_NOW is 05-17 12:00, so the cutoff
+    # is 05-16 12:00; done-recent merged 05-16 10:00 (26h ago) is below it and
+    # done-old (05-01) far below → both excluded.
+    assert [i["identifier"] for i in allt.json()] == []
+
+
+@pytest.mark.asyncio
+async def test_api_issues_done_scope_defaults_to_last_24h(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.sqlite"
+    conn = await db.connect(db_path)
+    try:
+        # UI_NOW is 05-17 12:00, so the rolling cutoff is 05-16 12:00.
+        # Merged 2h ago → inside the 24h window.
+        await db.issues.upsert(
+            conn, id="done-fresh", identifier="ENG-1", title="fresh", team_key="ENG"
+        )
+        # Merged 30h ago → outside the 24h window.
+        await db.issues.upsert(
+            conn, id="done-stale", identifier="ENG-2", title="stale", team_key="ENG"
+        )
+        await conn.execute(
+            """
+            INSERT INTO issue_prs (issue_id, github_repo, binding_key, pr_number,
+                pr_url, created_at, merged_at)
+            VALUES
+                ('done-fresh', 'o/r', 'k', 1, 'u', '2026-05-17T09:00:00Z',
+                 '2026-05-17T10:00:00Z'),
+                ('done-stale', 'o/r', 'k', 2, 'u', '2026-05-16T05:00:00Z',
+                 '2026-05-16T06:00:00Z')
+            """
+        )
+        await conn.commit()
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_dist_dir=_dist(tmp_path),
+            clock=lambda: UI_NOW,
+        )
+        async with await _client(app) as client:
+            default = await client.get("/api/issues?scope=done")
+            override = await client.get("/api/issues?scope=done&from=2026-05-10&to=2026-05-17")
+    finally:
+        await conn.close()
+
+    # No `from` → only the issue completed within the last 24h is returned.
+    assert default.status_code == 200
+    assert [i["identifier"] for i in default.json()] == ["ENG-1"]
+    # Explicit `from` overrides the 24h default and surfaces the older done issue.
+    assert override.status_code == 200
+    assert [i["identifier"] for i in override.json()] == ["ENG-1", "ENG-2"]
 
 
 @pytest.mark.asyncio
@@ -3609,11 +3659,14 @@ async def test_api_issues_done_scope_limit(tmp_path: Path) -> None:
     db_path = tmp_path / "state.sqlite"
     conn = await db.connect(db_path)
     try:
-        # Three done issues, merged at increasing times (ENG-3 newest).
+        # Three done issues, merged at increasing times (ENG-3 newest). All
+        # within the rolling 24h default window (UI_NOW is 05-17 12:00, so the
+        # cutoff is 05-16 12:00) so the count limit — not the window — is what's
+        # under test here.
         merges = {
-            1: "2026-05-14T10:00:00Z",
-            2: "2026-05-15T10:00:00Z",
-            3: "2026-05-16T10:00:00Z",
+            1: "2026-05-16T13:00:00Z",
+            2: "2026-05-16T20:00:00Z",
+            3: "2026-05-17T10:00:00Z",
         }
         for i, merged in merges.items():
             await db.issues.upsert(
@@ -3644,7 +3697,7 @@ async def test_api_issues_done_scope_limit(tmp_path: Path) -> None:
     assert limited.status_code == 200
     # limit=N returns the N newest completed, ordering unchanged.
     assert [i["identifier"] for i in limited.json()] == ["ENG-3", "ENG-2"]
-    assert limited.json()[0]["completed_at"] == "2026-05-16T10:00:00Z"
+    assert limited.json()[0]["completed_at"] == "2026-05-17T10:00:00Z"
     # Omitting limit defaults to 50 → all three.
     assert [i["identifier"] for i in defaulted.json()] == ["ENG-3", "ENG-2", "ENG-1"]
     # Bounds validated ge=1 le=500.
