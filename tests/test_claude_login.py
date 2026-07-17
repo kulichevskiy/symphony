@@ -9,6 +9,7 @@ requests) and the credential-file helpers.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -61,6 +62,35 @@ async def test_registry_discard_closes_process() -> None:
     registry.add(proc)
     await registry.discard("s1")
     assert proc.closed is True
+    assert registry.pop("s1") is None
+
+
+@pytest.mark.asyncio
+async def test_registry_pop_expired_session_returns_none_and_closes() -> None:
+    now = [0.0]
+    registry = PendingLoginRegistry(
+        id_factory=iter(["s1"]).__next__, ttl_secs=10.0, clock=lambda: now[0]
+    )
+    proc = _FakeLogin("https://claude.ai/oauth", "{}")
+    registry.add(proc)
+    now[0] = 10.0
+    assert registry.pop("s1") is None
+    await asyncio.sleep(0)  # let the fire-and-forget close() task run
+    assert proc.closed is True
+
+
+@pytest.mark.asyncio
+async def test_registry_add_sweeps_expired_sessions() -> None:
+    now = [0.0]
+    registry = PendingLoginRegistry(
+        id_factory=iter(["s1", "s2"]).__next__, ttl_secs=10.0, clock=lambda: now[0]
+    )
+    abandoned = _FakeLogin("https://claude.ai/oauth", "{}")
+    registry.add(abandoned)
+    now[0] = 10.0
+    registry.add(_FakeLogin("https://claude.ai/oauth", "{}"))
+    await asyncio.sleep(0)
+    assert abandoned.closed is True
     assert registry.pop("s1") is None
 
 

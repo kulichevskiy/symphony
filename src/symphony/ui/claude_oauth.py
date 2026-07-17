@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from pathlib import Path
 
 import aiosqlite
 from fastapi import APIRouter, HTTPException
@@ -36,6 +37,7 @@ from ..claude_login import (
     PendingLoginRegistry,
     claude_credential_expired,
     claude_expires_at,
+    default_claude_credentials_path,
 )
 from ..crypto import (
     CredentialCipher,
@@ -65,10 +67,12 @@ def create_claude_oauth_router(
     registry: PendingLoginRegistry,
     login_factory: Callable[[], ClaudeLoginProcess],
     clock: Callable[[], datetime] | None = None,
+    credentials_path: Path | None = None,
 ) -> APIRouter:
     """Build the gated Claude login router. `login_factory` returns a fresh
     login subprocess per `start`; faked in tests."""
     router = APIRouter(prefix="/api/oauth/claude")
+    creds_path = credentials_path or default_claude_credentials_path()
 
     @router.get("/start")
     async def claude_start() -> dict[str, str]:
@@ -119,6 +123,16 @@ def create_claude_oauth_router(
     async def claude_disconnect() -> dict[str, str]:
         conn = await conn_provider()
         await db.oauth_connections.delete(conn, _PROVIDER)
+        # The login subprocess already wrote its own credentials file; clear it
+        # too so a disconnected card doesn't leave a still-usable local
+        # credential a run could pick up outside the DB (OAuth in UI 5/7 review
+        # fix). Best-effort — a bare DB disconnect still succeeds either way.
+        try:
+            creds_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            _log.warning("failed to remove local claude credentials file", exc_info=True)
         return {"status": "not_connected"}
 
     @router.post("/test")

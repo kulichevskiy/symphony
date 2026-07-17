@@ -28,6 +28,7 @@ import json
 import logging
 import re
 import secrets
+import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -44,9 +45,16 @@ _URL_RE = re.compile(r"https://\S*oauth\S*", re.IGNORECASE)
 # How long to wait for the URL to appear / the login to complete after a code.
 _START_TIMEOUT_SECS = 60.0
 _SUBMIT_TIMEOUT_SECS = 120.0
-# The `claude` login invocation. `/login` drives the interactive OAuth flow;
-# stdin/stdout are piped so the daemon feeds the pasted code and scrapes the URL.
-DEFAULT_LOGIN_COMMAND: tuple[str, ...] = ("claude", "/login")
+# How long a pending login may sit unsubmitted before it's treated as
+# abandoned (operator closed the tab / refreshed / never pasted a code) and
+# its subprocess is killed. Generous — it has to cover opening a browser tab,
+# authorizing on claude.ai, and copying the code back.
+_PENDING_LOGIN_TTL_SECS = 900.0
+# The `claude` login invocation. `auth login` is the scriptable CLI subcommand
+# that drives the OAuth flow (`/login` is a REPL-only slash command, not
+# invocable as a CLI argument); stdin/stdout are piped so the daemon feeds the
+# pasted code and scrapes the URL.
+DEFAULT_LOGIN_COMMAND: tuple[str, ...] = ("claude", "auth", "login")
 
 
 class ClaudeLoginError(Exception):
@@ -69,27 +77,69 @@ class ClaudeLoginProcess(Protocol):
 class PendingLoginRegistry:
     """In-memory, single-use registry of live login subprocesses keyed by an
     unguessable session id. Single-process by design (one daemon); a daemon
-    restart drops any in-flight login."""
+    restart drops any in-flight login.
 
-    def __init__(self, *, id_factory: Callable[[], str] | None = None) -> None:
-        self._pending: dict[str, ClaudeLoginProcess] = {}
+    Entries expire after `ttl_secs` (default `_PENDING_LOGIN_TTL_SECS`): if the
+    operator closes the tab, refreshes mid-login, or never pastes a code back,
+    the subprocess would otherwise run forever. `add` opportunistically sweeps
+    expired entries (closing their subprocess) so a login nobody finished
+    doesn't leak indefinitely; `pop` also refuses an entry past its deadline."""
+
+    def __init__(
+        self,
+        *,
+        id_factory: Callable[[], str] | None = None,
+        ttl_secs: float = _PENDING_LOGIN_TTL_SECS,
+        clock: Callable[[], float] | None = None,
+    ) -> None:
+        self._pending: dict[str, tuple[ClaudeLoginProcess, float]] = {}
         self._id_factory = id_factory or (lambda: secrets.token_urlsafe(_SESSION_ENTROPY_BYTES))
+        self._ttl_secs = ttl_secs
+        self._clock = clock or time.monotonic
 
     def add(self, process: ClaudeLoginProcess) -> str:
+        self._evict_expired()
         session_id = self._id_factory()
-        self._pending[session_id] = process
+        self._pending[session_id] = (process, self._clock() + self._ttl_secs)
         return session_id
 
     def pop(self, session_id: str) -> ClaudeLoginProcess | None:
         """Return and remove the handle for `session_id` (single-use), or `None`
-        if it is unknown / already consumed."""
-        return self._pending.pop(session_id, None)
+        if it is unknown, already consumed, or expired."""
+        entry = self._pending.pop(session_id, None)
+        if entry is None:
+            return None
+        process, deadline = entry
+        if self._clock() >= deadline:
+            self._schedule_close(process)
+            return None
+        return process
 
     async def discard(self, session_id: str) -> None:
         """Drop and tear down an abandoned/failed login."""
-        process = self._pending.pop(session_id, None)
-        if process is not None:
-            await process.close()
+        entry = self._pending.pop(session_id, None)
+        if entry is not None:
+            await entry[0].close()
+
+    def _evict_expired(self) -> None:
+        now = self._clock()
+        expired = [sid for sid, (_, deadline) in self._pending.items() if now >= deadline]
+        for sid in expired:
+            process, _ = self._pending.pop(sid)
+            log.info("pending Claude login session %s expired unsubmitted; closing it", sid)
+            self._schedule_close(process)
+
+    @staticmethod
+    def _schedule_close(process: ClaudeLoginProcess) -> None:
+        """Fire-and-forget `process.close()`. `add`/`pop` are sync so eviction
+        can't await; there's always a running loop in production (callers are
+        async route handlers), so this only silently no-ops in sync unit tests
+        that never advance the clock past a deadline anyway."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(process.close())
 
 
 def default_claude_credentials_path() -> Path:

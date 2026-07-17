@@ -46,7 +46,14 @@ class _FakeLogin:
         return self._credential
 
 
-def _app(conn: Any, db_path: Path, *, credential: str | None = None, auth: bool = False) -> Any:
+def _app(
+    conn: Any,
+    db_path: Path,
+    *,
+    credential: str | None = None,
+    auth: bool = False,
+    claude_credentials_path: Path | None = None,
+) -> Any:
     return create_app(
         _Handler(),
         conn,
@@ -55,6 +62,7 @@ def _app(conn: Any, db_path: Path, *, credential: str | None = None, auth: bool 
         oauth_cipher=CredentialCipher(_KEY),
         claude_login_factory=lambda: _FakeLogin(credential or _credential()),
         auth0_settings=_settings() if auth else None,
+        claude_credentials_path=claude_credentials_path,
     )
 
 
@@ -189,6 +197,37 @@ async def test_disconnect_clears_row(tmp_path: Path) -> None:
             resp = await client.post("/api/oauth/claude/disconnect")
         assert resp.status_code == 200
         assert await db.oauth_connections.get_status(conn, "claude") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_removes_local_credentials_file(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        creds_path = tmp_path / ".credentials.json"
+        creds_path.write_text("{}", encoding="utf-8")
+        app = _app(conn, db_path, claude_credentials_path=creds_path)
+        async with _client(app) as client:
+            session = (await client.get("/api/oauth/claude/start")).json()["login_session"]
+            await client.post(
+                "/api/oauth/claude/submit-code", json={"login_session": session, "code": "c"}
+            )
+            resp = await client.post("/api/oauth/claude/disconnect")
+        assert resp.status_code == 200
+        assert not creds_path.exists()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_without_local_file_still_succeeds(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path, claude_credentials_path=tmp_path / "nope" / ".credentials.json")
+        async with _client(app) as client:
+            resp = await client.post("/api/oauth/claude/disconnect")
+        assert resp.status_code == 200
     finally:
         await conn.close()
 

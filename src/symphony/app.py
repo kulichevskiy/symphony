@@ -112,6 +112,7 @@ def create_app(
     auth0_settings: Auth0Settings | None = None,
     oauth_cipher: CredentialCipher | None = None,
     claude_login_factory: Callable[[], ClaudeLoginProcess] | None = None,
+    claude_credentials_path: Path | None = None,
     clock: Clock | None = None,
 ) -> FastAPI:
     # Publicly-exposed deployments (docker-compose.coolify.yml) set
@@ -270,6 +271,7 @@ def create_app(
                     registry=PendingLoginRegistry(),
                     login_factory=claude_login_factory or (lambda: SubprocessClaudeLogin()),
                     clock=clock,
+                    credentials_path=claude_credentials_path,
                 ),
                 dependencies=api_dependencies,
             )

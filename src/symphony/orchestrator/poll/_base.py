@@ -58,7 +58,7 @@ from ...credentials import (
     RunCredentials,
     github_host_for_repo,
 )
-from ...crypto import CredentialCipher
+from ...crypto import CredentialCipher, CredentialDecryptError, CredentialKeyMissingError
 from ...effective_config import ConfigBootError, assemble_effective_config
 from ...github.client import GitHub, GitHubClient, GitHubError
 from ...github.webhook import GitHubWebhookEvent
@@ -471,10 +471,10 @@ class _OrchestratorBase:
         # the Linear OAuth app config (when set) so an expired DB token gets
         # refreshed in place instead of permanently falling back to
         # `LINEAR_API_KEY` once the 24h access token lapses.
-        _cipher = CredentialCipher(config.symphony_encryption_key)
+        self._cipher = CredentialCipher(config.symphony_encryption_key)
         self._credential_resolver = CredentialResolver(
             conn,
-            _cipher,
+            self._cipher,
             linear_oauth_provider=(
                 linear_provider(config.linear_oauth_client_id, config.linear_oauth_client_secret)
                 if config.linear_oauth_client_id and config.linear_oauth_client_secret
@@ -486,7 +486,7 @@ class _OrchestratorBase:
         # a run the daemon reads the credential file back and re-persists it to
         # the DB if it changed. Serialized per provider by the write-back's own
         # lock so two concurrent runs finishing at once can't clobber each other.
-        self._credential_write_back = CredentialWriteBack(conn, _cipher)
+        self._credential_write_back = CredentialWriteBack(conn, self._cipher)
         self._claude_credentials_path = (
             claude_credentials_path
             if claude_credentials_path is not None
@@ -2989,6 +2989,34 @@ class _OrchestratorBase:
         )
         return RunCredentials(github_token=github_token, linear_token=linear_token)
 
+    async def _restore_claude_credentials(self) -> None:
+        """Before a Claude run, restore the credentials file from the DB's
+        connected/expired Claude row if the file is missing — a redeploy or
+        volume loss can drop the auth volume while the DB still holds the last
+        write-back (OAuth in UI 5/7 review fix). A no-op when the file already
+        exists, Claude isn't UI-connected, or the stored credential can't be
+        decrypted. Never raises into the run — restore is best-effort, mirroring
+        `_write_back_claude_credentials`."""
+        if read_claude_credential(self._claude_credentials_path) is not None:
+            return
+        status = await db.oauth_connections.get_status(self._conn, "claude")
+        if status is None or status.status not in ("connected", "expired"):
+            return
+        try:
+            credential = await db.oauth_connections.get_credential(
+                self._conn, "claude", self._cipher
+            )
+        except (CredentialDecryptError, CredentialKeyMissingError):
+            return
+        if not credential:
+            return
+        try:
+            self._claude_credentials_path.parent.mkdir(parents=True, exist_ok=True)
+            self._claude_credentials_path.write_text(credential, encoding="utf-8")
+            self._claude_credentials_path.chmod(0o600)
+        except OSError:
+            log.warning("claude credential restore failed", exc_info=True)
+
     async def _write_back_claude_credentials(self) -> None:
         """After a Claude run, persist the (possibly refreshed) credential file
         back to the DB if it changed (OAuth in UI 5/7). A no-op when Claude
@@ -3030,6 +3058,8 @@ class _OrchestratorBase:
             credentials=await self._resolve_run_credentials(binding),
             github_host=github_host_for_repo(binding.github_repo),
         )
+        if role.agent == "claude":
+            await self._restore_claude_credentials()
 
         log_path = self.config.log_root / f"{run_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3335,6 +3365,8 @@ class _OrchestratorBase:
             credentials=await self._resolve_run_credentials(binding),
             github_host=github_host_for_repo(binding.github_repo),
         )
+        if role.agent == "claude":
+            await self._restore_claude_credentials()
 
         log_path = self.config.log_root / f"{run_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
