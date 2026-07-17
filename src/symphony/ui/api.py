@@ -282,10 +282,17 @@ def _optional_int(value: object) -> int | None:
 # Day-string param shape (`YYYY-MM-DD`) for the `from`/`to` date-window filters.
 DAY_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
 
-# Default cap on the done scope of /api/issues when no `limit` is given. The
-# done window defaults to 12 months, so returning the whole history every poll
-# is wasteful; the newest N is enough for the dashboard's Done lane + table.
+# Safety ceiling on the done scope of /api/issues when no `limit` is given.
+# The primary bound is now the 24h time window (DONE_SCOPE_DEFAULT_WINDOW); this
+# count only guards against an exceptionally busy window returning an unbounded
+# list. The newest N is enough for the dashboard's Done lane + table.
 DONE_SCOPE_DEFAULT_LIMIT = 50
+
+# Default rolling window for the done scope when the request gives no explicit
+# lower bound (`from`): only issues completed within the last 24h are listed, so
+# the dashboard's Done section stays a snapshot of "what we just finished".
+# Explicit `from`/`to` override this (the seam the future archive page uses).
+DONE_SCOPE_DEFAULT_WINDOW = timedelta(hours=24)
 
 
 def _started_at_window(date_from: str | None, date_to: str | None) -> tuple[list[str], list[str]]:
@@ -1048,6 +1055,7 @@ def _list_issues_query(
     now: datetime,
     date_from: str | None = None,
     date_to: str | None = None,
+    done_since: str | None = None,
     provider: str | None = None,
     teams: list[str] | None = None,
     models: list[tuple[str, str]] | None = None,
@@ -1086,8 +1094,14 @@ def _list_issues_query(
         # check runs in Python on this small set.
         completion = "COALESCE(pr.max_merged_at, la.latest_activity_ts)"
         if date_from is not None:
+            # Explicit lower bound (day string) overrides the 24h default.
             where.append(f"{completion} >= ?")
             where_params.append(date_from)
+        elif done_since is not None:
+            # Rolling now-24h default: an ISO-timestamp lower bound (sub-day),
+            # so the Done section reflects only what was just finished.
+            where.append(f"{completion} >= ?")
+            where_params.append(done_since)
         if date_to is not None:
             where.append(f"{completion} < date(?, '+1 day')")
             where_params.append(date_to)
@@ -1264,12 +1278,23 @@ def create_api_router(
         try:
             conn = await ui_db_pool.connection()
             request_now = now()
+            # Done scope defaults to a rolling now-24h window unless the request
+            # gives an explicit date bound. Any explicit `from`/`to` is an
+            # override (the archive-page seam) — including a `to`-only historical
+            # query, which must not inherit the now-24h lower bound and come back
+            # empty.
+            done_since = (
+                _utc_iso(request_now - DONE_SCOPE_DEFAULT_WINDOW)
+                if is_done and date_from is None and date_to is None
+                else None
+            )
             query, params = _list_issues_query(
                 scope,
                 q,
                 now=request_now,
                 date_from=date_from,
                 date_to=date_to,
+                done_since=done_since,
                 provider=provider_filter,
                 teams=team_filter,
                 models=model_filter,
@@ -1366,6 +1391,8 @@ def create_api_router(
                             continue
                         completed_at = issue.get("max_merged_at") or issue.get("latest_activity_ts")
                         if completed_at is None:
+                            continue
+                        if done_since is not None and str(completed_at) < done_since:
                             continue
                         completed_day = str(completed_at)[:10]
                         if date_from is not None and completed_day < date_from:

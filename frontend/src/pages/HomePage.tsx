@@ -703,7 +703,7 @@ export const BOARD_COLUMNS: Array<{
   { key: "local_review", label: "Local review", dot: "bg-cyan-500" },
   { key: "review", label: "Review", dot: "bg-violet-500", mixed: true },
   { key: "merge", label: "Merge", dot: "bg-emerald-500", mixed: true },
-  { key: "done", label: "Done", dot: "bg-green-500" },
+  { key: "done", label: "Done · 24h", dot: "bg-green-500" },
 ];
 
 /** Which lane a live run sits in, by its stage (fix stages ride with their
@@ -853,18 +853,10 @@ function BoardCard({
 }
 
 /** Max cards rendered in the Done lane before collapsing to a "+N more"
- *  affordance. The done feed is capped server-side (default 50); this keeps the
- *  board readable and nudges deeper browsing into the Table view. */
+ *  affordance. The done feed is scoped server-side to the last 24h (capped at
+ *  50); this keeps the board readable on a busy day and nudges deeper browsing
+ *  into the Table view, which shows the same 24h set. */
 export const DONE_LANE_CARD_CAP = 30;
-
-/** How many done issues the home feed fetches by default (matches the API's
- *  own default). The kanban shows the newest `DONE_LANE_CARD_CAP`; the rest
- *  are reachable via the "+N more" affordance / Table view's "Load more". */
-const DONE_SCOPE_LIMIT = 50;
-
-/** Ceiling for the done scope's `limit` param (matches the API's `le=500`).
- *  "Load more" in the Table view steps toward this instead of unbounded growth. */
-const DONE_SCOPE_MAX_LIMIT = 500;
 
 /** The issues kanban: one lane per pipeline step, every tracked issue exactly
  *  once. Cards are links to the issue page (⌘-click works); the identifier
@@ -1093,18 +1085,6 @@ export function HomePage() {
   const modelsKey = [...models].sort().join(",");
   const modelsFilter = models.length ? models : undefined;
 
-  // How many done issues to request; grows via the Table view's "Load more".
-  // Reset to the default whenever the filters change — done synchronously
-  // during render (not in a useEffect) so the reset lands before the done
-  // query runs with the new filters, instead of one render later.
-  const doneFilterKey = `${provider}|${teamsKey}|${modelsKey}|${from}|${to}`;
-  const [doneLimit, setDoneLimit] = useState(DONE_SCOPE_LIMIT);
-  const [prevDoneFilterKey, setPrevDoneFilterKey] = useState(doneFilterKey);
-  if (doneFilterKey !== prevDoneFilterKey) {
-    setPrevDoneFilterKey(doneFilterKey);
-    setDoneLimit(DONE_SCOPE_LIMIT);
-  }
-
   const summaryQuery = useQuery({
     queryKey: ["spend-summary", provider, teamsKey, modelsKey, from, to],
     queryFn: () =>
@@ -1136,31 +1116,26 @@ export function HomePage() {
     refetchInterval: 10_000,
     placeholderData: (prev) => prev,
   });
-  // Over-fetch by one beyond `doneLimit` so an exact page boundary (50, 100,
-  // …) can be told apart from "there's really more": if the extra row comes
-  // back, there's a next page; if not, `doneLimit` was already everything.
-  const doneRequestLimit = Math.min(doneLimit + 1, DONE_SCOPE_MAX_LIMIT);
+  // The done list is fixed to the backend's rolling last-24h window — it does
+  // NOT take the global date filter (that still drives the active list and the
+  // token/heatmap widgets). Omitting `from`/`to` lets the backend apply its
+  // 24h default; the count-based ceiling stays behind the time window.
   const doneQuery = useQuery({
-    queryKey: ["issues", "done", provider, teamsKey, modelsKey, from, to, doneRequestLimit],
+    queryKey: ["issues", "done", provider, teamsKey, modelsKey],
     queryFn: () =>
       fetchIssues({
         scope: "done",
         provider: providerFilter,
         teams: teamsFilter,
-        from: dateFrom,
-        to: dateTo,
         models: modelsFilter,
-        limit: doneRequestLimit,
       }),
     refetchInterval: 30_000,
     placeholderData: (prev) => prev,
   });
 
   const active = activeQuery.data ?? [];
-  const doneFetched = doneQuery.data ?? [];
-  const done = doneFetched.slice(0, doneLimit);
+  const done = doneQuery.data ?? [];
   const tracked = summaryQuery.data?.totals.issues ?? 0;
-  const hasMoreDone = doneFetched.length > doneLimit && doneLimit < DONE_SCOPE_MAX_LIMIT;
 
   const openIssue = (id: string) => navigate(`/issue/${encodeURIComponent(id)}`);
 
@@ -1240,29 +1215,15 @@ export function HomePage() {
               <h3 className="flex items-center gap-2 text-sm font-semibold">
                 Recently done{" "}
                 <span className="font-mono text-xs font-normal text-muted-foreground">
-                  · {done.length}
+                  · last 24h · {done.length}
                 </span>
               </h3>
             </div>
             {done.length ? (
-              <>
-                <IssueTable issues={done} mode="done" nowMs={nowMs} onOpen={openIssue} />
-                {hasMoreDone ? (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setDoneLimit((l) => Math.min(l + DONE_SCOPE_LIMIT, DONE_SCOPE_MAX_LIMIT))
-                    }
-                    disabled={doneQuery.isFetching}
-                    className="mt-2 w-full rounded-md border border-dashed border-border py-2 text-center text-xs font-medium text-muted-foreground transition-colors hover:border-blue-400 hover:text-foreground disabled:opacity-50 dark:hover:border-blue-600"
-                  >
-                    {doneQuery.isFetching ? "Loading…" : "Load more"}
-                  </button>
-                ) : null}
-              </>
+              <IssueTable issues={done} mode="done" nowMs={nowMs} onOpen={openIssue} />
             ) : (
               <div className="rounded-md border border-border p-6 text-sm text-muted-foreground">
-                No completed issues match your filters
+                Nothing completed in the last 24h
               </div>
             )}
           </>
@@ -1270,8 +1231,8 @@ export function HomePage() {
       </section>
 
       <footer className="mt-10 border-t border-border pt-4 text-xs text-muted-foreground">
-        Completed = Linear <span className="font-mono">done</span> lane or all tracked
-        PRs merged · completion time shown relative to now
+        Completed (last 24h) = Linear <span className="font-mono">done</span> lane or all
+        tracked PRs merged · completion time shown relative to now
       </footer>
     </main>
   );
