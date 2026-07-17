@@ -2901,7 +2901,8 @@ class _MergeMixin(_OrchestratorBase):
         """Reset the workspace to the remote branch; a failure is logged and
         tolerated (the merge proceeds anyway)."""
         try:
-            await _sync_workspace_to_remote(workspace_path, branch)
+            github_token = await self._resolve_github_token()
+            await _sync_workspace_to_remote(workspace_path, branch, github_token=github_token)
         except Exception as e:  # noqa: BLE001
             log.warning(
                 "workspace sync failed for merge %s, proceeding anyway: %s",

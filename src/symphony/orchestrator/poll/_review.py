@@ -2350,7 +2350,8 @@ class _ReviewMixin(_OrchestratorBase):
             nonlocal start_sha
             # Step 1: orchestrator fetches origin.
             try:
-                await _sync_workspace_to_remote(workspace_path, branch)
+                github_token = await self._resolve_github_token()
+                await _sync_workspace_to_remote(workspace_path, branch, github_token=github_token)
             except Exception as e:  # noqa: BLE001
                 log.warning("workspace sync failed for %s: %s", issue.identifier, e)
                 await self._fail_review_run(

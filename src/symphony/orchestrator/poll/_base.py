@@ -85,15 +85,18 @@ from ...tracker import (
 from ...tracker import (
     Issue as LinearIssue,
 )
+from ...ui.oauth import linear_provider
 from ...workspace import Workspace
 from ..reconciler import Reconciler
 from ._git import (
+    _DEFAULT_PUSH_AUTH_HOST,
     _branch_ahead_of_base,
     _clear_git_push_auth,
     _configure_git_push_auth,
     _default_force_push,
     _default_push,
     _git_status_short,
+    _push_auth_host,
     _workspace_dirty_files,
     _workspace_ref_landed_in_base,
 )
@@ -450,9 +453,18 @@ class _OrchestratorBase:
         self._runner: Runner = runner if runner is not None else LocalRunner()
         # Resolves each run's creds DB-first (OAuth in UI 4/7). A provider with
         # no connected `oauth_connections` row falls back to the env/volume
-        # value below, so migration is per-provider and zero-downtime.
+        # value below, so migration is per-provider and zero-downtime. Passed
+        # the Linear OAuth app config (when set) so an expired DB token gets
+        # refreshed in place instead of permanently falling back to
+        # `LINEAR_API_KEY` once the 24h access token lapses.
         self._credential_resolver = CredentialResolver(
-            conn, CredentialCipher(config.symphony_encryption_key)
+            conn,
+            CredentialCipher(config.symphony_encryption_key),
+            linear_oauth_provider=(
+                linear_provider(config.linear_oauth_client_id, config.linear_oauth_client_secret)
+                if config.linear_oauth_client_id and config.linear_oauth_client_secret
+                else None
+            ),
         )
         # Last Linear token applied to registered trackers via
         # `_refresh_linear_tracker_credentials`, so a tick only touches the
@@ -2437,7 +2449,7 @@ class _OrchestratorBase:
         pr_number: int,
     ) -> None:
         try:
-            gh = await self._gh_client()
+            gh = await self._gh_client(repo=binding.github_repo)
             await gh.pr_comment(
                 pr_number,
                 "@codex review",
@@ -2756,7 +2768,16 @@ class _OrchestratorBase:
         """
 
         async def _push(workspace_path: Path, branch: str) -> None:
-            github_token = await self._resolve_github_token()
+            # A GHE (`[HOST/]OWNER/REPO`) remote must keep its own
+            # host-specific auth — the DB connection / `GH_TOKEN` fallback
+            # are both scoped to github.com, so promoting either here would
+            # send the wrong host's token (OAuth in UI 4/7 review fix).
+            host = await _push_auth_host(workspace_path)
+            github_token = (
+                await self._resolve_github_token()
+                if host in (None, _DEFAULT_PUSH_AUTH_HOST)
+                else None
+            )
             await _clear_git_push_auth(workspace_path)
             if github_token:
                 await _configure_git_push_auth(workspace_path, github_token)
@@ -2777,10 +2798,10 @@ class _OrchestratorBase:
         for that binding would fail at the very first workspace acquire
         (OAuth in UI 4/7 review fix). Mirrors `_gh_client`.
         """
-        client = await self._gh_client()
+        client = await self._gh_client(repo=repo)
         await client.repo_clone(repo, dest)
 
-    async def _gh_client(self) -> GitHubClient:
+    async def _gh_client(self, *, repo: str | None = None) -> GitHubClient:
         """A GitHub client using the DB-resolved token when available.
 
         Every `self._gh_client()` call site (pushes aside — those go through
@@ -2788,17 +2809,29 @@ class _OrchestratorBase:
         delivery, so merge/comment/view/checks calls stay consistent with
         the push+PR the DB token already made (OAuth in UI 4/7 review fix).
         Falls back to the ambient `self._gh` when no DB connection exists.
+
+        `repo`, when given, gates the DB/env promotion to a github.com
+        target (see `_resolve_github_token`) so a GHE binding's calls keep
+        using `self._gh`'s own host-specific auth.
         """
-        github_token = await self._resolve_github_token()
+        github_token = await self._resolve_github_token(repo=repo)
         return GitHub(token=github_token) if github_token else self._gh
 
-    async def _resolve_github_token(self) -> str | None:
+    async def _resolve_github_token(self, *, repo: str | None = None) -> str | None:
         """The GitHub token to use for delivery (push + PR), DB-first.
 
         Falls back to the ambient `GH_TOKEN` when no DB connection is
         connected, so an instance mid-migration keeps delivering exactly as
         before.
+
+        The DB connection and `GH_TOKEN` fallback are both scoped to
+        github.com — a `[HOST/]OWNER/REPO` GitHub Enterprise binding must
+        keep resolving auth however it already did (ambient `gh` login /
+        host-specific env), so `repo` naming a non-default host skips this
+        resolution entirely and returns `None` (OAuth in UI 4/7 review fix).
         """
+        if repo is not None and github_host_for_repo(repo) != "github.com":
+            return None
         return await self._credential_resolver.resolve(
             "github", fallback=os.environ.get("GH_TOKEN")
         )
@@ -2876,10 +2909,13 @@ class _OrchestratorBase:
         non-Linear provider (SYM-199 review fix). Each provider falls back to
         the ambient env/volume value when it has no connected DB row, keeping
         the current instance running through migration.
+
+        Routed through `_resolve_github_token(repo=...)` so a GHE binding's
+        run never gets the github.com DB/`GH_TOKEN` promoted into it — that
+        token is scoped to github.com and would break the GHE push/PR calls
+        the run makes (OAuth in UI 4/7 review fix).
         """
-        github_token = await self._credential_resolver.resolve(
-            "github", fallback=os.environ.get("GH_TOKEN")
-        )
+        github_token = await self._resolve_github_token(repo=binding.github_repo)
         if binding.provider != "linear":
             return RunCredentials(github_token=github_token, linear_token=None)
         linear_token = await self._credential_resolver.resolve_linear_auth_header(

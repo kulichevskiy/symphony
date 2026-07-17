@@ -258,6 +258,19 @@ def _config_has_linear_bindings(cfg: Config) -> bool:
     return any(binding.provider == "linear" for binding in cfg.repos)
 
 
+async def _config_has_usable_linear_auth(conn: aiosqlite.Connection, cfg: Config) -> bool:
+    """Whether Linear-bound work can actually authenticate: either the env
+    `LINEAR_API_KEY` fallback, or a connected DB OAuth row the runtime
+    `CredentialResolver` resolves instead. A DB-only connection (UI-configured,
+    no `LINEAR_API_KEY` in the deployment env) must not fail this boot gate —
+    otherwise a migration to the DB-stored connection can never actually start
+    the daemon (OAuth in UI 4/7 review fix)."""
+    if cfg.linear_api_key:
+        return True
+    status = await db.oauth_connections.get_status(conn, "linear")
+    return status is not None and status.status == "connected"
+
+
 def _tracker_context_for_binding(binding: RepoBinding) -> TrackerContext:
     return context_for_binding(binding)
 
@@ -374,8 +387,12 @@ async def _run(config_path: Path, *, once: bool) -> None:
         except ConfigBootError as e:
             click.echo(str(e), err=True)
             sys.exit(2)
-        if _config_has_linear_bindings(cfg) and not cfg.linear_api_key:
-            click.echo("LINEAR_API_KEY env var is empty; aborting", err=True)
+        if _config_has_linear_bindings(cfg) and not await _config_has_usable_linear_auth(conn, cfg):
+            click.echo(
+                "LINEAR_API_KEY env var is empty and no Linear OAuth connection is "
+                "configured; aborting",
+                err=True,
+            )
             sys.exit(2)
         _enforce_require_auth0(cfg)
         async with _configured_tracker_registry(cfg) as (trackers, _):
@@ -748,13 +765,14 @@ async def _preflight(config_path: Path) -> None:
             boot_gates=False,
             yaml_has_repos_topology=yaml_has_repos_topology,
         )
+        has_usable_linear_auth = await _config_has_usable_linear_auth(conn, cfg)
     except ConfigBootError as e:
         click.echo(str(e), err=True)
         sys.exit(2)
     finally:
         await conn.close()
-    if _config_has_linear_bindings(cfg) and not cfg.linear_api_key:
-        click.echo("LINEAR_API_KEY is empty", err=True)
+    if _config_has_linear_bindings(cfg) and not has_usable_linear_auth:
+        click.echo("LINEAR_API_KEY is empty and no Linear OAuth connection is configured", err=True)
         sys.exit(2)
     if cfg.ui.enabled:
         # Raises ClickException on a partial AUTH0_* env — surface that here

@@ -23,15 +23,18 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import aiosqlite
 
 from . import db
 from .crypto import CredentialCipher, CredentialDecryptError, CredentialKeyMissingError
+from .oauth import OAuthError, OAuthProvider, refresh_access_token
 
 log = logging.getLogger(__name__)
+
+_ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
 
 @dataclass(frozen=True)
@@ -55,7 +58,7 @@ def _is_expired(expires_at: str) -> bool:
     is in the past. An unparseable value is treated as not-expired rather than
     forcing a fallback on a format we don't recognize."""
     try:
-        deadline = datetime.strptime(expires_at, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        deadline = datetime.strptime(expires_at, _ISO_FORMAT).replace(tzinfo=UTC)
     except ValueError:
         return False
     return datetime.now(UTC) >= deadline
@@ -64,9 +67,21 @@ def _is_expired(expires_at: str) -> bool:
 class CredentialResolver:
     """`provider → credential`, DB connection first, else env/volume fallback."""
 
-    def __init__(self, conn: aiosqlite.Connection, cipher: CredentialCipher) -> None:
+    def __init__(
+        self,
+        conn: aiosqlite.Connection,
+        cipher: CredentialCipher,
+        *,
+        linear_oauth_provider: OAuthProvider | None = None,
+    ) -> None:
         self._conn = conn
         self._cipher = cipher
+        # Only Linear's OAuth access token expires (24h) — set when the
+        # caller has Linear OAuth client credentials configured, so an
+        # expired row can be refreshed in place instead of permanently
+        # falling back to `LINEAR_API_KEY` for the rest of the token's would-
+        # be lifetime.
+        self._linear_oauth_provider = linear_oauth_provider
 
     async def resolve(self, provider: str, *, fallback: str | None = None) -> str | None:
         """The provider's credential, DB-first.
@@ -108,6 +123,9 @@ class CredentialResolver:
         if status is None or status.status != "connected":
             return fallback, False
         if status.expires_at is not None and _is_expired(status.expires_at):
+            refreshed = await self._try_refresh(provider)
+            if refreshed is not None:
+                return refreshed, True
             log.warning("%s connection expired at %s; using fallback", provider, status.expires_at)
             return fallback, False
         try:
@@ -124,6 +142,53 @@ class CredentialResolver:
         if credential:
             return credential, True
         return fallback, False
+
+    async def _try_refresh(self, provider: str) -> str | None:
+        """Attempt to refresh an expired `provider` row in place via its
+        stored refresh token, writing the new credential back so subsequent
+        calls (this run and later ones) see a live connection instead of
+        re-falling-back on every tick until an operator reconnects. Returns
+        the new access token, or `None` if the provider has no refresh
+        support, no stored refresh token, or the refresh itself fails —
+        any of which the caller treats exactly like "no usable DB
+        connection"."""
+        if provider != "linear" or self._linear_oauth_provider is None:
+            return None
+        try:
+            refresh_token = await db.oauth_connections.get_refresh_token(
+                self._conn, provider, self._cipher
+            )
+        except (CredentialDecryptError, CredentialKeyMissingError):
+            return None
+        if not refresh_token:
+            return None
+        try:
+            token = await refresh_access_token(
+                self._linear_oauth_provider, refresh_token=refresh_token
+            )
+        except OAuthError:
+            log.warning("%s OAuth token refresh failed; using fallback", provider)
+            return None
+        expires_at = (
+            (datetime.now(UTC) + timedelta(seconds=token.expires_in)).strftime(_ISO_FORMAT)
+            if token.expires_in is not None
+            else None
+        )
+        await db.oauth_connections.set_connection(
+            self._conn,
+            provider=provider,
+            credential=token.access_token,
+            cipher=self._cipher,
+            # Some providers omit `refresh_token` on refresh, meaning the
+            # original one is still valid — keep it rather than dropping it.
+            refresh_token=token.refresh_token or refresh_token,
+            status="connected",
+            expires_at=expires_at,
+            updated_at=datetime.now(UTC).strftime(_ISO_FORMAT),
+            updated_by="auto-refresh",
+        )
+        log.info("%s OAuth token refreshed, valid until %s", provider, expires_at)
+        return token.access_token
 
     async def resolve_run_credentials(
         self, *, github_fallback: str | None = None, linear_fallback: str | None = None

@@ -5177,7 +5177,7 @@ async def test_merge_conflict_fix_run_aborts_rebase_on_failure(
         )
 
         assert result is False
-        sync_workspace.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+        sync_workspace.assert_awaited_once_with(workspace_path, "symphony/eng-1", github_token=None)
         abort_rebase.assert_awaited_once_with(workspace_path)
         if failure_mode == "continue":
             add_and_continue.assert_awaited_once_with(workspace_path, ["conflicted.py"])
@@ -5260,7 +5260,7 @@ async def test_merge_conflict_fix_reports_status_when_rebase_has_no_unresolved_p
         )
 
         assert result is False
-        sync_workspace.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+        sync_workspace.assert_awaited_once_with(workspace_path, "symphony/eng-1", github_token=None)
         abort_rebase.assert_awaited_once_with(workspace_path)
         posted = [c.args[1] for c in linear.post_comment.await_args_list]
         assert any("rebase failed with no unresolved paths" in b for b in posted), posted
@@ -5299,7 +5299,9 @@ async def test_merge_conflict_fix_uses_synced_head_as_noop_baseline(
 
         synced = False
 
-        async def sync_workspace(_workspace_path: Path, _branch: str) -> None:
+        async def sync_workspace(
+            _workspace_path: Path, _branch: str, *, github_token: str | None = None
+        ) -> None:
             nonlocal synced
             synced = True
 
@@ -5426,7 +5428,7 @@ async def test_merge_conflict_fix_run_continues_through_later_conflicts(
         )
 
         assert result is True
-        sync_workspace.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+        sync_workspace.assert_awaited_once_with(workspace_path, "symphony/eng-1", github_token=None)
         assert conflicted_files.await_count == 2
         assert add_and_continue.await_args_list == [
             call(workspace_path, ["first.py"]),

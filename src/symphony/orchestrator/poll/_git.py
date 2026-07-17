@@ -159,39 +159,56 @@ async def _default_force_push(workspace_path: Path, branch: str) -> None:
         )
 
 
-async def _sync_workspace_to_remote(workspace_path: Path, branch: str) -> None:
+async def _sync_workspace_to_remote(
+    workspace_path: Path, branch: str, *, github_token: str | None = None
+) -> None:
     """Fetch and hard-reset the workspace to origin/branch.
 
     Called before the merge agent so that local commits left behind by
     review-fix runs (which may have diverged from the remote) do not cause
     a non-fast-forward push failure later.
+
+    `github_token`, when given, is applied as the same in-memory push-auth
+    header `_configure_git_push_auth` sets for a push (and cleared right
+    after) — a DB-only GitHub setup for a private repo has no ambient git
+    credential, so this fetch would otherwise fail before the merge/review
+    agent ever starts (OAuth in UI 4/7 review fix).
     """
-    fetch_proc = await asyncio.create_subprocess_exec(
-        "git",
-        "fetch",
-        "origin",
-        branch,
-        cwd=str(workspace_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        stdin=asyncio.subprocess.DEVNULL,
-    )
-    _, stderr = await fetch_proc.communicate()
-    if fetch_proc.returncode != 0:
-        raise RuntimeError(f"git fetch failed: {stderr.decode(errors='replace').strip()}")
-    reset_proc = await asyncio.create_subprocess_exec(
-        "git",
-        "reset",
-        "--hard",
-        f"origin/{branch}",
-        cwd=str(workspace_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        stdin=asyncio.subprocess.DEVNULL,
-    )
-    _, stderr = await reset_proc.communicate()
-    if reset_proc.returncode != 0:
-        raise RuntimeError(f"git reset --hard failed: {stderr.decode(errors='replace').strip()}")
+    if github_token:
+        await _configure_git_push_auth(workspace_path, github_token)
+    try:
+        fetch_proc = await asyncio.create_subprocess_exec(
+            "git",
+            "fetch",
+            "origin",
+            branch,
+            cwd=str(workspace_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            env=_push_auth_subprocess_env(workspace_path),
+        )
+        _, stderr = await fetch_proc.communicate()
+        if fetch_proc.returncode != 0:
+            raise RuntimeError(f"git fetch failed: {stderr.decode(errors='replace').strip()}")
+        reset_proc = await asyncio.create_subprocess_exec(
+            "git",
+            "reset",
+            "--hard",
+            f"origin/{branch}",
+            cwd=str(workspace_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+        )
+        _, stderr = await reset_proc.communicate()
+        if reset_proc.returncode != 0:
+            raise RuntimeError(
+                f"git reset --hard failed: {stderr.decode(errors='replace').strip()}"
+            )
+    finally:
+        if github_token:
+            await _clear_git_push_auth(workspace_path)
 
 
 async def _git_fetch(workspace_path: Path) -> None:

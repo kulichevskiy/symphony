@@ -162,6 +162,42 @@ class TokenResponse:
     expires_in: int | None = None
 
 
+async def _post_token_request(
+    provider: OAuthProvider,
+    data: dict[str, str],
+    *,
+    client: httpx.AsyncClient | None = None,
+) -> TokenResponse:
+    """POST a token-endpoint request and parse the response. Shared by
+    `exchange_code` (`grant_type=authorization_code`) and `refresh_access_token`
+    (`grant_type=refresh_token`) — both a code exchange and a refresh hit the
+    same `token_url` and return the same `{access_token, refresh_token,
+    expires_in}` shape."""
+    headers = {"Accept": "application/json"}
+    if client is not None:
+        resp = await client.post(provider.token_url, data=data, headers=headers)
+    else:
+        async with httpx.AsyncClient() as owned:
+            resp = await owned.post(provider.token_url, data=data, headers=headers)
+    try:
+        resp.raise_for_status()
+        payload = resp.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise OAuthError(f"token request with {provider.provider} failed") from exc
+    if not isinstance(payload, dict) or payload.get("error"):
+        raise OAuthError(f"token request with {provider.provider} was rejected")
+    token = payload.get("access_token")
+    if not isinstance(token, str) or not token:
+        raise OAuthError(f"token request with {provider.provider} returned no access token")
+    refresh_token = payload.get("refresh_token")
+    expires_in = payload.get("expires_in")
+    return TokenResponse(
+        access_token=token,
+        refresh_token=refresh_token if isinstance(refresh_token, str) else None,
+        expires_in=expires_in if isinstance(expires_in, int) else None,
+    )
+
+
 async def exchange_code(
     provider: OAuthProvider,
     *,
@@ -180,26 +216,24 @@ async def exchange_code(
         "code_verifier": code_verifier,
         "grant_type": "authorization_code",
     }
-    headers = {"Accept": "application/json"}
-    if client is not None:
-        resp = await client.post(provider.token_url, data=data, headers=headers)
-    else:
-        async with httpx.AsyncClient() as owned:
-            resp = await owned.post(provider.token_url, data=data, headers=headers)
-    try:
-        resp.raise_for_status()
-        payload = resp.json()
-    except (httpx.HTTPError, ValueError) as exc:
-        raise OAuthError(f"token exchange with {provider.provider} failed") from exc
-    if not isinstance(payload, dict) or payload.get("error"):
-        raise OAuthError(f"token exchange with {provider.provider} was rejected")
-    token = payload.get("access_token")
-    if not isinstance(token, str) or not token:
-        raise OAuthError(f"token exchange with {provider.provider} returned no access token")
-    refresh_token = payload.get("refresh_token")
-    expires_in = payload.get("expires_in")
-    return TokenResponse(
-        access_token=token,
-        refresh_token=refresh_token if isinstance(refresh_token, str) else None,
-        expires_in=expires_in if isinstance(expires_in, int) else None,
-    )
+    return await _post_token_request(provider, data, client=client)
+
+
+async def refresh_access_token(
+    provider: OAuthProvider,
+    *,
+    refresh_token: str,
+    client: httpx.AsyncClient | None = None,
+) -> TokenResponse:
+    """Exchange a stored `refresh_token` for a new access token (RFC 6749
+    §6) — Linear's OAuth access tokens expire (24h) and are issued with one;
+    GitHub's classic-OAuth-app tokens don't expire and never carry one, so
+    this is only ever called for a provider whose stored row has one. Raises
+    `OAuthError` on the same conditions as `exchange_code`."""
+    data = {
+        "client_id": provider.client_id,
+        "client_secret": provider.client_secret,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
+    return await _post_token_request(provider, data, client=client)
