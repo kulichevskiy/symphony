@@ -21,6 +21,7 @@ from symphony.credentials import (
     materialize_credentials,
 )
 from symphony.crypto import CredentialCipher
+from symphony.oauth import OAuthProvider, TokenResponse
 
 
 async def _conn(tmp_path: Path):  # type: ignore[no-untyped-def]
@@ -67,6 +68,48 @@ async def test_resolve_falls_back_when_not_connected(tmp_path: Path) -> None:
         # An expired connection is broken — fall back rather than hand out a
         # token that will 401 mid-run.
         assert await resolver.resolve("linear", fallback="env_key") == "env_key"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_resolve_refreshes_expired_linear_row_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    conn = await _conn(tmp_path)
+    cipher = CredentialCipher("k")
+    try:
+        # A row the Connections `Test` flow flipped to `expired` still holds a
+        # usable refresh token — resolve must refresh in place, not fall back
+        # (which would drop a DB-only Linear deployment to no-key).
+        await db.oauth_connections.set_connection(
+            conn,
+            provider="linear",
+            credential="stale_access",
+            refresh_token="refresh_me",
+            cipher=cipher,
+            status="expired",
+        )
+
+        async def _fake_refresh(provider, *, refresh_token):  # type: ignore[no-untyped-def]
+            assert refresh_token == "refresh_me"
+            return TokenResponse(access_token="fresh_access", refresh_token="r2", expires_in=3600)
+
+        monkeypatch.setattr("symphony.credentials.refresh_access_token", _fake_refresh)
+        provider = OAuthProvider(
+            provider="linear",
+            authorize_url="https://linear.app/oauth/authorize",
+            token_url="https://api.linear.app/oauth/token",
+            test_url="https://api.linear.app/graphql",
+            client_id="cid",
+            client_secret="secret",
+            scopes=("read",),
+        )
+        resolver = CredentialResolver(conn, cipher, linear_oauth_provider=provider)
+        assert await resolver.resolve("linear", fallback="env_key") == "fresh_access"
+        # Written back: the row is `connected` again for later ticks.
+        status = await db.oauth_connections.get_status(conn, "linear")
+        assert status is not None and status.status == "connected"
     finally:
         await conn.close()
 

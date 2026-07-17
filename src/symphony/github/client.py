@@ -170,10 +170,16 @@ class GitHub:
         *,
         gh_path: str = "gh",
         token: str | None = None,
+        token_github_com_only: bool = False,
         env: dict[str, str] | None = None,
     ) -> None:
         self._gh = gh_path
         self._token = token
+        # When True, `token` is known to be a github.com credential (the
+        # DB/`GH_TOKEN` resolver only ever yields one — it returns None for a
+        # non-github.com host), so it must never be exported as
+        # GH_ENTERPRISE_TOKEN. See `_run_capture`.
+        self._token_github_com_only = token_github_com_only
         self._extra_env = dict(env or {})
         self._auto_merge_disabled_repos: set[str] = set()
 
@@ -202,10 +208,17 @@ class GitHub:
         env = {**os.environ, **self._extra_env}
         if self._token is not None:
             # `gh` splits auth by host: GH_TOKEN for github.com / *.ghe.com,
-            # GH_ENTERPRISE_TOKEN for GHES. We don't know the target host up
-            # front, so set both — gh reads the one matching the call.
+            # GH_ENTERPRISE_TOKEN for GHES.
             env["GH_TOKEN"] = self._token
-            env["GH_ENTERPRISE_TOKEN"] = self._token
+            # A github.com-scoped token must NOT also land in
+            # GH_ENTERPRISE_TOKEN: on any call that omits `repo` (dozens of
+            # `_gh_client()` sites), exporting it would override a GHES
+            # binding's own ambient host auth and break its `pr view`/`pr
+            # merge`/`pr diff` (OAuth in UI 4/7 review fix). Otherwise we don't
+            # know the target host up front, so set both and let gh read the
+            # one matching the call.
+            if not self._token_github_com_only:
+                env["GH_ENTERPRISE_TOKEN"] = self._token
         try:
             proc = await asyncio.create_subprocess_exec(
                 self._gh,

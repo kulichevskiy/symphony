@@ -2817,7 +2817,9 @@ class _OrchestratorBase:
         (OAuth in UI 4/7 review fix).
         """
         github_token = await self._resolve_github_token(repo=repo)
-        client = GitHub(token=github_token) if github_token else self._gh
+        client = (
+            GitHub(token=github_token, token_github_com_only=True) if github_token else self._gh
+        )
         clone_target = (
             f"https://github.com/{'/'.join(repo.split('/')[-2:])}" if github_token else repo
         )
@@ -2851,7 +2853,12 @@ class _OrchestratorBase:
         using `self._gh`'s own host-specific auth.
         """
         github_token = await self._resolve_github_token(repo=repo)
-        return GitHub(token=github_token) if github_token else self._gh
+        # `_resolve_github_token` only ever returns a github.com-scoped token
+        # (it returns None for a non-github.com host), so flag it so the client
+        # never promotes it into GH_ENTERPRISE_TOKEN — a repo-less call site
+        # that targets a GHES binding otherwise breaks its host auth (OAuth in
+        # UI 4/7 review fix).
+        return GitHub(token=github_token, token_github_com_only=True) if github_token else self._gh
 
     async def _resolve_github_token(self, *, repo: str | None = None) -> str | None:
         """The GitHub token to use for delivery (push + PR), DB-first.

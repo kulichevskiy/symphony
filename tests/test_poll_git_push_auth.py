@@ -77,11 +77,35 @@ async def test_configure_uses_ghe_host_from_origin(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_configure_is_noop_for_ssh_remote(tmp_path: Path) -> None:
+async def test_configure_rewrites_github_ssh_remote_to_https(tmp_path: Path) -> None:
+    # An existing workspace cloned over SSH (documented
+    # `gh auth login --git-protocol ssh` flow) must still authenticate with a
+    # newly connected DB/GH_TOKEN credential: the SSH transport is rewritten to
+    # HTTPS (insteadOf) for the child process and the Basic header applied.
     repo = tmp_path / "repo"
     repo.mkdir()
     await _git(repo, "init")
     await _git(repo, "remote", "add", "origin", "git@github.com:org/repo.git")
+
+    await _configure_git_push_auth(repo, "tok")
+
+    configured = _configured_headers(repo)
+    assert configured.get("url.https://github.com/.insteadOf") == "git@github.com:"
+    header = configured.get("http.https://github.com/.extraheader", "")
+    assert "basic" in header.lower()
+
+    await _clear_git_push_auth(repo)
+    assert _configured_headers(repo) == {}
+
+
+@pytest.mark.asyncio
+async def test_configure_is_noop_for_ghe_ssh_remote(tmp_path: Path) -> None:
+    # A github.com-scoped token is the wrong host's credential for a GHES SSH
+    # remote — leave it on its own SSH-key auth.
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    await _git(repo, "init")
+    await _git(repo, "remote", "add", "origin", "git@ghe.example.com:org/repo.git")
 
     await _configure_git_push_auth(repo, "tok")
 

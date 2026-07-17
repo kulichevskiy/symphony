@@ -50,23 +50,10 @@ def _push_auth_subprocess_env(workspace_path: Path) -> dict[str, str] | None:
     return env
 
 
-async def _push_auth_host(workspace_path: Path) -> str | None:
-    """The host to scope the push-auth header to, derived from `origin`.
-
-    Handles the documented `[HOST/]OWNER/REPO` binding form (e.g. a GHE
-    remote like `ghe.example.com/org/repo`), whose `origin` is not
-    `github.com` — a hardcoded host would silently fail to authenticate
-    those pushes. Falls back to the default host when `origin` can't be
-    read (workspace not yet a git repo, no remote configured) so existing
-    single-host deployments are unaffected. Returns ``None`` only when
-    `origin` is unambiguously an SSH remote (the documented
-    `gh auth login --git-protocol ssh` flow, README.md:48) — `http.extraHeader`
-    does not apply to that transport, so injecting it would be a no-op.
-
-    Never raises: a workspace dir that doesn't exist yet (or any other
-    OS-level failure starting `git`) degrades to the default host, matching
-    `_clear_git_push_auth`'s existing best-effort contract.
-    """
+async def _read_origin_url(workspace_path: Path) -> str | None:
+    """`origin`'s URL, or `None` when it can't be read (not a git repo yet, no
+    remote, or any OS-level failure starting `git`). Never raises — matches
+    `_clear_git_push_auth`'s best-effort contract."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "git",
@@ -80,15 +67,57 @@ async def _push_auth_host(workspace_path: Path) -> str | None:
         )
         stdout, _ = await proc.communicate()
     except OSError:
-        return _DEFAULT_PUSH_AUTH_HOST
-    if proc.returncode != 0:
-        return _DEFAULT_PUSH_AUTH_HOST
-    url = stdout.decode(errors="replace").strip()
-    if url.startswith("https://"):
-        return url[len("https://") :].split("/", 1)[0] or _DEFAULT_PUSH_AUTH_HOST
-    if url.startswith("git@") or url.startswith("ssh://"):
         return None
-    return _DEFAULT_PUSH_AUTH_HOST
+    if proc.returncode != 0:
+        return None
+    return stdout.decode(errors="replace").strip()
+
+
+def _parse_origin(url: str) -> tuple[str, str | None]:
+    """`(host, ssh_base)` derived from `origin`'s URL.
+
+    `host` is the remote host (e.g. `github.com`, or a GHE host like
+    `ghe.example.com`). `ssh_base` is the `insteadOf` source prefix for an SSH
+    remote — the leading substring that, rewritten to `https://<host>/`, turns
+    the SSH URL into its HTTPS form — or `None` for an HTTPS remote. An
+    unrecognized URL degrades to the default host with no SSH rewrite.
+    """
+    if url.startswith("https://"):
+        return url[len("https://") :].split("/", 1)[0] or _DEFAULT_PUSH_AUTH_HOST, None
+    if url.startswith("ssh://"):
+        # ssh://[user@]host[:port]/owner/repo
+        authority = url[len("ssh://") :].split("/", 1)[0]
+        host = authority.split("@", 1)[-1].split(":", 1)[0] or _DEFAULT_PUSH_AUTH_HOST
+        return host, f"ssh://{authority}/"
+    if url.startswith("git@"):
+        # git@host:owner/repo (scp-like form)
+        host = url[len("git@") :].split(":", 1)[0] or _DEFAULT_PUSH_AUTH_HOST
+        return host, f"git@{host}:"
+    return _DEFAULT_PUSH_AUTH_HOST, None
+
+
+async def _push_auth_host(workspace_path: Path) -> str | None:
+    """The host to scope the push-auth header to, derived from `origin`.
+
+    Handles the documented `[HOST/]OWNER/REPO` binding form (e.g. a GHE
+    remote like `ghe.example.com/org/repo`), whose `origin` is not
+    `github.com` — a hardcoded host would silently fail to authenticate
+    those pushes. Falls back to the default host when `origin` can't be
+    read (workspace not yet a git repo, no remote configured) so existing
+    single-host deployments are unaffected. Returns ``None`` when `origin`
+    is an SSH remote — `http.extraHeader` does not apply to that transport,
+    so the token can't authenticate it as-is (`_configure_git_push_auth`
+    handles the github.com SSH case by rewriting the transport to HTTPS).
+
+    Never raises (see `_read_origin_url`).
+    """
+    origin = await _read_origin_url(workspace_path)
+    if origin is None:
+        return _DEFAULT_PUSH_AUTH_HOST
+    host, ssh_base = _parse_origin(origin)
+    if ssh_base is not None:
+        return None
+    return host
 
 
 async def _configure_git_push_auth(workspace_path: Path, token: str) -> None:
@@ -98,13 +127,31 @@ async def _configure_git_push_auth(workspace_path: Path, token: str) -> None:
     plaintext GitHub token must never touch a persistent file (OAuth in UI
     4/7 review fix). `x-access-token` is the GitHub convention for a
     token-as-password Basic credential. Paired with `_clear_git_push_auth`,
-    called right after the push regardless of outcome. A no-op when `origin`
-    is an SSH remote (see `_push_auth_host`).
+    called right after the push regardless of outcome.
+
+    For a github.com SSH remote — an existing workspace cloned via the
+    documented `gh auth login --git-protocol ssh` flow — the token is a
+    github.com credential and `http.extraHeader` can't authenticate the SSH
+    transport, so the transport is rewritten to HTTPS for the child process
+    only (git's `url.<https>.insteadOf`) and the header applied there, letting
+    a newly connected DB/`GH_TOKEN` credential authenticate the fetch/push
+    without touching `.git/config` (OAuth in UI 4/7 review fix). A GHES SSH
+    remote is left untouched (a no-op): the github.com-scoped token is the
+    wrong host's credential, so it keeps its own SSH-key auth.
     """
-    host = await _push_auth_host(workspace_path)
-    if host is None:
-        return
+    origin = await _read_origin_url(workspace_path)
+    host, ssh_base = (
+        _parse_origin(origin) if origin is not None else (_DEFAULT_PUSH_AUTH_HOST, None)
+    )
     basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+    if ssh_base is not None:
+        if host != _DEFAULT_PUSH_AUTH_HOST:
+            return
+        _push_auth_env[workspace_path] = {
+            f"url.https://{host}/.insteadOf": ssh_base,
+            _push_auth_config_key(host): f"AUTHORIZATION: basic {basic}",
+        }
+        return
     _push_auth_env[workspace_path] = {
         _push_auth_config_key(host): f"AUTHORIZATION: basic {basic}",
     }

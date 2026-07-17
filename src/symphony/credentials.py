@@ -120,13 +120,31 @@ class CredentialResolver:
         except Exception:  # noqa: BLE001 — a DB read hiccup must not break the run
             log.warning("oauth_connections status read failed for %s; using fallback", provider)
             return fallback, False
-        if status is None or status.status != "connected":
+        if status is None:
             return fallback, False
-        if status.expires_at is not None and _is_expired(status.expires_at):
+        # A row the Connections `Test` flow (or a prior tick) flipped to
+        # `expired` after its access token lapsed can still hold a usable
+        # refresh token — a Linear OAuth access token lives only 24h. Treat
+        # that the same as a `connected` row whose own deadline has passed:
+        # attempt an in-place refresh before falling back, so a DB-only Linear
+        # deployment doesn't drop to no-`LINEAR_API_KEY` (failing startup /
+        # hot-add) until an operator reconnects by hand (OAuth in UI 4/7
+        # review fix). A provider without refresh support (e.g. GitHub) or with
+        # no stored refresh token falls back exactly as before.
+        if status.status not in ("connected", "expired"):
+            return fallback, False
+        if status.status == "expired" or (
+            status.expires_at is not None and _is_expired(status.expires_at)
+        ):
             refreshed = await self._try_refresh(provider)
             if refreshed is not None:
                 return refreshed, True
-            log.warning("%s connection expired at %s; using fallback", provider, status.expires_at)
+            log.warning(
+                "%s connection expired (status=%s, expires_at=%s); using fallback",
+                provider,
+                status.status,
+                status.expires_at,
+            )
             return fallback, False
         try:
             credential = await db.oauth_connections.get_credential(
