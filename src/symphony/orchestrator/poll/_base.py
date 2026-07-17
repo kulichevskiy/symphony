@@ -916,8 +916,11 @@ class _OrchestratorBase:
         # valid DB connection but no `LINEAR_API_KEY`, the very first
         # `viewer_team_keys()`/`team_states()` calls run unauthenticated
         # (or against a stale env key) since `_refresh_linear_tracker_credentials`
-        # otherwise only runs from inside `_tick`, after `run()` already calls
-        # `warmup()` (OAuth in UI 4/7 review fix).
+        # otherwise only runs from inside `_tick`. `cli.py` also calls this
+        # once directly before the startup `reconcile()`, which runs even
+        # earlier than `warmup()`; the call here is a harmless re-refresh that
+        # keeps `warmup()` correct standalone (e.g. in tests that call it
+        # without going through `cli._run`) (OAuth in UI 4/7 review fix).
         try:
             await self._refresh_linear_tracker_credentials()
         except Exception:  # noqa: BLE001 — must not block startup

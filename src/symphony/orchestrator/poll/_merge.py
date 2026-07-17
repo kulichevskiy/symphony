@@ -799,7 +799,8 @@ class _MergeMixin(_OrchestratorBase):
         async def setup(workspace_path: Path) -> bool:
             nonlocal start_sha
             try:
-                await _git_fetch_branch(workspace_path, branch)
+                github_token = await self._resolve_github_token(repo=binding.github_repo)
+                await _git_fetch_branch(workspace_path, branch, github_token=github_token)
             except Exception as e:  # noqa: BLE001
                 await self._mark_merge_required_check_fix_needs_approval(
                     binding=binding,

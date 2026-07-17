@@ -211,39 +211,65 @@ async def _sync_workspace_to_remote(
             await _clear_git_push_auth(workspace_path)
 
 
-async def _git_fetch(workspace_path: Path) -> None:
-    """Run ``git fetch origin`` in *workspace_path*."""
-    proc = await asyncio.create_subprocess_exec(
-        "git",
-        "fetch",
-        "origin",
-        cwd=str(workspace_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        stdin=asyncio.subprocess.DEVNULL,
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(f"git fetch failed: {stderr.decode(errors='replace').strip()}")
+async def _git_fetch(workspace_path: Path, *, github_token: str | None = None) -> None:
+    """Run ``git fetch origin`` in *workspace_path*.
 
-
-async def _git_fetch_branch(workspace_path: Path, branch: str) -> None:
-    """Fetch ``origin/branch`` so remote-head validation has a fresh baseline."""
-    proc = await asyncio.create_subprocess_exec(
-        "git",
-        "fetch",
-        "origin",
-        branch,
-        cwd=str(workspace_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        stdin=asyncio.subprocess.DEVNULL,
-    )
-    _, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"git fetch origin {branch} failed: {stderr.decode(errors='replace').strip()}"
+    `github_token`, when given, is applied as the same in-memory push-auth
+    header `_sync_workspace_to_remote` uses (and cleared right after) — a
+    DB-only GitHub setup for a private repo has no ambient git credential, so
+    this fetch would otherwise fail (OAuth in UI 4/7 review fix).
+    """
+    if github_token:
+        await _configure_git_push_auth(workspace_path, github_token)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "fetch",
+            "origin",
+            cwd=str(workspace_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            env=_push_auth_subprocess_env(workspace_path),
         )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(f"git fetch failed: {stderr.decode(errors='replace').strip()}")
+    finally:
+        if github_token:
+            await _clear_git_push_auth(workspace_path)
+
+
+async def _git_fetch_branch(
+    workspace_path: Path, branch: str, *, github_token: str | None = None
+) -> None:
+    """Fetch ``origin/branch`` so remote-head validation has a fresh baseline.
+
+    `github_token`, when given, is applied the same way as in `_git_fetch`
+    (OAuth in UI 4/7 review fix).
+    """
+    if github_token:
+        await _configure_git_push_auth(workspace_path, github_token)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "git",
+            "fetch",
+            "origin",
+            branch,
+            cwd=str(workspace_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,
+            env=_push_auth_subprocess_env(workspace_path),
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"git fetch origin {branch} failed: {stderr.decode(errors='replace').strip()}"
+            )
+    finally:
+        if github_token:
+            await _clear_git_push_auth(workspace_path)
 
 
 async def _git_status_short(workspace_path: Path) -> str:

@@ -29,6 +29,8 @@ from .agent.codex_models import SUPPORTED_CODEX_EFFORTS
 from .app import build_server_config, create_app
 from .auth import Auth0Settings
 from .config import Config, RepoBinding, RoleName, Secrets
+from .credentials import CredentialResolver
+from .crypto import CredentialCipher
 from .effective_config import ConfigBootError, assemble_effective_config
 from .github.webhook import GitHubWebhookSettings
 from .linear.client import Linear, LinearError, LinearIssue
@@ -45,6 +47,7 @@ from .tracker import (
     for_binding,
 )
 from .ui.external import GitHubExternalClient
+from .ui.oauth import linear_provider
 from .webhook import WebhookSettings
 
 if TYPE_CHECKING:
@@ -260,15 +263,30 @@ def _config_has_linear_bindings(cfg: Config) -> bool:
 
 async def _config_has_usable_linear_auth(conn: aiosqlite.Connection, cfg: Config) -> bool:
     """Whether Linear-bound work can actually authenticate: either the env
-    `LINEAR_API_KEY` fallback, or a connected DB OAuth row the runtime
-    `CredentialResolver` resolves instead. A DB-only connection (UI-configured,
-    no `LINEAR_API_KEY` in the deployment env) must not fail this boot gate —
+    `LINEAR_API_KEY` fallback, or a DB OAuth row the runtime `CredentialResolver`
+    can actually resolve a token from. A DB-only connection (UI-configured, no
+    `LINEAR_API_KEY` in the deployment env) must not fail this boot gate —
     otherwise a migration to the DB-stored connection can never actually start
-    the daemon (OAuth in UI 4/7 review fix)."""
+    the daemon (OAuth in UI 4/7 review fix).
+
+    Goes through the same resolver `_base.py` uses at runtime — not just a
+    `status == "connected"` check — so a row that's `connected` but actually
+    unusable (expired with no working refresh, or undecryptable after a key
+    rotation) correctly fails this gate instead of waving startup through into
+    `_configured_tracker_registry` with no way to authenticate."""
     if cfg.linear_api_key:
         return True
-    status = await db.oauth_connections.get_status(conn, "linear")
-    return status is not None and status.status == "connected"
+    resolver = CredentialResolver(
+        conn,
+        CredentialCipher(cfg.symphony_encryption_key),
+        linear_oauth_provider=(
+            linear_provider(cfg.linear_oauth_client_id, cfg.linear_oauth_client_secret)
+            if cfg.linear_oauth_client_id and cfg.linear_oauth_client_secret
+            else None
+        ),
+    )
+    token = await resolver.resolve_linear_auth_header()
+    return token is not None
 
 
 def _tracker_context_for_binding(binding: RepoBinding) -> TrackerContext:
@@ -421,6 +439,13 @@ async def _run(config_path: Path, *, once: bool) -> None:
                 tracker_factory=_hot_add_tracker if db_owns_topology else None,
                 repo_secret_view=repo_secret_view if db_owns_topology else None,
             )
+            # Apply the DB-resolved Linear token to every registered tracker
+            # before reconcile touches Linear — `orch.warmup()` (which also
+            # does this) only runs later, from the `once` branch below or from
+            # `orch.run()`, so without this call startup reconcile would post
+            # tracker comments unauthenticated (or on a stale env key) on a
+            # fresh boot with a DB-only Linear connection (review fix).
+            await orch._refresh_linear_tracker_credentials()  # pylint: disable=protected-access
             await reconcile(conn, trackers, bindings=cfg.repos)
             if once:
                 await orch.warmup()

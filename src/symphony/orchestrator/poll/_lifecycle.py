@@ -708,7 +708,7 @@ class _LifecycleMixin(_OrchestratorBase):
         if binding.base_branch is not None:
             return binding.base_branch
         try:
-            gh = await self._gh_client()
+            gh = await self._gh_client(repo=binding.github_repo)
             return await gh.repo_default_branch(binding.github_repo)
         except GitHubError as e:
             log.warning(
@@ -1211,8 +1211,11 @@ class _LifecycleMixin(_OrchestratorBase):
         # connected UI credential instead of ambient `gh`/`git` auth once a
         # binding's repo has a connected GitHub row. `_push_fn` resolves and
         # configures/clears the push-auth header itself; `_gh_client` resolves
-        # the same token for the PR API calls below.
-        gh = await self._gh_client()
+        # the same token for the PR API calls below. `repo=binding.github_repo`
+        # so a `[HOST/]OWNER/REPO` GHE binding keeps `_resolve_github_token`'s
+        # non-github.com guard and falls back to `self._gh`'s host-specific auth
+        # instead of wrongly promoting a github.com DB/env token.
+        gh = await self._gh_client(repo=binding.github_repo)
         try:
             await self._push_fn(workspace_path, branch)
         except Exception as e:  # noqa: BLE001
@@ -1456,7 +1459,7 @@ class _LifecycleMixin(_OrchestratorBase):
             base_branch = binding.base_branch
             if base_branch is None:
                 try:
-                    gh = await self._gh_client()
+                    gh = await self._gh_client(repo=binding.github_repo)
                     base_branch = await gh.repo_default_branch(binding.github_repo)
                 except GitHubError as e:
                     log.warning(
@@ -1708,7 +1711,7 @@ class _LifecycleMixin(_OrchestratorBase):
             f"- strategy: `{binding.review_strategy}`\n"
         )
         try:
-            gh = await self._gh_client()
+            gh = await self._gh_client(repo=binding.github_repo)
             await gh.pr_comment(pr_number, body, repo=binding.github_repo)
         except GitHubError as e:
             log.warning(

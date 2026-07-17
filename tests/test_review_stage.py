@@ -278,7 +278,7 @@ def _default_workspace_head_sha(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_workspace_ref_sha(_workspace_path: Path, _ref: str) -> str:
         return "before-fix-sha"
 
-    async def fake_git_fetch_branch(_workspace_path: Path, _branch: str) -> None:
+    async def fake_git_fetch_branch(_workspace_path: Path, _branch: str, **_kwargs: object) -> None:
         return None
 
     for module in (poll_module, review_module):
