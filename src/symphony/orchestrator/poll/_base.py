@@ -95,6 +95,7 @@ from ._git import (
     _configure_git_push_auth,
     _default_force_push,
     _default_push,
+    _git_fetch,
     _git_status_short,
     _push_auth_host,
     _workspace_dirty_files,
@@ -477,7 +478,11 @@ class _OrchestratorBase:
         self._workspace: Workspace = (
             workspace
             if workspace is not None
-            else Workspace(root=config.workspace_root, clone_fn=self._clone_with_resolved_auth)
+            else Workspace(
+                root=config.workspace_root,
+                clone_fn=self._clone_with_resolved_auth,
+                fetch_fn=self._fetch_with_resolved_auth,
+            )
         )
         # Wrapped so every push call site — delivery, review re-push,
         # force-push, merge/acceptance push — resolves the DB token and
@@ -2803,6 +2808,20 @@ class _OrchestratorBase:
         """
         client = await self._gh_client(repo=repo)
         await client.repo_clone(repo, dest)
+
+    async def _fetch_with_resolved_auth(self, repo: str, workspace_path: Path) -> None:
+        """Fetch `origin` in an already-cloned workspace using the DB-resolved
+        GitHub token when available.
+
+        `Workspace.acquire()` re-fetches every time a run reuses an existing
+        clone, not just on first clone — a DB-only private repo has no
+        ambient `gh`/`GH_TOKEN` credential, so without this that re-fetch
+        would fail on every dispatch after the first for that issue (OAuth in
+        UI 4/7 review fix). Mirrors `_clone_with_resolved_auth`/`_gh_client`'s
+        GHE host gating via `repo`.
+        """
+        github_token = await self._resolve_github_token(repo=repo)
+        await _git_fetch(workspace_path, github_token=github_token)
 
     async def _gh_client(self, *, repo: str | None = None) -> GitHubClient:
         """A GitHub client using the DB-resolved token when available.

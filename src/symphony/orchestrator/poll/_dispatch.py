@@ -443,7 +443,7 @@ class _DispatchMixin(_OrchestratorBase):
             return pr, False
 
         try:
-            gh = await self._gh_client()
+            gh = await self._gh_client(repo=binding.github_repo)
             view = await gh.pr_view(pr.pr_number, repo=binding.github_repo)
         except GitHubError as e:
             log.warning(

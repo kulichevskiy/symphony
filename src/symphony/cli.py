@@ -293,6 +293,27 @@ def _tracker_context_for_binding(binding: RepoBinding) -> TrackerContext:
     return context_for_binding(binding)
 
 
+async def _resolve_db_linear_api_key(conn: aiosqlite.Connection, cfg: Config) -> str | None:
+    """The DB-resolved Linear bearer token, or `None` if none is usable.
+
+    Shared by `_configured_tracker_registry`'s boot-time secrets seed and
+    `_run`'s hot-add secrets seed — both build a `LinearTracker` via
+    `for_binding`, which rejects an empty key outright, so a DB-only
+    deployment (no `LINEAR_API_KEY` env) needs this resolved up front at
+    both call sites, not just at boot (OAuth in UI 4/7 review fix).
+    """
+    resolver = CredentialResolver(
+        conn,
+        CredentialCipher(cfg.symphony_encryption_key),
+        linear_oauth_provider=(
+            linear_provider(cfg.linear_oauth_client_id, cfg.linear_oauth_client_secret)
+            if cfg.linear_oauth_client_id and cfg.linear_oauth_client_secret
+            else None
+        ),
+    )
+    return await resolver.resolve_linear_auth_header()
+
+
 async def _db_owns_topology(conn: aiosqlite.Connection, *, yaml_has_repos_topology: bool) -> bool:
     """Whether the DB is the topology source of truth: bindings exist now, the
     importer has migrated it before (`config_globals.migrated_at` set), or
@@ -329,16 +350,7 @@ async def _configured_tracker_registry(
         # front and seed construction with it — otherwise `for_binding` below
         # builds an unauthenticated client that raises before this context
         # manager even yields (OAuth in UI 4/7 review fix).
-        resolver = CredentialResolver(
-            conn,
-            CredentialCipher(cfg.symphony_encryption_key),
-            linear_oauth_provider=(
-                linear_provider(cfg.linear_oauth_client_id, cfg.linear_oauth_client_secret)
-                if cfg.linear_oauth_client_id and cfg.linear_oauth_client_secret
-                else None
-            ),
-        )
-        resolved = await resolver.resolve_linear_auth_header()
+        resolved = await _resolve_db_linear_api_key(conn, cfg)
         if resolved:
             secrets = secrets.model_copy(update={"linear_api_key": resolved})
     registry = TrackerRegistry()
@@ -424,6 +436,11 @@ async def _run(config_path: Path, *, once: bool) -> None:
         except ConfigBootError as e:
             click.echo(str(e), err=True)
             sys.exit(2)
+        # Must run before `_config_has_usable_linear_auth`: that check's DB-first
+        # resolver can refresh (and write back) an expired Linear OAuth token,
+        # which is state mutation this fail-closed gate must precede, not follow
+        # (OAuth in UI 4/7 review fix).
+        _enforce_require_auth0(cfg)
         if _config_has_linear_bindings(cfg) and not await _config_has_usable_linear_auth(conn, cfg):
             click.echo(
                 "LINEAR_API_KEY env var is empty and no Linear OAuth connection is "
@@ -431,12 +448,21 @@ async def _run(config_path: Path, *, once: bool) -> None:
                 err=True,
             )
             sys.exit(2)
-        _enforce_require_auth0(cfg)
         async with _configured_tracker_registry(cfg, conn) as (trackers, _):
             # When the DB owns topology, hot-apply binding edits at each tick
             # boundary (SYM-189). A reload introducing a provider/site the
             # process never saw at boot builds a real client from `Secrets`.
             reload_secrets = Secrets()
+            if not reload_secrets.linear_api_key:
+                # Seed the same DB-resolved token `_configured_tracker_registry`
+                # used for boot trackers — a Linear binding (or aliased
+                # provider/site) added after boot has no other source of a
+                # working key in a DB-only deployment, so without this,
+                # `for_binding` below raises on the very first hot-add
+                # (OAuth in UI 4/7 review fix).
+                resolved = await _resolve_db_linear_api_key(conn, cfg)
+                if resolved:
+                    reload_secrets = reload_secrets.model_copy(update={"linear_api_key": resolved})
 
             def _hot_add_tracker(binding: RepoBinding) -> IssueTracker:
                 return for_binding(binding, reload_secrets)

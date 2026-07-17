@@ -174,15 +174,21 @@ async def _post_token_request(
     same `token_url` and return the same `{access_token, refresh_token,
     expires_in}` shape."""
     headers = {"Accept": "application/json"}
-    if client is not None:
-        resp = await client.post(provider.token_url, data=data, headers=headers)
-    else:
-        async with httpx.AsyncClient() as owned:
-            resp = await owned.post(provider.token_url, data=data, headers=headers)
     try:
+        if client is not None:
+            resp = await client.post(provider.token_url, data=data, headers=headers)
+        else:
+            async with httpx.AsyncClient() as owned:
+                resp = await owned.post(provider.token_url, data=data, headers=headers)
         resp.raise_for_status()
         payload = resp.json()
     except (httpx.HTTPError, ValueError) as exc:
+        # Covers both a transport failure (unreachable/timeout — raised by
+        # `post()` itself) and a non-2xx/unparsable response (raised by
+        # `raise_for_status()`/`resp.json()` below) — an expired Linear
+        # token's in-place refresh must surface as `OAuthError`, not an
+        # uncaught `httpx.HTTPError`, so callers' fallback-to-env handling
+        # actually runs (OAuth in UI 4/7 review fix).
         raise OAuthError(f"token request with {provider.provider} failed") from exc
     if not isinstance(payload, dict) or payload.get("error"):
         raise OAuthError(f"token request with {provider.provider} was rejected")

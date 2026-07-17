@@ -75,7 +75,7 @@ def _install_fake_runtime(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setattr("symphony.orchestrator.poll._base.GitHub", lambda: fake_gh)
     monkeypatch.setattr(
         "symphony.orchestrator.poll._base.Workspace",
-        lambda root, clone_fn: fake_workspace,
+        lambda root, clone_fn, fetch_fn=None: fake_workspace,
     )
     monkeypatch.setattr("symphony.orchestrator.poll._base._default_push", AsyncMock())
 
