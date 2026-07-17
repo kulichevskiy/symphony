@@ -1376,6 +1376,11 @@ export function ConnectionCard({
       setCode("");
       onChanged?.();
     } catch {
+      // The daemon already popped the login session on failure, so the code
+      // is dead either way — clear it back to Connect instead of stranding
+      // the operator on a Submit that will now 404.
+      setClaudeLogin(null);
+      setCode("");
       setError("Couldn't complete the login — the code may be wrong or expired.");
     } finally {
       setBusy(false);
@@ -1425,7 +1430,11 @@ export function ConnectionCard({
         </p>
       ) : null}
       <div className="mt-4 flex gap-2">
-        <Button type="button" onClick={connect} disabled={!wired || busy}>
+        <Button
+          type="button"
+          onClick={connect}
+          disabled={!wired || busy || claudeLogin !== null}
+        >
           {connected ? "Reconnect" : "Connect"}
         </Button>
         <Button

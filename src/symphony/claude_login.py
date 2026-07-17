@@ -164,13 +164,16 @@ class SubprocessClaudeLogin:
         self._proc: asyncio.subprocess.Process | None = None
 
     async def start(self) -> str:
-        self._proc = await asyncio.create_subprocess_exec(
-            *self._command,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=self._env,
-        )
+        try:
+            self._proc = await asyncio.create_subprocess_exec(
+                *self._command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env=self._env,
+            )
+        except OSError as exc:
+            raise ClaudeLoginError("failed to start the Claude login process") from exc
         try:
             return await asyncio.wait_for(self._read_url(), timeout=self._start_timeout)
         except ClaudeLoginError:
@@ -194,10 +197,13 @@ class SubprocessClaudeLogin:
         proc = self._proc
         if proc is None or proc.stdin is None:
             raise ClaudeLoginError("login process is not running")
-        proc.stdin.write(f"{code}\n".encode())
-        await proc.stdin.drain()
         try:
-            await asyncio.wait_for(proc.wait(), timeout=self._submit_timeout)
+            # `communicate` drains stdout/stderr concurrently with the write +
+            # wait; a bare `proc.wait()` here can deadlock once the pipe fills
+            # since the child blocks on write and never reads the code.
+            await asyncio.wait_for(
+                proc.communicate(input=f"{code}\n".encode()), timeout=self._submit_timeout
+            )
         except TimeoutError as exc:
             await self.close()
             raise ClaudeLoginError("timed out completing the Claude login") from exc
