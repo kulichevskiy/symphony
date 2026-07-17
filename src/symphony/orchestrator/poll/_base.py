@@ -16,6 +16,7 @@ pre-split `Orchestrator`.
 from __future__ import annotations
 
 import asyncio
+import inspect
 
 # --- imports merged from the pre-split poll/__init__.py (SYM-151) ---
 import json
@@ -304,7 +305,7 @@ class _OrchestratorBase:
     # --- attribute annotations (single source of truth for the whole class) ---
     config: Config
     _trackers: TrackerRegistry
-    _tracker_factory: Callable[[RepoBinding], IssueTracker] | None
+    _tracker_factory: Callable[[RepoBinding], IssueTracker | Awaitable[IssueTracker]] | None
     _reload_bindings_from_db: bool
     _config_write_lock: asyncio.Lock
     _binding_keys: frozenset[BindingKey] | None
@@ -381,7 +382,8 @@ class _OrchestratorBase:
         force_push_fn: PushFn | None = None,
         clock: Callable[[], datetime] | None = None,
         reload_bindings_from_db: bool = False,
-        tracker_factory: Callable[[RepoBinding], IssueTracker] | None = None,
+        tracker_factory: Callable[[RepoBinding], IssueTracker | Awaitable[IssueTracker]]
+        | None = None,
         repo_secret_view: db.config_repo_secrets.RepoSecretView | None = None,
     ) -> None:
         self.config = config
@@ -1373,7 +1375,8 @@ class _OrchestratorBase:
                 all_registered = False
                 continue
             try:
-                tracker = self._tracker_factory(binding)
+                built = self._tracker_factory(binding)
+                tracker = await built if inspect.isawaitable(built) else built
             except Exception:  # noqa: BLE001 — must not kill the loop
                 log.exception("failed to build tracker for hot-add: %s", ctx)
                 all_registered = False

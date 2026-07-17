@@ -498,7 +498,9 @@ class _AcceptanceMixin(_OrchestratorBase):
         pr_number: int,
     ) -> str:
         try:
-            return await (await self._gh_client()).pr_diff(pr_number, repo=binding.github_repo)
+            return await (await self._gh_client(repo=binding.github_repo)).pr_diff(
+                pr_number, repo=binding.github_repo
+            )
         except GitHubError as e:
             log.warning(
                 "could not fetch acceptance PR diff for %s#%d on %s: %s",
