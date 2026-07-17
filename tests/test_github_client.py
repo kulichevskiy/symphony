@@ -635,6 +635,18 @@ async def test_gh_token_override_forwarded_to_subprocess_env(fake_gh) -> None:  
     assert "statusCheckRollup" not in fields
 
 
+async def test_github_com_only_token_not_exported_as_enterprise(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    # A github.com-scoped token (the DB/GH_TOKEN resolver only ever yields one)
+    # must never land in GH_ENTERPRISE_TOKEN: on a repo-less call that targets a
+    # GHES binding it would otherwise override that host's own auth.
+    log = fake_gh({"pr view": [0, '{"number": 5}']})
+    gh = GitHub(token="ghs_gh_com", token_github_com_only=True)
+    await gh.pr_view(5, repo="org/r")
+    call = _calls(log)[0]
+    assert call["env_GH_TOKEN"] == "ghs_gh_com"
+    assert call["env_GH_ENTERPRISE_TOKEN"] == ""
+
+
 async def test_pr_view_status_rollup_is_opt_in(fake_gh) -> None:  # type: ignore[no-untyped-def]
     log = fake_gh({"pr view": [0, '{"number": 5}']})
     gh = GitHub()

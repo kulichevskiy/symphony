@@ -293,7 +293,7 @@ class _MergeMixin(_OrchestratorBase):
             return False
 
         try:
-            view = await self._gh.pr_view(pr.pr_number, repo=binding.github_repo)
+            view = await (await self._gh_client()).pr_view(pr.pr_number, repo=binding.github_repo)
         except GitHubError as e:
             log.warning(
                 "could not view PR for merge wait reconcile %s#%d: %s",
@@ -416,7 +416,8 @@ class _MergeMixin(_OrchestratorBase):
     ) -> dict[str, object] | None:
         if repo in cache:
             return cache[repo]
-        repo_view = getattr(self._gh, "repo_view", None)
+        gh = await self._gh_client()
+        repo_view = getattr(gh, "repo_view", None)
         if repo_view is None:
             cache[repo] = None
             return None
@@ -516,7 +517,7 @@ class _MergeMixin(_OrchestratorBase):
         if binding.base_branch is not None:
             return binding.base_branch
         try:
-            result_obj: object = self._gh.repo_default_branch(binding.github_repo)
+            result_obj: object = (await self._gh_client()).repo_default_branch(binding.github_repo)
             if inspect.isawaitable(result_obj):
                 result_obj = await result_obj
             if isinstance(result_obj, str) and result_obj.strip():
@@ -555,7 +556,7 @@ class _MergeMixin(_OrchestratorBase):
             required_contexts = await get_required_contexts(
                 binding.github_repo,
                 pr_number,
-                gh=self._gh,
+                gh=await self._gh_client(),
                 cache=required_context_cache,
             )
         except GitHubError as e:
@@ -602,10 +603,10 @@ class _MergeMixin(_OrchestratorBase):
             name = _status_check_identity(check)
             try:
                 if run_id:
-                    tail = await self._gh.run_failed_log_tail(run_id, repo=repo)
+                    tail = await (await self._gh_client()).run_failed_log_tail(run_id, repo=repo)
                 else:
                     link = str(check.get("detailsUrl") or check.get("targetUrl") or "")
-                    tail = await self._gh.check_log_tail(
+                    tail = await (await self._gh_client()).check_log_tail(
                         GitHubCheckRun(
                             name=name,
                             state=str(check.get("state") or check.get("conclusion") or ""),
@@ -798,7 +799,8 @@ class _MergeMixin(_OrchestratorBase):
         async def setup(workspace_path: Path) -> bool:
             nonlocal start_sha
             try:
-                await _git_fetch_branch(workspace_path, branch)
+                github_token = await self._resolve_github_token(repo=binding.github_repo)
+                await _git_fetch_branch(workspace_path, branch, github_token=github_token)
             except Exception as e:  # noqa: BLE001
                 await self._mark_merge_required_check_fix_needs_approval(
                     binding=binding,
@@ -1271,7 +1273,9 @@ class _MergeMixin(_OrchestratorBase):
             )
             fixed_head_sha = ""
             try:
-                fixed_view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
+                fixed_view = await (await self._gh_client()).pr_view(
+                    pr_number, repo=binding.github_repo
+                )
                 fixed_head_sha = str(fixed_view.get("headRefOid") or "")
             except Exception as e:  # noqa: BLE001
                 log.warning(
@@ -1405,7 +1409,7 @@ class _MergeMixin(_OrchestratorBase):
             return None
         if view is None:
             try:
-                view = await self._gh.pr_view(
+                view = await (await self._gh_client()).pr_view(
                     candidate.pr_number,
                     repo=binding.github_repo,
                     include_status_checks=True,
@@ -1695,7 +1699,7 @@ class _MergeMixin(_OrchestratorBase):
         if binding is None or binding.auto_merge:
             return 0
         try:
-            view = await self._gh.pr_view(pr.pr_number, repo=binding.github_repo)
+            view = await (await self._gh_client()).pr_view(pr.pr_number, repo=binding.github_repo)
         except GitHubError as e:
             log.warning(
                 "could not verify parked closed-unmerged PR state for %s#%d: %s",
@@ -2147,7 +2151,7 @@ class _MergeMixin(_OrchestratorBase):
         """
         tasks: list[asyncio.Task[None]] = []
         try:
-            view = await self._gh.pr_view(
+            view = await (await self._gh_client()).pr_view(
                 candidate.pr_number,
                 repo=binding.github_repo,
                 include_status_checks=True,
@@ -2620,7 +2624,7 @@ class _MergeMixin(_OrchestratorBase):
         run_id: str,
     ) -> None:
         try:
-            view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
+            view = await (await self._gh_client()).pr_view(pr_number, repo=binding.github_repo)
             if await self._finalize_pr_if_closed(
                 binding=binding,
                 issue=issue,
@@ -2898,7 +2902,8 @@ class _MergeMixin(_OrchestratorBase):
         """Reset the workspace to the remote branch; a failure is logged and
         tolerated (the merge proceeds anyway)."""
         try:
-            await _sync_workspace_to_remote(workspace_path, branch)
+            github_token = await self._resolve_github_token()
+            await _sync_workspace_to_remote(workspace_path, branch, github_token=github_token)
         except Exception as e:  # noqa: BLE001
             log.warning(
                 "workspace sync failed for merge %s, proceeding anyway: %s",
@@ -3010,7 +3015,7 @@ class _MergeMixin(_OrchestratorBase):
         recovery.
         """
         try:
-            premerge_view = await self._gh.pr_view(
+            premerge_view = await (await self._gh_client()).pr_view(
                 pr_number,
                 repo=binding.github_repo,
             )
@@ -3094,7 +3099,7 @@ class _MergeMixin(_OrchestratorBase):
         """Merge the PR, recovering from merge conflicts / required-check
         failures. Returns True if the run halted (caller returns the run id)."""
         try:
-            await self._gh.pr_merge(
+            await (await self._gh_client()).pr_merge(
                 pr_number,
                 strategy=binding.merge_strategy,
                 auto=binding.allow_auto_merge,
@@ -3104,7 +3109,7 @@ class _MergeMixin(_OrchestratorBase):
             log.warning("merge failed for %s#%d: %s", binding.github_repo, pr_number, e)
             if _is_merge_conflict_error(e):
                 try:
-                    conflict_view = await self._gh.pr_view(
+                    conflict_view = await (await self._gh_client()).pr_view(
                         pr_number,
                         repo=binding.github_repo,
                     )
@@ -3135,7 +3140,7 @@ class _MergeMixin(_OrchestratorBase):
                 required_view = premerge_view
             else:
                 try:
-                    required_view = await self._gh.pr_view(
+                    required_view = await (await self._gh_client()).pr_view(
                         pr_number,
                         repo=binding.github_repo,
                         include_status_checks=True,
@@ -3231,7 +3236,7 @@ class _MergeMixin(_OrchestratorBase):
         pr_url: str,
         run_id: str,
     ) -> bool:
-        view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
+        view = await (await self._gh_client()).pr_view(pr_number, repo=binding.github_repo)
         if not _pr_view_is_merged(view):
             return False
         await self._mark_merge_done(

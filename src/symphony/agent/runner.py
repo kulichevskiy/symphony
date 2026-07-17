@@ -14,7 +14,10 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
+
+if TYPE_CHECKING:
+    from ..credentials import RunCredentials
 
 
 @dataclass
@@ -40,6 +43,18 @@ class RunnerSpec:
     # SYM-148). This cap kills it regardless. 0 disables (no cap).
     wall_clock_secs: float = 0
     stage: str = ""  # implement|review|merge — telemetry only
+    # Credentials resolved DB-first (OAuth in UI 4/7). When set, the runner
+    # materializes them into a private, torn-down home for the run — GH_TOKEN +
+    # a git credential helper, and the Linear bearer — so a run drives off the
+    # UI-stored connection instead of the ambient env/volume. `None` (the
+    # default) leaves the run on whatever the inherited env already provides.
+    credentials: RunCredentials | None = None
+    # The GitHub host the materialized git credential store scopes to
+    # (`credentials.github_token` otherwise; irrelevant when unset). Comes
+    # from the binding's `[HOST/]OWNER/REPO` `github_repo` — a GHE binding's
+    # host isn't `github.com`, and a credential store written for the wrong
+    # host never matches on push (SYM-199 review fix).
+    github_host: str = "github.com"
 
 
 @dataclass

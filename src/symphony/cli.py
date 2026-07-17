@@ -29,6 +29,8 @@ from .agent.codex_models import SUPPORTED_CODEX_EFFORTS
 from .app import build_server_config, create_app
 from .auth import Auth0Settings
 from .config import Config, RepoBinding, RoleName, Secrets
+from .credentials import CredentialResolver
+from .crypto import CredentialCipher
 from .effective_config import ConfigBootError, assemble_effective_config
 from .github.webhook import GitHubWebhookSettings
 from .linear.client import Linear, LinearError, LinearIssue
@@ -45,6 +47,7 @@ from .tracker import (
     for_binding,
 )
 from .ui.external import GitHubExternalClient
+from .ui.oauth import linear_provider
 from .webhook import WebhookSettings
 
 if TYPE_CHECKING:
@@ -258,8 +261,57 @@ def _config_has_linear_bindings(cfg: Config) -> bool:
     return any(binding.provider == "linear" for binding in cfg.repos)
 
 
+async def _config_has_usable_linear_auth(conn: aiosqlite.Connection, cfg: Config) -> bool:
+    """Whether Linear-bound work can actually authenticate: either the env
+    `LINEAR_API_KEY` fallback, or a DB OAuth row the runtime `CredentialResolver`
+    can actually resolve a token from. A DB-only connection (UI-configured, no
+    `LINEAR_API_KEY` in the deployment env) must not fail this boot gate —
+    otherwise a migration to the DB-stored connection can never actually start
+    the daemon (OAuth in UI 4/7 review fix).
+
+    Goes through the same resolver `_base.py` uses at runtime — not just a
+    `status == "connected"` check — so a row that's `connected` but actually
+    unusable (expired with no working refresh, or undecryptable after a key
+    rotation) correctly fails this gate instead of waving startup through into
+    `_configured_tracker_registry` with no way to authenticate."""
+    if cfg.linear_api_key:
+        return True
+    resolver = CredentialResolver(
+        conn,
+        CredentialCipher(cfg.symphony_encryption_key),
+        linear_oauth_provider=(
+            linear_provider(cfg.linear_oauth_client_id, cfg.linear_oauth_client_secret)
+            if cfg.linear_oauth_client_id and cfg.linear_oauth_client_secret
+            else None
+        ),
+    )
+    token = await resolver.resolve_linear_auth_header()
+    return token is not None
+
+
 def _tracker_context_for_binding(binding: RepoBinding) -> TrackerContext:
     return context_for_binding(binding)
+
+
+async def _resolve_db_linear_api_key(conn: aiosqlite.Connection, cfg: Config) -> str | None:
+    """The DB-resolved Linear bearer token, or `None` if none is usable.
+
+    Shared by `_configured_tracker_registry`'s boot-time secrets seed and
+    `_run`'s hot-add secrets seed — both build a `LinearTracker` via
+    `for_binding`, which rejects an empty key outright, so a DB-only
+    deployment (no `LINEAR_API_KEY` env) needs this resolved up front at
+    both call sites, not just at boot (OAuth in UI 4/7 review fix).
+    """
+    resolver = CredentialResolver(
+        conn,
+        CredentialCipher(cfg.symphony_encryption_key),
+        linear_oauth_provider=(
+            linear_provider(cfg.linear_oauth_client_id, cfg.linear_oauth_client_secret)
+            if cfg.linear_oauth_client_id and cfg.linear_oauth_client_secret
+            else None
+        ),
+    )
+    return await resolver.resolve_linear_auth_header()
 
 
 async def _db_owns_topology(conn: aiosqlite.Connection, *, yaml_has_repos_topology: bool) -> bool:
@@ -289,8 +341,21 @@ async def _db_owns_topology(conn: aiosqlite.Connection, *, yaml_has_repos_topolo
 @asynccontextmanager
 async def _configured_tracker_registry(
     cfg: Config,
+    conn: aiosqlite.Connection | None = None,
 ) -> AsyncIterator[tuple[TrackerRegistry, Linear | None]]:
     secrets = Secrets()
+    if conn is not None and _config_has_linear_bindings(cfg):
+        # DB-first, same as `CredentialResolver`: resolve regardless of
+        # whether `LINEAR_API_KEY` is set, so a connected Linear OAuth row
+        # takes priority over a stale/incidental env key exactly like it
+        # would at runtime (not just when the env key is empty). Also
+        # covers a DB-only boot (no `LINEAR_API_KEY` env) — `LinearTracker.
+        # __init__` rejects an empty key outright, so resolving up front
+        # here seeds construction with it before `for_binding` below builds
+        # an unauthenticated client that raises (OAuth in UI 4/7 review fix).
+        resolved = await _resolve_db_linear_api_key(conn, cfg)
+        if resolved:
+            secrets = secrets.model_copy(update={"linear_api_key": resolved})
     registry = TrackerRegistry()
     external_linear: Linear | None = None
     async with AsyncExitStack() as stack:
@@ -374,18 +439,35 @@ async def _run(config_path: Path, *, once: bool) -> None:
         except ConfigBootError as e:
             click.echo(str(e), err=True)
             sys.exit(2)
-        if _config_has_linear_bindings(cfg) and not cfg.linear_api_key:
-            click.echo("LINEAR_API_KEY env var is empty; aborting", err=True)
-            sys.exit(2)
+        # Must run before `_config_has_usable_linear_auth`: that check's DB-first
+        # resolver can refresh (and write back) an expired Linear OAuth token,
+        # which is state mutation this fail-closed gate must precede, not follow
+        # (OAuth in UI 4/7 review fix).
         _enforce_require_auth0(cfg)
-        async with _configured_tracker_registry(cfg) as (trackers, _):
+        if _config_has_linear_bindings(cfg) and not await _config_has_usable_linear_auth(conn, cfg):
+            click.echo(
+                "LINEAR_API_KEY env var is empty and no Linear OAuth connection is "
+                "configured; aborting",
+                err=True,
+            )
+            sys.exit(2)
+        async with _configured_tracker_registry(cfg, conn) as (trackers, _):
             # When the DB owns topology, hot-apply binding edits at each tick
             # boundary (SYM-189). A reload introducing a provider/site the
             # process never saw at boot builds a real client from `Secrets`.
-            reload_secrets = Secrets()
-
-            def _hot_add_tracker(binding: RepoBinding) -> IssueTracker:
-                return for_binding(binding, reload_secrets)
+            async def _hot_add_tracker(binding: RepoBinding) -> IssueTracker:
+                # Resolved fresh on every hot-add rather than once at `_run`
+                # startup — a DB-owned/empty install can boot with no Linear
+                # OAuth connection yet, and the operator connecting one after
+                # boot must have it picked up by the next hot-add, not just
+                # ones after a restart (OAuth in UI 4/7 review fix).
+                secrets = Secrets()
+                # DB-first regardless of whether the env key is set, matching
+                # `_configured_tracker_registry` and `CredentialResolver`.
+                resolved = await _resolve_db_linear_api_key(conn, cfg)
+                if resolved:
+                    secrets = secrets.model_copy(update={"linear_api_key": resolved})
+                return for_binding(binding, secrets)
 
             # Live view of per-repo webhook secrets, built from the DB and
             # hot-swapped by the config write path so a secret set/replaced/
@@ -404,6 +486,13 @@ async def _run(config_path: Path, *, once: bool) -> None:
                 tracker_factory=_hot_add_tracker if db_owns_topology else None,
                 repo_secret_view=repo_secret_view if db_owns_topology else None,
             )
+            # Apply the DB-resolved Linear token to every registered tracker
+            # before reconcile touches Linear — `orch.warmup()` (which also
+            # does this) only runs later, from the `once` branch below or from
+            # `orch.run()`, so without this call startup reconcile would post
+            # tracker comments unauthenticated (or on a stale env key) on a
+            # fresh boot with a DB-only Linear connection (review fix).
+            await orch._refresh_linear_tracker_credentials()  # pylint: disable=protected-access
             await reconcile(conn, trackers, bindings=cfg.repos)
             if once:
                 await orch.warmup()
@@ -737,49 +826,56 @@ def _report_effort_support(agent: str, model: str, effort: str, supported: list[
 async def _preflight(config_path: Path) -> None:
     conn = await db.connect(Config.peek_db_path(config_path))
     try:
-        yaml_has_repos_topology = Config.peek_repos_topology(config_path)
-        db_owns_topology = await _db_owns_topology(
-            conn, yaml_has_repos_topology=yaml_has_repos_topology
-        )
-        base = Config.load(config_path, resolve_repos=not db_owns_topology)
-        cfg = await assemble_effective_config(
-            conn,
-            base,
-            boot_gates=False,
-            yaml_has_repos_topology=yaml_has_repos_topology,
-        )
-    except ConfigBootError as e:
-        click.echo(str(e), err=True)
-        sys.exit(2)
+        try:
+            yaml_has_repos_topology = Config.peek_repos_topology(config_path)
+            db_owns_topology = await _db_owns_topology(
+                conn, yaml_has_repos_topology=yaml_has_repos_topology
+            )
+            base = Config.load(config_path, resolve_repos=not db_owns_topology)
+            cfg = await assemble_effective_config(
+                conn,
+                base,
+                boot_gates=False,
+                yaml_has_repos_topology=yaml_has_repos_topology,
+            )
+            has_usable_linear_auth = await _config_has_usable_linear_auth(conn, cfg)
+        except ConfigBootError as e:
+            click.echo(str(e), err=True)
+            sys.exit(2)
+        if _config_has_linear_bindings(cfg) and not has_usable_linear_auth:
+            click.echo(
+                "LINEAR_API_KEY is empty and no Linear OAuth connection is configured", err=True
+            )
+            sys.exit(2)
+        if cfg.ui.enabled:
+            # Raises ClickException on a partial AUTH0_* env — surface that here
+            # rather than at daemon startup.
+            if _auth0_settings(cfg) is not None:
+                click.echo("Auth0 config: ok, /api/* gate enabled")
+            else:
+                click.echo("Auth0 config: unset, /api/* is unauthenticated")
+        if _config_can_run_codex_cli(cfg):
+            click.echo(
+                "codex runs use --dangerously-bypass-approvals-and-sandbox "
+                "(container is the sandbox); no permissions profile needed"
+            )
+        else:
+            click.echo("codex CLI not used by configured repos")
+        try:
+            # Structural binding checks first: they emit their findings before the
+            # online capability check, so an ANTHROPIC_API_KEY gap can't mask them.
+            # `conn` stays open through here (not closed until this function's
+            # outer `finally`) so a DB-only Linear connection can still be
+            # resolved when building the tracker registry below.
+            async with _configured_tracker_registry(cfg, conn) as (trackers, _):
+                ok = await _preflight_configured_bindings(cfg, trackers)
+            caps_ok = await _preflight_validate_capabilities(cfg)
+        except ValueError as e:
+            click.echo(str(e), err=True)
+            sys.exit(2)
+        sys.exit(0 if (ok and caps_ok) else 1)
     finally:
         await conn.close()
-    if _config_has_linear_bindings(cfg) and not cfg.linear_api_key:
-        click.echo("LINEAR_API_KEY is empty", err=True)
-        sys.exit(2)
-    if cfg.ui.enabled:
-        # Raises ClickException on a partial AUTH0_* env — surface that here
-        # rather than at daemon startup.
-        if _auth0_settings(cfg) is not None:
-            click.echo("Auth0 config: ok, /api/* gate enabled")
-        else:
-            click.echo("Auth0 config: unset, /api/* is unauthenticated")
-    if _config_can_run_codex_cli(cfg):
-        click.echo(
-            "codex runs use --dangerously-bypass-approvals-and-sandbox "
-            "(container is the sandbox); no permissions profile needed"
-        )
-    else:
-        click.echo("codex CLI not used by configured repos")
-    try:
-        # Structural binding checks first: they emit their findings before the
-        # online capability check, so an ANTHROPIC_API_KEY gap can't mask them.
-        async with _configured_tracker_registry(cfg) as (trackers, _):
-            ok = await _preflight_configured_bindings(cfg, trackers)
-        caps_ok = await _preflight_validate_capabilities(cfg)
-    except ValueError as e:
-        click.echo(str(e), err=True)
-        sys.exit(2)
-    sys.exit(0 if (ok and caps_ok) else 1)
 
 
 @main.group()

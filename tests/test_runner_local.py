@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os.path
 import sys
 from pathlib import Path
 
@@ -16,6 +17,12 @@ import pytest
 
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.agent.runners.local import LocalRunner
+from symphony.credentials import RunCredentials
+
+
+def _path_exists(path: Path) -> bool:
+    # Sync helper so the filesystem check isn't flagged inside an async test.
+    return os.path.exists(path)
 
 
 @pytest.mark.asyncio
@@ -109,6 +116,147 @@ async def test_runner_kills_on_stall(tmp_path: Path) -> None:
         if ev.kind in ("exit", "stall_timeout"):
             break
     assert "stall_timeout" in kinds
+
+
+@pytest.mark.asyncio
+async def test_runner_materializes_credentials_into_private_home_torn_down_after(
+    tmp_path: Path,
+) -> None:
+    # A run with resolved credentials gets a private, torn-down credential home:
+    # GH_TOKEN + a git credential store are visible to the subprocess for the
+    # duration of the run, then removed — never a persistent volume file.
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-creds",
+        workspace_path=tmp_path,
+        command=[
+            "sh",
+            "-c",
+            'printf "%s\\n" "$GH_TOKEN"; printf "%s\\n" "$GIT_CONFIG_GLOBAL"; '
+            'cat "$GIT_CONFIG_GLOBAL"',
+        ],
+        stall_secs=10,
+        credentials=RunCredentials(github_token="gho_run", linear_token="lin_run"),
+    )
+    events = [ev async for ev in runner.run(spec)]
+    stdout = [e.line for e in events if e.kind == "stdout"]
+    assert stdout[0] == "gho_run"
+    gitconfig = Path(stdout[1])
+    assert "helper = store" in "\n".join(stdout[2:])
+    # Torn down after the run — the private home no longer exists on disk.
+    assert not _path_exists(gitconfig)
+    assert not _path_exists(gitconfig.parent)
+
+
+@pytest.mark.asyncio
+async def test_runner_binding_gh_token_overrides_materialized_git_credential_helper(
+    tmp_path: Path,
+) -> None:
+    # A binding that supplies its own GH_TOKEN via `env:` must win for *every*
+    # consumer, not just env-reading ones like `gh` — including the git
+    # credential helper materialized from the DB/volume-resolved token. Not
+    # materializing anything would leave `git push` on whatever the ambient
+    # host state already provides, silently ignoring the binding's override;
+    # instead the binding's own token gets materialized (SYM-199 review fix).
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-binding-token",
+        workspace_path=tmp_path,
+        command=[
+            "sh",
+            "-c",
+            'printf "%s\\n" "$GH_TOKEN"; printf "%s\\n" "${GIT_CONFIG_GLOBAL:-<unset>}"; '
+            'cat "$(dirname "$GIT_CONFIG_GLOBAL")/.git-credentials"',
+        ],
+        stall_secs=10,
+        env={"GH_TOKEN": "binding_own_token"},
+        credentials=RunCredentials(github_token="gho_run", linear_token="lin_run"),
+    )
+    events = [ev async for ev in runner.run(spec)]
+    stdout = [e.line for e in events if e.kind == "stdout"]
+    assert stdout[0] == "binding_own_token"
+    assert stdout[1] != "<unset>"
+    assert "binding_own_token" in stdout[2]
+    assert "gho_run" not in stdout[2]
+
+
+@pytest.mark.asyncio
+async def test_runner_preserves_global_git_identity_with_materialized_creds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Materializing creds replaces GIT_CONFIG_GLOBAL for the run. If that
+    # doesn't also preserve the pre-existing global config, the container's
+    # `user.name`/`user.email` (set --global in the Dockerfile, no auto-detect
+    # in the headless container) is silently dropped and `git commit` either
+    # mis-attributes or fails outright the moment a GitHub connection exists.
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    (fake_home / ".gitconfig").write_text(
+        "[user]\n\tname = Symphony\n\temail = symphony@localhost\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "file.txt").write_text("hi", encoding="utf-8")
+
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-identity",
+        workspace_path=repo,
+        command=[
+            "sh",
+            "-c",
+            "git init -q && git add file.txt && git commit -q -m test "
+            "&& git log -1 --format='%an <%ae>'",
+        ],
+        stall_secs=10,
+        credentials=RunCredentials(github_token="gho_run"),
+    )
+    events = [ev async for ev in runner.run(spec)]
+    stdout = [e.line for e in events if e.kind == "stdout"]
+    exits = [e for e in events if e.kind == "exit"]
+    assert exits and exits[0].returncode == 0
+    assert stdout[-1] == "Symphony <symphony@localhost>"
+
+
+@pytest.mark.asyncio
+async def test_runner_cleans_up_cred_home_when_materialization_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # If materializing creds raises (disk full, permission error), the
+    # plaintext temp dir must not be left on disk and the run must not
+    # silently proceed without creds — the exception propagates.
+    import symphony.agent.runners.local as local_mod
+
+    created_homes: list[str] = []
+    real_mkdtemp = local_mod.tempfile.mkdtemp
+
+    def _tracking_mkdtemp(*args: object, **kwargs: object) -> str:
+        home = real_mkdtemp(*args, **kwargs)  # type: ignore[arg-type]
+        created_homes.append(home)
+        return home
+
+    def _boom(*args: object, **kwargs: object) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(local_mod.tempfile, "mkdtemp", _tracking_mkdtemp)
+    monkeypatch.setattr(local_mod, "materialize_credentials", _boom)
+
+    runner = LocalRunner()
+    spec = RunnerSpec(
+        run_id="r-creds-fail",
+        workspace_path=tmp_path,
+        command=["true"],
+        stall_secs=10,
+        credentials=RunCredentials(github_token="gho_run"),
+    )
+    with pytest.raises(OSError, match="disk full"):
+        async for _ in runner.run(spec):
+            pass
+
+    assert len(created_homes) == 1
+    assert not _path_exists(Path(created_homes[0]))
 
 
 @pytest.mark.asyncio

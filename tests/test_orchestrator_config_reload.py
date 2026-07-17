@@ -738,9 +738,13 @@ def _linear_binding(*, team: str, repo: str, site: str = "default") -> RepoBindi
 class _FakeLinearTracker:
     def __init__(self) -> None:
         self.closed = False
+        self.api_keys: list[str] = []
 
     async def aclose(self) -> None:
         self.closed = True
+
+    def set_api_key(self, api_key: str) -> None:
+        self.api_keys.append(api_key)
 
 
 @pytest.mark.asyncio
@@ -793,6 +797,91 @@ async def test_hot_added_linear_tracker_aliased_as_default(
         assert registry.get(TrackerContext(provider="linear", site="acme")) is built[0]
         assert registry.get(TrackerContext()) is built[0]
         assert registry.resolve(TrackerContext()) is built[0]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_linear_disconnect_reverts_tracker_to_env_fallback(tmp_path: Path) -> None:
+    """A DB Linear connection applied to the tracker must not stick around
+    once the connection is gone. `Disconnect` (`db.oauth_connections.delete`)
+    and a failed liveness `Test` (`update_status` → `expired`) both make
+    `resolve` stop returning the DB token — the tracker must revert to the
+    ambient `LINEAR_API_KEY` on the next refresh instead of keeping the
+    stale/revoked DB token pinned until a restart (SYM-199 review fix)."""
+    cfg = Config(
+        workspace_root=tmp_path / "workspaces",
+        log_root=tmp_path / "logs",
+        db_path=tmp_path / "symphony.sqlite",
+        symphony_encryption_key="enc-key",
+        linear_api_key="env_key",
+        repos=[_linear_binding(team="ENG", repo="org/repo")],
+    )
+    conn = await db.connect(cfg.db_path)
+    try:
+        tracker = _FakeLinearTracker()
+        registry = TrackerRegistry()
+        registry.register("linear", "default", tracker)
+        orch = Orchestrator(cfg, registry, conn, tracker_factory=lambda _b: tracker)
+
+        from symphony.crypto import CredentialCipher
+
+        await db.oauth_connections.set_connection(
+            conn, provider="linear", credential="db_token", cipher=CredentialCipher("enc-key")
+        )
+
+        await orch._refresh_linear_tracker_credentials()  # noqa: SLF001
+        assert tracker.api_keys[-1] == "Bearer db_token"
+
+        await db.oauth_connections.delete(conn, "linear")
+
+        await orch._refresh_linear_tracker_credentials()  # noqa: SLF001
+        assert tracker.api_keys[-1] == "env_key"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_refresh_applies_db_token_to_tracker_hot_added_after_first_refresh(
+    tmp_path: Path,
+) -> None:
+    """A Linear tracker hot-added on a later tick, after the DB token was
+    already applied to the trackers registered at that point, must still
+    receive the DB token even though the resolved value hasn't changed since
+    the previous refresh — a scalar value-equality short-circuit on the
+    resolved token would skip it and leave it on the ambient env key
+    (SYM-199 review fix)."""
+    cfg = Config(
+        workspace_root=tmp_path / "workspaces",
+        log_root=tmp_path / "logs",
+        db_path=tmp_path / "symphony.sqlite",
+        symphony_encryption_key="enc-key",
+        linear_api_key="env_key",
+        repos=[_linear_binding(team="ENG", repo="org/repo")],
+    )
+    conn = await db.connect(cfg.db_path)
+    try:
+        tracker1 = _FakeLinearTracker()
+        registry = TrackerRegistry()
+        registry.register("linear", "default", tracker1)
+        orch = Orchestrator(cfg, registry, conn, tracker_factory=lambda _b: tracker1)
+
+        from symphony.crypto import CredentialCipher
+
+        await db.oauth_connections.set_connection(
+            conn, provider="linear", credential="db_token", cipher=CredentialCipher("enc-key")
+        )
+
+        await orch._refresh_linear_tracker_credentials()  # noqa: SLF001
+        assert tracker1.api_keys[-1] == "Bearer db_token"
+
+        tracker2 = _FakeLinearTracker()
+        registry.register("linear", "acme", tracker2)
+
+        await orch._refresh_linear_tracker_credentials()  # noqa: SLF001
+        assert tracker2.api_keys == ["Bearer db_token"], (
+            f"tracker2 saw {tracker2.api_keys}, not the DB token"
+        )
     finally:
         await conn.close()
 

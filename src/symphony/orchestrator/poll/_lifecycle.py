@@ -708,7 +708,8 @@ class _LifecycleMixin(_OrchestratorBase):
         if binding.base_branch is not None:
             return binding.base_branch
         try:
-            return await self._gh.repo_default_branch(binding.github_repo)
+            gh = await self._gh_client(repo=binding.github_repo)
+            return await gh.repo_default_branch(binding.github_repo)
         except GitHubError as e:
             log.warning(
                 "repo_default_branch failed for %s; falling back to gh default: %s",
@@ -1205,7 +1206,16 @@ class _LifecycleMixin(_OrchestratorBase):
                 await self._park_deliver_failed(msg, ctx=ctx)
                 return run_id
 
-        # 5. Push branch, open PR, post stage-transition comment.
+        # 5. Push branch, open PR, post stage-transition comment. The GitHub
+        # token is resolved DB-first (OAuth in UI 4/7) so delivery uses the
+        # connected UI credential instead of ambient `gh`/`git` auth once a
+        # binding's repo has a connected GitHub row. `_push_fn` resolves and
+        # configures/clears the push-auth header itself; `_gh_client` resolves
+        # the same token for the PR API calls below. `repo=binding.github_repo`
+        # so a `[HOST/]OWNER/REPO` GHE binding keeps `_resolve_github_token`'s
+        # non-github.com guard and falls back to `self._gh`'s host-specific auth
+        # instead of wrongly promoting a github.com DB/env token.
+        gh = await self._gh_client(repo=binding.github_repo)
         try:
             await self._push_fn(workspace_path, branch)
         except Exception as e:  # noqa: BLE001
@@ -1215,7 +1225,7 @@ class _LifecycleMixin(_OrchestratorBase):
 
         pr_url: str = ""
         try:
-            pr_url = await self._gh.ensure_pr(
+            pr_url = await gh.ensure_pr(
                 title=build_pr_title(issue),
                 body="",
                 base=base_branch,
@@ -1449,7 +1459,8 @@ class _LifecycleMixin(_OrchestratorBase):
             base_branch = binding.base_branch
             if base_branch is None:
                 try:
-                    base_branch = await self._gh.repo_default_branch(binding.github_repo)
+                    gh = await self._gh_client(repo=binding.github_repo)
+                    base_branch = await gh.repo_default_branch(binding.github_repo)
                 except GitHubError as e:
                     log.warning(
                         "repo_default_branch failed during local review on %s: %s; "
@@ -1700,7 +1711,8 @@ class _LifecycleMixin(_OrchestratorBase):
             f"- strategy: `{binding.review_strategy}`\n"
         )
         try:
-            await self._gh.pr_comment(pr_number, body, repo=binding.github_repo)
+            gh = await self._gh_client(repo=binding.github_repo)
+            await gh.pr_comment(pr_number, body, repo=binding.github_repo)
         except GitHubError as e:
             log.warning(
                 "could not post local-review PR summary on %s#%d: %s",

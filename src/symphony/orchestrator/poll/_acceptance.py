@@ -498,7 +498,9 @@ class _AcceptanceMixin(_OrchestratorBase):
         pr_number: int,
     ) -> str:
         try:
-            return await self._gh.pr_diff(pr_number, repo=binding.github_repo)
+            return await (await self._gh_client(repo=binding.github_repo)).pr_diff(
+                pr_number, repo=binding.github_repo
+            )
         except GitHubError as e:
             log.warning(
                 "could not fetch acceptance PR diff for %s#%d on %s: %s",
@@ -1102,7 +1104,8 @@ class _AcceptanceMixin(_OrchestratorBase):
         branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
         try:
             try:
-                await _git_fetch_branch(workspace_path, branch)
+                github_token = await self._resolve_github_token(repo=binding.github_repo)
+                await _git_fetch_branch(workspace_path, branch, github_token=github_token)
             except Exception as e:  # noqa: BLE001
                 log.warning(
                     "could not fetch acceptance fix-run remote HEAD for %s: %s",

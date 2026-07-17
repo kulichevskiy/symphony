@@ -23,6 +23,7 @@ from .tracker import Issue
 log = logging.getLogger(__name__)
 
 CloneFn = Callable[[str, Path], Awaitable[None]]
+FetchFn = Callable[[str, Path], Awaitable[None]]
 DEFAULT_TTL_SECS = 7 * 24 * 3600
 DEFAULT_SWEEP_INTERVAL_SECS = 6 * 3600
 ARCHIVE_DIR = "_archive"
@@ -56,10 +57,18 @@ class Workspace:
         *,
         root: Path,
         clone_fn: CloneFn,
+        fetch_fn: FetchFn | None = None,
         ttl_secs: int = DEFAULT_TTL_SECS,
     ) -> None:
         self._root = root
         self._clone_fn = clone_fn
+        # Auth-resolving fetch for an already-cloned workspace (OAuth in UI
+        # 4/7 review fix). `clone_fn` alone only covers a repo's first clone —
+        # a DB-only private repo whose workspace already exists would
+        # otherwise hit an unauthenticated `git fetch` on every later
+        # dispatch. `None` (tests, no DB resolver wired up) keeps the plain
+        # unauthenticated fetch below.
+        self._fetch_fn = fetch_fn
         self._ttl_secs = ttl_secs
         # Per-path lock serializes sweep_ttl against acquire/cleanup so
         # the sweeper can't rmtree a dir between an acquire's mtime read
@@ -122,7 +131,10 @@ class Workspace:
                 # is empty, so genuinely orphaned state still gets cleared.
                 if path not in self._in_use:
                     await self._abort_interrupted_ops(path)
-                await self._git(path, "fetch", "origin")
+                if self._fetch_fn is not None:
+                    await self._fetch_fn(binding.github_repo, path)
+                else:
+                    await self._git(path, "fetch", "origin")
             else:
                 if path.exists():
                     # Residue from an interrupted clone — git clone refuses

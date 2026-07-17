@@ -278,7 +278,7 @@ def _default_workspace_head_sha(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_workspace_ref_sha(_workspace_path: Path, _ref: str) -> str:
         return "before-fix-sha"
 
-    async def fake_git_fetch_branch(_workspace_path: Path, _branch: str) -> None:
+    async def fake_git_fetch_branch(_workspace_path: Path, _branch: str, **_kwargs: object) -> None:
         return None
 
     for module in (poll_module, review_module):
@@ -730,6 +730,132 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
         assert fix_runs[0].status == "completed"
         assert fix_runs[0].pid == 999
         assert fix_runs[0].cost_usd == pytest.approx(0.011025)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_red_ci_fix_run_repush_and_codex_reping_use_db_github_token(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OAuth in UI 4/7 acceptance: a review-fix re-push and its `@codex
+    review` re-ping both use the connected DB GitHub token, with no
+    `GH_TOKEN` in env and no ambient `gh` auth (review fix — push auth was
+    previously only wired for the first delivery push, and `self._gh` API
+    calls were never DB-token-aware at all)."""
+    from symphony.crypto import CredentialCipher
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.oauth_connections.set_connection(
+            conn,
+            provider="github",
+            credential="gho_db_secret",
+            cipher=CredentialCipher("enc-key"),
+        )
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[_binding(agent="codex", codex_model="gpt-5.1-codex-max")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+            symphony_encryption_key="enc-key",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue_in_progress())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        advance_head(workspace_path)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        # Ambient `gh` — must never be called once a DB GitHub row is
+        # connected; any call on it fails the test loudly instead of
+        # silently using stale/ambient auth.
+        gh = MagicMock()
+        gh.pr_checks = AsyncMock(side_effect=AssertionError("ambient gh.pr_checks used"))
+        gh.pr_view = AsyncMock(side_effect=AssertionError("ambient gh.pr_view used"))
+        gh.pr_comment = AsyncMock(side_effect=AssertionError("ambient gh.pr_comment used"))
+
+        from symphony.orchestrator.poll._git import _push_auth_subprocess_env  # noqa: PLC0415
+
+        push_seen_auth: list[str] = []
+
+        async def _push_fn(path: Path, branch: str) -> None:
+            env = _push_auth_subprocess_env(path) or {}
+            count = int(env.get("GIT_CONFIG_COUNT", "0"))
+            headers = {
+                env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(count)
+            }
+            push_seen_auth.append(headers.get("http.https://github.com/.extraheader", ""))
+
+        gh_ctor_calls: list[dict[str, object]] = []
+
+        class _RecordingGitHub:
+            def __init__(self, **kwargs: object) -> None:
+                gh_ctor_calls.append(kwargs)
+                self.pr_checks = AsyncMock(
+                    return_value=PRChecks(
+                        [
+                            CheckRun(
+                                name="lint",
+                                state="FAILURE",
+                                bucket="fail",
+                                link="https://github.com/org/repo/actions/runs/1/jobs/2",
+                            )
+                        ]
+                    )
+                )
+                self.pr_view = AsyncMock(
+                    return_value={"headRefOid": "head-sha", "mergeable": "MERGEABLE"}
+                )
+                self.check_log_tail = AsyncMock(return_value="ruff found a lint failure")
+                self.pr_comment = AsyncMock()
+                self.pr_issue_comments = AsyncMock(return_value=[])
+
+        monkeypatch.setattr("symphony.orchestrator.poll._base.GitHub", _RecordingGitHub)
+
+        runner = _FakeRunner(
+            [
+                RunnerEvent(kind="started", pid=999),
+                RunnerEvent(kind="exit", returncode=0),
+            ]
+        )
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=_push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _poll_review_and_wait(orch)
+
+        # The re-push happened while the workspace's local git config
+        # carried the DB token as a Basic auth header.
+        assert len(push_seen_auth) == 1
+        assert push_seen_auth[0]
+        import base64 as _b64
+
+        expected = _b64.b64encode(b"x-access-token:gho_db_secret").decode()
+        assert expected in push_seen_auth[0]
+
+        # `@codex review` re-ping and every other GitHub read/write in this
+        # run went through a client built with the DB token.
+        assert gh_ctor_calls
+        assert all(kwargs["token"] == "gho_db_secret" for kwargs in gh_ctor_calls)
+        gh.pr_checks.assert_not_awaited()
+        gh.pr_view.assert_not_awaited()
+        gh.pr_comment.assert_not_awaited()
     finally:
         await conn.close()
 
@@ -5051,7 +5177,7 @@ async def test_merge_conflict_fix_run_aborts_rebase_on_failure(
         )
 
         assert result is False
-        sync_workspace.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+        sync_workspace.assert_awaited_once_with(workspace_path, "symphony/eng-1", github_token=None)
         abort_rebase.assert_awaited_once_with(workspace_path)
         if failure_mode == "continue":
             add_and_continue.assert_awaited_once_with(workspace_path, ["conflicted.py"])
@@ -5134,7 +5260,7 @@ async def test_merge_conflict_fix_reports_status_when_rebase_has_no_unresolved_p
         )
 
         assert result is False
-        sync_workspace.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+        sync_workspace.assert_awaited_once_with(workspace_path, "symphony/eng-1", github_token=None)
         abort_rebase.assert_awaited_once_with(workspace_path)
         posted = [c.args[1] for c in linear.post_comment.await_args_list]
         assert any("rebase failed with no unresolved paths" in b for b in posted), posted
@@ -5173,7 +5299,9 @@ async def test_merge_conflict_fix_uses_synced_head_as_noop_baseline(
 
         synced = False
 
-        async def sync_workspace(_workspace_path: Path, _branch: str) -> None:
+        async def sync_workspace(
+            _workspace_path: Path, _branch: str, *, github_token: str | None = None
+        ) -> None:
             nonlocal synced
             synced = True
 
@@ -5300,7 +5428,7 @@ async def test_merge_conflict_fix_run_continues_through_later_conflicts(
         )
 
         assert result is True
-        sync_workspace.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+        sync_workspace.assert_awaited_once_with(workspace_path, "symphony/eng-1", github_token=None)
         assert conflicted_files.await_count == 2
         assert add_and_continue.await_args_list == [
             call(workspace_path, ["first.py"]),

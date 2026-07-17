@@ -119,6 +119,15 @@ class LinearTracker:
             timeout=timeout,
         )
 
+    def set_api_key(self, api_key: str) -> None:
+        """Swap the `Authorization` header without tearing down the client.
+
+        Lets a DB-first credential refresh (OAuth in UI 4/7) point an
+        already-constructed tracker at a newer token in place, instead of
+        rebuilding the client (and its connection pool) on every refresh.
+        """
+        self._client.headers["Authorization"] = api_key
+
     async def aclose(self) -> None:
         await self._client.aclose()
 

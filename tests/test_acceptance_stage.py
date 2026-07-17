@@ -1011,7 +1011,7 @@ async def test_acceptance_reject_dispatches_fix_then_rechecks(
     async def no_sync(_workspace_path: Path, _branch: str) -> None:
         return None
 
-    async def no_fetch(_workspace_path: Path, _branch: str) -> None:
+    async def no_fetch(_workspace_path: Path, _branch: str, **_kwargs: object) -> None:
         return None
 
     async def remote_sha(_workspace_path: Path, _ref: str) -> str:
@@ -1114,7 +1114,7 @@ async def test_acceptance_reject_after_fix_opens_operator_wait(
     async def no_sync(_workspace_path: Path, _branch: str) -> None:
         return None
 
-    async def no_fetch(_workspace_path: Path, _branch: str) -> None:
+    async def no_fetch(_workspace_path: Path, _branch: str, **_kwargs: object) -> None:
         return None
 
     async def remote_sha(_workspace_path: Path, _ref: str) -> str:
@@ -1206,7 +1206,7 @@ async def test_acceptance_fix_gated_by_launch_gate_over_cap(
     still veto one over a met cap — same as the other follow-up stages
     (SYM-193 review)."""
 
-    async def no_fetch(_workspace_path: Path, _branch: str) -> None:
+    async def no_fetch(_workspace_path: Path, _branch: str, **_kwargs: object) -> None:
         return None
 
     async def remote_sha(_workspace_path: Path, _ref: str) -> str:
@@ -1273,7 +1273,7 @@ async def test_acceptance_fix_without_new_commit_opens_operator_wait(
     async def no_sync(_workspace_path: Path, _branch: str) -> None:
         return None
 
-    async def no_fetch(_workspace_path: Path, _branch: str) -> None:
+    async def no_fetch(_workspace_path: Path, _branch: str, **_kwargs: object) -> None:
         return None
 
     async def remote_sha(_workspace_path: Path, _ref: str) -> str:

@@ -583,7 +583,7 @@ class _ReviewMixin(_OrchestratorBase):
         # retry just re-arms the monitor without a remote ping.
         if binding.resolved_remote_review():
             try:
-                await self._gh.pr_comment(
+                await (await self._gh_client()).pr_comment(
                     state.pr_number, "@codex review", repo=binding.github_repo
                 )
             except GitHubError as e:
@@ -1226,7 +1226,7 @@ class _ReviewMixin(_OrchestratorBase):
         head_sha = _unknown_head_ci_scope(checks)
         mergeable = ""
         try:
-            view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
+            view = await (await self._gh_client()).pr_view(pr_number, repo=binding.github_repo)
             head_sha = str(view.get("headRefOid") or "") or head_sha
             mergeable = str(view.get("mergeable") or "")
         except Exception as e:  # noqa: BLE001
@@ -1238,7 +1238,7 @@ class _ReviewMixin(_OrchestratorBase):
             )
 
         head_committed_at = await _commit_committed_at_or_empty(
-            self._gh,
+            await self._gh_client(),
             repo=binding.github_repo,
             sha=head_sha,
         )
@@ -1306,7 +1306,7 @@ class _ReviewMixin(_OrchestratorBase):
         """
         storage_issue_id = run.issue_id
         try:
-            checks = await self._gh.pr_checks(pr_number, repo=binding.github_repo)
+            checks = await (await self._gh_client()).pr_checks(pr_number, repo=binding.github_repo)
         except GitHubError as e:
             failures = await db.review_state.bump_ci_fetch_failures(self._conn, storage_issue_id)
             log.warning(
@@ -1377,7 +1377,9 @@ class _ReviewMixin(_OrchestratorBase):
                 # bindings still ignore Codex bot signals here; they only
                 # honor human review-state changes.
                 try:
-                    raw_reviews = await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
+                    raw_reviews = await (await self._gh_client()).pr_reviews(
+                        pr_number, repo=binding.github_repo
+                    )
                     review_signal_reviews = _reviews_from_github(raw_reviews)
                 except GitHubError as e:
                     log.warning(
@@ -1392,7 +1394,7 @@ class _ReviewMixin(_OrchestratorBase):
                 review_signal_reactions: tuple[Reaction, ...] = ()
                 if remote_review:
                     try:
-                        raw_comments = await self._gh.pr_review_comments(
+                        raw_comments = await (await self._gh_client()).pr_review_comments(
                             pr_number, repo=binding.github_repo
                         )
                         review_signal_comments = _review_comments_from_github(raw_comments)
@@ -1406,7 +1408,7 @@ class _ReviewMixin(_OrchestratorBase):
                         review_signal_comments = []
 
                     try:
-                        raw_reactions = await self._gh.pr_reactions(
+                        raw_reactions = await (await self._gh_client()).pr_reactions(
                             pr_number, repo=binding.github_repo
                         )
                         review_signal_reactions = _reactions_from_github(raw_reactions)
@@ -1438,7 +1440,9 @@ class _ReviewMixin(_OrchestratorBase):
                     verdict = review_verdict
         elif not remote_review:
             try:
-                raw_reviews = await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
+                raw_reviews = await (await self._gh_client()).pr_reviews(
+                    pr_number, repo=binding.github_repo
+                )
                 human_reviews = tuple(
                     r
                     for r in _reviews_from_github(raw_reviews)
@@ -1465,7 +1469,9 @@ class _ReviewMixin(_OrchestratorBase):
             )
         else:
             try:
-                raw_reviews = await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
+                raw_reviews = await (await self._gh_client()).pr_reviews(
+                    pr_number, repo=binding.github_repo
+                )
                 reviews: tuple[Review, ...] = _reviews_from_github(raw_reviews)
             except GitHubError as e:
                 log.warning(
@@ -1477,7 +1483,7 @@ class _ReviewMixin(_OrchestratorBase):
                 reviews = ()
 
             try:
-                raw_comments = await self._gh.pr_review_comments(
+                raw_comments = await (await self._gh_client()).pr_review_comments(
                     pr_number, repo=binding.github_repo
                 )
                 comments: list[ReviewComment] = _review_comments_from_github(raw_comments)
@@ -1491,7 +1497,9 @@ class _ReviewMixin(_OrchestratorBase):
                 comments = []
 
             try:
-                raw_reactions = await self._gh.pr_reactions(pr_number, repo=binding.github_repo)
+                raw_reactions = await (await self._gh_client()).pr_reactions(
+                    pr_number, repo=binding.github_repo
+                )
                 reactions: tuple[Reaction, ...] = _reactions_from_github(raw_reactions)
             except GitHubError as e:
                 log.warning(
@@ -1503,7 +1511,7 @@ class _ReviewMixin(_OrchestratorBase):
                 reactions = ()
 
             try:
-                issue_comments = await self._gh.pr_issue_comments(
+                issue_comments = await (await self._gh_client()).pr_issue_comments(
                     pr_number, repo=binding.github_repo
                 )
             except GitHubError as e:
@@ -1676,7 +1684,8 @@ class _ReviewMixin(_OrchestratorBase):
         async def setup(workspace_path: Path) -> bool:
             nonlocal start_sha
             try:
-                await _git_fetch_branch(workspace_path, branch)
+                github_token = await self._resolve_github_token(repo=binding.github_repo)
+                await _git_fetch_branch(workspace_path, branch, github_token=github_token)
             except Exception as e:  # noqa: BLE001
                 await self._fail_review_run(
                     run=run,
@@ -1976,17 +1985,21 @@ class _ReviewMixin(_OrchestratorBase):
         pr_number: int,
         include_comments: bool = False,
     ) -> tuple[Verdict, str, str, list[dict[str, object]]]:
-        view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
+        view = await (await self._gh_client()).pr_view(pr_number, repo=binding.github_repo)
         head_sha = str(view.get("headRefOid") or "")
         if not head_sha:
             raise GitHubError(f"pr view missing headRefOid for {binding.github_repo}#{pr_number}")
         comments = []
         if include_comments:
-            comments = await self._gh.pr_review_comments(pr_number, repo=binding.github_repo)
-        reviews = await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
-        reactions = await self._gh.pr_reactions(pr_number, repo=binding.github_repo)
+            comments = await (await self._gh_client()).pr_review_comments(
+                pr_number, repo=binding.github_repo
+            )
+        reviews = await (await self._gh_client()).pr_reviews(pr_number, repo=binding.github_repo)
+        reactions = await (await self._gh_client()).pr_reactions(
+            pr_number, repo=binding.github_repo
+        )
         try:
-            issue_comments = await self._gh.pr_issue_comments(
+            issue_comments = await (await self._gh_client()).pr_issue_comments(
                 pr_number,
                 repo=binding.github_repo,
             )
@@ -2000,7 +2013,9 @@ class _ReviewMixin(_OrchestratorBase):
                 e,
             )
             issue_comments = []
-        committed_at = await self._gh.commit_committed_at(binding.github_repo, head_sha)
+        committed_at = await (await self._gh_client()).commit_committed_at(
+            binding.github_repo, head_sha
+        )
 
         snapshot = ReviewSnapshot(
             head_sha=head_sha,
@@ -2032,7 +2047,7 @@ class _ReviewMixin(_OrchestratorBase):
         if state.pr_number is None:
             return False
         try:
-            await self._gh.pr_comment(
+            await (await self._gh_client()).pr_comment(
                 state.pr_number,
                 "@codex review",
                 repo=binding.github_repo,
@@ -2103,7 +2118,8 @@ class _ReviewMixin(_OrchestratorBase):
         async def setup(workspace_path: Path) -> bool:
             nonlocal start_sha
             try:
-                await _git_fetch_branch(workspace_path, branch)
+                github_token = await self._resolve_github_token(repo=binding.github_repo)
+                await _git_fetch_branch(workspace_path, branch, github_token=github_token)
             except Exception as e:  # noqa: BLE001
                 await self._fail_review_run(
                     run=run,
@@ -2302,7 +2318,9 @@ class _ReviewMixin(_OrchestratorBase):
         base_branch = binding.base_branch
         if base_branch is None:
             try:
-                base_branch = await self._gh.repo_default_branch(binding.github_repo)
+                base_branch = await (await self._gh_client()).repo_default_branch(
+                    binding.github_repo
+                )
             except GitHubError as e:
                 log.warning(
                     "repo_default_branch failed for %s; falling back to 'main': %s",
@@ -2334,7 +2352,8 @@ class _ReviewMixin(_OrchestratorBase):
             nonlocal start_sha
             # Step 1: orchestrator fetches origin.
             try:
-                await _sync_workspace_to_remote(workspace_path, branch)
+                github_token = await self._resolve_github_token(repo=binding.github_repo)
+                await _sync_workspace_to_remote(workspace_path, branch, github_token=github_token)
             except Exception as e:  # noqa: BLE001
                 log.warning("workspace sync failed for %s: %s", issue.identifier, e)
                 await self._fail_review_run(
@@ -2360,7 +2379,8 @@ class _ReviewMixin(_OrchestratorBase):
                 return False
 
             try:
-                await _git_fetch(workspace_path)
+                github_token = await self._resolve_github_token(repo=binding.github_repo)
+                await _git_fetch(workspace_path, github_token=github_token)
             except Exception as e:  # noqa: BLE001
                 log.warning("git fetch failed for %s: %s", issue.identifier, e)
                 await self._fail_review_run(
@@ -2780,7 +2800,7 @@ class _ReviewMixin(_OrchestratorBase):
             if check.name not in failing_names:
                 continue
             try:
-                tail = await self._gh.check_log_tail(check, repo=repo)
+                tail = await (await self._gh_client()).check_log_tail(check, repo=repo)
             except GitHubError as e:
                 tail = f"(could not fetch failing-check log: {e})"
             if not tail:
@@ -3016,7 +3036,7 @@ class _ReviewMixin(_OrchestratorBase):
                 self._workspace.release(binding, issue)
         if state.pr_number is not None and binding.resolved_remote_review():
             try:
-                await self._gh.pr_comment(
+                await (await self._gh_client()).pr_comment(
                     state.pr_number, "@codex review", repo=binding.github_repo
                 )
             except GitHubError as e:
@@ -3546,7 +3566,9 @@ class _ReviewMixin(_OrchestratorBase):
             return
         if issue_comments is None:
             try:
-                raw = await self._gh.pr_issue_comments(pr_number, repo=binding.github_repo)
+                raw = await (await self._gh_client()).pr_issue_comments(
+                    pr_number, repo=binding.github_repo
+                )
             except GitHubError as e:
                 log.warning(
                     "could not fetch issue comments for %s#%d: %s",
@@ -3643,18 +3665,18 @@ class _ReviewMixin(_OrchestratorBase):
         view: dict[str, object] | None = None,
     ) -> Verdict:
         if view is None:
-            view = await self._gh.pr_view(pr_number, repo=binding.github_repo)
+            view = await (await self._gh_client()).pr_view(pr_number, repo=binding.github_repo)
         head_sha = str(view.get("headRefOid") or "")
         if not head_sha:
             raise GitHubError(f"pr view missing headRefOid for {binding.github_repo}#{pr_number}")
 
-        checks = await self._gh.pr_checks(pr_number, repo=binding.github_repo)
+        checks = await (await self._gh_client()).pr_checks(pr_number, repo=binding.github_repo)
         ci = [_review_check_from_github(run) for run in checks.runs]
         if not binding.resolved_remote_review():
             human_reviews = tuple(
                 r
                 for r in _reviews_from_github(
-                    await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
+                    await (await self._gh_client()).pr_reviews(pr_number, repo=binding.github_repo)
                 )
                 if not is_codex_author(r.user_login)
             )
@@ -3670,14 +3692,16 @@ class _ReviewMixin(_OrchestratorBase):
                 ),
             )
 
-        comments = await self._gh.pr_review_comments(
+        comments = await (await self._gh_client()).pr_review_comments(
             pr_number,
             repo=binding.github_repo,
         )
-        reviews = await self._gh.pr_reviews(pr_number, repo=binding.github_repo)
-        reactions = await self._gh.pr_reactions(pr_number, repo=binding.github_repo)
+        reviews = await (await self._gh_client()).pr_reviews(pr_number, repo=binding.github_repo)
+        reactions = await (await self._gh_client()).pr_reactions(
+            pr_number, repo=binding.github_repo
+        )
         try:
-            issue_comments = await self._gh.pr_issue_comments(
+            issue_comments = await (await self._gh_client()).pr_issue_comments(
                 pr_number,
                 repo=binding.github_repo,
             )
@@ -3689,7 +3713,9 @@ class _ReviewMixin(_OrchestratorBase):
                 e,
             )
             issue_comments = []
-        committed_at = await self._gh.commit_committed_at(binding.github_repo, head_sha)
+        committed_at = await (await self._gh_client()).commit_committed_at(
+            binding.github_repo, head_sha
+        )
 
         snapshot = ReviewSnapshot(
             head_sha=head_sha,
