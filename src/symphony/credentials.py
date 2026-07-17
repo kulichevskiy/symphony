@@ -21,7 +21,9 @@ Two pieces make the UI-stored connections actually drive agent runs:
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -216,6 +218,71 @@ class CredentialResolver:
             github_token=await self.resolve("github", fallback=github_fallback),
             linear_token=await self.resolve_linear_auth_header(fallback=linear_fallback),
         )
+
+
+class CredentialWriteBack:
+    """Persist a runtime-refreshed credential back into `oauth_connections`.
+
+    Claude/Codex refresh their access token at runtime, rewriting the
+    credential file a run reads from. After such a run the daemon reads the
+    file back and calls `write_back`: if the provider has a live DB connection
+    and the credential actually changed, it re-encrypts + upserts it, so the
+    next run (or a redeploy that lost the auth volume) authenticates without a
+    re-auth. Writes are serialized per provider by an `asyncio.Lock` so two
+    concurrent runs finishing at once can't read-modify-write over each other.
+    """
+
+    def __init__(
+        self,
+        conn: aiosqlite.Connection,
+        cipher: CredentialCipher,
+        *,
+        now: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._conn = conn
+        self._cipher = cipher
+        self._now = now or (lambda: datetime.now(UTC))
+        self._locks: dict[str, asyncio.Lock] = {}
+
+    def _lock(self, provider: str) -> asyncio.Lock:
+        return self._locks.setdefault(provider, asyncio.Lock())
+
+    async def write_back(
+        self, provider: str, credential: str, *, expires_at: str | None = None
+    ) -> bool:
+        """Persist `credential` for `provider` if a live DB connection exists and
+        the stored value differs. Returns True when a write happened.
+
+        A no-op when the provider has no `connected`/`expired` row — the
+        credential is then purely ambient (env/volume), and slurping it into the
+        store unsolicited would flip a never-connected provider to DB-backed.
+        """
+        async with self._lock(provider):
+            status = await db.oauth_connections.get_status(self._conn, provider)
+            if status is None or status.status not in ("connected", "expired"):
+                return False
+            try:
+                current = await db.oauth_connections.get_credential(
+                    self._conn, provider, self._cipher
+                )
+            except (CredentialDecryptError, CredentialKeyMissingError):
+                # A rotated/corrupt key means we can't compare — overwrite with
+                # the fresh material rather than leaving a dead row in place.
+                current = None
+            if current == credential:
+                return False
+            await db.oauth_connections.set_connection(
+                self._conn,
+                provider=provider,
+                credential=credential,
+                cipher=self._cipher,
+                status="connected",
+                expires_at=expires_at,
+                updated_at=self._now().strftime(_ISO_FORMAT),
+                updated_by="write-back",
+            )
+            log.info("%s credential written back after runtime refresh", provider)
+            return True
 
 
 def github_host_for_repo(repo: str) -> str:

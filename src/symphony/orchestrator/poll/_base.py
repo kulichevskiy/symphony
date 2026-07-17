@@ -46,8 +46,18 @@ from ...agent.process import parse_event_line
 from ...agent.prompt import implement_prompt
 from ...agent.runner import Runner, RunnerSpec
 from ...agent.runners.local import LocalRunner
+from ...claude_login import (
+    claude_expires_at,
+    default_claude_credentials_path,
+    read_claude_credential,
+)
 from ...config import Config, RepoBinding, ResolvedRole, binding_natural_key
-from ...credentials import CredentialResolver, RunCredentials, github_host_for_repo
+from ...credentials import (
+    CredentialResolver,
+    CredentialWriteBack,
+    RunCredentials,
+    github_host_for_repo,
+)
 from ...crypto import CredentialCipher
 from ...effective_config import ConfigBootError, assemble_effective_config
 from ...github.client import GitHub, GitHubClient, GitHubError
@@ -385,6 +395,7 @@ class _OrchestratorBase:
         tracker_factory: Callable[[RepoBinding], IssueTracker | Awaitable[IssueTracker]]
         | None = None,
         repo_secret_view: db.config_repo_secrets.RepoSecretView | None = None,
+        claude_credentials_path: Path | None = None,
     ) -> None:
         self.config = config
         if isinstance(tracker_or_registry, TrackerRegistry):
@@ -460,14 +471,26 @@ class _OrchestratorBase:
         # the Linear OAuth app config (when set) so an expired DB token gets
         # refreshed in place instead of permanently falling back to
         # `LINEAR_API_KEY` once the 24h access token lapses.
+        _cipher = CredentialCipher(config.symphony_encryption_key)
         self._credential_resolver = CredentialResolver(
             conn,
-            CredentialCipher(config.symphony_encryption_key),
+            _cipher,
             linear_oauth_provider=(
                 linear_provider(config.linear_oauth_client_id, config.linear_oauth_client_secret)
                 if config.linear_oauth_client_id and config.linear_oauth_client_secret
                 else None
             ),
+        )
+        # Write-back of runtime-refreshed agent credentials (OAuth in UI 5/7):
+        # Claude/Codex rotate their access token in place during a run, so after
+        # a run the daemon reads the credential file back and re-persists it to
+        # the DB if it changed. Serialized per provider by the write-back's own
+        # lock so two concurrent runs finishing at once can't clobber each other.
+        self._credential_write_back = CredentialWriteBack(conn, _cipher)
+        self._claude_credentials_path = (
+            claude_credentials_path
+            if claude_credentials_path is not None
+            else default_claude_credentials_path()
         )
         # Last Linear token applied to registered trackers via
         # `_refresh_linear_tracker_credentials`, so a tick only touches the
@@ -2966,6 +2989,21 @@ class _OrchestratorBase:
         )
         return RunCredentials(github_token=github_token, linear_token=linear_token)
 
+    async def _write_back_claude_credentials(self) -> None:
+        """After a Claude run, persist the (possibly refreshed) credential file
+        back to the DB if it changed (OAuth in UI 5/7). A no-op when Claude
+        isn't UI-connected, when the file is absent, or when nothing changed.
+        Never raises into the finished run — write-back is best-effort."""
+        credential = read_claude_credential(self._claude_credentials_path)
+        if not credential:
+            return
+        try:
+            await self._credential_write_back.write_back(
+                "claude", credential, expires_at=claude_expires_at(credential)
+            )
+        except Exception:  # noqa: BLE001 — write-back must never break a finished run
+            log.warning("claude credential write-back failed", exc_info=True)
+
     async def _run_stage_command(
         self,
         *,
@@ -3058,6 +3096,11 @@ class _OrchestratorBase:
                         break
         finally:
             self._active_run_ids.discard(run_id)
+        # Claude refreshes its access token in place during a run; persist the
+        # refreshed credential back to the DB so the next run (or a redeploy
+        # that lost the auth volume) doesn't need a re-auth (OAuth in UI 5/7).
+        if role.agent == "claude":
+            await self._write_back_claude_credentials()
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
         )
@@ -3361,6 +3404,10 @@ class _OrchestratorBase:
             self._active_run_ids.discard(run_id)
             if clear_pid_on_finish:
                 await db.runs.update_pid(self._conn, run_id, None)
+        # See `_run_stage_command`: a Claude fix/review run can also refresh its
+        # token in place, so persist the refreshed credential back (5/7).
+        if role.agent == "claude":
+            await self._write_back_claude_credentials()
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
         )

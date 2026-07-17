@@ -232,12 +232,57 @@ describe("ConnectionsPanel", () => {
     render(
       <ConnectionsPanel
         connections={[
-          { provider: "claude", label: "Claude", status: "not_connected", expires_at: null },
+          { provider: "codex", label: "Codex", status: "not_connected", expires_at: null },
         ]}
         onChanged={() => {}}
       />,
     );
     expect((screen.getByText("Connect") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("opens the Claude code-paste flow and submits the pasted code", async () => {
+    const fn = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      if (String(input).endsWith("/start")) {
+        return new Response(
+          JSON.stringify({
+            authorize_url: "https://claude.ai/oauth/authorize?code=1",
+            login_session: "sess-1",
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(JSON.stringify({ status: "connected", expires_at: null }), {
+        status: 200,
+      });
+    });
+    vi.stubGlobal("fetch", fn);
+    const onChanged = vi.fn();
+    render(
+      <ConnectionsPanel
+        connections={[
+          { provider: "claude", label: "Claude", status: "not_connected", expires_at: null },
+        ]}
+        onChanged={onChanged}
+      />,
+    );
+    // Claude is wired via code-paste, not a redirect.
+    expect((screen.getByText("Connect") as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByText("Connect"));
+    await waitFor(() => expect(screen.getByText(/claude\.ai\/oauth/)).toBeTruthy());
+
+    const input = screen.getByLabelText(/authorization code/i);
+    fireEvent.change(input, { target: { value: "pasted-code" } });
+    fireEvent.click(screen.getByText(/Submit/i));
+    await waitFor(() => expect(onChanged).toHaveBeenCalled());
+
+    expect(fn.mock.calls[0][0]).toBe("/api/oauth/claude/start");
+    const submit = fn.mock.calls.find((c) =>
+      String(c[0]).endsWith("/api/oauth/claude/submit-code"),
+    );
+    expect(submit).toBeTruthy();
+    const body = JSON.parse(String((submit?.[1] as RequestInit).body));
+    expect(body.code).toBe("pasted-code");
+    expect(body.login_session).toBe("sess-1");
   });
 });
 

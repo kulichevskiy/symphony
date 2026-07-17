@@ -27,7 +27,10 @@ import {
   type FieldError,
   type RoleCell,
   type RolesMatrix,
+  startClaudeLogin,
+  type ClaudeLoginStart,
   startOAuth,
+  submitClaudeCode,
   testConnection,
   updateBinding,
   updateRoles,
@@ -1315,10 +1318,12 @@ function connectionStatusClass(status: string): string {
   return "text-muted-foreground";
 }
 
-// Providers with a wired redirect-OAuth flow. GitHub (OAuth in UI 2/7) and
-// Linear (3/7) share the redirect engine; the CLI logins (Claude/Codex) arrive
-// in later slices, so their buttons stay inert until then.
-const WIRED_PROVIDERS = new Set(["github", "linear"]);
+// Providers with a wired Connect flow. GitHub (OAuth in UI 2/7) and Linear
+// (3/7) share the redirect engine; Claude (5/7) uses the code-paste login (no
+// browser-reachable callback). Codex arrives in 6/7, so its button stays inert.
+const WIRED_PROVIDERS = new Set(["github", "linear", "claude"]);
+// Providers whose Connect is the code-paste CLI login rather than a redirect.
+const CODE_PASTE_PROVIDERS = new Set(["claude"]);
 
 export function ConnectionCard({
   connection,
@@ -1330,7 +1335,13 @@ export function ConnectionCard({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [testResult, setTestResult] = useState<string | null>(null);
+  // Set while a Claude code-paste login is in flight: the CLI's OAuth URL to
+  // authorize + the login-session tying the pasted code back to the daemon's
+  // live subprocess.
+  const [claudeLogin, setClaudeLogin] = useState<ClaudeLoginStart | null>(null);
+  const [code, setCode] = useState("");
   const wired = WIRED_PROVIDERS.has(connection.provider);
+  const codePaste = CODE_PASTE_PROVIDERS.has(connection.provider);
   const connected =
     connection.status === "connected" || connection.status === "expired";
 
@@ -1338,12 +1349,35 @@ export function ConnectionCard({
     setBusy(true);
     setError(null);
     try {
+      if (codePaste) {
+        // No browser-reachable callback: surface the CLI's OAuth URL in a panel
+        // and take the pasted authorization code back (see submitCode below).
+        setClaudeLogin(await startClaudeLogin());
+        setBusy(false);
+        return;
+      }
       const { authorize_url } = await startOAuth(connection.provider);
       // Full-page navigation to the provider consent screen; it redirects back
       // to the ungated callback, which stores the token and returns us here.
       window.location.assign(authorize_url);
     } catch {
       setError("Couldn't start authorization — check the OAuth app config.");
+      setBusy(false);
+    }
+  }
+
+  async function submitCode() {
+    if (claudeLogin === null) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await submitClaudeCode(claudeLogin.login_session, code.trim());
+      setClaudeLogin(null);
+      setCode("");
+      onChanged?.();
+    } catch {
+      setError("Couldn't complete the login — the code may be wrong or expired.");
+    } finally {
       setBusy(false);
     }
   }
@@ -1411,6 +1445,37 @@ export function ConnectionCard({
           Test
         </Button>
       </div>
+      {claudeLogin ? (
+        <div className="mt-4 space-y-2">
+          <p className="text-xs text-muted-foreground">
+            Open this URL, authorize, then paste the code shown:
+          </p>
+          <a
+            href={claudeLogin.authorize_url}
+            target="_blank"
+            rel="noreferrer"
+            className="block break-all font-mono text-xs text-primary underline"
+          >
+            {claudeLogin.authorize_url}
+          </a>
+          <label className="block text-xs" htmlFor={`claude-code-${connection.provider}`}>
+            Authorization code
+          </label>
+          <Input
+            id={`claude-code-${connection.provider}`}
+            value={code}
+            onChange={(e) => setCode(e.target.value)}
+            autoComplete="off"
+          />
+          <Button
+            type="button"
+            onClick={submitCode}
+            disabled={busy || code.trim() === ""}
+          >
+            Submit
+          </Button>
+        </div>
+      ) : null}
       {testResult ? (
         <p className="mt-2 text-xs text-muted-foreground" role="status">
           Test: token is {testResult === "live" ? "live" : testResult}

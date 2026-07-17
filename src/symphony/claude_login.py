@@ -1,0 +1,219 @@
+"""Claude code-paste login driver + pending-login registry (OAuth in UI 5/7).
+
+Claude has no redirect-OAuth we can reach from the operator's browser (no
+localhost callback), so the daemon drives the `claude` CLI login as a
+subprocess instead:
+
+  * `start` spawns the login process and reads back the OAuth URL it prints —
+    the operator authorizes that in their own browser;
+  * `submit_code` writes the pasted authorization code to the process's stdin,
+    waits for it to finish writing its credentials file, and returns that
+    file's raw contents so the caller can encrypt + store it.
+
+The live subprocess handle has to survive *between* those two HTTP requests, so
+a `PendingLoginRegistry` (in-memory, single-process — Symphony is one daemon)
+holds it keyed by an unguessable login-session id minted on `start`. A daemon
+restart mid-login drops the handle; the operator just restarts the login
+(acceptable for single-tenant).
+
+The credential material is Claude's own `~/.claude/.credentials.json`: the whole
+JSON blob is what we store (so a later write-back can restore it byte-for-byte),
+and `claude_expires_at` reads the `expiresAt` out of it for the card's `Test`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+import secrets
+from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Protocol
+
+log = logging.getLogger(__name__)
+
+_SESSION_ENTROPY_BYTES = 32
+_ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+# The CLI prints its consent URL to stdout/stderr; grab the first https URL that
+# looks like an OAuth authorize link. Kept permissive so a minor URL change in
+# the CLI doesn't silently break capture.
+_URL_RE = re.compile(r"https://\S*oauth\S*", re.IGNORECASE)
+# How long to wait for the URL to appear / the login to complete after a code.
+_START_TIMEOUT_SECS = 60.0
+_SUBMIT_TIMEOUT_SECS = 120.0
+# The `claude` login invocation. `/login` drives the interactive OAuth flow;
+# stdin/stdout are piped so the daemon feeds the pasted code and scrapes the URL.
+DEFAULT_LOGIN_COMMAND: tuple[str, ...] = ("claude", "/login")
+
+
+class ClaudeLoginError(Exception):
+    """The login subprocess failed to surface a URL or complete on a code. The
+    router renders this as a failed connect, never a raw traceback."""
+
+
+class ClaudeLoginProcess(Protocol):
+    """One in-flight `claude` login. `start` returns the OAuth URL to show the
+    operator; `submit_code` feeds the pasted code and returns the raw credential
+    JSON the CLI wrote; `close` tears down a login that was abandoned."""
+
+    async def start(self) -> str: ...
+
+    async def submit_code(self, code: str) -> str: ...
+
+    async def close(self) -> None: ...
+
+
+class PendingLoginRegistry:
+    """In-memory, single-use registry of live login subprocesses keyed by an
+    unguessable session id. Single-process by design (one daemon); a daemon
+    restart drops any in-flight login."""
+
+    def __init__(self, *, id_factory: Callable[[], str] | None = None) -> None:
+        self._pending: dict[str, ClaudeLoginProcess] = {}
+        self._id_factory = id_factory or (lambda: secrets.token_urlsafe(_SESSION_ENTROPY_BYTES))
+
+    def add(self, process: ClaudeLoginProcess) -> str:
+        session_id = self._id_factory()
+        self._pending[session_id] = process
+        return session_id
+
+    def pop(self, session_id: str) -> ClaudeLoginProcess | None:
+        """Return and remove the handle for `session_id` (single-use), or `None`
+        if it is unknown / already consumed."""
+        return self._pending.pop(session_id, None)
+
+    async def discard(self, session_id: str) -> None:
+        """Drop and tear down an abandoned/failed login."""
+        process = self._pending.pop(session_id, None)
+        if process is not None:
+            await process.close()
+
+
+def default_claude_credentials_path() -> Path:
+    """Where the `claude` CLI writes its OAuth credentials (`HOME` is the
+    deployment's persistent auth volume — see docker-compose.yml)."""
+    return Path.home() / ".claude" / ".credentials.json"
+
+
+def read_claude_credential(path: Path) -> str | None:
+    """The raw contents of Claude's credentials file, or `None` if it doesn't
+    exist. Returned verbatim so a write-back can restore it byte-for-byte."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+
+
+def claude_expires_at(raw: str) -> str | None:
+    """The stored credential's access-token expiry as an absolute ISO timestamp
+    (`%Y-%m-%dT%H:%M:%SZ`), or `None` if the blob has no parseable `expiresAt`.
+
+    Claude stores it under `claudeAiOauth.expiresAt` as epoch milliseconds."""
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    oauth = payload.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    expires_ms = oauth.get("expiresAt")
+    if not isinstance(expires_ms, (int, float)) or isinstance(expires_ms, bool):
+        return None
+    return datetime.fromtimestamp(expires_ms / 1000, tz=UTC).strftime(_ISO_FORMAT)
+
+
+def claude_credential_expired(raw: str) -> bool:
+    """Whether the stored credential's access token is past its `expiresAt`.
+    A blob with no parseable expiry is treated as not-expired — the card's
+    `Test` reflects "live" rather than flipping a usable connection to expired
+    on a format we don't recognize."""
+    expires_at = claude_expires_at(raw)
+    if expires_at is None:
+        return False
+    deadline = datetime.strptime(expires_at, _ISO_FORMAT).replace(tzinfo=UTC)
+    return datetime.now(UTC) >= deadline
+
+
+class SubprocessClaudeLogin:
+    """Drives the real `claude` login CLI as a subprocess.
+
+    `start` spawns it and scrapes the OAuth URL off its output; `submit_code`
+    writes the pasted code to stdin, waits for the process to exit cleanly, and
+    reads back the credentials file it wrote. Faked in tests via
+    `ClaudeLoginProcess`."""
+
+    def __init__(
+        self,
+        *,
+        command: Sequence[str] = DEFAULT_LOGIN_COMMAND,
+        credentials_path: Path | None = None,
+        env: dict[str, str] | None = None,
+        start_timeout: float = _START_TIMEOUT_SECS,
+        submit_timeout: float = _SUBMIT_TIMEOUT_SECS,
+    ) -> None:
+        self._command = tuple(command)
+        self._credentials_path = credentials_path or default_claude_credentials_path()
+        self._env = env
+        self._start_timeout = start_timeout
+        self._submit_timeout = submit_timeout
+        self._proc: asyncio.subprocess.Process | None = None
+
+    async def start(self) -> str:
+        self._proc = await asyncio.create_subprocess_exec(
+            *self._command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=self._env,
+        )
+        try:
+            return await asyncio.wait_for(self._read_url(), timeout=self._start_timeout)
+        except ClaudeLoginError:
+            await self.close()
+            raise
+        except Exception as exc:  # noqa: BLE001 — surface any spawn/read failure cleanly
+            await self.close()
+            raise ClaudeLoginError("timed out waiting for the Claude login URL") from exc
+
+    async def _read_url(self) -> str:
+        assert self._proc is not None and self._proc.stdout is not None
+        while True:
+            raw = await self._proc.stdout.readline()
+            if not raw:
+                raise ClaudeLoginError("Claude login exited before printing a URL")
+            match = _URL_RE.search(raw.decode(errors="replace"))
+            if match is not None:
+                return match.group(0)
+
+    async def submit_code(self, code: str) -> str:
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            raise ClaudeLoginError("login process is not running")
+        proc.stdin.write(f"{code}\n".encode())
+        await proc.stdin.drain()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=self._submit_timeout)
+        except TimeoutError as exc:
+            await self.close()
+            raise ClaudeLoginError("timed out completing the Claude login") from exc
+        if proc.returncode != 0:
+            raise ClaudeLoginError(f"Claude login exited with code {proc.returncode}")
+        credential = read_claude_credential(self._credentials_path)
+        if not credential:
+            raise ClaudeLoginError("Claude login produced no credentials")
+        return credential
+
+    async def close(self) -> None:
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return
+        try:
+            proc.kill()
+            await proc.wait()
+        except ProcessLookupError:
+            pass
