@@ -222,7 +222,7 @@ class Reconciler:
         gh: GitHubClient,
         *,
         clock: Callable[[], datetime] | None = None,
-        gh_client_factory: Callable[[], Awaitable[GitHubClient]] | None = None,
+        gh_client_factory: Callable[[str | None], Awaitable[GitHubClient]] | None = None,
     ) -> None:
         self.config = config
         self._conn = conn
@@ -244,9 +244,18 @@ class Reconciler:
     def tracker(self, ctx: TrackerContext | None = None) -> IssueTracker:
         return self._trackers.resolve(ctx)
 
-    async def _gh_client(self) -> GitHubClient:
+    async def _gh_client(self, repo: str | None = None) -> GitHubClient:
+        """A GitHub client for `repo`.
+
+        `repo` must be passed whenever the immediately following call targets
+        a specific `[HOST/]OWNER/REPO` — the daemon's factory (`_base.py`'s
+        `_gh_client`) gates the github.com DB/`GH_TOKEN` promotion on it, so
+        omitting it would inject that fallback even for a GHE target that
+        must keep using its own host-specific auth (OAuth in UI 4/7 review
+        fix).
+        """
         if self._gh_client_factory is not None:
-            return await self._gh_client_factory()
+            return await self._gh_client_factory(repo)
         return self._gh
 
     def _now(self) -> datetime:
@@ -505,7 +514,7 @@ class Reconciler:
 
         if post_commit_review_request is not None:
             try:
-                gh = await self._gh_client()
+                gh = await self._gh_client(repo=post_commit_review_request.github_repo)
                 await gh.pr_comment(
                     post_commit_review_request.pr_number,
                     "@codex review",
@@ -709,8 +718,8 @@ class Reconciler:
         prs: list[LocalIssuePr],
     ) -> tuple[list[GithubPrObservation], dict[str, object]]:
         observations: list[GithubPrObservation] = []
-        gh = await self._gh_client()
         for pr in prs:
+            gh = await self._gh_client(repo=pr.github_repo)
             try:
                 view = await gh.pr_view(pr.pr_number, repo=pr.github_repo)
             except GitHubError as exc:
@@ -775,7 +784,6 @@ class Reconciler:
         }
         seen_repos: set[str] = set()
         orphans: list[_AdoptableOrphanPr] = []
-        gh = await self._gh_client()
         for binding in matched_bindings:
             if not binding.reconcile_enabled:
                 continue
@@ -783,6 +791,7 @@ class Reconciler:
             if repo_key in active_recorded_repos or repo_key in seen_repos:
                 continue
             seen_repos.add(repo_key)
+            gh = await self._gh_client(repo=binding.github_repo)
             head = f"{binding.branch_prefix}/{identifier}"
             try:
                 found = await gh.open_pr_for_head(head=head, repo=binding.github_repo)

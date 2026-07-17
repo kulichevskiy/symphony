@@ -2808,9 +2808,18 @@ class _OrchestratorBase:
         `gh` login, no `GH_TOKEN`) can still clone — otherwise every dispatch
         for that binding would fail at the very first workspace acquire
         (OAuth in UI 4/7 review fix). Mirrors `_gh_client`.
+
+        A deployment that followed the documented `gh auth login
+        --git-protocol ssh` setup has `gh repo clone` clone over SSH by
+        default, silently ignoring the resolved DB/`GH_TOKEN` credential —
+        so when a token was actually resolved, clone the explicit `https://`
+        URL to force `gh` onto the protocol that credential works with
+        (OAuth in UI 4/7 review fix).
         """
-        client = await self._gh_client(repo=repo)
-        await client.repo_clone(repo, dest)
+        github_token = await self._resolve_github_token(repo=repo)
+        client = GitHub(token=github_token) if github_token else self._gh
+        clone_target = f"https://github.com/{'/'.join(repo.split('/')[-2:])}" if github_token else repo
+        await client.repo_clone(clone_target, dest)
 
     async def _fetch_with_resolved_auth(self, repo: str, workspace_path: Path) -> None:
         """Fetch `origin` in an already-cloned workspace using the DB-resolved
@@ -2826,7 +2835,7 @@ class _OrchestratorBase:
         github_token = await self._resolve_github_token(repo=repo)
         await _git_fetch(workspace_path, github_token=github_token)
 
-    async def _gh_client(self, *, repo: str | None = None) -> GitHubClient:
+    async def _gh_client(self, repo: str | None = None) -> GitHubClient:
         """A GitHub client using the DB-resolved token when available.
 
         Every `self._gh_client()` call site (pushes aside — those go through
