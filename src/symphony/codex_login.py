@@ -252,6 +252,9 @@ async def refresh_codex_credential(
         tokens["refresh_token"] = new_refresh
     payload = dict(payload)
     payload["tokens"] = tokens
+    # codex stamps last_refresh on every refresh (chrono Utc::now, RFC3339);
+    # leaving the old value would misreport freshness / re-trigger refreshes.
+    payload["last_refresh"] = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     return json.dumps(payload)
 
 

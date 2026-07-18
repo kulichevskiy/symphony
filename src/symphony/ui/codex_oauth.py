@@ -93,6 +93,12 @@ def create_codex_oauth_router(
     # Serializes the terminal poll's persist against disconnect so a success
     # landing mid-disconnect can't re-create the row the operator just cleared.
     op_lock = asyncio.Lock()
+    # Bumped on every disconnect. `start()` can block up to a minute waiting for
+    # the CLI to print the device code — before it's in the registry, so
+    # discard_all() can't see it. Capturing the generation across the wait lets
+    # start discard a login whose disconnect landed mid-`start()` instead of
+    # adding it (a later poll would otherwise persist post-disconnect creds).
+    generation = {"n": 0}
 
     @router.get("/start")
     async def codex_start() -> dict[str, str]:
@@ -101,6 +107,7 @@ def create_codex_oauth_router(
                 status_code=503,
                 detail="SYMPHONY_ENCRYPTION_KEY is not configured; cannot store credentials",
             )
+        started_generation = generation["n"]
         process = login_factory()
         try:
             device_auth = await process.start()
@@ -108,7 +115,15 @@ def create_codex_oauth_router(
             _log.warning("codex login failed to start: %s", exc)
             await process.close()
             raise HTTPException(status_code=502, detail="could not start the Codex login") from exc
-        login_session = registry.add(process)
+        async with op_lock:
+            if generation["n"] != started_generation:
+                # A disconnect landed while we waited for the device code —
+                # drop this login instead of registering it.
+                await process.close()
+                raise HTTPException(
+                    status_code=409, detail="login superseded by a disconnect; restart the login"
+                )
+            login_session = registry.add(process)
         return {
             "verification_uri": device_auth.verification_uri,
             "user_code": device_auth.user_code,
@@ -165,6 +180,7 @@ def create_codex_oauth_router(
         # can neither slip its persist in before the delete nor pop a session
         # this already tore down (it returns not_connected instead).
         async with op_lock:
+            generation["n"] += 1
             await registry.discard_all()
             conn = await conn_provider()
             await db.oauth_connections.delete(conn, _PROVIDER)
@@ -191,7 +207,7 @@ def create_codex_oauth_router(
                 provider=_PROVIDER,
                 status="expired",
                 updated_at=_now_iso(clock),
-                updated_by="oauth",
+                updated_by="test",
             )
             return {"status": "expired"}
         if not credential:
@@ -210,12 +226,15 @@ def create_codex_oauth_router(
         # still a working connection (the CLI refreshes in its per-run dir and
         # the write-back persists it). Only refreshless expiry is dead.
         live = not codex_credential_expired(credential) or _has_refresh_token(credential)
+        # updated_by="test", NOT "oauth": a liveness Test is not an operator
+        # reconnect, so the auth-failure stale-run guard must not treat a Test
+        # click mid-run as "operator reconnected" and suppress expiry (review fix).
         await db.oauth_connections.update_status(
             conn,
             provider=_PROVIDER,
             status="connected" if live else "expired",
             updated_at=_now_iso(clock),
-            updated_by="oauth",
+            updated_by="test",
         )
         return {"status": "live" if live else "expired"}
 

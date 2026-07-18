@@ -299,3 +299,27 @@ async def test_test_does_not_resurrect_auth_failure_expiry(tmp_path: Path) -> No
         assert status is not None and status.status == "expired"
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_test_does_not_count_as_reconnect(tmp_path: Path) -> None:
+    """A liveness Test stamps updated_by='test', not 'oauth' — the auth-failure
+    stale-run guard treats only 'oauth' (a real reconnect) as "changed
+    underneath", so a Test click mid-run can't suppress a later expiry."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        await db.oauth_connections.set_connection(
+            conn,
+            provider="codex",
+            credential=_credential(_FUTURE),
+            cipher=CredentialCipher(_KEY),
+            status="connected",
+            updated_by="oauth",
+        )
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            await client.post("/api/oauth/codex/test")
+        status = await db.oauth_connections.get_status(conn, "codex")
+        assert status is not None and status.updated_by == "test"
+    finally:
+        await conn.close()
