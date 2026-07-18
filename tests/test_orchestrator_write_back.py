@@ -7,6 +7,7 @@ that dir at finalize, and the dir is torn down."""
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -64,7 +65,7 @@ async def test_materialize_finalize_round_trip_with_refresh(tmp_path: Path) -> N
         assert await db.oauth_connections.get_credential(harness.conn, "claude", cipher) == _cred(
             "tok-v1"
         )
-        assert not config_dir.exists()  # torn down with the run
+        assert config_dir.name not in os.listdir(config_dir.parent)  # torn down
 
         # Run 2 starts from the refreshed credential.
         env2 = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
