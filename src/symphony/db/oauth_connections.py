@@ -169,17 +169,23 @@ async def assert_cipher_usable(conn: aiosqlite.Connection, cipher: CredentialCip
     instruction instead of surfacing as silent OAuth 503s at runtime. A store
     with no encrypted rows passes regardless of the cipher."""
     cur = await conn.execute(
-        "SELECT provider, credential FROM oauth_connections WHERE length(credential) > 0"
+        "SELECT provider, credential, refresh_token FROM oauth_connections"
+        " WHERE length(credential) > 0"
     )
     rows = await cur.fetchall()
     if not rows:
         return
-    broken: list[str] = []
+    broken: set[str] = set()
     for row in rows:
         try:
             cipher.decrypt(bytes(row["credential"]))
+            # The refresh token matters as much as the access token — a Linear
+            # row whose access token decrypts but whose refresh token is corrupt
+            # dies at the first in-place refresh (Config v2 2/9 review fix).
+            if row["refresh_token"] is not None:
+                cipher.decrypt(bytes(row["refresh_token"]))
         except (CredentialDecryptError, CredentialKeyMissingError):
-            broken.append(str(row["provider"]))
+            broken.add(str(row["provider"]))
     if broken:
         raise EncryptionKeyLostError(sorted(broken))
 

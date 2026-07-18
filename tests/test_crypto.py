@@ -91,3 +91,13 @@ def test_key_fingerprint_stable_and_never_the_key() -> None:
     assert len(fp) == 12
     assert "deployment-secret" not in fp
     assert key_fingerprint("") == ""
+
+
+def test_resolve_key_race_loser_adopts_winners_key(tmp_path: Path) -> None:
+    """Two overlapping first boots must agree on one key: once a winner's file
+    exists, a second resolve returns its key rather than a new one."""
+    winner = resolve_encryption_key("", tmp_path)
+    loser = resolve_encryption_key("", tmp_path)
+    assert loser == winner
+    # No stray temp files left behind.
+    assert [n for n in os.listdir(tmp_path) if n.startswith(".encryption_key.tmp")] == []
