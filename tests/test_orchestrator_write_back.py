@@ -17,6 +17,7 @@ import respx
 
 from symphony import db
 from symphony.claude_login import CLAUDE_OAUTH_TOKEN_URL
+from symphony.codex_login import CODEX_REFRESH_TOKEN_URL
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.crypto import CredentialCipher
 from tests.harness import Harness
@@ -363,6 +364,7 @@ def _codex_cred_soon(access: str = "at", refresh: str = "rt") -> str:
 
 
 @pytest.mark.asyncio
+@respx.mock
 async def test_codex_central_refresh_serialized_and_written_back(tmp_path: Path) -> None:
     """SYM-217: a near-expiry codex row is refreshed centrally (via the CLI
     seam) exactly once under concurrency, and the refresh is persisted."""
@@ -372,20 +374,15 @@ async def test_codex_central_refresh_serialized_and_written_back(tmp_path: Path)
         await db.oauth_connections.set_connection(
             harness.conn, provider="codex", credential=_codex_cred_soon(), cipher=cipher
         )
-        calls = {"n": 0}
-        fresh = json.dumps({"tokens": {"access_token": "fresh", "refresh_token": "rt2"}})
-
-        async def fake_cli_refresh(_credential: str) -> str:
-            calls["n"] += 1
-            return fresh
-
-        harness.orch._run_codex_cli_refresh = fake_cli_refresh  # type: ignore[assignment]  # noqa: SLF001
+        route = respx.post(CODEX_REFRESH_TOKEN_URL).mock(
+            return_value=httpx.Response(200, json={"access_token": "fresh", "refresh_token": "rt2"})
+        )
         env_a, env_b = await asyncio.gather(
             harness.orch._materialize_claude_env("codex"),  # noqa: SLF001
             harness.orch._materialize_claude_env("codex"),  # noqa: SLF001
         )
         try:
-            assert calls["n"] == 1  # serialized: second dispatch reused the refresh
+            assert route.call_count == 1  # serialized: second dispatch reused the refresh
             for env in (env_a, env_b):
                 blob = (Path(env["CODEX_HOME"]) / "auth.json").read_text(encoding="utf-8")
                 assert json.loads(blob)["tokens"]["access_token"] == "fresh"
@@ -399,6 +396,7 @@ async def test_codex_central_refresh_serialized_and_written_back(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+@respx.mock
 async def test_codex_central_refresh_fail_open(tmp_path: Path) -> None:
     """A CLI refresh that can't run leaves the run to refresh in-place — the
     codex dispatch is never blocked (fail-open, unlike claude)."""
@@ -409,10 +407,7 @@ async def test_codex_central_refresh_fail_open(tmp_path: Path) -> None:
             harness.conn, provider="codex", credential=_codex_cred_soon(), cipher=cipher
         )
 
-        async def failed_refresh(_credential: str) -> None:
-            return None
-
-        harness.orch._run_codex_cli_refresh = failed_refresh  # type: ignore[assignment]  # noqa: SLF001
+        respx.post(CODEX_REFRESH_TOKEN_URL).mock(return_value=httpx.Response(400, json={}))
         env = await harness.orch._materialize_claude_env("codex")  # noqa: SLF001
         try:
             assert env.get("CODEX_HOME")  # dispatch proceeds

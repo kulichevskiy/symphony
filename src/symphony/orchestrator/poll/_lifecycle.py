@@ -1583,21 +1583,23 @@ class _LifecycleMixin(_OrchestratorBase):
                     reviewer_codex_model=reviewer_role.attribution_codex_model(),
                     verifier_codex_model=verifier_role.attribution_codex_model(),
                 )
-                # A local-review subprocess (reviewer/verifier/fixer) that died
-                # on auth surfaces as LoopResult.api_error — the stage-runner
-                # flag hooks don't see it, so flag here for each UI-backed agent
-                # role, flipping the card + arming the dispatch gate (Config v2
-                # 6/9 review fix).
-                lr_api_error = result.api_error if result is not None else None
-                if lr_api_error is not None:
-                    for lr_agent in lr_role_agents & _AGENT_CRED_LAYOUT.keys():
-                        await self._flag_claude_auth_failure(
-                            lr_agent,
-                            lr_api_error,
-                            run_started_at=local_review_started_at,
-                            provider=lr_agent,
-                        )
+                # Write-back first, THEN flag: an auth-failure expire must
+                # land after finalize's write-back, or the write-back would
+                # re-persist the row as connected (Config v2 6/9 review fix).
                 await self._finalize_claude_env(claude_env)
+                # A local-review subprocess that died on auth surfaces as
+                # LoopResult.api_error tagged with the failing agent — flag ONLY
+                # that provider (a claude reviewer failing must not expire a
+                # codex fixer), flipping the card + arming the dispatch gate.
+                lr_api_error = result.api_error if result is not None else None
+                lr_failed_agent = result.api_error_agent if result is not None else None
+                if lr_api_error is not None and lr_failed_agent in _AGENT_CRED_LAYOUT:
+                    await self._flag_claude_auth_failure(
+                        lr_failed_agent,
+                        lr_api_error,
+                        run_started_at=local_review_started_at,
+                        provider=lr_failed_agent,
+                    )
 
             log.info(
                 "local-review phase for %s ended in %s (iterations=%d, strategy=%s, reviewer=%s)",

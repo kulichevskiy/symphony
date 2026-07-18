@@ -132,10 +132,14 @@ def create_codex_oauth_router(
             # Terminal: consume the session, then persist encrypted — under the
             # op lock so a concurrent disconnect fully wins or fully loses.
             async with op_lock:
-                if registry.pop(body.login_session) is None:
+                popped = registry.pop(body.login_session)
+                if popped is None:
                     # A concurrent disconnect already tore this session down;
                     # don't resurrect the row it cleared.
                     return {"status": "not_connected", "expires_at": None}
+                # Close the finished login subprocess + its private home — pop
+                # alone leaves the temp CODEX_HOME and process handle behind.
+                await popped.close()
                 expires_at = codex_expires_at(result.credential)
                 conn = await conn_provider()
                 await db.oauth_connections.set_connection(

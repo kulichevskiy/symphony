@@ -39,6 +39,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+import httpx
+
 log = logging.getLogger(__name__)
 
 _ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
@@ -189,6 +191,67 @@ def codex_expires_at(raw: str) -> str | None:
     return datetime.fromtimestamp(exp, tz=UTC).strftime(_ISO_FORMAT)
 
 
+# codex's own OAuth client + refresh endpoint (from openai/codex
+# codex-rs/login/src/auth/manager.rs): the daemon refreshes the stored token
+# with the same standard refresh grant the CLI uses, so it's a plain HTTP call
+# (testable), not a CLI invocation. Env overrides mirror the CLI's.
+CODEX_OAUTH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
+CODEX_REFRESH_TOKEN_URL = "https://auth.openai.com/oauth/token"
+_CODEX_REFRESH_TIMEOUT_SECS = 30.0
+
+
+async def refresh_codex_credential(
+    raw: str, *, client: httpx.AsyncClient | None = None
+) -> str | None:
+    """Exchange the codex credential blob's refresh token for a fresh access
+    token and return the rebuilt `auth.json` blob (unrelated fields preserved),
+    or `None` when there's no refresh token or the exchange fails. Never raises.
+
+    Uses codex's documented refresh grant (client_id + POST
+    auth.openai.com/oauth/token, grant_type=refresh_token). `access_token` and
+    `refresh_token` are updated; `id_token` and everything else are left as-is
+    (codex stores id_token as parsed claims — the daemon only needs the access
+    token live)."""
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    if not isinstance(tokens, dict):
+        return None
+    refresh_token = tokens.get("refresh_token")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        return None
+    client_id = os.environ.get("CODEX_APP_SERVER_LOGIN_CLIENT_ID", CODEX_OAUTH_CLIENT_ID)
+    url = os.environ.get("CODEX_REFRESH_TOKEN_URL_OVERRIDE", CODEX_REFRESH_TOKEN_URL)
+    data = {"client_id": client_id, "grant_type": "refresh_token", "refresh_token": refresh_token}
+    owns = client is None
+    http = client or httpx.AsyncClient(timeout=_CODEX_REFRESH_TIMEOUT_SECS)
+    try:
+        resp = await http.post(url, json=data)
+        if resp.status_code != 200:
+            log.warning("codex token refresh failed with HTTP %d", resp.status_code)
+            return None
+        body = resp.json()
+    except (httpx.HTTPError, ValueError):
+        log.warning("codex token refresh failed", exc_info=True)
+        return None
+    finally:
+        if owns:
+            await http.aclose()
+    access_token = body.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        return None
+    tokens = dict(tokens)
+    tokens["access_token"] = access_token
+    new_refresh = body.get("refresh_token")
+    if isinstance(new_refresh, str) and new_refresh:
+        tokens["refresh_token"] = new_refresh
+    payload = dict(payload)
+    payload["tokens"] = tokens
+    return json.dumps(payload)
+
+
 def codex_credential_expires_within(raw: str, horizon_secs: float) -> bool:
     """Whether the codex access token expires within `horizon_secs` from now
     (Config v2 4/9 extended to codex, SYM-217): the daemon refreshes centrally
@@ -243,9 +306,10 @@ class SubprocessCodexLogin:
                 Path(tempfile.mkdtemp(prefix="symphony-codex-login-")) / "auth.json"
             )
             self._owns_home = True
-        self._env = dict(env or {})
-        # Point the CLI at that private home so it writes auth.json there.
-        self._env.setdefault("CODEX_HOME", str(self._credentials_path.parent))
+        # Inherit the daemon env (PATH etc. the CLI needs) unless the caller
+        # passed an explicit env; then point CODEX_HOME at the private home.
+        self._env = dict(env) if env is not None else dict(os.environ)
+        self._env["CODEX_HOME"] = str(self._credentials_path.parent)
         self._start_timeout = start_timeout
         self._proc: asyncio.subprocess.Process | None = None
         self._drain_task: asyncio.Task[None] | None = None

@@ -612,6 +612,7 @@ async def run_local_review_session(
 
     return await run_local_review_loop(
         reviewer_agent=reviewer_role.agent,
+        fixer_agent=fixer_role.agent,
         reviewer=_reviewer,
         fixer=_fixer,
         cap=cap,

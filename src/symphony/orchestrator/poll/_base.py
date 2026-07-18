@@ -16,7 +16,6 @@ pre-split `Orchestrator`.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import inspect
 
 # --- imports merged from the pre-split poll/__init__.py (SYM-151) ---
@@ -60,6 +59,7 @@ from ...codex_login import (
     codex_expires_at,
     default_codex_credentials_path,
     pin_file_auth_storage,
+    refresh_codex_credential,
 )
 from ...config import Config, RepoBinding, ResolvedRole, binding_natural_key
 from ...credentials import (
@@ -3084,37 +3084,6 @@ class _OrchestratorBase:
             )
             return refreshed
 
-    async def _run_codex_cli_refresh(self, credential: str) -> str | None:
-        """Refresh a codex credential by running the codex CLI once in an
-        isolated CODEX_HOME (spec decision 7, plan B — codex has no
-        daemon-side token endpoint). Materializes `credential`, runs the CLI's
-        non-interactive status command (which loads + refreshes the token),
-        reads `auth.json` back. Returns the refreshed blob, or `None` on any
-        failure. Overridden in tests. Never raises."""
-        home = Path(tempfile.mkdtemp(prefix="symphony-codex-refresh-"))
-        try:
-            (home / "auth.json").write_text(credential, encoding="utf-8")
-            pin_file_auth_storage(home)
-            proc = await asyncio.create_subprocess_exec(
-                *CODEX_REFRESH_COMMAND,
-                env={**os.environ, "CODEX_HOME": str(home)},
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=_CODEX_REFRESH_TIMEOUT_SECS)
-            except TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                return None
-            if proc.returncode != 0:
-                return None
-            return read_claude_credential(home / "auth.json")
-        except (OSError, asyncio.CancelledError):
-            return None
-        finally:
-            shutil.rmtree(home, ignore_errors=True)
-
     async def _maybe_refresh_codex_credential(self, credential: str) -> str | None:
         """Central proactive codex refresh (SYM-217). Mirrors the claude path
         (serialized, CAS write-back, near-expiry trigger), but refreshes via
@@ -3131,7 +3100,7 @@ class _OrchestratorBase:
                 return None
             if not codex_credential_expires_within(current, horizon):
                 return current
-            refreshed = await self._run_codex_cli_refresh(current)
+            refreshed = await refresh_codex_credential(current)
             if not refreshed or refreshed == current:
                 log.info("codex central refresh unavailable/no-op; run will refresh in-place")
                 return current
@@ -3250,13 +3219,12 @@ class _OrchestratorBase:
             low = stdout.lower()
             _auth_phrases = (
                 "not logged in",
-                "unauthorized",
-                "401",
-                "authentication",
-                "refresh token",
-                "re-authenticate",
-                "please run",
-                "log in again",
+                "please run /login",
+                "authentication_error",
+                "invalid api key",
+                "refresh token expired",
+                "refresh_token_expired",
+                "401 unauthorized",
             )
             if any(phrase in low for phrase in _auth_phrases):
                 api_error = StreamApiError(message="authentication failure", status=401)
@@ -4483,12 +4451,6 @@ _AGENT_CRED_LAYOUT: dict[str, tuple[str, str]] = {
 # Refresh horizon when no wall-clock cap is configured (Config v2 4/9): a
 # token must outlive the longest plausible run so the CLI never refreshes.
 _DEFAULT_REFRESH_HORIZON_SECS = 2 * 60 * 60
-# The codex CLI invocation the daemon runs to force a token refresh in an
-# isolated CODEX_HOME (SYM-217, plan B). `login status` loads + refreshes the
-# stored token non-interactively. CONFIRM against a live codex on first
-# connect — it is the one piece this slice couldn't exercise.
-CODEX_REFRESH_COMMAND: tuple[str, ...] = ("codex", "login", "status")
-_CODEX_REFRESH_TIMEOUT_SECS = 60.0
 
 
 MERGE_WAIT_RECONCILE_INTERVAL_SECS = 600
