@@ -902,34 +902,35 @@ class _AcceptanceMixin(_OrchestratorBase):
                             visual_acceptance=effective_mode in {"dev", "preview"},
                         )
                         # Acceptance spawns its own runner rather than going
-                        # through `_run_stage_command`/`_run_runner`, so it needs
-                        # the same Claude credential restore-before/write-back-
-                        # after as those (OAuth in UI 5/7 review fix).
-                        if accept_role.agent == "claude":
-                            await self._restore_claude_credentials()
-                        verdict = await run_acceptance(
-                            runner=self._runner,
-                            run_id=run_id,
-                            workspace_path=workspace_path,
-                            mode=effective_mode,
-                            linear_description=issue.description,
-                            pr_diff_summary=pr_diff_summary,
-                            taste_guide=load_taste_guide(
-                                binding_taste_guide=binding.acceptance.taste_guide,
-                            ),
-                            criteria=criteria_predicates,
-                            stall_secs=binding.acceptance.time_cap_minutes * 60,
-                            preview_url=preview_url,
-                            dev_command=binding.acceptance.dev_command,
-                            dev_port=binding.acceptance.dev_port,
-                            log_root=self.config.log_root,
-                            agent=accept_role.agent,
-                            codex_model=role_codex_model(accept_role),
-                            claude_model=role_claude_model(accept_role),
-                            effort=accept_role.effort,
-                        )
-                        if accept_role.agent == "claude":
-                            await self._write_back_claude_credentials()
+                        # through `_run_stage_command`/`_run_runner`, so it gets
+                        # the same per-run Claude credential materialization +
+                        # write-back as those (Config v2 3/9).
+                        claude_env = await self._materialize_claude_env(accept_role.agent)
+                        try:
+                            verdict = await run_acceptance(
+                                runner=self._runner,
+                                run_id=run_id,
+                                workspace_path=workspace_path,
+                                mode=effective_mode,
+                                linear_description=issue.description,
+                                pr_diff_summary=pr_diff_summary,
+                                taste_guide=load_taste_guide(
+                                    binding_taste_guide=binding.acceptance.taste_guide,
+                                ),
+                                criteria=criteria_predicates,
+                                stall_secs=binding.acceptance.time_cap_minutes * 60,
+                                preview_url=preview_url,
+                                dev_command=binding.acceptance.dev_command,
+                                dev_port=binding.acceptance.dev_port,
+                                log_root=self.config.log_root,
+                                agent=accept_role.agent,
+                                codex_model=role_codex_model(accept_role),
+                                claude_model=role_claude_model(accept_role),
+                                effort=accept_role.effort,
+                                extra_env=claude_env,
+                            )
+                        finally:
+                            await self._finalize_claude_env(claude_env)
                         await _record_run_model_usage(
                             self._conn,
                             run_id,

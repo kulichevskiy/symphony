@@ -23,6 +23,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import tempfile
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -48,7 +50,6 @@ from ...agent.runner import Runner, RunnerSpec
 from ...agent.runners.local import LocalRunner
 from ...claude_login import (
     claude_expires_at,
-    default_claude_credentials_path,
     read_claude_credential,
 )
 from ...config import Config, RepoBinding, ResolvedRole, binding_natural_key
@@ -395,7 +396,6 @@ class _OrchestratorBase:
         tracker_factory: Callable[[RepoBinding], IssueTracker | Awaitable[IssueTracker]]
         | None = None,
         repo_secret_view: db.config_repo_secrets.RepoSecretView | None = None,
-        claude_credentials_path: Path | None = None,
     ) -> None:
         self.config = config
         if isinstance(tracker_or_registry, TrackerRegistry):
@@ -487,11 +487,6 @@ class _OrchestratorBase:
         # the DB if it changed. Serialized per provider by the write-back's own
         # lock so two concurrent runs finishing at once can't clobber each other.
         self._credential_write_back = CredentialWriteBack(conn, self._cipher)
-        self._claude_credentials_path = (
-            claude_credentials_path
-            if claude_credentials_path is not None
-            else default_claude_credentials_path()
-        )
         # Last Linear token applied to registered trackers via
         # `_refresh_linear_tracker_credentials`, so a tick only touches the
         # client's header when the DB token actually changed.
@@ -2989,48 +2984,66 @@ class _OrchestratorBase:
         )
         return RunCredentials(github_token=github_token, linear_token=linear_token)
 
-    async def _restore_claude_credentials(self) -> None:
-        """Before a Claude run, restore the credentials file from the DB's
-        connected/expired Claude row if the file is missing — a redeploy or
-        volume loss can drop the auth volume while the DB still holds the last
-        write-back (OAuth in UI 5/7 review fix). A no-op when the file already
-        exists, Claude isn't UI-connected, or the stored credential can't be
-        decrypted. Never raises into the run — restore is best-effort, mirroring
-        `_write_back_claude_credentials`."""
-        if read_claude_credential(self._claude_credentials_path) is not None:
-            return
+    async def _resolve_claude_credential(self) -> str | None:
+        """The UI-stored Claude credential blob, or `None` when Claude isn't
+        UI-connected or the stored credential can't be decrypted (the run then
+        falls back to whatever ambient auth the environment provides)."""
         status = await db.oauth_connections.get_status(self._conn, "claude")
         if status is None or status.status not in ("connected", "expired"):
-            return
+            return None
         try:
             credential = await db.oauth_connections.get_credential(
                 self._conn, "claude", self._cipher
             )
         except (CredentialDecryptError, CredentialKeyMissingError):
-            return
-        if not credential:
-            return
-        try:
-            self._claude_credentials_path.parent.mkdir(parents=True, exist_ok=True)
-            self._claude_credentials_path.write_text(credential, encoding="utf-8")
-            self._claude_credentials_path.chmod(0o600)
-        except OSError:
-            log.warning("claude credential restore failed", exc_info=True)
+            return None
+        return credential or None
 
-    async def _write_back_claude_credentials(self) -> None:
-        """After a Claude run, persist the (possibly refreshed) credential file
-        back to the DB if it changed (OAuth in UI 5/7). A no-op when Claude
-        isn't UI-connected, when the file is absent, or when nothing changed.
-        Never raises into the finished run — write-back is best-effort."""
-        credential = read_claude_credential(self._claude_credentials_path)
-        if not credential:
-            return
+    async def _materialize_claude_env(self, agent: str) -> dict[str, str]:
+        """Per-run Claude credential materialization (Config v2 3/9).
+
+        For a Claude run with a UI-stored credential, writes it into a private,
+        single-run config dir and returns `{"CLAUDE_CONFIG_DIR": ...}` so the
+        CLI authenticates off the DB copy — concurrent runs each get their own
+        dir, so they can never race one shared credentials file. Returns `{}`
+        (and materializes nothing) for non-Claude runs or when Claude isn't
+        UI-connected. The caller MUST pass the returned env to
+        `_finalize_claude_env` when the run ends — that reads the (possibly
+        refreshed) credential back for the DB write-back and removes the dir."""
+        if agent != "claude":
+            return {}
+        credential = await self._resolve_claude_credential()
+        if credential is None:
+            return {}
+        config_dir = Path(tempfile.mkdtemp(prefix="symphony-claude-"))
         try:
-            await self._credential_write_back.write_back(
-                "claude", credential, expires_at=claude_expires_at(credential)
-            )
-        except Exception:  # noqa: BLE001 — write-back must never break a finished run
-            log.warning("claude credential write-back failed", exc_info=True)
+            os.chmod(config_dir, 0o700)
+            credentials_path = config_dir / ".credentials.json"
+            credentials_path.write_text(credential, encoding="utf-8")
+            credentials_path.chmod(0o600)
+        except OSError:
+            log.warning("claude credential materialization failed", exc_info=True)
+            shutil.rmtree(config_dir, ignore_errors=True)
+            return {}
+        return {"CLAUDE_CONFIG_DIR": str(config_dir)}
+
+    async def _finalize_claude_env(self, claude_env: dict[str, str]) -> None:
+        """Tear down a `_materialize_claude_env` dir: persist the (possibly
+        refreshed) credential back to the DB if it changed (OAuth in UI 5/7),
+        then remove the per-run dir. A no-op for `{}`. Never raises into the
+        finished run — write-back is best-effort."""
+        config_dir = claude_env.get("CLAUDE_CONFIG_DIR")
+        if not config_dir:
+            return
+        credential = read_claude_credential(Path(config_dir) / ".credentials.json")
+        if credential:
+            try:
+                await self._credential_write_back.write_back(
+                    "claude", credential, expires_at=claude_expires_at(credential)
+                )
+            except Exception:  # noqa: BLE001 — write-back must never break a finished run
+                log.warning("claude credential write-back failed", exc_info=True)
+        shutil.rmtree(config_dir, ignore_errors=True)
 
     async def _run_stage_command(
         self,
@@ -3046,11 +3059,14 @@ class _OrchestratorBase:
         prior_total: float,
     ) -> tuple[UsageDelta, str, int | None]:
         storage_issue_id = storage_issue_id or issue.id
+        # Per-run private CLAUDE_CONFIG_DIR from the DB credential (Config v2
+        # 3/9); binding env still overrides. Torn down in `finally` below.
+        claude_env = await self._materialize_claude_env(role.agent)
         spec = RunnerSpec(
             run_id=run_id,
             workspace_path=workspace_path,
             command=command,
-            env=dict(binding.env),
+            env={**claude_env, **binding.env},
             stall_secs=self.config.stall_timeout_secs,
             command_secs=self.config.command_timeout_secs,
             wall_clock_secs=self.config.wall_clock_timeout_secs,
@@ -3058,8 +3074,6 @@ class _OrchestratorBase:
             credentials=await self._resolve_run_credentials(binding),
             github_host=github_host_for_repo(binding.github_repo),
         )
-        if role.agent == "claude":
-            await self._restore_claude_credentials()
 
         log_path = self.config.log_root / f"{run_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3126,11 +3140,10 @@ class _OrchestratorBase:
                         break
         finally:
             self._active_run_ids.discard(run_id)
-        # Claude refreshes its access token in place during a run; persist the
-        # refreshed credential back to the DB so the next run (or a redeploy
-        # that lost the auth volume) doesn't need a re-auth (OAuth in UI 5/7).
-        if role.agent == "claude":
-            await self._write_back_claude_credentials()
+            # Claude refreshes its access token in place during a run; persist
+            # the refreshed credential from the per-run dir back to the DB and
+            # remove the dir (Config v2 3/9).
+            await self._finalize_claude_env(claude_env)
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
         )
@@ -3353,11 +3366,14 @@ class _OrchestratorBase:
         prior_total: float = 0.0,
         clear_pid_on_finish: bool = False,
     ) -> tuple[UsageDelta, str, int | None]:
+        # Per-run private CLAUDE_CONFIG_DIR from the DB credential (Config v2
+        # 3/9); binding env still overrides. Torn down in `finally` below.
+        claude_env = await self._materialize_claude_env(role.agent)
         spec = RunnerSpec(
             run_id=run_id,
             workspace_path=workspace_path,
             command=command,
-            env=dict(binding.env),
+            env={**claude_env, **binding.env},
             stall_secs=self.config.stall_timeout_secs,
             command_secs=self.config.command_timeout_secs,
             wall_clock_secs=self.config.wall_clock_timeout_secs,
@@ -3365,8 +3381,6 @@ class _OrchestratorBase:
             credentials=await self._resolve_run_credentials(binding),
             github_host=github_host_for_repo(binding.github_repo),
         )
-        if role.agent == "claude":
-            await self._restore_claude_credentials()
 
         log_path = self.config.log_root / f"{run_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3436,10 +3450,9 @@ class _OrchestratorBase:
             self._active_run_ids.discard(run_id)
             if clear_pid_on_finish:
                 await db.runs.update_pid(self._conn, run_id, None)
-        # See `_run_stage_command`: a Claude fix/review run can also refresh its
-        # token in place, so persist the refreshed credential back (5/7).
-        if role.agent == "claude":
-            await self._write_back_claude_credentials()
+            # See `_run_stage_command`: a Claude fix/review run can also refresh
+            # its token in place — write back from the per-run dir + tear down.
+            await self._finalize_claude_env(claude_env)
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
         )

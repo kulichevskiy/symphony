@@ -1524,21 +1524,17 @@ class _LifecycleMixin(_OrchestratorBase):
 
             # Local review builds its own RunnerSpec / collect_runner_output
             # instead of going through `_run_stage_command`/`_run_runner`, so it
-            # needs the same Claude credential restore-before / write-back-after
-            # when any of its roles runs on Claude — otherwise a UI-connected
-            # Claude (DB-only creds after a redeploy / lost auth volume) leaves
-            # the reviewer/verifier/fixer subprocesses with no credentials file
-            # (OAuth in UI 5/7 review fix).
-            local_review_uses_claude = "claude" in {
-                reviewer_role.agent,
-                verifier_role.agent,
-                fixer_role.agent,
-            }
+            # gets the same per-run Claude credential materialization +
+            # write-back (Config v2 3/9) when any of its roles runs on Claude.
+            local_review_agent = (
+                "claude"
+                if "claude" in {reviewer_role.agent, verifier_role.agent, fixer_role.agent}
+                else ""
+            )
+            claude_env = await self._materialize_claude_env(local_review_agent)
 
             result: LoopResult | None = None
             try:
-                if local_review_uses_claude:
-                    await self._restore_claude_credentials()
                 result = await run_local_review_session(
                     runner=self._runner,
                     workspace_path=workspace_path,
@@ -1554,7 +1550,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     stall_secs=self.config.stall_timeout_secs,
                     command_secs=self.config.command_timeout_secs,
                     wall_clock_secs=self.config.wall_clock_timeout_secs,
-                    binding_env=dict(binding.env),
+                    binding_env={**claude_env, **binding.env},
                     mcp_servers=dict(binding.mcp_servers),
                     last_message_dir=last_message_dir,
                     head_sha_provider=_workspace_head_sha,
@@ -1573,8 +1569,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     reviewer_codex_model=reviewer_role.attribution_codex_model(),
                     verifier_codex_model=verifier_role.attribution_codex_model(),
                 )
-                if local_review_uses_claude:
-                    await self._write_back_claude_credentials()
+                await self._finalize_claude_env(claude_env)
 
             log.info(
                 "local-review phase for %s ended in %s (iterations=%d, strategy=%s, reviewer=%s)",
