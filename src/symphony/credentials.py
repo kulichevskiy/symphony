@@ -248,7 +248,12 @@ class CredentialWriteBack:
         return self._locks.setdefault(provider, asyncio.Lock())
 
     async def write_back(
-        self, provider: str, credential: str, *, expires_at: str | None = None
+        self,
+        provider: str,
+        credential: str,
+        *,
+        expires_at: str | None = None,
+        expected_prior: str | None = None,
     ) -> bool:
         """Persist `credential` for `provider` if a live DB connection exists and
         the stored value differs. Returns True when a write happened.
@@ -256,6 +261,12 @@ class CredentialWriteBack:
         A no-op when the provider has no `connected`/`expired` row — the
         credential is then purely ambient (env/volume), and slurping it into the
         store unsolicited would flip a never-connected provider to DB-backed.
+
+        `expected_prior` makes the write compare-and-set (Config v2 5/9): the
+        caller passes the credential its run *started from*, and the write
+        no-ops when the row no longer matches — an operator's mid-run
+        disconnect/reconnect wins over the finished run's stale material
+        instead of being resurrected/overwritten by it.
         """
         async with self._lock(provider):
             status = await db.oauth_connections.get_status(self._conn, provider)
@@ -270,6 +281,13 @@ class CredentialWriteBack:
                 # the fresh material rather than leaving a dead row in place.
                 current = None
             if current == credential:
+                return False
+            if expected_prior is not None and current is not None and current != expected_prior:
+                log.info(
+                    "%s write-back skipped: the stored credential changed mid-run "
+                    "(disconnect/reconnect or a concurrent refresh) — CAS no-op",
+                    provider,
+                )
                 return False
             await db.oauth_connections.set_connection(
                 self._conn,

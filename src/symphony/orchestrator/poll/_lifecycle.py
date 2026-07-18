@@ -880,6 +880,10 @@ class _LifecycleMixin(_OrchestratorBase):
                 api_error = _read_run_stream_api_error_obj(log_path)
                 if api_error is not None:
                     reason = api_error.message
+                    # An authentication failure flips the Claude card to
+                    # `expired` and arms the dispatch gate (Config v2 5/9) —
+                    # never a retry loop.
+                    await self._flag_claude_auth_failure(implement_role.agent, api_error)
                     if await self._maybe_requeue_transient_agent_failure(
                         run_id=run_id,
                         binding=binding,

@@ -213,3 +213,110 @@ async def test_refresh_failure_marks_expired_and_blocks_materialization(tmp_path
         assert status.updated_by == "auto-refresh"
     finally:
         await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_cas_write_back_skips_when_row_changed_mid_run(tmp_path: Path) -> None:
+    """Config v2 5/9: an operator reconnect while a run is in flight wins over
+    the run's stale refreshed credential — the finalize write-back CAS no-ops."""
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="claude", credential=_cred("tok-run-start"), cipher=cipher
+        )
+        env = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
+        # Mid-run: the CLI refreshes its private copy...
+        (Path(env["CLAUDE_CONFIG_DIR"]) / ".credentials.json").write_text(
+            _cred("tok-run-refreshed"), encoding="utf-8"
+        )
+        # ...while the operator reconnects in the UI (row replaced).
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="claude", credential=_cred("tok-reconnected"), cipher=cipher
+        )
+        await harness.orch._finalize_claude_env(env)  # noqa: SLF001
+        # The reconnect sticks; the stale run material did not overwrite it.
+        assert await db.oauth_connections.get_credential(harness.conn, "claude", cipher) == _cred(
+            "tok-reconnected"
+        )
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_mid_run_is_not_resurrected(tmp_path: Path) -> None:
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="claude", credential=_cred("tok"), cipher=cipher
+        )
+        env = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
+        (Path(env["CLAUDE_CONFIG_DIR"]) / ".credentials.json").write_text(
+            _cred("tok-refreshed"), encoding="utf-8"
+        )
+        # Operator disconnects mid-run: the row is deleted.
+        await db.oauth_connections.delete(harness.conn, "claude")
+        await harness.orch._finalize_claude_env(env)  # noqa: SLF001
+        # Disconnect sticks — write_back's no-row guard keeps it deleted.
+        assert await db.oauth_connections.get_status(harness.conn, "claude") is None
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_auth_failure_flags_expired_and_gates_dispatch(tmp_path: Path) -> None:
+    """Config v2 5/9: an auth-failed Claude run flips the row to `expired`;
+    the dispatch gate then blocks further Claude runs until reconnect —
+    the SYM-200/201 hot loop is structurally impossible."""
+
+    class _AuthError:
+        message = "Not logged in · Please run /login"
+        status = None
+
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="claude", credential=_cred("tok"), cipher=cipher
+        )
+        # Live connection: no block.
+        assert await harness.orch._claude_expired_block_reason("claude") is None  # noqa: SLF001
+
+        await harness.orch._flag_claude_auth_failure("claude", _AuthError())  # noqa: SLF001
+        status = await db.oauth_connections.get_status(harness.conn, "claude")
+        assert status is not None and status.status == "expired"
+        assert status.updated_by == "auth-failure"
+
+        blocked = await harness.orch._claude_expired_block_reason("claude")  # noqa: SLF001
+        assert blocked is not None and "reconnect Claude" in blocked
+        # Non-Claude agents and non-auth errors never flip/block.
+        assert await harness.orch._claude_expired_block_reason("codex") is None  # noqa: SLF001
+
+        class _Http500:
+            message = "API Error: 500 upstream"
+            status = 500
+
+        await db.oauth_connections.update_status(
+            harness.conn, provider="claude", status="connected"
+        )
+        await harness.orch._flag_claude_auth_failure("claude", _Http500())  # noqa: SLF001
+        status = await db.oauth_connections.get_status(harness.conn, "claude")
+        assert status is not None and status.status == "connected"
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_auth_failure_without_ui_connection_is_noop(tmp_path: Path) -> None:
+    class _AuthError:
+        message = "Not logged in"
+        status = 401
+
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        await harness.orch._flag_claude_auth_failure("claude", _AuthError())  # noqa: SLF001
+        assert await db.oauth_connections.get_status(harness.conn, "claude") is None
+        assert await harness.orch._claude_expired_block_reason("claude") is None  # noqa: SLF001
+    finally:
+        await harness.close()

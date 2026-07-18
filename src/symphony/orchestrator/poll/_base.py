@@ -3054,6 +3054,50 @@ class _OrchestratorBase:
             )
             return refreshed
 
+    async def _claude_expired_block_reason(self, agent: str) -> str | None:
+        """Dispatch gate (Config v2 5/9): a Claude run must not start while the
+        UI connection is `expired` — retrying an authentication failure without
+        a reconnect just burns runs (the SYM-200/201 hot loops). Returns the
+        park reason, or `None` when dispatch may proceed (non-Claude agents,
+        no UI connection at all, or a live one)."""
+        if agent != "claude":
+            return None
+        status = await db.oauth_connections.get_status(self._conn, "claude")
+        if status is None or status.status != "expired":
+            return None
+        return (
+            "the Claude connection is expired — reconnect Claude on the "
+            "Connections page, then retry"
+        )
+
+    async def _flag_claude_auth_failure(self, agent: str, api_error: object) -> None:
+        """After a Claude run died on an authentication error, flip the UI
+        connection to `expired` so the Connections card surfaces the fix and
+        the dispatch gate above stops further runs (Config v2 5/9). A no-op
+        for non-auth errors or when Claude was never UI-connected."""
+        if agent != "claude" or api_error is None:
+            return
+        message = str(getattr(api_error, "message", "") or "")
+        status_code = getattr(api_error, "status", None)
+        looks_auth = (
+            "not logged in" in message.lower()
+            or "authentication" in message.lower()
+            or status_code == 401
+        )
+        if not looks_auth:
+            return
+        status = await db.oauth_connections.get_status(self._conn, "claude")
+        if status is None or status.status not in ("connected", "expired"):
+            return
+        log.warning("claude run failed on authentication; marking the connection expired")
+        await db.oauth_connections.update_status(
+            self._conn,
+            provider="claude",
+            status="expired",
+            updated_at=self._now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            updated_by="auth-failure",
+        )
+
     async def _materialize_claude_env(self, agent: str) -> dict[str, str]:
         """Per-run Claude credential materialization (Config v2 3/9).
 
@@ -3079,6 +3123,11 @@ class _OrchestratorBase:
             credentials_path = config_dir / ".credentials.json"
             credentials_path.write_text(credential, encoding="utf-8")
             credentials_path.chmod(0o600)
+            # Pristine copy of what this run started from — the CAS guard the
+            # finalize write-back compares the DB row against (Config v2 5/9).
+            prior_path = config_dir / ".credentials.orig"
+            prior_path.write_text(credential, encoding="utf-8")
+            prior_path.chmod(0o600)
         except OSError:
             log.warning("claude credential materialization failed", exc_info=True)
             shutil.rmtree(config_dir, ignore_errors=True)
@@ -3094,10 +3143,14 @@ class _OrchestratorBase:
         if not config_dir:
             return
         credential = read_claude_credential(Path(config_dir) / ".credentials.json")
-        if credential:
+        prior = read_claude_credential(Path(config_dir) / ".credentials.orig")
+        if credential and credential != prior:
             try:
                 await self._credential_write_back.write_back(
-                    "claude", credential, expires_at=claude_expires_at(credential)
+                    "claude",
+                    credential,
+                    expires_at=claude_expires_at(credential),
+                    expected_prior=prior,
                 )
             except Exception:  # noqa: BLE001 — write-back must never break a finished run
                 log.warning("claude credential write-back failed", exc_info=True)
@@ -3119,6 +3172,10 @@ class _OrchestratorBase:
         storage_issue_id = storage_issue_id or issue.id
         # Per-run private CLAUDE_CONFIG_DIR from the DB credential (Config v2
         # 3/9); binding env still overrides. Torn down in `finally` below.
+        blocked = await self._claude_expired_block_reason(role.agent)
+        if blocked is not None:
+            log.warning("run %s not dispatched: %s", run_id, blocked)
+            return UsageDelta(), "spawn_failed", None
         claude_env = await self._materialize_claude_env(role.agent)
         spec = RunnerSpec(
             run_id=run_id,
@@ -3426,6 +3483,10 @@ class _OrchestratorBase:
     ) -> tuple[UsageDelta, str, int | None]:
         # Per-run private CLAUDE_CONFIG_DIR from the DB credential (Config v2
         # 3/9); binding env still overrides. Torn down in `finally` below.
+        blocked = await self._claude_expired_block_reason(role.agent)
+        if blocked is not None:
+            log.warning("run %s not dispatched: %s", run_id, blocked)
+            return UsageDelta(), "spawn_failed", None
         claude_env = await self._materialize_claude_env(role.agent)
         spec = RunnerSpec(
             run_id=run_id,
