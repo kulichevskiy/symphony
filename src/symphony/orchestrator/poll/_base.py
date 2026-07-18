@@ -3155,7 +3155,13 @@ class _OrchestratorBase:
         status = await db.oauth_connections.get_status(self._conn, provider)
         if status is None or status.status not in ("connected", "expired"):
             return
-        if run_started_at and status.updated_at:
+        # The stale-run guard suppresses flagging only when the row changed
+        # under an operator RECONNECT after the run started — a daemon token
+        # refresh (auto-refresh/write-back) bumps updated_at but keeps the same
+        # account, so a 401 on the refreshed token must still expire it
+        # (review fix: don't treat a refreshed run as stale).
+        _operator_touched = status.updated_by in ("oauth",)
+        if _operator_touched and run_started_at and status.updated_at:
             updated: datetime | None
             started: datetime | None
             try:

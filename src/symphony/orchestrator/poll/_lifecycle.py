@@ -1507,6 +1507,18 @@ class _LifecycleMixin(_OrchestratorBase):
             # full historical cost) and so the runs-history audit trail
             # shows the local-review phase alongside implement/review/
             # merge stages.
+            # Refuse an already-`expired` agent connection BEFORE creating the
+            # run row — a raise after the row is inserted would orphan a
+            # `running` local_review row (blocks later active-run dedupe,
+            # pollutes history). Cheap status check; no materialization/refresh
+            # here (review fix).
+            lr_role_agents = {reviewer_role.agent, verifier_role.agent, fixer_role.agent}
+            for lr_agent in ("claude", "codex"):
+                if lr_agent in lr_role_agents:
+                    pre_blocked = await self._claude_expired_block_reason(lr_agent)
+                    if pre_blocked is not None:
+                        raise RuntimeError(pre_blocked)
+
             local_review_run_id = str(uuid.uuid4())
             await db.runs.create(
                 self._conn,
@@ -1529,35 +1541,28 @@ class _LifecycleMixin(_OrchestratorBase):
 
             # Local review builds its own RunnerSpec / collect_runner_output
             # instead of going through `_run_stage_command`/`_run_runner`, so it
-            # gets the same per-run Claude credential materialization +
-            # write-back (Config v2 3/9) when any of its roles runs on Claude.
-            lr_role_agents = {reviewer_role.agent, verifier_role.agent, fixer_role.agent}
+            # gets the same per-run agent credential materialization +
+            # write-back (Config v2 3/9) when any of its roles runs on a
+            # UI-connected agent. Materialization is INSIDE the try so a
+            # post-materialize block still runs the finally (finalize the run +
+            # tear down the per-run dirs) instead of orphaning either.
             local_review_started_at = self._now().strftime("%Y-%m-%dT%H:%M:%SZ")
             claude_env: dict[str, str] = {}
             agent_envs: dict[str, dict[str, str]] = {}
-            for lr_agent in ("claude", "codex"):
-                if lr_agent not in lr_role_agents:
-                    continue
-                # Gate on an already-`expired` row BEFORE materializing —
-                # materialization can proactively refresh a within-horizon
-                # token and write the row back `connected`, which would defeat
-                # the post-materialize gate and resume without the required
-                # reconnect (Config v2 6/9 review fix). Stage runners gate
-                # pre-materialize too.
-                pre_blocked = await self._claude_expired_block_reason(lr_agent)
-                if pre_blocked is not None:
-                    await self._finalize_claude_env(claude_env)
-                    raise RuntimeError(pre_blocked)
-                env_for_agent = await self._materialize_claude_env(lr_agent)
-                agent_envs[lr_agent] = env_for_agent
-                claude_env.update(env_for_agent)
-                lr_blocked = await self._post_materialize_block_reason(lr_agent, env_for_agent)
-                if lr_blocked is not None:
-                    await self._finalize_claude_env(claude_env)
-                    raise RuntimeError(lr_blocked)
-
             result: LoopResult | None = None
             try:
+                for lr_agent in ("claude", "codex"):
+                    if lr_agent not in lr_role_agents:
+                        continue
+                    env_for_agent = await self._materialize_claude_env(lr_agent)
+                    agent_envs[lr_agent] = env_for_agent
+                    claude_env.update(env_for_agent)
+                    # Post-materialize gate: a refresh that failed inside
+                    # materialization flipped the row to `expired` and yielded
+                    # {} — block rather than run on ambient creds.
+                    lr_blocked = await self._post_materialize_block_reason(lr_agent, env_for_agent)
+                    if lr_blocked is not None:
+                        raise RuntimeError(lr_blocked)
                 result = await run_local_review_session(
                     runner=self._runner,
                     workspace_path=workspace_path,
