@@ -3170,25 +3170,10 @@ class _OrchestratorBase:
         prior_total: float,
     ) -> tuple[UsageDelta, str, int | None]:
         storage_issue_id = storage_issue_id or issue.id
-        # Per-run private CLAUDE_CONFIG_DIR from the DB credential (Config v2
-        # 3/9); binding env still overrides. Torn down in `finally` below.
         blocked = await self._claude_expired_block_reason(role.agent)
         if blocked is not None:
             log.warning("run %s not dispatched: %s", run_id, blocked)
             return UsageDelta(), "spawn_failed", None
-        claude_env = await self._materialize_claude_env(role.agent)
-        spec = RunnerSpec(
-            run_id=run_id,
-            workspace_path=workspace_path,
-            command=command,
-            env={**claude_env, **binding.env},
-            stall_secs=self.config.stall_timeout_secs,
-            command_secs=self.config.command_timeout_secs,
-            wall_clock_secs=self.config.wall_clock_timeout_secs,
-            stage=stage,
-            credentials=await self._resolve_run_credentials(binding),
-            github_host=github_host_for_repo(binding.github_repo),
-        )
 
         log_path = self.config.log_root / f"{run_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3206,6 +3191,24 @@ class _OrchestratorBase:
             run_id=run_id,
             stage=stage,
             workspace_path=workspace_path,
+        )
+        run_credentials = await self._resolve_run_credentials(binding)
+        # Per-run private CLAUDE_CONFIG_DIR from the DB credential (Config v2
+        # 3/9); binding env still overrides. Materialized LAST — everything
+        # between here and the `finally` that tears it down must be
+        # infallible, or a setup failure would leak the dir (review fix).
+        claude_env = await self._materialize_claude_env(role.agent)
+        spec = RunnerSpec(
+            run_id=run_id,
+            workspace_path=workspace_path,
+            command=command,
+            env={**claude_env, **binding.env},
+            stall_secs=self.config.stall_timeout_secs,
+            command_secs=self.config.command_timeout_secs,
+            wall_clock_secs=self.config.wall_clock_timeout_secs,
+            stage=stage,
+            credentials=run_credentials,
+            github_host=github_host_for_repo(binding.github_repo),
         )
         self._active_run_ids.add(run_id)
         try:
@@ -3481,12 +3484,21 @@ class _OrchestratorBase:
         prior_total: float = 0.0,
         clear_pid_on_finish: bool = False,
     ) -> tuple[UsageDelta, str, int | None]:
-        # Per-run private CLAUDE_CONFIG_DIR from the DB credential (Config v2
-        # 3/9); binding env still overrides. Torn down in `finally` below.
         blocked = await self._claude_expired_block_reason(role.agent)
         if blocked is not None:
             log.warning("run %s not dispatched: %s", run_id, blocked)
             return UsageDelta(), "spawn_failed", None
+
+        log_path = self.config.log_root / f"{run_id}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+
+        cumulative_usage = UsageDelta()
+        final_kind = "exit"
+        final_returncode: int | None = None
+        cost_estimator = _UsageCostEstimator(agent=role.agent, codex_model=role_codex_model(role))
+        run_credentials = await self._resolve_run_credentials(binding)
+        # See `_run_stage_command`: materialized last so nothing fallible sits
+        # between the dir's creation and the `finally` that tears it down.
         claude_env = await self._materialize_claude_env(role.agent)
         spec = RunnerSpec(
             run_id=run_id,
@@ -3497,17 +3509,9 @@ class _OrchestratorBase:
             command_secs=self.config.command_timeout_secs,
             wall_clock_secs=self.config.wall_clock_timeout_secs,
             stage=stage,
-            credentials=await self._resolve_run_credentials(binding),
+            credentials=run_credentials,
             github_host=github_host_for_repo(binding.github_repo),
         )
-
-        log_path = self.config.log_root / f"{run_id}.log"
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-
-        cumulative_usage = UsageDelta()
-        final_kind = "exit"
-        final_returncode: int | None = None
-        cost_estimator = _UsageCostEstimator(agent=role.agent, codex_model=role_codex_model(role))
         activity = (
             self._activity_session(
                 binding=binding,

@@ -270,6 +270,10 @@ async def run_local_review_session(
             run_id=_safe_run_id(parent_run_id, run_suffix),
             workspace_path=workspace_path,
             command=command,
+            # Same env as the fix turns: a Claude reviewer/verifier needs the
+            # per-run CLAUDE_CONFIG_DIR the orchestrator materialized
+            # (Config v2 3/9 review fix).
+            env=dict(binding_env or {}),
             stall_secs=stall_secs,
             command_secs=command_secs,
             wall_clock_secs=wall_clock_secs,

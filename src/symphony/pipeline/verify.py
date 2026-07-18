@@ -142,6 +142,9 @@ async def run_verify_session(
     usage_handler: Callable[[Usage], object] | None = None,
     fix_log_path: Path | None = None,
     allow_fixes: bool = True,
+    # Per-run credential env from the orchestrator (e.g. CLAUDE_CONFIG_DIR,
+    # Config v2 3/9) — the agent fix turn runs with it.
+    extra_env: dict[str, str] | None = None,
 ) -> VerifyResult:
     """Run the verify gate: verify → (one fix turn → verify again) on red.
 
@@ -179,6 +182,7 @@ async def run_verify_session(
     spec = RunnerSpec(
         run_id=_safe_run_id(parent_run_id, "verify-fix"),
         workspace_path=workspace_path,
+        env=dict(extra_env or {}),
         command=_build_fix_command(
             agent=fixer_role.agent,
             codex_model=fixer_role.codex_model_arg(),
