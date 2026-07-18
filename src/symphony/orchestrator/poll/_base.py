@@ -16,6 +16,7 @@ pre-split `Orchestrator`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 
 # --- imports merged from the pre-split poll/__init__.py (SYM-151) ---
@@ -55,6 +56,7 @@ from ...claude_login import (
     refresh_claude_credential,
 )
 from ...codex_login import (
+    codex_credential_expires_within,
     codex_expires_at,
     default_codex_credentials_path,
     pin_file_auth_storage,
@@ -503,6 +505,12 @@ class _OrchestratorBase:
         # the refresh token is one-shot, so a second exchange with the same
         # token would kill the fresh credential the first one just minted.
         self._claude_refresh_lock = asyncio.Lock()
+        # Serializes proactive codex refreshes (SYM-217): the CLI rotates a
+        # one-shot refresh token, so concurrent codex dispatches must not each
+        # clone + refresh the same auth.json (OpenAI: one auth.json per
+        # serialized stream). One central refresh before fan-out feeds every
+        # run a fresh token so none refreshes itself.
+        self._codex_refresh_lock = asyncio.Lock()
         # Last Linear token applied to registered trackers via
         # `_refresh_linear_tracker_credentials`, so a tick only touches the
         # client's header when the DB token actually changed.
@@ -3076,6 +3084,68 @@ class _OrchestratorBase:
             )
             return refreshed
 
+    async def _run_codex_cli_refresh(self, credential: str) -> str | None:
+        """Refresh a codex credential by running the codex CLI once in an
+        isolated CODEX_HOME (spec decision 7, plan B — codex has no
+        daemon-side token endpoint). Materializes `credential`, runs the CLI's
+        non-interactive status command (which loads + refreshes the token),
+        reads `auth.json` back. Returns the refreshed blob, or `None` on any
+        failure. Overridden in tests. Never raises."""
+        home = Path(tempfile.mkdtemp(prefix="symphony-codex-refresh-"))
+        try:
+            (home / "auth.json").write_text(credential, encoding="utf-8")
+            pin_file_auth_storage(home)
+            proc = await asyncio.create_subprocess_exec(
+                *CODEX_REFRESH_COMMAND,
+                env={**os.environ, "CODEX_HOME": str(home)},
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=_CODEX_REFRESH_TIMEOUT_SECS)
+            except TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                return None
+            if proc.returncode != 0:
+                return None
+            return read_claude_credential(home / "auth.json")
+        except (OSError, asyncio.CancelledError):
+            return None
+        finally:
+            shutil.rmtree(home, ignore_errors=True)
+
+    async def _maybe_refresh_codex_credential(self, credential: str) -> str | None:
+        """Central proactive codex refresh (SYM-217). Mirrors the claude path
+        (serialized, CAS write-back, near-expiry trigger), but refreshes via
+        the CLI. Fail-open: if the CLI refresh can't run, return the current
+        credential and let the run's own CLI refresh be the fallback — dispatch
+        is never blocked on a codex refresh miss (unlike claude, codex has no
+        clean pre-dispatch failure signal)."""
+        horizon = self.config.wall_clock_timeout_secs or _DEFAULT_REFRESH_HORIZON_SECS
+        if not codex_credential_expires_within(credential, horizon):
+            return credential
+        async with self._codex_refresh_lock:
+            current = await self._resolve_agent_credential("codex")
+            if current is None:
+                return None
+            if not codex_credential_expires_within(current, horizon):
+                return current
+            refreshed = await self._run_codex_cli_refresh(current)
+            if not refreshed or refreshed == current:
+                log.info("codex central refresh unavailable/no-op; run will refresh in-place")
+                return current
+            wrote = await self._credential_write_back.write_back(
+                "codex",
+                refreshed,
+                expires_at=codex_expires_at(refreshed),
+                expected_prior=current,
+            )
+            if not wrote:
+                return await self._resolve_agent_credential("codex")
+            log.info("codex token refreshed centrally before dispatch")
+            return refreshed
+
     async def _claude_expired_block_reason(self, agent: str) -> str | None:
         """Dispatch gate (Config v2 5/9): a Claude run must not start while the
         UI connection is `expired` — retrying an authentication failure without
@@ -3173,10 +3243,23 @@ class _OrchestratorBase:
         if stdout is None:
             return
         api_error: object | None = classify_stream_api_error(stdout)
-        if api_error is None and "not logged in" in stdout.lower():
-            # Claude can also fail auth with a plain-text (often stderr-only)
-            # "Not logged in" line the JSONL classifier skips.
-            api_error = StreamApiError(message="Not logged in", status=401)
+        if api_error is None:
+            # Pre-stream auth failures print a plain-text (often stderr-only)
+            # line the JSONL classifier skips: claude's "Not logged in", and
+            # codex's auth-session / refresh failure phrasings.
+            low = stdout.lower()
+            _auth_phrases = (
+                "not logged in",
+                "unauthorized",
+                "401",
+                "authentication",
+                "refresh token",
+                "re-authenticate",
+                "please run",
+                "log in again",
+            )
+            if any(phrase in low for phrase in _auth_phrases):
+                api_error = StreamApiError(message="authentication failure", status=401)
         if api_error is None:
             return
         cur = await self._conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,))
@@ -3203,11 +3286,16 @@ class _OrchestratorBase:
         credential = await self._resolve_agent_credential(agent)
         if credential is None:
             return {}
+        # Central proactive refresh before fan-out so a run never rotates the
+        # one-shot refresh token itself (Config v2 4/9 for claude; SYM-217 for
+        # codex via the CLI). Claude blocks dispatch on a hard refresh failure;
+        # codex is fail-open (its refresh is best-effort — see the method).
         if agent == "claude":
-            # Central proactive refresh (Config v2 4/9) — Claude only: codex's
-            # token endpoint has no daemon-side refresh yet (the CLI refreshes
-            # inside its own per-run dir; the write-back below persists it).
             credential = await self._maybe_refresh_claude_credential(credential)
+            if credential is None:
+                return {}
+        elif agent == "codex":
+            credential = await self._maybe_refresh_codex_credential(credential)
             if credential is None:
                 return {}
         config_dir = Path(tempfile.mkdtemp(prefix=f"symphony-{agent}-"))
@@ -4395,6 +4483,12 @@ _AGENT_CRED_LAYOUT: dict[str, tuple[str, str]] = {
 # Refresh horizon when no wall-clock cap is configured (Config v2 4/9): a
 # token must outlive the longest plausible run so the CLI never refreshes.
 _DEFAULT_REFRESH_HORIZON_SECS = 2 * 60 * 60
+# The codex CLI invocation the daemon runs to force a token refresh in an
+# isolated CODEX_HOME (SYM-217, plan B). `login status` loads + refreshes the
+# stored token non-interactively. CONFIRM against a live codex on first
+# connect — it is the one piece this slice couldn't exercise.
+CODEX_REFRESH_COMMAND: tuple[str, ...] = ("codex", "login", "status")
+_CODEX_REFRESH_TIMEOUT_SECS = 60.0
 
 
 MERGE_WAIT_RECONCILE_INTERVAL_SECS = 600

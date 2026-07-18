@@ -43,6 +43,7 @@ from ...pipeline.verify import VerifyResult, run_verify_session
 from ...tokens import effective_tokens
 from ...tracker import Issue as LinearIssue
 from ._base import (
+    _AGENT_CRED_LAYOUT,
     _binding_storage_key,
     _local_review_status_from_result,
     _OrchestratorBase,
@@ -1531,6 +1532,7 @@ class _LifecycleMixin(_OrchestratorBase):
             # gets the same per-run Claude credential materialization +
             # write-back (Config v2 3/9) when any of its roles runs on Claude.
             lr_role_agents = {reviewer_role.agent, verifier_role.agent, fixer_role.agent}
+            local_review_started_at = self._now().strftime("%Y-%m-%dT%H:%M:%SZ")
             claude_env: dict[str, str] = {}
             agent_envs: dict[str, dict[str, str]] = {}
             for lr_agent in ("claude", "codex"):
@@ -1581,6 +1583,20 @@ class _LifecycleMixin(_OrchestratorBase):
                     reviewer_codex_model=reviewer_role.attribution_codex_model(),
                     verifier_codex_model=verifier_role.attribution_codex_model(),
                 )
+                # A local-review subprocess (reviewer/verifier/fixer) that died
+                # on auth surfaces as LoopResult.api_error — the stage-runner
+                # flag hooks don't see it, so flag here for each UI-backed agent
+                # role, flipping the card + arming the dispatch gate (Config v2
+                # 6/9 review fix).
+                lr_api_error = result.api_error if result is not None else None
+                if lr_api_error is not None:
+                    for lr_agent in lr_role_agents & _AGENT_CRED_LAYOUT.keys():
+                        await self._flag_claude_auth_failure(
+                            lr_agent,
+                            lr_api_error,
+                            run_started_at=local_review_started_at,
+                            provider=lr_agent,
+                        )
                 await self._finalize_claude_env(claude_env)
 
             log.info(

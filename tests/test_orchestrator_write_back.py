@@ -348,3 +348,75 @@ async def test_codex_materialize_finalize_round_trip(tmp_path: Path) -> None:
         assert home.name not in os.listdir(home.parent)
     finally:
         await harness.close()
+
+
+def _codex_cred_soon(access: str = "at", refresh: str = "rt") -> str:
+    # codex expiry = JWT exp; build a minimal JWT with a near-future exp.
+    import base64 as _b64
+    import time as _time
+
+    exp = int(_time.time() + 60)
+    header = _b64.urlsafe_b64encode(b'{"alg":"none"}').rstrip(b"=").decode()
+    payload = _b64.urlsafe_b64encode(f'{{"exp":{exp}}}'.encode()).rstrip(b"=").decode()
+    jwt = f"{header}.{payload}.sig"
+    return json.dumps({"tokens": {"access_token": jwt, "refresh_token": refresh}, "id": access})
+
+
+@pytest.mark.asyncio
+async def test_codex_central_refresh_serialized_and_written_back(tmp_path: Path) -> None:
+    """SYM-217: a near-expiry codex row is refreshed centrally (via the CLI
+    seam) exactly once under concurrency, and the refresh is persisted."""
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="codex", credential=_codex_cred_soon(), cipher=cipher
+        )
+        calls = {"n": 0}
+        fresh = json.dumps({"tokens": {"access_token": "fresh", "refresh_token": "rt2"}})
+
+        async def fake_cli_refresh(_credential: str) -> str:
+            calls["n"] += 1
+            return fresh
+
+        harness.orch._run_codex_cli_refresh = fake_cli_refresh  # type: ignore[assignment]  # noqa: SLF001
+        env_a, env_b = await asyncio.gather(
+            harness.orch._materialize_claude_env("codex"),  # noqa: SLF001
+            harness.orch._materialize_claude_env("codex"),  # noqa: SLF001
+        )
+        try:
+            assert calls["n"] == 1  # serialized: second dispatch reused the refresh
+            for env in (env_a, env_b):
+                blob = (Path(env["CODEX_HOME"]) / "auth.json").read_text(encoding="utf-8")
+                assert json.loads(blob)["tokens"]["access_token"] == "fresh"
+        finally:
+            await harness.orch._finalize_claude_env(env_a)  # noqa: SLF001
+            await harness.orch._finalize_claude_env(env_b)  # noqa: SLF001
+        stored = await db.oauth_connections.get_credential(harness.conn, "codex", cipher)
+        assert json.loads(stored)["tokens"]["access_token"] == "fresh"
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_codex_central_refresh_fail_open(tmp_path: Path) -> None:
+    """A CLI refresh that can't run leaves the run to refresh in-place — the
+    codex dispatch is never blocked (fail-open, unlike claude)."""
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="codex", credential=_codex_cred_soon(), cipher=cipher
+        )
+
+        async def failed_refresh(_credential: str) -> None:
+            return None
+
+        harness.orch._run_codex_cli_refresh = failed_refresh  # type: ignore[assignment]  # noqa: SLF001
+        env = await harness.orch._materialize_claude_env("codex")  # noqa: SLF001
+        try:
+            assert env.get("CODEX_HOME")  # dispatch proceeds
+        finally:
+            await harness.orch._finalize_claude_env(env)  # noqa: SLF001
+    finally:
+        await harness.close()

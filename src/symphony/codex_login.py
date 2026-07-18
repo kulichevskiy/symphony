@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -188,6 +189,18 @@ def codex_expires_at(raw: str) -> str | None:
     return datetime.fromtimestamp(exp, tz=UTC).strftime(_ISO_FORMAT)
 
 
+def codex_credential_expires_within(raw: str, horizon_secs: float) -> bool:
+    """Whether the codex access token expires within `horizon_secs` from now
+    (Config v2 4/9 extended to codex, SYM-217): the daemon refreshes centrally
+    when expiry falls inside a run's max wall clock. No parseable expiry →
+    False."""
+    expires_at = codex_expires_at(raw)
+    if expires_at is None:
+        return False
+    deadline = datetime.strptime(expires_at, _ISO_FORMAT).replace(tzinfo=UTC)
+    return datetime.now(UTC).timestamp() + horizon_secs >= deadline.timestamp()
+
+
 def codex_credential_expired(raw: str) -> bool:
     """Whether the stored credential's access token is past its expiry. A blob
     with no parseable expiry is treated as not-expired — the card's `Test`
@@ -218,8 +231,21 @@ class SubprocessCodexLogin:
         start_timeout: float = _START_TIMEOUT_SECS,
     ) -> None:
         self._command = tuple(command)
-        self._credentials_path = credentials_path or default_codex_credentials_path()
-        self._env = env
+        # Each pending login gets its own private CODEX_HOME so two concurrent
+        # device flows (second tab / refresh) never share one auth.json —
+        # last-writer-wins there could persist the wrong account (Config v2 6/9
+        # review fix). The caller can pin a path for tests.
+        if credentials_path is not None:
+            self._credentials_path = credentials_path
+            self._owns_home = False
+        else:
+            self._credentials_path = (
+                Path(tempfile.mkdtemp(prefix="symphony-codex-login-")) / "auth.json"
+            )
+            self._owns_home = True
+        self._env = dict(env or {})
+        # Point the CLI at that private home so it writes auth.json there.
+        self._env.setdefault("CODEX_HOME", str(self._credentials_path.parent))
         self._start_timeout = start_timeout
         self._proc: asyncio.subprocess.Process | None = None
         self._drain_task: asyncio.Task[None] | None = None
@@ -308,10 +334,13 @@ class SubprocessCodexLogin:
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         proc = self._proc
-        if proc is None or proc.returncode is not None:
-            return
-        try:
-            proc.kill()
-            await proc.wait()
-        except ProcessLookupError:
-            pass
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+        if self._owns_home:
+            import shutil as _shutil
+
+            _shutil.rmtree(self._credentials_path.parent, ignore_errors=True)
