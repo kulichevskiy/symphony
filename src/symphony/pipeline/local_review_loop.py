@@ -145,7 +145,10 @@ IterationCallback = Callable[[int, LocalVerdict, float], Awaitable[None]]
 async def run_local_review_loop(
     *,
     reviewer_agent: ReviewerAgent,
-    fixer_agent: str,
+    # Which agent runs the fixer turns — tags `api_error_agent` on a fix-run
+    # failure so callers flag only the failing provider. Defaults to the
+    # reviewer's agent for the common single-agent config.
+    fixer_agent: str = "",
     reviewer: ReviewerCallable,
     fixer: FixerCallable,
     cap: int,
