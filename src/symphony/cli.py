@@ -30,7 +30,7 @@ from .app import build_server_config, create_app
 from .auth import Auth0Settings
 from .config import Config, RepoBinding, RoleName, Secrets
 from .credentials import CredentialResolver
-from .crypto import CredentialCipher
+from .crypto import CredentialCipher, EncryptionKeyLostError, resolve_encryption_key
 from .effective_config import ConfigBootError, assemble_effective_config
 from .github.webhook import GitHubWebhookSettings
 from .linear.client import Linear, LinearError, LinearIssue
@@ -437,6 +437,26 @@ async def _run(config_path: Path, *, once: bool) -> None:
                 conn, base, yaml_has_repos_topology=yaml_has_repos_topology
             )
         except ConfigBootError as e:
+            click.echo(str(e), err=True)
+            sys.exit(2)
+        # Effective encryption key (Config v2 2/9): explicit env/.env wins,
+        # else auto-provisioned from/into the data volume next to the DB. The
+        # resolved key rides on cfg so every downstream cipher (orchestrator,
+        # UI routers via ui_external_config, the auth gates below) agrees.
+        cfg = cfg.model_copy(
+            update={
+                "symphony_encryption_key": resolve_encryption_key(
+                    cfg.symphony_encryption_key, Config.peek_db_path(config_path).parent
+                )
+            }
+        )
+        # Fail the boot loudly when stored credentials no longer decrypt (key
+        # lost/rotated) — never silent OAuth 503s at runtime.
+        try:
+            await db.oauth_connections.assert_cipher_usable(
+                conn, CredentialCipher(cfg.symphony_encryption_key)
+            )
+        except EncryptionKeyLostError as e:
             click.echo(str(e), err=True)
             sys.exit(2)
         # Must run before `_config_has_usable_linear_auth`: that check's DB-first

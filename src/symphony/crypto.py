@@ -16,11 +16,19 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import logging
 import os
+import secrets
+from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
+log = logging.getLogger(__name__)
+
 _ENV_VAR = "SYMPHONY_ENCRYPTION_KEY"
+# Auto-provisioned key file, living next to the DB in the data volume so it
+# survives redeploys with the data it protects (Config v2 2/9).
+KEY_FILE_NAME = ".encryption_key"
 
 
 class CredentialKeyMissingError(Exception):
@@ -45,6 +53,58 @@ class CredentialDecryptError(Exception):
             "stored credential could not be decrypted with the current "
             "encryption key — re-authorize the provider"
         )
+
+
+class EncryptionKeyLostError(Exception):
+    """Encrypted credential rows exist but the effective key cannot decrypt
+    them — the key was lost or rotated. Raised at boot so the failure is a
+    loud, instructive crash instead of silent OAuth 503s at runtime."""
+
+    def __init__(self, providers: list[str]) -> None:
+        super().__init__(
+            "the effective encryption key cannot decrypt the stored credentials "
+            f"for: {', '.join(providers)}. Restore the original {_ENV_VAR} (or the "
+            f"{KEY_FILE_NAME} file in the data volume), or delete the stored "
+            "connections and re-authorize each provider in the UI."
+        )
+        self.providers = providers
+
+
+def resolve_encryption_key(explicit_key: str, data_dir: Path) -> str:
+    """The deployment's effective encryption key (Config v2 2/9).
+
+    An explicit key (env/.env `SYMPHONY_ENCRYPTION_KEY`) always wins and never
+    touches the filesystem. Otherwise the key file in `data_dir` is used,
+    generated on first boot (0600) so a fresh install needs no manual key
+    provisioning. The key value itself is never logged."""
+    explicit = explicit_key.strip()
+    if explicit:
+        return explicit
+    key_path = data_dir / KEY_FILE_NAME
+    try:
+        existing = key_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        existing = ""
+    if existing:
+        return existing
+    key = secrets.token_hex(32)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    key_path.write_text(key + "\n", encoding="utf-8")
+    key_path.chmod(0o600)
+    log.info(
+        "generated a new credential encryption key at %s (fingerprint %s)",
+        key_path,
+        key_fingerprint(key),
+    )
+    return key
+
+
+def key_fingerprint(key: str) -> str:
+    """Short non-reversible identifier for the effective key — safe to log and
+    to show in the UI so an operator can tell which key an instance runs."""
+    if not key:
+        return ""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
 
 
 def _derive_key(secret: str) -> bytes:

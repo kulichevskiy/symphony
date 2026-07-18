@@ -20,7 +20,7 @@ from uvicorn import Config as UvicornConfig
 from .auth import Auth0Settings, create_auth_config_router, create_auth_dependency
 from .claude_login import ClaudeLoginProcess, PendingLoginRegistry, SubprocessClaudeLogin
 from .config import Config
-from .crypto import CredentialCipher
+from .crypto import CredentialCipher, key_fingerprint, resolve_encryption_key
 from .db.config_repo_secrets import RepoSecretView
 from .github.client import GitHub
 from .github.webhook import (
@@ -237,8 +237,21 @@ def create_app(
                 )
             # Read-only Connections page: per-provider status from the encrypted
             # `oauth_connections` store (credential material never served).
+            # The key *fingerprint* (non-reversible) is exposed so an operator
+            # can tell which encryption key the instance runs (Config v2 2/9).
+            _fp_config = (
+                ui_external_config() if callable(ui_external_config) else ui_external_config
+            )
+            _fp_base = _fp_config if _fp_config is not None else Config()
             app.include_router(
-                create_connections_router(ui_pool),
+                create_connections_router(
+                    ui_pool,
+                    key_fingerprint=key_fingerprint(
+                        resolve_encryption_key(
+                            _fp_base.symphony_encryption_key, ui_pool.path.parent
+                        )
+                    ),
+                ),
                 dependencies=api_dependencies,
             )
 
@@ -255,10 +268,16 @@ def create_app(
             # docker-compose.coolify.yml), so reading process env directly would
             # never see the key there. `base_config` is sourced from `Secrets`,
             # which reads `.env` the same way `github_oauth_client_id` above does.
+            # An empty key auto-provisions from/into the data volume next to the
+            # DB (Config v2 2/9) instead of leaving the cipher unavailable.
             cipher = (
                 oauth_cipher
                 if oauth_cipher is not None
-                else CredentialCipher(base_config.symphony_encryption_key)
+                else CredentialCipher(
+                    resolve_encryption_key(
+                        base_config.symphony_encryption_key, oauth_write_pool.path.parent
+                    )
+                )
             )
             # Claude code-paste login (5/7): no browser-reachable callback, so
             # it's a separate router mounted BEFORE the generic engine below —

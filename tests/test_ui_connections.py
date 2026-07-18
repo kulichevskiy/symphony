@@ -16,7 +16,7 @@ import respx
 from symphony import db
 from symphony.app import create_app
 from symphony.config import Config
-from symphony.crypto import CredentialCipher
+from symphony.crypto import KEY_FILE_NAME, CredentialCipher, key_fingerprint
 
 from .test_auth import JWKS_URI, _jwks, _settings, _token
 from .test_webhook import _Handler
@@ -101,5 +101,48 @@ async def test_connections_gated_behind_auth(tmp_path: Path) -> None:
                 "/api/connections", headers={"Authorization": f"Bearer {_token()}"}
             )
             assert authed.status_code == 200
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_key_fingerprint_endpoint_and_auto_provisioned_key(tmp_path: Path) -> None:
+    """Config v2 2/9: with no explicit key configured, `create_app` auto-
+    provisions one next to the DB and the API serves its fingerprint —
+    never the key itself."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)  # ui_external_config has no encryption key set
+        key_path = tmp_path / KEY_FILE_NAME
+        assert key_path.exists()  # auto-provisioned at app construction
+        key = key_path.read_text(encoding="utf-8").strip()
+        async with _client(app) as client:
+            resp = await client.get("/api/connections/key")
+        assert resp.status_code == 200, resp.text
+        assert resp.json() == {"fingerprint": key_fingerprint(key)}
+        assert key not in resp.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_key_fingerprint_reflects_explicit_key(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = create_app(
+            _Handler(),
+            conn,
+            ui_enabled=True,
+            ui_db_path=db_path,
+            ui_external_config=Config(
+                linear_api_key="test-linear-key",
+                symphony_encryption_key="explicit-secret",
+            ),
+        )
+        async with _client(app) as client:
+            resp = await client.get("/api/connections/key")
+        assert resp.json() == {"fingerprint": key_fingerprint("explicit-secret")}
+        # An explicit key never writes the key file.
+        assert not (tmp_path / KEY_FILE_NAME).exists()
     finally:
         await conn.close()

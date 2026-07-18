@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import os
+import stat
+from pathlib import Path
+
 import pytest
 
 from symphony.crypto import (
+    KEY_FILE_NAME,
     CredentialCipher,
     CredentialDecryptError,
     CredentialKeyMissingError,
+    key_fingerprint,
+    resolve_encryption_key,
 )
 
 
@@ -50,3 +57,37 @@ def test_from_env_reads_deployment_secret(monkeypatch: pytest.MonkeyPatch) -> No
 
     monkeypatch.delenv("SYMPHONY_ENCRYPTION_KEY", raising=False)
     assert CredentialCipher.from_env().available is False
+
+
+def test_resolve_key_explicit_wins_and_writes_nothing(tmp_path: Path) -> None:
+    assert resolve_encryption_key("explicit-secret", tmp_path) == "explicit-secret"
+    assert not (tmp_path / KEY_FILE_NAME).exists()
+
+
+def test_resolve_key_generates_once_with_0600(tmp_path: Path) -> None:
+    key = resolve_encryption_key("", tmp_path)
+    key_path = tmp_path / KEY_FILE_NAME
+    assert key and key_path.exists()
+    assert stat.S_IMODE(os.stat(key_path).st_mode) == 0o600
+    # Reused verbatim on the next boot — not regenerated.
+    assert resolve_encryption_key("", tmp_path) == key
+
+
+def test_resolve_key_reuses_existing_file(tmp_path: Path) -> None:
+    (tmp_path / KEY_FILE_NAME).write_text("preexisting-key\n", encoding="utf-8")
+    assert resolve_encryption_key("", tmp_path) == "preexisting-key"
+
+
+def test_resolve_key_regenerates_over_empty_file(tmp_path: Path) -> None:
+    (tmp_path / KEY_FILE_NAME).write_text("", encoding="utf-8")
+    key = resolve_encryption_key("", tmp_path)
+    assert key
+    assert (tmp_path / KEY_FILE_NAME).read_text(encoding="utf-8").strip() == key
+
+
+def test_key_fingerprint_stable_and_never_the_key() -> None:
+    fp = key_fingerprint("deployment-secret")
+    assert fp == key_fingerprint("deployment-secret")
+    assert len(fp) == 12
+    assert "deployment-secret" not in fp
+    assert key_fingerprint("") == ""
