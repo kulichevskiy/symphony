@@ -49,8 +49,10 @@ from ...agent.prompt import implement_prompt
 from ...agent.runner import Runner, RunnerSpec
 from ...agent.runners.local import LocalRunner
 from ...claude_login import (
+    claude_credential_expires_within,
     claude_expires_at,
     read_claude_credential,
+    refresh_claude_credential,
 )
 from ...config import Config, RepoBinding, ResolvedRole, binding_natural_key
 from ...credentials import (
@@ -487,6 +489,11 @@ class _OrchestratorBase:
         # the DB if it changed. Serialized per provider by the write-back's own
         # lock so two concurrent runs finishing at once can't clobber each other.
         self._credential_write_back = CredentialWriteBack(conn, self._cipher)
+        # Serializes proactive Claude token refreshes (Config v2 4/9): two
+        # concurrent dispatches near expiry must produce exactly one refresh —
+        # the refresh token is one-shot, so a second exchange with the same
+        # token would kill the fresh credential the first one just minted.
+        self._claude_refresh_lock = asyncio.Lock()
         # Last Linear token applied to registered trackers via
         # `_refresh_linear_tracker_credentials`, so a tick only touches the
         # client's header when the DB token actually changed.
@@ -2999,6 +3006,54 @@ class _OrchestratorBase:
             return None
         return credential or None
 
+    async def _maybe_refresh_claude_credential(self, credential: str) -> str | None:
+        """Proactive central token refresh (Config v2 4/9).
+
+        When the stored access token would expire within the run's maximum
+        wall clock, the daemon refreshes it here — serialized, before dispatch
+        — so the CLI inside a run never rotates the one-shot refresh token
+        itself (which is what raced concurrent runs to death). Far-from-expiry
+        credentials pass through untouched. A failed refresh flips the row to
+        `expired` and returns `None`: dispatch must not proceed on a token
+        that dies mid-run."""
+        horizon = self.config.wall_clock_timeout_secs or _DEFAULT_REFRESH_HORIZON_SECS
+        if not claude_credential_expires_within(credential, horizon):
+            return credential
+        async with self._claude_refresh_lock:
+            # A concurrent dispatch may have refreshed while we waited.
+            current = await self._resolve_claude_credential()
+            if current is None:
+                return None
+            if not claude_credential_expires_within(current, horizon):
+                return current
+            refreshed = await refresh_claude_credential(current)
+            now = self._now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            if refreshed is None:
+                log.warning("claude token refresh failed; marking the connection expired")
+                await db.oauth_connections.update_status(
+                    self._conn,
+                    provider="claude",
+                    status="expired",
+                    updated_at=now,
+                    updated_by="auto-refresh",
+                )
+                return None
+            await db.oauth_connections.set_connection(
+                self._conn,
+                provider="claude",
+                credential=refreshed,
+                cipher=self._cipher,
+                status="connected",
+                expires_at=claude_expires_at(refreshed),
+                updated_at=now,
+                updated_by="auto-refresh",
+            )
+            log.info(
+                "claude token refreshed centrally, valid until %s",
+                claude_expires_at(refreshed),
+            )
+            return refreshed
+
     async def _materialize_claude_env(self, agent: str) -> dict[str, str]:
         """Per-run Claude credential materialization (Config v2 3/9).
 
@@ -3013,6 +3068,9 @@ class _OrchestratorBase:
         if agent != "claude":
             return {}
         credential = await self._resolve_claude_credential()
+        if credential is None:
+            return {}
+        credential = await self._maybe_refresh_claude_credential(credential)
         if credential is None:
             return {}
         config_dir = Path(tempfile.mkdtemp(prefix="symphony-claude-"))
@@ -4125,6 +4183,10 @@ class _OrchestratorBase:
 
 
 log = logging.getLogger(__name__)
+
+# Refresh horizon when no wall-clock cap is configured (Config v2 4/9): a
+# token must outlive the longest plausible run so the CLI never refreshes.
+_DEFAULT_REFRESH_HORIZON_SECS = 2 * 60 * 60
 
 
 MERGE_WAIT_RECONCILE_INTERVAL_SECS = 600

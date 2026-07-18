@@ -6,13 +6,17 @@ that dir at finalize, and the dir is torn down."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from pathlib import Path
 
+import httpx
 import pytest
+import respx
 
 from symphony import db
+from symphony.claude_login import CLAUDE_OAUTH_TOKEN_URL
 from symphony.config import Config, LinearStates, RepoBinding
 from symphony.crypto import CredentialCipher
 from tests.harness import Harness
@@ -110,5 +114,102 @@ async def test_not_connected_or_non_claude_materializes_nothing(tmp_path: Path) 
         assert await harness.orch._materialize_claude_env("codex") == {}  # noqa: SLF001
         # Finalizing an empty env is a no-op (and must not slurp ambient creds).
         await harness.orch._finalize_claude_env({})  # noqa: SLF001
+    finally:
+        await harness.close()
+
+
+def _cred_soon(token: str, refresh: str = "rt-1") -> str:
+    """Credential expiring in ~60s — inside any refresh horizon."""
+    import time as _time
+
+    return json.dumps(
+        {
+            "claudeAiOauth": {
+                "accessToken": token,
+                "refreshToken": refresh,
+                "expiresAt": int((_time.time() + 60) * 1000),
+                "scopes": ["user:inference"],
+            }
+        }
+    )
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_near_expiry_refreshes_exactly_once_under_concurrency(tmp_path: Path) -> None:
+    """Config v2 4/9: two concurrent dispatches near expiry → one serialized
+    refresh; both runs materialize the refreshed token."""
+    route = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"access_token": "tok-new", "refresh_token": "rt-2", "expires_in": 28800},
+        )
+    )
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="claude", credential=_cred_soon("tok-old"), cipher=cipher
+        )
+        env_a, env_b = await asyncio.gather(
+            harness.orch._materialize_claude_env("claude"),  # noqa: SLF001
+            harness.orch._materialize_claude_env("claude"),  # noqa: SLF001
+        )
+        try:
+            assert route.call_count == 1
+            for env in (env_a, env_b):
+                blob = json.loads(
+                    (Path(env["CLAUDE_CONFIG_DIR"]) / ".credentials.json").read_text()
+                )
+                assert blob["claudeAiOauth"]["accessToken"] == "tok-new"
+                assert blob["claudeAiOauth"]["refreshToken"] == "rt-2"
+                assert blob["claudeAiOauth"]["scopes"] == ["user:inference"]
+        finally:
+            await harness.orch._finalize_claude_env(env_a)  # noqa: SLF001
+            await harness.orch._finalize_claude_env(env_b)  # noqa: SLF001
+        stored = await db.oauth_connections.get_credential(harness.conn, "claude", cipher)
+        assert json.loads(stored)["claudeAiOauth"]["accessToken"] == "tok-new"
+        status = await db.oauth_connections.get_status(harness.conn, "claude")
+        assert status is not None and status.updated_by == "auto-refresh"
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_far_expiry_never_refreshes(tmp_path: Path) -> None:
+    route = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(
+        return_value=httpx.Response(200, json={"access_token": "x"})
+    )
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="claude", credential=_cred("tok"), cipher=cipher
+        )
+        env = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
+        try:
+            assert route.call_count == 0
+        finally:
+            await harness.orch._finalize_claude_env(env)  # noqa: SLF001
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_refresh_failure_marks_expired_and_blocks_materialization(tmp_path: Path) -> None:
+    respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(return_value=httpx.Response(400, json={}))
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="claude", credential=_cred_soon("tok-old"), cipher=cipher
+        )
+        env = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
+        assert env == {}  # dispatch must not proceed on a dying token
+        status = await db.oauth_connections.get_status(harness.conn, "claude")
+        assert status is not None and status.status == "expired"
+        assert status.updated_by == "auto-refresh"
     finally:
         await harness.close()
