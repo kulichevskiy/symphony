@@ -289,7 +289,7 @@ async def test_auth_failure_flags_expired_and_gates_dispatch(tmp_path: Path) -> 
         assert status.updated_by == "auth-failure"
 
         blocked = await harness.orch._claude_expired_block_reason("claude")  # noqa: SLF001
-        assert blocked is not None and "reconnect Claude" in blocked
+        assert blocked is not None and "reconnect it" in blocked
         # Non-Claude agents and non-auth errors never flip/block.
         assert await harness.orch._claude_expired_block_reason("codex") is None  # noqa: SLF001
 
@@ -318,5 +318,33 @@ async def test_auth_failure_without_ui_connection_is_noop(tmp_path: Path) -> Non
         await harness.orch._flag_claude_auth_failure("claude", _AuthError())  # noqa: SLF001
         assert await db.oauth_connections.get_status(harness.conn, "claude") is None
         assert await harness.orch._claude_expired_block_reason("claude") is None  # noqa: SLF001
+    finally:
+        await harness.close()
+
+
+def _codex_cred(token: str = "at") -> str:
+    # auth.json shape: tokens.access_token (a JWT is not required for storage).
+    return json.dumps({"OPENAI_API_KEY": None, "tokens": {"access_token": token}})
+
+
+@pytest.mark.asyncio
+async def test_codex_materialize_finalize_round_trip(tmp_path: Path) -> None:
+    """Config v2 6/9: a connected Codex row materializes into a private
+    per-run CODEX_HOME; a mid-run refresh is written back (CAS); teardown."""
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="codex", credential=_codex_cred("tok-0"), cipher=cipher
+        )
+        env = await harness.orch._materialize_claude_env("codex")  # noqa: SLF001
+        home = Path(env["CODEX_HOME"])
+        assert (home / "auth.json").read_text(encoding="utf-8") == _codex_cred("tok-0")
+        (home / "auth.json").write_text(_codex_cred("tok-1"), encoding="utf-8")
+        await harness.orch._finalize_claude_env(env)  # noqa: SLF001
+        assert await db.oauth_connections.get_credential(
+            harness.conn, "codex", cipher
+        ) == _codex_cred("tok-1")
+        assert home.name not in os.listdir(home.parent)
     finally:
         await harness.close()

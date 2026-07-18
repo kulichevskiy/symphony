@@ -232,12 +232,62 @@ describe("ConnectionsPanel", () => {
     render(
       <ConnectionsPanel
         connections={[
-          { provider: "codex", label: "Codex", status: "not_connected", expires_at: null },
+          { provider: "vertex", label: "Vertex", status: "not_connected", expires_at: null },
         ]}
         onChanged={() => {}}
       />,
     );
     expect((screen.getByText("Connect") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("opens the Codex device-auth flow and polls to connected", async () => {
+    // Stays pending until the operator "finishes" on the provider site, so the
+    // panel (URL + code) is observable before the poll loop clears it.
+    let finished = false;
+    const fn = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      if (String(input).endsWith("/start")) {
+        return new Response(
+          JSON.stringify({
+            verification_uri: "https://auth.openai.com/device",
+            user_code: "WDJB-MJHT",
+            login_session: "sess-c",
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify({ status: finished ? "connected" : "pending", expires_at: null }),
+        { status: 200 },
+      );
+    });
+    vi.stubGlobal("fetch", fn);
+    const onChanged = vi.fn();
+    render(
+      <ConnectionsPanel
+        connections={[
+          { provider: "codex", label: "Codex", status: "not_connected", expires_at: null },
+        ]}
+        onChanged={onChanged}
+      />,
+    );
+    // Codex is wired via device-auth, not a redirect.
+    expect((screen.getByText("Connect") as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByText("Connect"));
+    // Surfaces the verification URL + user code for the operator, and holds
+    // while the login is pending.
+    await waitFor(() => {
+      expect(screen.getByText(/auth\.openai\.com\/device/)).toBeTruthy();
+      expect(screen.getByText("WDJB-MJHT")).toBeTruthy();
+    });
+    // Operator completes it; the next poll reports connected.
+    finished = true;
+    await waitFor(() => expect(onChanged).toHaveBeenCalled(), { timeout: 4000 });
+
+    expect(fn.mock.calls[0][0]).toBe("/api/oauth/codex/start");
+    const poll = fn.mock.calls.find((c) => String(c[0]).endsWith("/api/oauth/codex/poll"));
+    expect(poll).toBeTruthy();
+    const body = JSON.parse(String((poll?.[1] as RequestInit).body));
+    expect(body.login_session).toBe("sess-c");
   });
 
   it("opens the Claude code-paste flow and submits the pasted code", async () => {
