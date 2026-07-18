@@ -23,6 +23,7 @@ import {
   fetchConfigOptions,
   fetchConfigView,
   fetchConnections,
+  fetchConnectionsKey,
   fetchRoles,
   type FieldError,
   type RoleCell,
@@ -1548,6 +1549,11 @@ export function ConfigPage() {
     staleTime: Infinity,
     retry: retryUnlessNotFound,
   });
+  const connectionsKey = useQuery({
+    queryKey: ["connections-key"],
+    queryFn: fetchConnectionsKey,
+    staleTime: Infinity,
+  });
   const connections = useQuery({
     queryKey: ["connections"],
     queryFn: fetchConnections,
@@ -1627,6 +1633,15 @@ export function ConfigPage() {
           Credentials for the providers Symphony talks to. Connect GitHub and
           Linear here; the other providers arrive in later releases.
         </p>
+        {connectionsKey.data?.fingerprint ? (
+          <p
+            className="mt-0.5 text-xs text-muted-foreground"
+            title="Non-reversible fingerprint of the credential encryption key"
+          >
+            Encryption key fingerprint:{" "}
+            <code className="font-mono">{connectionsKey.data.fingerprint}</code>
+          </p>
+        ) : null}
       </div>
       {connections.data ? (
         <div className="mb-8">

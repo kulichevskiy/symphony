@@ -15,7 +15,12 @@ from dataclasses import dataclass
 
 import aiosqlite
 
-from ..crypto import CredentialCipher
+from ..crypto import (
+    CredentialCipher,
+    CredentialDecryptError,
+    CredentialKeyMissingError,
+    EncryptionKeyLostError,
+)
 
 # The providers surfaced on the Connections page, in display order.
 PROVIDERS: tuple[str, ...] = ("github", "linear", "claude", "codex")
@@ -155,6 +160,34 @@ async def update_status(
     )
     if commit:
         await conn.commit()
+
+
+async def assert_cipher_usable(conn: aiosqlite.Connection, cipher: CredentialCipher) -> None:
+    """Boot guard (Config v2 2/9): when encrypted credential rows exist, the
+    effective key must decrypt them. Raises `EncryptionKeyLostError` (listing
+    the affected providers) so a lost/rotated key crashes the boot with an
+    instruction instead of surfacing as silent OAuth 503s at runtime. A store
+    with no encrypted rows passes regardless of the cipher."""
+    cur = await conn.execute(
+        "SELECT provider, credential, refresh_token FROM oauth_connections"
+        " WHERE length(credential) > 0"
+    )
+    rows = await cur.fetchall()
+    if not rows:
+        return
+    broken: set[str] = set()
+    for row in rows:
+        try:
+            cipher.decrypt(bytes(row["credential"]))
+            # The refresh token matters as much as the access token — a Linear
+            # row whose access token decrypts but whose refresh token is corrupt
+            # dies at the first in-place refresh (Config v2 2/9 review fix).
+            if row["refresh_token"] is not None:
+                cipher.decrypt(bytes(row["refresh_token"]))
+        except (CredentialDecryptError, CredentialKeyMissingError):
+            broken.add(str(row["provider"]))
+    if broken:
+        raise EncryptionKeyLostError(sorted(broken))
 
 
 async def delete(conn: aiosqlite.Connection, provider: str, *, commit: bool = True) -> None:

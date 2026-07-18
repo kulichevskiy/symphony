@@ -30,7 +30,7 @@ from .app import build_server_config, create_app
 from .auth import Auth0Settings
 from .config import Config, RepoBinding, RoleName, Secrets
 from .credentials import CredentialResolver
-from .crypto import CredentialCipher
+from .crypto import CredentialCipher, EncryptionKeyLostError, resolve_encryption_key
 from .effective_config import ConfigBootError, assemble_effective_config
 from .github.webhook import GitHubWebhookSettings
 from .linear.client import Linear, LinearError, LinearIssue
@@ -261,6 +261,19 @@ def _config_has_linear_bindings(cfg: Config) -> bool:
     return any(binding.provider == "linear" for binding in cfg.repos)
 
 
+def _resolve_key_into(cfg: Config, config_path: Path) -> Config:
+    """The effective encryption key resolved onto cfg (Config v2 2/9): explicit
+    env/.env key wins, else the auto-provisioned file next to the DB. Shared by
+    every CLI entry point that builds ciphers off cfg (daemon, preflight)."""
+    return cfg.model_copy(
+        update={
+            "symphony_encryption_key": resolve_encryption_key(
+                cfg.symphony_encryption_key, Config.peek_db_path(config_path).parent
+            )
+        }
+    )
+
+
 async def _config_has_usable_linear_auth(conn: aiosqlite.Connection, cfg: Config) -> bool:
     """Whether Linear-bound work can actually authenticate: either the env
     `LINEAR_API_KEY` fallback, or a DB OAuth row the runtime `CredentialResolver`
@@ -437,6 +450,20 @@ async def _run(config_path: Path, *, once: bool) -> None:
                 conn, base, yaml_has_repos_topology=yaml_has_repos_topology
             )
         except ConfigBootError as e:
+            click.echo(str(e), err=True)
+            sys.exit(2)
+        # Effective encryption key (Config v2 2/9): explicit env/.env wins,
+        # else auto-provisioned from/into the data volume next to the DB. The
+        # resolved key rides on cfg so every downstream cipher (orchestrator,
+        # UI routers via ui_external_config, the auth gates below) agrees.
+        cfg = _resolve_key_into(cfg, config_path)
+        # Fail the boot loudly when stored credentials no longer decrypt (key
+        # lost/rotated) — never silent OAuth 503s at runtime.
+        try:
+            await db.oauth_connections.assert_cipher_usable(
+                conn, CredentialCipher(cfg.symphony_encryption_key)
+            )
+        except EncryptionKeyLostError as e:
             click.echo(str(e), err=True)
             sys.exit(2)
         # Must run before `_config_has_usable_linear_auth`: that check's DB-first
@@ -838,6 +865,10 @@ async def _preflight(config_path: Path) -> None:
                 boot_gates=False,
                 yaml_has_repos_topology=yaml_has_repos_topology,
             )
+            # Same key resolution as the daemon boot — a DB-only deployment
+            # (auto-provisioned key, no env var) must preflight with the same
+            # cipher the daemon will run with (Config v2 2/9 review fix).
+            cfg = _resolve_key_into(cfg, config_path)
             has_usable_linear_auth = await _config_has_usable_linear_auth(conn, cfg)
         except ConfigBootError as e:
             click.echo(str(e), err=True)
@@ -1440,6 +1471,9 @@ async def _dispatch(linear_id: str, config_path: Path) -> None:
         except ConfigBootError as e:
             click.echo(str(e), err=True)
             sys.exit(2)
+        # Same effective key as the daemon boot: the Orchestrator this command
+        # constructs builds its cipher off cfg (Config v2 2/9 review fix).
+        cfg = _resolve_key_into(cfg, config_path)
         async with Linear(cfg.linear_api_key) as linear:
             try:
                 issue = await linear.lookup_issue(linear_id)

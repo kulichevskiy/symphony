@@ -15,12 +15,21 @@ decrypts) is surfaced as an explicit, catchable error the API layer renders as
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
+import logging
 import os
+import secrets
+from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
 
+log = logging.getLogger(__name__)
+
 _ENV_VAR = "SYMPHONY_ENCRYPTION_KEY"
+# Auto-provisioned key file, living next to the DB in the data volume so it
+# survives redeploys with the data it protects (Config v2 2/9).
+KEY_FILE_NAME = ".encryption_key"
 
 
 class CredentialKeyMissingError(Exception):
@@ -45,6 +54,79 @@ class CredentialDecryptError(Exception):
             "stored credential could not be decrypted with the current "
             "encryption key — re-authorize the provider"
         )
+
+
+class EncryptionKeyLostError(Exception):
+    """Encrypted credential rows exist but the effective key cannot decrypt
+    them — the key was lost or rotated. Raised at boot so the failure is a
+    loud, instructive crash instead of silent OAuth 503s at runtime."""
+
+    def __init__(self, providers: list[str]) -> None:
+        super().__init__(
+            "the effective encryption key cannot decrypt the stored credentials "
+            f"for: {', '.join(providers)}. Restore the original {_ENV_VAR} (or the "
+            f"{KEY_FILE_NAME} file in the data volume), or delete the stored "
+            "connections and re-authorize each provider in the UI."
+        )
+        self.providers = providers
+
+
+def resolve_encryption_key(explicit_key: str, data_dir: Path) -> str:
+    """The deployment's effective encryption key (Config v2 2/9).
+
+    An explicit key (env/.env `SYMPHONY_ENCRYPTION_KEY`) always wins and never
+    touches the filesystem. Otherwise the key file in `data_dir` is used,
+    generated on first boot (0600) so a fresh install needs no manual key
+    provisioning. The key value itself is never logged."""
+    explicit = explicit_key.strip()
+    if explicit:
+        return explicit
+    key_path = data_dir / KEY_FILE_NAME
+    try:
+        existing = key_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        existing = ""
+    if existing:
+        return existing
+    data_dir.mkdir(parents=True, exist_ok=True)
+    # Generation is serialized by an flock on a sidecar lock file: overlapping
+    # first boots (deploy recreate shares one data volume on one host) must
+    # agree on one key — under the lock, whoever arrives second re-reads the
+    # winner's file instead of writing (or replacing it with) a different
+    # secret. The lock also makes the empty-file (truncated write) recovery
+    # race-free.
+    lock_fd = os.open(data_dir / f"{KEY_FILE_NAME}.lock", os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            existing = key_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            existing = ""
+        if existing:
+            return existing
+        key = secrets.token_hex(32)
+        tmp_path = data_dir / f"{KEY_FILE_NAME}.tmp"
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(key + "\n")
+        os.replace(tmp_path, key_path)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
+    log.info(
+        "generated a new credential encryption key at %s (fingerprint %s)",
+        key_path,
+        key_fingerprint(key),
+    )
+    return key
+
+
+def key_fingerprint(key: str) -> str:
+    """Short non-reversible identifier for the effective key — safe to log and
+    to show in the UI so an operator can tell which key an instance runs."""
+    if not key:
+        return ""
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:12]
 
 
 def _derive_key(secret: str) -> bytes:

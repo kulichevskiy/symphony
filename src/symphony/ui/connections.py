@@ -39,9 +39,21 @@ class ConnectionView(BaseModel):
     expires_at: str | None = None
 
 
-def create_connections_router(pool: ReadOnlyDbPool) -> APIRouter:
-    """Router exposing `GET /api/connections` — the four providers' statuses."""
+class ConnectionsKeyView(BaseModel):
+    """The effective encryption key's non-reversible fingerprint (Config v2
+    2/9) — lets an operator verify which key an instance runs. Never the key."""
+
+    fingerprint: str
+
+
+def create_connections_router(pool: ReadOnlyDbPool, *, key_fingerprint: str = "") -> APIRouter:
+    """Router exposing `GET /api/connections` — the four providers' statuses —
+    and `GET /api/connections/key`, the encryption-key fingerprint."""
     router = APIRouter(prefix="/api")
+
+    @router.get("/connections/key", response_model=ConnectionsKeyView)
+    async def connections_key() -> ConnectionsKeyView:
+        return ConnectionsKeyView(fingerprint=key_fingerprint)
 
     @router.get("/connections", response_model=list[ConnectionView])
     async def list_connections() -> list[ConnectionView]:

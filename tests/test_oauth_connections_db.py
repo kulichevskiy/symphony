@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from symphony import db
-from symphony.crypto import CredentialCipher, CredentialDecryptError
+from symphony.crypto import CredentialCipher, CredentialDecryptError, EncryptionKeyLostError
 
 
 async def _conn(tmp_path: Path):  # type: ignore[no-untyped-def]
@@ -169,5 +169,87 @@ async def test_set_replaces_existing_row(tmp_path: Path) -> None:
         assert status is not None and status.status == "expired"
         assert await db.oauth_connections.get_credential(conn, "codex", cipher) == "b"
         assert len(await db.oauth_connections.list_statuses(conn)) == 1
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_assert_cipher_usable_passes_on_empty_store(tmp_path: Path) -> None:
+    conn = await _conn(tmp_path)
+    try:
+        # No encrypted rows: even an unavailable cipher passes the boot guard.
+        await db.oauth_connections.assert_cipher_usable(conn, CredentialCipher(""))
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_assert_cipher_usable_passes_with_matching_key(tmp_path: Path) -> None:
+    conn = await _conn(tmp_path)
+    cipher = CredentialCipher("k")
+    try:
+        await db.oauth_connections.set_connection(
+            conn, provider="claude", credential="tok", cipher=cipher, status="connected"
+        )
+        await db.oauth_connections.assert_cipher_usable(conn, cipher)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_assert_cipher_usable_fails_loudly_on_lost_key(tmp_path: Path) -> None:
+    conn = await _conn(tmp_path)
+    try:
+        await db.oauth_connections.set_connection(
+            conn,
+            provider="claude",
+            credential="t1",
+            cipher=CredentialCipher("old"),
+            status="connected",
+        )
+        await db.oauth_connections.set_connection(
+            conn,
+            provider="github",
+            credential="t2",
+            cipher=CredentialCipher("old"),
+            status="connected",
+        )
+        with pytest.raises(EncryptionKeyLostError) as exc:
+            await db.oauth_connections.assert_cipher_usable(conn, CredentialCipher("new"))
+        assert exc.value.providers == ["claude", "github"]
+        assert "re-authorize" in str(exc.value)
+        # A missing key over encrypted rows fails the same way.
+        with pytest.raises(EncryptionKeyLostError):
+            await db.oauth_connections.assert_cipher_usable(conn, CredentialCipher(""))
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_assert_cipher_usable_catches_corrupt_refresh_token(tmp_path: Path) -> None:
+    """An access token that decrypts but a refresh token that doesn't (partial
+    restore / manual repair) must fail the boot guard too — the row would die
+    at its first in-place refresh otherwise."""
+    conn = await _conn(tmp_path)
+    good = CredentialCipher("k")
+    try:
+        await db.oauth_connections.set_connection(
+            conn,
+            provider="linear",
+            credential="tok",
+            cipher=good,
+            refresh_token="rt",
+            status="connected",
+        )
+        # Corrupt the refresh token: re-encrypt it under a different key.
+        other = CredentialCipher("other-key")
+        await conn.execute(
+            "UPDATE oauth_connections SET refresh_token = ? WHERE provider = 'linear'",
+            (other.encrypt("rt"),),
+        )
+        await conn.commit()
+        with pytest.raises(EncryptionKeyLostError) as exc:
+            await db.oauth_connections.assert_cipher_usable(conn, good)
+        assert exc.value.providers == ["linear"]
     finally:
         await conn.close()
