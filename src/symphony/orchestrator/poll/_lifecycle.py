@@ -1536,6 +1536,10 @@ class _LifecycleMixin(_OrchestratorBase):
                 else ""
             )
             claude_env = await self._materialize_claude_env(local_review_agent)
+            lr_blocked = await self._post_materialize_block_reason(local_review_agent, claude_env)
+            if lr_blocked is not None:
+                await self._finalize_claude_env(claude_env)
+                raise RuntimeError(lr_blocked)
 
             result: LoopResult | None = None
             try:
@@ -1554,7 +1558,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     stall_secs=self.config.stall_timeout_secs,
                     command_secs=self.config.command_timeout_secs,
                     wall_clock_secs=self.config.wall_clock_timeout_secs,
-                    binding_env={**claude_env, **binding.env},
+                    binding_env=dict(binding.env),
                     agent_env=dict(claude_env),
                     mcp_servers=dict(binding.mcp_servers),
                     last_message_dir=last_message_dir,
@@ -2018,6 +2022,12 @@ class _LifecycleMixin(_OrchestratorBase):
         finally:
             # No-op unless the fix turn actually materialized (lazy above).
             await self._finalize_claude_env(verify_claude_env)
+            if result is None or not result.ok:
+                # A Claude verify-fix that died on auth must flip the card and
+                # arm the dispatch gate like the stage runners (Config v2 5/9).
+                await self._flag_auth_failure_from_log(
+                    fixer_role.agent, verify_log_path, 1, verify_run_id
+                )
             await self._finalize_verify_run(
                 run_id=verify_run_id,
                 ok=result.ok if result is not None else False,

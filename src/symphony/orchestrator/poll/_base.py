@@ -3278,6 +3278,9 @@ class _OrchestratorBase:
         blocked = await self._post_materialize_block_reason(role.agent, claude_env)
         if blocked is not None:
             log.warning("run %s not dispatched: %s", run_id, blocked)
+            # The dir was already materialized; tear it down (no write-back
+            # happens — the file is unchanged from its pristine copy).
+            await self._finalize_claude_env(claude_env)
             return UsageDelta(), "spawn_failed", None
         spec = RunnerSpec(
             run_id=run_id,
@@ -3585,6 +3588,9 @@ class _OrchestratorBase:
         blocked = await self._post_materialize_block_reason(role.agent, claude_env)
         if blocked is not None:
             log.warning("run %s not dispatched: %s", run_id, blocked)
+            # The dir was already materialized; tear it down (no write-back
+            # happens — the file is unchanged from its pristine copy).
+            await self._finalize_claude_env(claude_env)
             return UsageDelta(), "spawn_failed", None
         spec = RunnerSpec(
             run_id=run_id,
