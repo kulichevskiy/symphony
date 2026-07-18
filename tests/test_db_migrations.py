@@ -186,3 +186,80 @@ async def test_db_facade_exports_runner(tmp_path: Path) -> None:
         assert db.apply_migrations is apply_migrations
     finally:
         await conn.close()
+
+
+async def test_same_line_statements_split_correctly(tmp_path: Path) -> None:
+    """Two statements on one line must execute as two statements (a line-based
+    splitter would glue them into one un-executable string)."""
+    path = tmp_path / "state.sqlite"
+    conn = await connect(path)  # v1
+    await conn.close()
+
+    migrations = _dir_with_baseline(tmp_path)
+    (migrations / "002_same_line.sql").write_text(
+        "CREATE TABLE a (id INTEGER PRIMARY KEY); CREATE TABLE b (note TEXT DEFAULT 'x; y');\n"
+    )
+    conn = await aiosqlite.connect(str(path))
+    conn.row_factory = aiosqlite.Row
+    try:
+        await apply_migrations(conn, db_path=path, migrations_dir=migrations)
+        assert {"a", "b"} <= await _table_names(conn)
+    finally:
+        await conn.close()
+
+
+async def test_backup_is_wal_aware(tmp_path: Path) -> None:
+    """Committed rows living only in the -wal file must reach the backup —
+    a bare file copy of state.sqlite would miss them."""
+    path = tmp_path / "state.sqlite"
+    conn = await connect(path)  # v1, WAL on
+    await conn.execute("INSERT INTO repos (linear_team_key, github_repo) VALUES ('T', 'o/r')")
+    await conn.commit()
+
+    migrations = _dir_with_baseline(tmp_path)
+    (migrations / "002_noop_table.sql").write_text("CREATE TABLE c (id INTEGER PRIMARY KEY);\n")
+    try:
+        await apply_migrations(conn, db_path=path, migrations_dir=migrations)
+    finally:
+        await conn.close()
+
+    backup = await aiosqlite.connect(str(tmp_path / "state.sqlite.bak-002"))
+    try:
+        cur = await backup.execute("SELECT github_repo FROM repos WHERE linear_team_key = 'T'")
+        row = await cur.fetchone()
+        assert row is not None and row[0] == "o/r"
+    finally:
+        await backup.close()
+
+
+async def test_two_migrators_racing_apply_once(tmp_path: Path) -> None:
+    """Deploy overlap: two daemons boot with the same pending migration. The
+    loser must re-read the version under the lock and no-op instead of
+    replaying the winner's migration (which would crash on CREATE TABLE)."""
+    path = tmp_path / "state.sqlite"
+    conn = await connect(path)  # v1
+    await conn.close()
+
+    migrations = _dir_with_baseline(tmp_path)
+    (migrations / "002_add_widgets.sql").write_text(
+        "CREATE TABLE widgets (id INTEGER PRIMARY KEY);\n"
+    )
+
+    async def _migrator() -> None:
+        c = await aiosqlite.connect(str(path))
+        c.row_factory = aiosqlite.Row
+        await c.execute("PRAGMA busy_timeout = 10000")
+        try:
+            await apply_migrations(c, db_path=path, migrations_dir=migrations)
+        finally:
+            await c.close()
+
+    await asyncio.gather(_migrator(), _migrator())
+
+    conn = await aiosqlite.connect(str(path))
+    conn.row_factory = aiosqlite.Row
+    try:
+        assert "widgets" in await _table_names(conn)
+        assert await _versions(conn) == [(1, "001_baseline"), (2, "002_add_widgets")]
+    finally:
+        await conn.close()

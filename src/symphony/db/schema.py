@@ -29,7 +29,6 @@ from __future__ import annotations
 import importlib.util
 import logging
 import re
-import shutil
 import sqlite3
 from pathlib import Path
 
@@ -51,8 +50,10 @@ async def connect(path: Path) -> aiosqlite.Connection:
     conn = await aiosqlite.connect(str(path))
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA foreign_keys = ON")
-    await conn.execute("PRAGMA journal_mode=WAL")
+    # Timeout first: on a DB not yet in WAL mode, the journal-mode switch
+    # itself needs the write lock and must wait out a deploy-overlap writer.
     await conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    await conn.execute("PRAGMA journal_mode=WAL")
     await apply_migrations(conn, db_path=path)
     return conn
 
@@ -75,25 +76,39 @@ async def apply_migrations(
     )
     await conn.commit()
 
-    cur = await conn.execute("SELECT MAX(version) FROM schema_version")
-    row = await cur.fetchone()
-    current = row[0] if row is not None and row[0] is not None else 0
-
-    pending = [(v, p) for v, p in _discover(migrations_dir) if v > current]
+    current = await _current_version(conn)
+    all_migrations = _discover(migrations_dir)
+    pending = [(v, p) for v, p in all_migrations if v > current]
     if not pending:
         return
     target = pending[-1][0]
 
     # Belt-and-suspenders next to the transaction below: restore-by-copy
     # covers anything a rollback can't (e.g. a future non-transactional
-    # step). Skipped on first boot — there is nothing to lose yet.
+    # step). Taken through SQLite's backup API, not a file copy — in WAL
+    # mode committed data can still live in `-wal`, which a bare copy of the
+    # main file would miss. Skipped on first boot — nothing to lose yet.
     if db_path is not None and current > 0:
         backup = db_path.with_name(f"{db_path.name}.bak-{target:03d}")
-        shutil.copy2(db_path, backup)
+        backup_conn = await aiosqlite.connect(str(backup))
+        try:
+            await conn.backup(backup_conn)
+        finally:
+            await backup_conn.close()
         log.info("DB backed up to %s before migrating v%03d -> v%03d", backup, current, target)
 
     await conn.execute("BEGIN IMMEDIATE")
     try:
+        # Two daemons can race to this point during a deploy overlap: both
+        # read the same `current` above, the loser waits on the winner's
+        # write lock, then must NOT replay the migrations the winner already
+        # applied — re-read the version now that we hold the lock.
+        current = await _current_version(conn)
+        pending = [(v, p) for v, p in all_migrations if v > current]
+        if not pending:
+            await conn.rollback()
+            return
+        target = pending[-1][0]
         for version, path in pending:
             if path.suffix == ".sql":
                 for statement in _split_statements(path.read_text(encoding="utf-8")):
@@ -110,6 +125,12 @@ async def apply_migrations(
         await conn.rollback()
         raise
     log.info("schema migrated to v%03d (%d migration(s) applied)", target, len(pending))
+
+
+async def _current_version(conn: aiosqlite.Connection) -> int:
+    cur = await conn.execute("SELECT MAX(version) FROM schema_version")
+    row = await cur.fetchone()
+    return row[0] if row is not None and row[0] is not None else 0
 
 
 def _discover(migrations_dir: Path) -> list[tuple[int, Path]]:
@@ -134,14 +155,16 @@ def _split_statements(sql: str) -> list[str]:
 
     `executescript` would issue an implicit COMMIT and break the runner's
     single transaction, so statements are executed one by one instead.
+    Accumulation is semicolon-by-semicolon (not line-by-line, which would glue
+    two same-line statements into one un-executable string);
     `sqlite3.complete_statement` handles semicolons inside strings, triggers,
     and comments correctly.
     """
     statements: list[str] = []
     buffer = ""
-    for line in sql.splitlines(keepends=True):
-        buffer += line
-        if sqlite3.complete_statement(buffer):
+    for chunk in re.split(r"(;)", sql):
+        buffer += chunk
+        if chunk == ";" and sqlite3.complete_statement(buffer):
             statement = buffer.strip()
             if _has_effective_sql(statement):
                 statements.append(statement)
