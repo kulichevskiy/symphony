@@ -1,254 +1,173 @@
-"""Schema bootstrap. Reads the checked-in `schema.sql` and applies it.
+"""Versioned schema migrations (Config v2 1/9).
 
-Foreign-key enforcement is per-connection in SQLite, so we issue
-`PRAGMA foreign_keys = ON` here rather than embedding it in the script.
+`connect()` opens the DB and brings it to the head schema version by applying
+any pending files from `migrations/` in order. The daemon is the sole
+migrator — UI pools open plain connections after boot, so they never race DDL.
+
+Boot behavior:
+
+  * `PRAGMA busy_timeout` makes a concurrent opener (deploy overlap: the old
+    and new container briefly share the volume) wait for the writer instead of
+    failing with `database table is locked`;
+  * pending migrations apply inside a single `BEGIN IMMEDIATE` transaction —
+    one writer, one commit; a crash mid-migration rolls back cleanly;
+  * before an *upgrade* (pending work on an already-versioned DB) the DB file
+    is copied aside as `<name>.bak-<target>`, so even a migration failure
+    outside the transaction's reach is recoverable by copying one file back.
+
+Migration files: `NNN_name.sql` (plain SQL, split on complete statements) or
+`NNN_name.py` (data-move escape hatch exposing `async def migrate(conn)`;
+no commits inside — the runner owns the transaction). The version is the
+leading integer; applied versions are recorded in `schema_version`.
+
+Foreign-key enforcement is per-connection in SQLite, so `connect()` issues
+`PRAGMA foreign_keys = ON` rather than embedding it in a migration.
 """
 
 from __future__ import annotations
 
-import json
+import importlib.util
+import logging
+import re
+import shutil
+import sqlite3
 from pathlib import Path
 
 import aiosqlite
 
-_SCHEMA_PATH = Path(__file__).parent / "schema.sql"
+log = logging.getLogger(__name__)
+
+MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+# Generous: must outlast a slow migration running on the other side of a
+# deploy overlap, plus ordinary writer contention.
+BUSY_TIMEOUT_MS = 60_000
+
+_MIGRATION_FILE_RE = re.compile(r"^(\d{3,})_\w+\.(sql|py)$")
 
 
 async def connect(path: Path) -> aiosqlite.Connection:
-    """Open (creating if needed) the SQLite database and apply the schema."""
+    """Open (creating if needed) the SQLite database and migrate it to head."""
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = await aiosqlite.connect(str(path))
     conn.row_factory = aiosqlite.Row
     await conn.execute("PRAGMA foreign_keys = ON")
     await conn.execute("PRAGMA journal_mode=WAL")
-    await apply_schema(conn)
+    await conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    await apply_migrations(conn, db_path=path)
     return conn
 
 
-async def apply_schema(conn: aiosqlite.Connection) -> None:
-    sql = _SCHEMA_PATH.read_text()
-    await conn.executescript(sql)
-    await _migrate(conn)
+async def apply_migrations(
+    conn: aiosqlite.Connection,
+    *,
+    db_path: Path | None = None,
+    migrations_dir: Path | None = None,
+) -> None:
+    """Apply every migration newer than the DB's recorded version, in order,
+    in one transaction. A no-op when the DB is already at head."""
+    migrations_dir = migrations_dir or MIGRATIONS_DIR
+    await conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_version ("
+        "  version    INTEGER PRIMARY KEY,"
+        "  name       TEXT NOT NULL,"
+        "  applied_at TEXT NOT NULL"
+        ")"
+    )
     await conn.commit()
 
+    cur = await conn.execute("SELECT MAX(version) FROM schema_version")
+    row = await cur.fetchone()
+    current = row[0] if row is not None and row[0] is not None else 0
 
-async def _migrate(conn: aiosqlite.Connection) -> None:
-    """Idempotent column adds for tables that pre-existed prior schema bumps."""
-    cur = await conn.execute("PRAGMA table_info(issues)")
-    issue_cols = {row[1] for row in await cur.fetchall()}
-    if "tracker_issue_id" not in issue_cols:
-        await conn.execute(
-            "ALTER TABLE issues ADD COLUMN tracker_issue_id TEXT NOT NULL DEFAULT ''"
-        )
-        await conn.execute("UPDATE issues SET tracker_issue_id = id WHERE tracker_issue_id = ''")
-    if "provider" not in issue_cols:
-        await conn.execute("ALTER TABLE issues ADD COLUMN provider TEXT NOT NULL DEFAULT 'linear'")
-    if "site" not in issue_cols:
-        await conn.execute("ALTER TABLE issues ADD COLUMN site TEXT NOT NULL DEFAULT 'default'")
-    if "granted_token_budget" not in issue_cols:
-        await conn.execute("ALTER TABLE issues ADD COLUMN granted_token_budget INTEGER DEFAULT 0")
-    await conn.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_issues_tracker_identity
-        ON issues(provider, site, tracker_issue_id)
-        """
-    )
+    pending = [(v, p) for v, p in _discover(migrations_dir) if v > current]
+    if not pending:
+        return
+    target = pending[-1][0]
 
-    cur = await conn.execute("PRAGMA table_info(runs)")
-    run_cols = {row[1] for row in await cur.fetchall()}
-    for col in (
-        "input_tokens",
-        "output_tokens",
-        "cache_write_tokens",
-        "cache_read_tokens",
-    ):
-        if col not in run_cols:
-            await conn.execute(f"ALTER TABLE runs ADD COLUMN {col} INTEGER NOT NULL DEFAULT 0")
-    if "termination_kind" not in run_cols:
-        await conn.execute("ALTER TABLE runs ADD COLUMN termination_kind TEXT NOT NULL DEFAULT ''")
-    if "termination_detail" not in run_cols:
-        await conn.execute(
-            "ALTER TABLE runs ADD COLUMN termination_detail TEXT NOT NULL DEFAULT ''"
-        )
-    if "exit_returncode" not in run_cols:
-        await conn.execute("ALTER TABLE runs ADD COLUMN exit_returncode INTEGER")
-    if "stage_done_announced_at" not in run_cols:
-        await conn.execute(
-            "ALTER TABLE runs ADD COLUMN stage_done_announced_at TEXT NOT NULL DEFAULT ''"
-        )
-    if "binding_key" not in run_cols:
-        await conn.execute("ALTER TABLE runs ADD COLUMN binding_key TEXT NOT NULL DEFAULT ''")
+    # Belt-and-suspenders next to the transaction below: restore-by-copy
+    # covers anything a rollback can't (e.g. a future non-transactional
+    # step). Skipped on first boot — there is nothing to lose yet.
+    if db_path is not None and current > 0:
+        backup = db_path.with_name(f"{db_path.name}.bak-{target:03d}")
+        shutil.copy2(db_path, backup)
+        log.info("DB backed up to %s before migrating v%03d -> v%03d", backup, current, target)
 
-    cur = await conn.execute("PRAGMA table_info(comment_cursors)")
-    cols = {row[1] for row in await cur.fetchall()}
-    if "last_seen_ids" not in cols:
-        await conn.execute(
-            "ALTER TABLE comment_cursors ADD COLUMN last_seen_ids TEXT NOT NULL DEFAULT '[]'"
-        )
+    await conn.execute("BEGIN IMMEDIATE")
+    try:
+        for version, path in pending:
+            if path.suffix == ".sql":
+                for statement in _split_statements(path.read_text(encoding="utf-8")):
+                    await conn.execute(statement)
+            else:
+                await _run_python_migration(path, conn)
+            await conn.execute(
+                "INSERT INTO schema_version (version, name, applied_at)"
+                " VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+                (version, path.stem),
+            )
+        await conn.commit()
+    except BaseException:
+        await conn.rollback()
+        raise
+    log.info("schema migrated to v%03d (%d migration(s) applied)", target, len(pending))
 
-    cur = await conn.execute("PRAGMA table_info(review_state)")
-    review_cols = {row[1] for row in await cur.fetchall()}
-    if "ci_fetch_failures" not in review_cols:
-        await conn.execute(
-            "ALTER TABLE review_state ADD COLUMN ci_fetch_failures INTEGER NOT NULL DEFAULT 0"
-        )
-    if "pr_number" not in review_cols:
-        await conn.execute("ALTER TABLE review_state ADD COLUMN pr_number INTEGER")
-    if "pr_url" not in review_cols:
-        await conn.execute("ALTER TABLE review_state ADD COLUMN pr_url TEXT NOT NULL DEFAULT ''")
-    if "github_repo" not in review_cols:
-        await conn.execute(
-            "ALTER TABLE review_state ADD COLUMN github_repo TEXT NOT NULL DEFAULT ''"
-        )
-    if "issue_label" not in review_cols:
-        await conn.execute(
-            "ALTER TABLE review_state ADD COLUMN issue_label TEXT NOT NULL DEFAULT ''"
-        )
-    if "codex_lgtm_comment_id" not in review_cols:
-        await conn.execute(
-            "ALTER TABLE review_state ADD COLUMN codex_lgtm_comment_id TEXT NOT NULL DEFAULT ''"
-        )
-    if "codex_review_requested_at" not in review_cols:
-        await conn.execute(
-            "ALTER TABLE review_state ADD COLUMN codex_review_requested_at TEXT NOT NULL DEFAULT ''"
-        )
 
-    cur = await conn.execute("PRAGMA table_info(webhook_deliveries)")
-    cols = {row[1] for row in await cur.fetchall()}
-    if "status" not in cols:
-        await conn.execute(
-            "ALTER TABLE webhook_deliveries ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
-        )
-        await conn.execute("UPDATE webhook_deliveries SET status = 'handled'")
-
-    cur = await conn.execute("PRAGMA table_info(issue_prs)")
-    cols = {row[1] for row in await cur.fetchall()}
-    if "binding_key" not in cols:
-        await conn.execute("ALTER TABLE issue_prs ADD COLUMN binding_key TEXT NOT NULL DEFAULT ''")
-    if "parked_at" not in cols:
-        await conn.execute("ALTER TABLE issue_prs ADD COLUMN parked_at TEXT")
-    if "review_bypassed" not in cols:
-        await conn.execute(
-            "ALTER TABLE issue_prs ADD COLUMN review_bypassed INTEGER NOT NULL DEFAULT 0"
-        )
-
-    cur = await conn.execute("PRAGMA table_info(acceptance_state)")
-    cols = {row[1] for row in await cur.fetchall()}
-    if "pr_head_sha" not in cols:
-        await conn.execute(
-            "ALTER TABLE acceptance_state ADD COLUMN pr_head_sha TEXT NOT NULL DEFAULT ''"
-        )
-    if "infra_retries" not in cols:
-        await conn.execute(
-            "ALTER TABLE acceptance_state ADD COLUMN infra_retries INTEGER NOT NULL DEFAULT 0"
-        )
-
-    cur = await conn.execute("PRAGMA table_info(merge_conflict_fix_marks)")
-    cols = {row[1] for row in await cur.fetchall()}
-    if "head_sha" not in cols:
-        await conn.execute(
-            "ALTER TABLE merge_conflict_fix_marks ADD COLUMN head_sha TEXT NOT NULL DEFAULT ''"
-        )
-
-    cur = await conn.execute("PRAGMA table_info(operator_waits)")
-    cols = {row[1] for row in await cur.fetchall()}
-    if "tracker_provider" not in cols:
-        await conn.execute(
-            "ALTER TABLE operator_waits ADD COLUMN tracker_provider TEXT NOT NULL DEFAULT 'linear'"
-        )
-        await conn.execute(
-            """
-            UPDATE operator_waits
-               SET tracker_provider = COALESCE(
-                   (SELECT provider FROM issues WHERE issues.id = operator_waits.issue_id),
-                   'linear'
-               )
-            """
-        )
-    if "tracker_site" not in cols:
-        await conn.execute(
-            "ALTER TABLE operator_waits ADD COLUMN tracker_site TEXT NOT NULL DEFAULT 'default'"
-        )
-        await conn.execute(
-            """
-            UPDATE operator_waits
-               SET tracker_site = COALESCE(
-                   (SELECT site FROM issues WHERE issues.id = operator_waits.issue_id),
-                   'default'
-               )
-            """
-        )
-    cur = await conn.execute("PRAGMA table_info(operator_waits)")
-    cols = {row[1] for row in await cur.fetchall()}
-    if "local_review_outcome" not in cols:
-        await conn.execute("ALTER TABLE operator_waits ADD COLUMN local_review_outcome TEXT")
-    cur = await conn.execute("PRAGMA table_info(operator_waits)")
-    cols = {row[1] for row in await cur.fetchall()}
-    if "provider" not in cols:
-        await conn.execute(
-            "ALTER TABLE operator_waits ADD COLUMN provider TEXT NOT NULL DEFAULT 'linear'"
-        )
-        await conn.execute(
-            """
-            UPDATE operator_waits
-               SET provider = COALESCE(
-                   (SELECT provider FROM issues WHERE issues.id = operator_waits.issue_id),
-                   NULLIF(tracker_provider, ''),
-                   'linear'
-               )
-            """
-        )
-
-    # Bindings created under the interim CRUD (SYM-190..193, before the
-    # repo-scoped secret table existed) still carry `webhook_secret` inside
-    # `config_bindings.payload`. Drain any such value into
-    # `config_repo_secrets` and strip it from the payload so the field can
-    # never mis-log as a spurious "cleared" on the binding's first routine
-    # edit (SYM-194 review). Idempotent: once a payload's `webhook_secret` key
-    # is gone, later runs find nothing to do.
-    #
-    # Two legacy bindings can share a `github_repo`; `ORDER BY id` plus
-    # last-non-empty-wins matches `config_import.import_config`'s documented
-    # tie-break for the same collapse, so both cutover paths land the same
-    # secret for a given repo instead of depending on unordered row-scan luck
-    # (SYM-194 review).
-    cur = await conn.execute("SELECT id, payload, github_repo FROM config_bindings ORDER BY id")
-    repo_secrets: dict[str, str] = {}
-    for row in await cur.fetchall():
-        try:
-            payload = json.loads(row["payload"])
-        except json.JSONDecodeError:
+def _discover(migrations_dir: Path) -> list[tuple[int, Path]]:
+    """`(version, path)` for every migration file, ordered. Rejects duplicate
+    version numbers — two files claiming one slot is always a merge mistake."""
+    found: dict[int, Path] = {}
+    for entry in sorted(migrations_dir.iterdir()):
+        match = _MIGRATION_FILE_RE.match(entry.name)
+        if match is None:
             continue
-        if "webhook_secret" not in payload:
-            continue
-        secret = payload.pop("webhook_secret", None)
-        await conn.execute(
-            "UPDATE config_bindings SET payload = ? WHERE id = ?",
-            (json.dumps(payload, separators=(",", ":")), row["id"]),
-        )
-        if secret:
-            repo_secrets[str(row["github_repo"])] = secret
-    for github_repo, secret in repo_secrets.items():
-        existing = await conn.execute(
-            "SELECT 1 FROM config_repo_secrets WHERE github_repo = ?", (github_repo,)
-        )
-        if await existing.fetchone() is not None:
-            # A real repo-secret row already exists (e.g. the operator already
-            # set one through the UI) — never clobber it with a stale legacy
-            # value.
-            continue
-        await conn.execute(
-            """
-            INSERT INTO config_repo_secrets (github_repo, secret, version, updated_at, updated_by)
-            VALUES (?, ?, 1, '', 'migration')
-            """,
-            (github_repo, secret),
-        )
+        version = int(match.group(1))
+        if version in found:
+            raise RuntimeError(
+                f"duplicate migration version {version:03d}: {found[version].name} and {entry.name}"
+            )
+        found[version] = entry
+    return sorted(found.items())
 
-    # Providers whose token exchange returns a `refresh_token` (Linear's
-    # access token expires in 24h) need it preserved alongside the access
-    # token — added after oauth_connections shipped in SYM-196.
-    cur = await conn.execute("PRAGMA table_info(oauth_connections)")
-    oauth_cols = {row[1] for row in await cur.fetchall()}
-    if "refresh_token" not in oauth_cols:
-        await conn.execute("ALTER TABLE oauth_connections ADD COLUMN refresh_token BLOB")
+
+def _split_statements(sql: str) -> list[str]:
+    """Split a migration script into individual statements.
+
+    `executescript` would issue an implicit COMMIT and break the runner's
+    single transaction, so statements are executed one by one instead.
+    `sqlite3.complete_statement` handles semicolons inside strings, triggers,
+    and comments correctly.
+    """
+    statements: list[str] = []
+    buffer = ""
+    for line in sql.splitlines(keepends=True):
+        buffer += line
+        if sqlite3.complete_statement(buffer):
+            statement = buffer.strip()
+            if _has_effective_sql(statement):
+                statements.append(statement)
+            buffer = ""
+    tail = buffer.strip()
+    if tail and _has_effective_sql(tail):
+        # Final statement without a trailing semicolon.
+        statements.append(tail)
+    return statements
+
+
+def _has_effective_sql(fragment: str) -> bool:
+    """Whether `fragment` contains anything besides `--` comments and blank
+    lines (executing a comment-only string is an error, not a no-op)."""
+    return any(line.strip() and not line.strip().startswith("--") for line in fragment.splitlines())
+
+
+async def _run_python_migration(path: Path, conn: aiosqlite.Connection) -> None:
+    """Load `NNN_name.py` and run its `async def migrate(conn)`. The module
+    must not commit — the runner owns the surrounding transaction."""
+    spec = importlib.util.spec_from_file_location(f"symphony_migration_{path.stem}", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load migration module {path.name}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    migrate = getattr(module, "migrate", None)
+    if migrate is None:
+        raise RuntimeError(f"migration {path.name} defines no `async def migrate(conn)`")
+    await migrate(conn)

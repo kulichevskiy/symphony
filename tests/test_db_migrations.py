@@ -1,0 +1,188 @@
+"""Versioned migration runner (Config v2 1/9).
+
+`db.connect` migrates a DB to head at open: fresh DBs get the full baseline,
+already-versioned DBs get only the pending files, upgrades are backed up
+first, failures roll back, and a concurrent writer makes the runner wait
+(busy_timeout) instead of crashing with `database table is locked`.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import os
+import shutil
+import sqlite3
+from pathlib import Path
+
+import aiosqlite
+import pytest
+
+from symphony import db
+from symphony.db.schema import MIGRATIONS_DIR, apply_migrations, connect
+
+
+async def _table_names(conn: aiosqlite.Connection) -> set[str]:
+    cur = await conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    return {row["name"] for row in await cur.fetchall()}
+
+
+async def _versions(conn: aiosqlite.Connection) -> list[tuple[int, str]]:
+    cur = await conn.execute("SELECT version, name FROM schema_version ORDER BY version")
+    return [(row["version"], row["name"]) for row in await cur.fetchall()]
+
+
+def _dir_with_baseline(tmp_path: Path) -> Path:
+    """A migrations dir seeded with the real baseline, ready for extra files."""
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    shutil.copy2(MIGRATIONS_DIR / "001_baseline.sql", migrations / "001_baseline.sql")
+    return migrations
+
+
+async def test_fresh_db_boots_at_head(tmp_path: Path) -> None:
+    conn = await connect(tmp_path / "state.sqlite")
+    try:
+        tables = await _table_names(conn)
+        assert {"issues", "runs", "oauth_connections", "config_bindings"} <= tables
+        assert await _versions(conn) == [(1, "001_baseline")]
+    finally:
+        await conn.close()
+
+
+async def test_reboot_is_noop_and_makes_no_backup(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite"
+    conn = await connect(path)
+    await conn.close()
+    conn = await connect(path)
+    try:
+        assert await _versions(conn) == [(1, "001_baseline")]
+    finally:
+        await conn.close()
+    assert not [name for name in os.listdir(tmp_path) if ".bak-" in name]
+
+
+async def test_pending_migration_applies_and_backs_up(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite"
+    conn = await connect(path)  # v1
+    await conn.close()
+
+    migrations = _dir_with_baseline(tmp_path)
+    (migrations / "002_add_widgets.sql").write_text(
+        "-- adds the widgets table\n"
+        "CREATE TABLE widgets (id INTEGER PRIMARY KEY, note TEXT NOT NULL DEFAULT '');\n"
+    )
+    conn = await aiosqlite.connect(str(path))
+    conn.row_factory = aiosqlite.Row
+    try:
+        await apply_migrations(conn, db_path=path, migrations_dir=migrations)
+        assert "widgets" in await _table_names(conn)
+        assert await _versions(conn) == [(1, "001_baseline"), (2, "002_add_widgets")]
+    finally:
+        await conn.close()
+    assert (tmp_path / "state.sqlite.bak-002").exists()
+
+
+async def test_failing_migration_rolls_back(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite"
+    conn = await connect(path)  # v1
+    await conn.close()
+
+    migrations = _dir_with_baseline(tmp_path)
+    (migrations / "002_broken.sql").write_text(
+        "CREATE TABLE almost (id INTEGER PRIMARY KEY);\n"
+        "CREATE TABLE broken (id INTEGER PRIMARY KEY, CONSTRAINT nonsense;\n"
+    )
+    conn = await aiosqlite.connect(str(path))
+    conn.row_factory = aiosqlite.Row
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            await apply_migrations(conn, db_path=path, migrations_dir=migrations)
+        # Rolled back: the partial table is gone and the version untouched.
+        assert "almost" not in await _table_names(conn)
+        assert await _versions(conn) == [(1, "001_baseline")]
+    finally:
+        await conn.close()
+    # The pre-upgrade backup exists for restore-by-copy recovery.
+    assert (tmp_path / "state.sqlite.bak-002").exists()
+
+
+async def test_python_migration_escape_hatch(tmp_path: Path) -> None:
+    path = tmp_path / "state.sqlite"
+    conn = await connect(path)  # v1
+    await conn.close()
+
+    migrations = _dir_with_baseline(tmp_path)
+    (migrations / "002_seed_repo.py").write_text(
+        "async def migrate(conn):\n"
+        "    await conn.execute(\n"
+        "        \"INSERT INTO repos (linear_team_key, github_repo) VALUES ('T', 'o/r')\"\n"
+        "    )\n"
+    )
+    conn = await aiosqlite.connect(str(path))
+    conn.row_factory = aiosqlite.Row
+    try:
+        await apply_migrations(conn, db_path=path, migrations_dir=migrations)
+        cur = await conn.execute("SELECT github_repo FROM repos WHERE linear_team_key = 'T'")
+        row = await cur.fetchone()
+        assert row is not None and row["github_repo"] == "o/r"
+        assert await _versions(conn) == [(1, "001_baseline"), (2, "002_seed_repo")]
+    finally:
+        await conn.close()
+
+
+async def test_duplicate_versions_rejected(tmp_path: Path) -> None:
+    migrations = _dir_with_baseline(tmp_path)
+    (migrations / "002_first.sql").write_text("CREATE TABLE a (id INTEGER PRIMARY KEY);\n")
+    (migrations / "002_second.sql").write_text("CREATE TABLE b (id INTEGER PRIMARY KEY);\n")
+    conn = await aiosqlite.connect(str(tmp_path / "state.sqlite"))
+    conn.row_factory = aiosqlite.Row
+    try:
+        with pytest.raises(RuntimeError, match="duplicate migration version 002"):
+            await apply_migrations(conn, migrations_dir=migrations)
+    finally:
+        await conn.close()
+
+
+async def test_concurrent_writer_waits_instead_of_crashing(tmp_path: Path) -> None:
+    """Deploy overlap: another connection holds the write lock while the
+    runner boots. With busy_timeout the runner waits it out; without it this
+    scenario was the 2026-07-18 `database table is locked` crash-loop."""
+    path = tmp_path / "state.sqlite"
+    conn = await connect(path)  # v1, WAL mode set
+    await conn.close()
+
+    migrations = _dir_with_baseline(tmp_path)
+    (migrations / "002_add_widgets.sql").write_text(
+        "CREATE TABLE widgets (id INTEGER PRIMARY KEY);\n"
+    )
+
+    holder = await aiosqlite.connect(str(path))
+    try:
+        await holder.execute("BEGIN IMMEDIATE")
+        await holder.execute("INSERT INTO repos (linear_team_key, github_repo) VALUES ('X', 'o/r')")
+
+        migrator = await aiosqlite.connect(str(path))
+        migrator.row_factory = aiosqlite.Row
+        await migrator.execute("PRAGMA busy_timeout = 10000")
+        try:
+            task = asyncio.create_task(
+                apply_migrations(migrator, db_path=path, migrations_dir=migrations)
+            )
+            await asyncio.sleep(0.3)  # runner is now blocked on the holder's lock
+            assert not task.done()
+            await holder.commit()  # release; the runner proceeds instead of crashing
+            await asyncio.wait_for(task, timeout=10)
+            assert "widgets" in await _table_names(migrator)
+        finally:
+            await migrator.close()
+    finally:
+        await holder.close()
+
+
+async def test_db_facade_exports_runner(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        assert await _versions(conn) == [(1, "001_baseline")]
+        assert db.apply_migrations is apply_migrations
+    finally:
+        await conn.close()
