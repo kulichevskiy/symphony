@@ -23,6 +23,7 @@ a `PendingLoginRegistry` (reused from 5/7).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -89,6 +90,9 @@ def create_codex_oauth_router(
     subprocess per `start`; faked in tests."""
     router = APIRouter(prefix="/api/oauth/codex")
     creds_path = credentials_path or default_codex_credentials_path()
+    # Serializes the terminal poll's persist against disconnect so a success
+    # landing mid-disconnect can't re-create the row the operator just cleared.
+    op_lock = asyncio.Lock()
 
     @router.get("/start")
     async def codex_start() -> dict[str, str]:
@@ -125,20 +129,25 @@ def create_codex_oauth_router(
             await registry.discard(body.login_session)
             raise HTTPException(status_code=502, detail="Codex login did not complete") from exc
         if result.status == STATUS_SUCCESS and result.credential is not None:
-            # Terminal: consume the session, then persist encrypted.
-            registry.pop(body.login_session)
-            expires_at = codex_expires_at(result.credential)
-            conn = await conn_provider()
-            await db.oauth_connections.set_connection(
-                conn,
-                provider=_PROVIDER,
-                credential=result.credential,
-                cipher=cipher,
-                status="connected",
-                expires_at=expires_at,
-                updated_at=_now_iso(clock),
-                updated_by="oauth",
-            )
+            # Terminal: consume the session, then persist encrypted — under the
+            # op lock so a concurrent disconnect fully wins or fully loses.
+            async with op_lock:
+                if registry.pop(body.login_session) is None:
+                    # A concurrent disconnect already tore this session down;
+                    # don't resurrect the row it cleared.
+                    return {"status": "not_connected", "expires_at": None}
+                expires_at = codex_expires_at(result.credential)
+                conn = await conn_provider()
+                await db.oauth_connections.set_connection(
+                    conn,
+                    provider=_PROVIDER,
+                    credential=result.credential,
+                    cipher=cipher,
+                    status="connected",
+                    expires_at=expires_at,
+                    updated_at=_now_iso(clock),
+                    updated_by="oauth",
+                )
             _log.info("oauth connection established for %s", _PROVIDER)
             return {"status": "connected", "expires_at": expires_at}
         if result.status == STATUS_FAILED:
@@ -148,11 +157,13 @@ def create_codex_oauth_router(
 
     @router.post("/disconnect")
     async def codex_disconnect() -> dict[str, str]:
-        # Kill any in-flight device login first: a late poll after this
-        # disconnect must not re-persist credentials the operator cleared.
-        await registry.discard_all()
-        conn = await conn_provider()
-        await db.oauth_connections.delete(conn, _PROVIDER)
+        # Under the op lock, and discard the in-flight login first: a late poll
+        # can neither slip its persist in before the delete nor pop a session
+        # this already tore down (it returns not_connected instead).
+        async with op_lock:
+            await registry.discard_all()
+            conn = await conn_provider()
+            await db.oauth_connections.delete(conn, _PROVIDER)
         # The login subprocess already wrote its own credentials file; clear it
         # too so a disconnected card doesn't leave a still-usable local
         # credential a run could pick up outside the DB (mirrors Claude 5/7).
@@ -181,9 +192,19 @@ def create_codex_oauth_router(
             return {"status": "expired"}
         if not credential:
             raise HTTPException(status_code=404, detail=f"{_PROVIDER} is not connected")
-        # A lapsed access-token JWT with a stored refresh token is still a
-        # working connection — the CLI refreshes it inside its per-run dir and
-        # the write-back persists it. Only refreshless expiry is dead.
+        # A run that hit a real 401 flipped the row to expired via auth-failure;
+        # the offline Test (JWT/refresh inspection) must not overturn that — only
+        # a reconnect clears it, or the expired dispatch gate is defeated.
+        status = await db.oauth_connections.get_status(conn, _PROVIDER)
+        if (
+            status is not None
+            and status.status == "expired"
+            and status.updated_by == "auth-failure"
+        ):
+            return {"status": "expired"}
+        # Otherwise: a lapsed access-token JWT with a stored refresh token is
+        # still a working connection (the CLI refreshes in its per-run dir and
+        # the write-back persists it). Only refreshless expiry is dead.
         live = not codex_credential_expired(credential) or _has_refresh_token(credential)
         await db.oauth_connections.update_status(
             conn,

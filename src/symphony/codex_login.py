@@ -47,7 +47,9 @@ _ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # uppercase-alnum block, optionally hyphenated — e.g. `ABCD-1234`).
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _URL_RE = re.compile(r"https://\S+", re.IGNORECASE)
-_CODE_RE = re.compile(r"\b([A-Z0-9]{4,8}(?:-[A-Z0-9]{4,8})+)\b")
+# The server-provided user_code is opaque: a hyphenated group (ABCD-1234)
+# OR a single block (WDJBMJHT). Prefer the hyphenated form, else a lone block.
+_CODE_RE = re.compile(r"\b([A-Z0-9]{4,8}(?:-[A-Z0-9]{4,8})+|[A-Z0-9]{6,10})\b")
 # How long to wait for the URL + code to appear after spawning the login.
 _START_TIMEOUT_SECS = 60.0
 
@@ -93,6 +95,32 @@ class CodexLoginProcess(Protocol):
     async def poll(self) -> CodexPollResult: ...
 
     async def close(self) -> None: ...
+
+
+def pin_file_auth_storage(codex_home: Path) -> None:
+    """Force codex to persist auth to `auth.json`, not the OS keyring.
+
+    codex's credential storage is `cli_auth_credentials_store` (`file` writes
+    `auth.json`; `keyring`/`auto` may use the OS store, leaving `auth.json`
+    empty). Pin `file` in the CODEX_HOME config.toml — replacing any existing
+    setting — so both the device login and per-run homes always read/write the
+    blob the daemon stores (Config v2 6/9 review fix)."""
+    import re as _re
+
+    try:
+        codex_home.mkdir(parents=True, exist_ok=True)
+        config = codex_home / "config.toml"
+        existing = config.read_text(encoding="utf-8") if config.exists() else ""
+        stripped = _re.sub(r"(?m)^\s*cli_auth_credentials_store\s*=.*$\n?", "", existing)
+        if stripped and not stripped.endswith("\n"):
+            stripped += "\n"
+        config.write_text(stripped + 'cli_auth_credentials_store = "file"\n', encoding="utf-8")
+    except OSError:
+        log.warning("could not pin codex file auth storage", exc_info=True)
+
+
+# Back-compat private alias used by SubprocessCodexLogin.
+_pin_file_auth_storage = pin_file_auth_storage
 
 
 def default_codex_credentials_path() -> Path:
@@ -203,16 +231,7 @@ class SubprocessCodexLogin:
         would leave the `auth.json` we read back empty. Pin file storage via
         the CODEX_HOME config.toml so the device login always writes the blob
         the daemon stores + materializes (Config v2 6/9 review fix)."""
-        home = self._credentials_path.parent
-        try:
-            home.mkdir(parents=True, exist_ok=True)
-            config = home / "config.toml"
-            existing = config.read_text(encoding="utf-8") if config.exists() else ""
-            if "preferred_auth_method" not in existing:
-                with config.open("a", encoding="utf-8") as fh:
-                    fh.write('\npreferred_auth_method = "apikey"\n')
-        except OSError:
-            log.warning("could not pin codex file auth storage", exc_info=True)
+        _pin_file_auth_storage(self._credentials_path.parent)
 
     async def start(self) -> CodexDeviceAuth:
         self._ensure_file_auth_storage()

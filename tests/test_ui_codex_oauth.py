@@ -270,3 +270,32 @@ async def test_start_is_auth_gated(tmp_path: Path) -> None:
                 assert authed.status_code == 200
         finally:
             await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_test_does_not_resurrect_auth_failure_expiry(tmp_path: Path) -> None:
+    """A row expired by a real 401 (updated_by=auth-failure) must stay expired
+    through offline Test — only a reconnect clears it, or the dispatch gate is
+    defeated (Config v2 5/9 + 6/9 review fix)."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        # A live-looking credential, but the row was expired by an auth failure.
+        await db.oauth_connections.set_connection(
+            conn,
+            provider="codex",
+            credential=_credential(_FUTURE),
+            cipher=CredentialCipher(_KEY),
+            status="connected",
+            updated_by="oauth",
+        )
+        await db.oauth_connections.update_status(
+            conn, provider="codex", status="expired", updated_by="auth-failure"
+        )
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.post("/api/oauth/codex/test")
+        assert resp.json()["status"] == "expired"
+        status = await db.oauth_connections.get_status(conn, "codex")
+        assert status is not None and status.status == "expired"
+    finally:
+        await conn.close()

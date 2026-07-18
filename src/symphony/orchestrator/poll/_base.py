@@ -54,7 +54,11 @@ from ...claude_login import (
     read_claude_credential,
     refresh_claude_credential,
 )
-from ...codex_login import codex_expires_at, default_codex_credentials_path
+from ...codex_login import (
+    codex_expires_at,
+    default_codex_credentials_path,
+    pin_file_auth_storage,
+)
 from ...config import Config, RepoBinding, ResolvedRole, binding_natural_key
 from ...credentials import (
     CredentialResolver,
@@ -3225,6 +3229,10 @@ class _OrchestratorBase:
                 default_toml = default_codex_credentials_path().parent / "config.toml"
                 if default_toml.exists():
                     shutil.copy2(default_toml, config_dir / "config.toml")
+                # Force file-backed auth in the per-run home: a copied
+                # keyring/auto setting would make the run read the OS store,
+                # not our materialized auth.json (Config v2 6/9 review fix).
+                pin_file_auth_storage(config_dir)
         except OSError:
             log.warning("%s credential materialization failed", agent, exc_info=True)
             shutil.rmtree(config_dir, ignore_errors=True)

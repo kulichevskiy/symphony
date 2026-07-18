@@ -147,3 +147,37 @@ async def test_read_device_auth_strips_ansi_escapes() -> None:
     device = await login._read_device_auth()  # noqa: SLF001
     assert device.verification_uri == "https://auth.openai.com/device"
     assert device.user_code == "WXYZ-1234"
+
+
+@pytest.mark.asyncio
+async def test_read_device_auth_accepts_unhyphenated_code() -> None:
+    from symphony.codex_login import SubprocessCodexLogin
+
+    lines = [b"visit https://auth.openai.com/device\n", b"code: WDJBMJHT\n"]
+
+    class _Stdout:
+        def __init__(self) -> None:
+            self._it = iter(lines)
+
+        async def readline(self) -> bytes:
+            return next(self._it, b"")
+
+    class _Proc:
+        stdout = _Stdout()
+
+    login = SubprocessCodexLogin()
+    login._proc = _Proc()  # type: ignore[assignment]  # noqa: SLF001
+    device = await login._read_device_auth()  # noqa: SLF001
+    assert device.user_code == "WDJBMJHT"
+
+
+def test_pin_file_auth_storage_replaces_keyring(tmp_path: Path) -> None:
+    from symphony.codex_login import pin_file_auth_storage
+
+    config = tmp_path / "config.toml"
+    config.write_text('model = "o3"\ncli_auth_credentials_store = "keyring"\n', encoding="utf-8")
+    pin_file_auth_storage(tmp_path)
+    text = config.read_text(encoding="utf-8")
+    assert 'cli_auth_credentials_store = "file"' in text
+    assert "keyring" not in text
+    assert 'model = "o3"' in text  # unrelated settings preserved
