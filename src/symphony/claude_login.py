@@ -35,6 +35,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
+import httpx
+
 log = logging.getLogger(__name__)
 
 _SESSION_ENTROPY_BYTES = 32
@@ -219,11 +221,84 @@ def claude_credential_expired(raw: str) -> bool:
     A blob with no parseable expiry is treated as not-expired — the card's
     `Test` reflects "live" rather than flipping a usable connection to expired
     on a format we don't recognize."""
+    return claude_credential_expires_within(raw, 0.0)
+
+
+def claude_credential_expires_within(raw: str, horizon_secs: float) -> bool:
+    """Whether the credential's access token expires within `horizon_secs`
+    from now (Config v2 4/9: the daemon refreshes proactively when the expiry
+    falls inside a run's maximum wall clock, so the CLI never has to rotate the
+    one-shot refresh token itself mid-run). No parseable expiry → False."""
     expires_at = claude_expires_at(raw)
     if expires_at is None:
         return False
     deadline = datetime.strptime(expires_at, _ISO_FORMAT).replace(tzinfo=UTC)
-    return datetime.now(UTC) >= deadline
+    return datetime.now(UTC).timestamp() + horizon_secs >= deadline.timestamp()
+
+
+# The Claude Code CLI's own public OAuth client — the daemon refreshes the
+# UI-stored credential through the standard refresh grant (RFC 6749 §6), the
+# same exchange the CLI performs itself. Plan B if this endpoint ever
+# resists: force a refresh via an isolated one-shot CLI invocation.
+CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+CLAUDE_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+_REFRESH_TIMEOUT_SECS = 30.0
+
+
+async def refresh_claude_credential(
+    raw: str, *, client: httpx.AsyncClient | None = None
+) -> str | None:
+    """Exchange the credential blob's refresh token for a fresh access token
+    and return the rebuilt blob (all unrelated fields preserved verbatim), or
+    `None` when the blob has no refresh token or the exchange fails. Never
+    raises — the caller treats `None` as "connection is dead, park it"."""
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    oauth = payload.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    refresh_token = oauth.get("refreshToken")
+    if not isinstance(refresh_token, str) or not refresh_token:
+        return None
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLAUDE_OAUTH_CLIENT_ID,
+    }
+    owns_client = client is None
+    http = client or httpx.AsyncClient(timeout=_REFRESH_TIMEOUT_SECS)
+    try:
+        response = await http.post(CLAUDE_OAUTH_TOKEN_URL, json=data)
+        if response.status_code != 200:
+            log.warning("claude token refresh failed with HTTP %d", response.status_code)
+            return None
+        token = response.json()
+    except (httpx.HTTPError, ValueError):
+        log.warning("claude token refresh failed", exc_info=True)
+        return None
+    finally:
+        if owns_client:
+            await http.aclose()
+    access_token = token.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        return None
+    oauth = dict(oauth)
+    oauth["accessToken"] = access_token
+    # Some providers omit refresh_token on refresh (the old one stays valid);
+    # Anthropic rotates it — keep whichever we were given.
+    new_refresh = token.get("refresh_token")
+    if isinstance(new_refresh, str) and new_refresh:
+        oauth["refreshToken"] = new_refresh
+    expires_in = token.get("expires_in")
+    if isinstance(expires_in, (int, float)) and not isinstance(expires_in, bool):
+        oauth["expiresAt"] = int((datetime.now(UTC).timestamp() + expires_in) * 1000)
+    payload = dict(payload)
+    payload["claudeAiOauth"] = oauth
+    return json.dumps(payload)
 
 
 class SubprocessClaudeLogin:

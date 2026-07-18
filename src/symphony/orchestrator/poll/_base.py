@@ -23,6 +23,8 @@ import json
 import logging
 import os
 import re
+import shutil
+import tempfile
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -47,9 +49,10 @@ from ...agent.prompt import implement_prompt
 from ...agent.runner import Runner, RunnerSpec
 from ...agent.runners.local import LocalRunner
 from ...claude_login import (
+    claude_credential_expires_within,
     claude_expires_at,
-    default_claude_credentials_path,
     read_claude_credential,
+    refresh_claude_credential,
 )
 from ...config import Config, RepoBinding, ResolvedRole, binding_natural_key
 from ...credentials import (
@@ -78,7 +81,11 @@ from ...pipeline.cost_guard import (
     UsageCostEstimator,
     UsageDelta,
 )
-from ...pipeline.local_review import StreamApiError, extract_last_agent_message
+from ...pipeline.local_review import (
+    StreamApiError,
+    classify_stream_api_error,
+    extract_last_agent_message,
+)
 from ...pipeline.local_review_loop import LoopOutcome, LoopResult
 from ...pipeline.state_machine import on_runner_event
 from ...tracker import (
@@ -395,7 +402,6 @@ class _OrchestratorBase:
         tracker_factory: Callable[[RepoBinding], IssueTracker | Awaitable[IssueTracker]]
         | None = None,
         repo_secret_view: db.config_repo_secrets.RepoSecretView | None = None,
-        claude_credentials_path: Path | None = None,
     ) -> None:
         self.config = config
         if isinstance(tracker_or_registry, TrackerRegistry):
@@ -487,11 +493,11 @@ class _OrchestratorBase:
         # the DB if it changed. Serialized per provider by the write-back's own
         # lock so two concurrent runs finishing at once can't clobber each other.
         self._credential_write_back = CredentialWriteBack(conn, self._cipher)
-        self._claude_credentials_path = (
-            claude_credentials_path
-            if claude_credentials_path is not None
-            else default_claude_credentials_path()
-        )
+        # Serializes proactive Claude token refreshes (Config v2 4/9): two
+        # concurrent dispatches near expiry must produce exactly one refresh —
+        # the refresh token is one-shot, so a second exchange with the same
+        # token would kill the fresh credential the first one just minted.
+        self._claude_refresh_lock = asyncio.Lock()
         # Last Linear token applied to registered trackers via
         # `_refresh_linear_tracker_credentials`, so a tick only touches the
         # client's header when the DB token actually changed.
@@ -2989,48 +2995,243 @@ class _OrchestratorBase:
         )
         return RunCredentials(github_token=github_token, linear_token=linear_token)
 
-    async def _restore_claude_credentials(self) -> None:
-        """Before a Claude run, restore the credentials file from the DB's
-        connected/expired Claude row if the file is missing — a redeploy or
-        volume loss can drop the auth volume while the DB still holds the last
-        write-back (OAuth in UI 5/7 review fix). A no-op when the file already
-        exists, Claude isn't UI-connected, or the stored credential can't be
-        decrypted. Never raises into the run — restore is best-effort, mirroring
-        `_write_back_claude_credentials`."""
-        if read_claude_credential(self._claude_credentials_path) is not None:
-            return
+    async def _resolve_claude_credential(self) -> str | None:
+        """The UI-stored Claude credential blob, or `None` when Claude isn't
+        UI-connected or the stored credential can't be decrypted (the run then
+        falls back to whatever ambient auth the environment provides)."""
         status = await db.oauth_connections.get_status(self._conn, "claude")
         if status is None or status.status not in ("connected", "expired"):
-            return
+            return None
         try:
             credential = await db.oauth_connections.get_credential(
                 self._conn, "claude", self._cipher
             )
         except (CredentialDecryptError, CredentialKeyMissingError):
-            return
-        if not credential:
-            return
-        try:
-            self._claude_credentials_path.parent.mkdir(parents=True, exist_ok=True)
-            self._claude_credentials_path.write_text(credential, encoding="utf-8")
-            self._claude_credentials_path.chmod(0o600)
-        except OSError:
-            log.warning("claude credential restore failed", exc_info=True)
+            return None
+        return credential or None
 
-    async def _write_back_claude_credentials(self) -> None:
-        """After a Claude run, persist the (possibly refreshed) credential file
-        back to the DB if it changed (OAuth in UI 5/7). A no-op when Claude
-        isn't UI-connected, when the file is absent, or when nothing changed.
-        Never raises into the finished run — write-back is best-effort."""
-        credential = read_claude_credential(self._claude_credentials_path)
-        if not credential:
-            return
-        try:
-            await self._credential_write_back.write_back(
-                "claude", credential, expires_at=claude_expires_at(credential)
+    async def _maybe_refresh_claude_credential(self, credential: str) -> str | None:
+        """Proactive central token refresh (Config v2 4/9).
+
+        When the stored access token would expire within the run's maximum
+        wall clock, the daemon refreshes it here — serialized, before dispatch
+        — so the CLI inside a run never rotates the one-shot refresh token
+        itself (which is what raced concurrent runs to death). Far-from-expiry
+        credentials pass through untouched. A failed refresh flips the row to
+        `expired` and returns `None`: dispatch must not proceed on a token
+        that dies mid-run."""
+        horizon = self.config.wall_clock_timeout_secs or _DEFAULT_REFRESH_HORIZON_SECS
+        if not claude_credential_expires_within(credential, horizon):
+            return credential
+        async with self._claude_refresh_lock:
+            # A concurrent dispatch may have refreshed while we waited.
+            current = await self._resolve_claude_credential()
+            if current is None:
+                return None
+            if not claude_credential_expires_within(current, horizon):
+                return current
+            refreshed = await refresh_claude_credential(current)
+            now = self._now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            if refreshed is None:
+                # A reconnect that landed while the (doomed) token exchange was
+                # in flight must win: only expire the row if it still holds the
+                # credential the failed refresh started from.
+                latest = await self._resolve_claude_credential()
+                if latest is not None and latest != current:
+                    log.info("claude refresh failed but the row was reconnected; using it")
+                    return latest
+                log.warning("claude token refresh failed; marking the connection expired")
+                await db.oauth_connections.update_status(
+                    self._conn,
+                    provider="claude",
+                    status="expired",
+                    updated_at=now,
+                    updated_by="auto-refresh",
+                )
+                return None
+            # CAS against the blob the refresh started from: an operator
+            # reconnect that landed while the token HTTP exchange was in
+            # flight must win over credentials derived from the stale
+            # refresh token (Config v2 5/9 review fix).
+            wrote = await self._credential_write_back.write_back(
+                "claude",
+                refreshed,
+                expires_at=claude_expires_at(refreshed),
+                expected_prior=current,
             )
-        except Exception:  # noqa: BLE001 — write-back must never break a finished run
-            log.warning("claude credential write-back failed", exc_info=True)
+            if not wrote:
+                log.info("claude refresh raced a reconnect; using the stored credential")
+                return await self._resolve_claude_credential()
+            log.info(
+                "claude token refreshed centrally, valid until %s",
+                claude_expires_at(refreshed),
+            )
+            return refreshed
+
+    async def _claude_expired_block_reason(self, agent: str) -> str | None:
+        """Dispatch gate (Config v2 5/9): a Claude run must not start while the
+        UI connection is `expired` — retrying an authentication failure without
+        a reconnect just burns runs (the SYM-200/201 hot loops). Returns the
+        park reason, or `None` when dispatch may proceed (non-Claude agents,
+        no UI connection at all, or a live one)."""
+        if agent != "claude":
+            return None
+        status = await db.oauth_connections.get_status(self._conn, "claude")
+        if status is None or status.status != "expired":
+            return None
+        return (
+            "the Claude connection is expired — reconnect Claude on the "
+            "Connections page, then retry"
+        )
+
+    async def _flag_claude_auth_failure(
+        self, agent: str, api_error: object, *, run_started_at: str = ""
+    ) -> None:
+        """After a Claude run died on an authentication error, flip the UI
+        connection to `expired` so the Connections card surfaces the fix and
+        the dispatch gate above stops further runs (Config v2 5/9). A no-op
+        for non-auth errors, when Claude was never UI-connected, or when the
+        stored row changed after the run started (`run_started_at`) — a fresh
+        reconnect/refresh must not be flagged for a stale run's failure."""
+        if agent != "claude" or api_error is None:
+            return
+        message = str(getattr(api_error, "message", "") or "")
+        status_code = getattr(api_error, "status", None)
+        looks_auth = (
+            "not logged in" in message.lower()
+            or "authentication" in message.lower()
+            or status_code == 401
+        )
+        if not looks_auth:
+            return
+        status = await db.oauth_connections.get_status(self._conn, "claude")
+        if status is None or status.status not in ("connected", "expired"):
+            return
+        if run_started_at and status.updated_at:
+            updated: datetime | None
+            started: datetime | None
+            try:
+                updated = datetime.fromisoformat(status.updated_at.replace("Z", "+00:00"))
+                started = datetime.fromisoformat(run_started_at.replace("Z", "+00:00"))
+            except ValueError:
+                updated = started = None
+            # OAuth updated_at has second precision while run started_at can
+            # carry microseconds — floor the start so a same-second reconnect
+            # counts as "after the run started" (conservative: don't flag).
+            if (
+                updated is not None
+                and started is not None
+                and updated >= started.replace(microsecond=0)
+            ):
+                log.info(
+                    "claude auth failure from a run older than the stored credential; not flagging"
+                )
+                return
+        log.warning("claude run failed on authentication; marking the connection expired")
+        await db.oauth_connections.update_status(
+            self._conn,
+            provider="claude",
+            status="expired",
+            updated_at=self._now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            updated_by="auth-failure",
+        )
+
+    async def _post_materialize_block_reason(
+        self, agent: str, claude_env: dict[str, str]
+    ) -> str | None:
+        """Second dispatch gate, after materialization: a proactive refresh that
+        failed inside `_materialize_claude_env` flips the row to `expired` and
+        yields `{}` — the run must then be blocked, not silently started on
+        ambient credentials (Config v2 5/9 review fix)."""
+        if agent != "claude":
+            return None
+        # Checked even when materialization produced an env: a row that is
+        # still `expired` after materialization (e.g. a blob with no parseable
+        # expiry that skipped the proactive refresh) must not dispatch.
+        return await self._claude_expired_block_reason(agent)
+
+    async def _flag_auth_failure_from_log(
+        self, agent: str, log_path: Path, returncode: int | None, run_id: str
+    ) -> None:
+        """After a failed agent run, recover the provider API error from the
+        run log and flip the connection on an authentication failure — every
+        runner path, not just the rc=0 implement completion gate (Config v2
+        5/9 review fix). Best-effort: an unreadable log is a no-op. The run's
+        own started_at (from the runs row) anchors the stale-run guard."""
+        if agent != "claude" or returncode in (0, None):
+            return
+        stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
+        if stdout is None:
+            return
+        api_error: object | None = classify_stream_api_error(stdout)
+        if api_error is None and "not logged in" in stdout.lower():
+            # Claude can also fail auth with a plain-text (often stderr-only)
+            # "Not logged in" line the JSONL classifier skips.
+            api_error = StreamApiError(message="Not logged in", status=401)
+        if api_error is None:
+            return
+        cur = await self._conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,))
+        row = await cur.fetchone()
+        run_started_at = str(row["started_at"]) if row is not None else ""
+        await self._flag_claude_auth_failure(agent, api_error, run_started_at=run_started_at)
+
+    async def _materialize_claude_env(self, agent: str) -> dict[str, str]:
+        """Per-run Claude credential materialization (Config v2 3/9).
+
+        For a Claude run with a UI-stored credential, writes it into a private,
+        single-run config dir and returns `{"CLAUDE_CONFIG_DIR": ...}` so the
+        CLI authenticates off the DB copy — concurrent runs each get their own
+        dir, so they can never race one shared credentials file. Returns `{}`
+        (and materializes nothing) for non-Claude runs or when Claude isn't
+        UI-connected. The caller MUST pass the returned env to
+        `_finalize_claude_env` when the run ends — that reads the (possibly
+        refreshed) credential back for the DB write-back and removes the dir."""
+        if agent != "claude":
+            return {}
+        credential = await self._resolve_claude_credential()
+        if credential is None:
+            return {}
+        credential = await self._maybe_refresh_claude_credential(credential)
+        if credential is None:
+            return {}
+        config_dir = Path(tempfile.mkdtemp(prefix="symphony-claude-"))
+        try:
+            os.chmod(config_dir, 0o700)
+            credentials_path = config_dir / ".credentials.json"
+            credentials_path.write_text(credential, encoding="utf-8")
+            credentials_path.chmod(0o600)
+            # Pristine copy of what this run started from — the CAS guard the
+            # finalize write-back compares the DB row against (Config v2 5/9).
+            prior_path = config_dir / ".credentials.orig"
+            prior_path.write_text(credential, encoding="utf-8")
+            prior_path.chmod(0o600)
+        except OSError:
+            log.warning("claude credential materialization failed", exc_info=True)
+            shutil.rmtree(config_dir, ignore_errors=True)
+            return {}
+        return {"CLAUDE_CONFIG_DIR": str(config_dir)}
+
+    async def _finalize_claude_env(self, claude_env: dict[str, str]) -> None:
+        """Tear down a `_materialize_claude_env` dir: persist the (possibly
+        refreshed) credential back to the DB if it changed (OAuth in UI 5/7),
+        then remove the per-run dir. A no-op for `{}`. Never raises into the
+        finished run — write-back is best-effort."""
+        config_dir = claude_env.get("CLAUDE_CONFIG_DIR")
+        if not config_dir:
+            return
+        credential = read_claude_credential(Path(config_dir) / ".credentials.json")
+        prior = read_claude_credential(Path(config_dir) / ".credentials.orig")
+        if credential and credential != prior:
+            try:
+                await self._credential_write_back.write_back(
+                    "claude",
+                    credential,
+                    expires_at=claude_expires_at(credential),
+                    expected_prior=prior,
+                )
+            except Exception:  # noqa: BLE001 — write-back must never break a finished run
+                log.warning("claude credential write-back failed", exc_info=True)
+        shutil.rmtree(config_dir, ignore_errors=True)
 
     async def _run_stage_command(
         self,
@@ -3046,20 +3247,10 @@ class _OrchestratorBase:
         prior_total: float,
     ) -> tuple[UsageDelta, str, int | None]:
         storage_issue_id = storage_issue_id or issue.id
-        spec = RunnerSpec(
-            run_id=run_id,
-            workspace_path=workspace_path,
-            command=command,
-            env=dict(binding.env),
-            stall_secs=self.config.stall_timeout_secs,
-            command_secs=self.config.command_timeout_secs,
-            wall_clock_secs=self.config.wall_clock_timeout_secs,
-            stage=stage,
-            credentials=await self._resolve_run_credentials(binding),
-            github_host=github_host_for_repo(binding.github_repo),
-        )
-        if role.agent == "claude":
-            await self._restore_claude_credentials()
+        blocked = await self._claude_expired_block_reason(role.agent)
+        if blocked is not None:
+            log.warning("run %s not dispatched: %s", run_id, blocked)
+            return UsageDelta(), "spawn_failed", None
 
         log_path = self.config.log_root / f"{run_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3077,6 +3268,31 @@ class _OrchestratorBase:
             run_id=run_id,
             stage=stage,
             workspace_path=workspace_path,
+        )
+        run_credentials = await self._resolve_run_credentials(binding)
+        # Per-run private CLAUDE_CONFIG_DIR from the DB credential (Config v2
+        # 3/9); binding env still overrides. Materialized LAST — everything
+        # between here and the `finally` that tears it down must be
+        # infallible, or a setup failure would leak the dir (review fix).
+        claude_env = await self._materialize_claude_env(role.agent)
+        blocked = await self._post_materialize_block_reason(role.agent, claude_env)
+        if blocked is not None:
+            log.warning("run %s not dispatched: %s", run_id, blocked)
+            # The dir was already materialized; tear it down (no write-back
+            # happens — the file is unchanged from its pristine copy).
+            await self._finalize_claude_env(claude_env)
+            return UsageDelta(), "spawn_failed", None
+        spec = RunnerSpec(
+            run_id=run_id,
+            workspace_path=workspace_path,
+            command=command,
+            env={**claude_env, **binding.env},
+            stall_secs=self.config.stall_timeout_secs,
+            command_secs=self.config.command_timeout_secs,
+            wall_clock_secs=self.config.wall_clock_timeout_secs,
+            stage=stage,
+            credentials=run_credentials,
+            github_host=github_host_for_repo(binding.github_repo),
         )
         self._active_run_ids.add(run_id)
         try:
@@ -3126,11 +3342,11 @@ class _OrchestratorBase:
                         break
         finally:
             self._active_run_ids.discard(run_id)
-        # Claude refreshes its access token in place during a run; persist the
-        # refreshed credential back to the DB so the next run (or a redeploy
-        # that lost the auth volume) doesn't need a re-auth (OAuth in UI 5/7).
-        if role.agent == "claude":
-            await self._write_back_claude_credentials()
+            # Claude refreshes its access token in place during a run; persist
+            # the refreshed credential from the per-run dir back to the DB and
+            # remove the dir (Config v2 3/9).
+            await self._finalize_claude_env(claude_env)
+        await self._flag_auth_failure_from_log(role.agent, log_path, final_returncode, run_id)
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
         )
@@ -3353,20 +3569,10 @@ class _OrchestratorBase:
         prior_total: float = 0.0,
         clear_pid_on_finish: bool = False,
     ) -> tuple[UsageDelta, str, int | None]:
-        spec = RunnerSpec(
-            run_id=run_id,
-            workspace_path=workspace_path,
-            command=command,
-            env=dict(binding.env),
-            stall_secs=self.config.stall_timeout_secs,
-            command_secs=self.config.command_timeout_secs,
-            wall_clock_secs=self.config.wall_clock_timeout_secs,
-            stage=stage,
-            credentials=await self._resolve_run_credentials(binding),
-            github_host=github_host_for_repo(binding.github_repo),
-        )
-        if role.agent == "claude":
-            await self._restore_claude_credentials()
+        blocked = await self._claude_expired_block_reason(role.agent)
+        if blocked is not None:
+            log.warning("run %s not dispatched: %s", run_id, blocked)
+            return UsageDelta(), "spawn_failed", None
 
         log_path = self.config.log_root / f"{run_id}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3375,6 +3581,29 @@ class _OrchestratorBase:
         final_kind = "exit"
         final_returncode: int | None = None
         cost_estimator = _UsageCostEstimator(agent=role.agent, codex_model=role_codex_model(role))
+        run_credentials = await self._resolve_run_credentials(binding)
+        # See `_run_stage_command`: materialized last so nothing fallible sits
+        # between the dir's creation and the `finally` that tears it down.
+        claude_env = await self._materialize_claude_env(role.agent)
+        blocked = await self._post_materialize_block_reason(role.agent, claude_env)
+        if blocked is not None:
+            log.warning("run %s not dispatched: %s", run_id, blocked)
+            # The dir was already materialized; tear it down (no write-back
+            # happens — the file is unchanged from its pristine copy).
+            await self._finalize_claude_env(claude_env)
+            return UsageDelta(), "spawn_failed", None
+        spec = RunnerSpec(
+            run_id=run_id,
+            workspace_path=workspace_path,
+            command=command,
+            env={**claude_env, **binding.env},
+            stall_secs=self.config.stall_timeout_secs,
+            command_secs=self.config.command_timeout_secs,
+            wall_clock_secs=self.config.wall_clock_timeout_secs,
+            stage=stage,
+            credentials=run_credentials,
+            github_host=github_host_for_repo(binding.github_repo),
+        )
         activity = (
             self._activity_session(
                 binding=binding,
@@ -3436,10 +3665,10 @@ class _OrchestratorBase:
             self._active_run_ids.discard(run_id)
             if clear_pid_on_finish:
                 await db.runs.update_pid(self._conn, run_id, None)
-        # See `_run_stage_command`: a Claude fix/review run can also refresh its
-        # token in place, so persist the refreshed credential back (5/7).
-        if role.agent == "claude":
-            await self._write_back_claude_credentials()
+            # See `_run_stage_command`: a Claude fix/review run can also refresh
+            # its token in place — write back from the per-run dir + tear down.
+            await self._finalize_claude_env(claude_env)
+        await self._flag_auth_failure_from_log(role.agent, log_path, final_returncode, run_id)
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
         )
@@ -4112,6 +4341,18 @@ class _OrchestratorBase:
 
 
 log = logging.getLogger(__name__)
+
+
+def _read_log_best_effort(log_path: Path) -> str | None:
+    try:
+        return log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+# Refresh horizon when no wall-clock cap is configured (Config v2 4/9): a
+# token must outlive the longest plausible run so the CLI never refreshes.
+_DEFAULT_REFRESH_HORIZON_SECS = 2 * 60 * 60
 
 
 MERGE_WAIT_RECONCILE_INTERVAL_SECS = 600

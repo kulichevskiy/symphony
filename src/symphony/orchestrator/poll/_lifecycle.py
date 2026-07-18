@@ -880,6 +880,10 @@ class _LifecycleMixin(_OrchestratorBase):
                 api_error = _read_run_stream_api_error_obj(log_path)
                 if api_error is not None:
                     reason = api_error.message
+                    # An authentication failure flips the Claude card to
+                    # `expired` and arms the dispatch gate (Config v2 5/9) —
+                    # never a retry loop.
+                    await self._flag_claude_auth_failure(implement_role.agent, api_error)
                     if await self._maybe_requeue_transient_agent_failure(
                         run_id=run_id,
                         binding=binding,
@@ -1524,21 +1528,21 @@ class _LifecycleMixin(_OrchestratorBase):
 
             # Local review builds its own RunnerSpec / collect_runner_output
             # instead of going through `_run_stage_command`/`_run_runner`, so it
-            # needs the same Claude credential restore-before / write-back-after
-            # when any of its roles runs on Claude — otherwise a UI-connected
-            # Claude (DB-only creds after a redeploy / lost auth volume) leaves
-            # the reviewer/verifier/fixer subprocesses with no credentials file
-            # (OAuth in UI 5/7 review fix).
-            local_review_uses_claude = "claude" in {
-                reviewer_role.agent,
-                verifier_role.agent,
-                fixer_role.agent,
-            }
+            # gets the same per-run Claude credential materialization +
+            # write-back (Config v2 3/9) when any of its roles runs on Claude.
+            local_review_agent = (
+                "claude"
+                if "claude" in {reviewer_role.agent, verifier_role.agent, fixer_role.agent}
+                else ""
+            )
+            claude_env = await self._materialize_claude_env(local_review_agent)
+            lr_blocked = await self._post_materialize_block_reason(local_review_agent, claude_env)
+            if lr_blocked is not None:
+                await self._finalize_claude_env(claude_env)
+                raise RuntimeError(lr_blocked)
 
             result: LoopResult | None = None
             try:
-                if local_review_uses_claude:
-                    await self._restore_claude_credentials()
                 result = await run_local_review_session(
                     runner=self._runner,
                     workspace_path=workspace_path,
@@ -1555,6 +1559,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     command_secs=self.config.command_timeout_secs,
                     wall_clock_secs=self.config.wall_clock_timeout_secs,
                     binding_env=dict(binding.env),
+                    agent_env=dict(claude_env),
                     mcp_servers=dict(binding.mcp_servers),
                     last_message_dir=last_message_dir,
                     head_sha_provider=_workspace_head_sha,
@@ -1573,8 +1578,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     reviewer_codex_model=reviewer_role.attribution_codex_model(),
                     verifier_codex_model=verifier_role.attribution_codex_model(),
                 )
-                if local_review_uses_claude:
-                    await self._write_back_claude_credentials()
+                await self._finalize_claude_env(claude_env)
 
             log.info(
                 "local-review phase for %s ended in %s (iterations=%d, strategy=%s, reviewer=%s)",
@@ -1975,11 +1979,30 @@ class _LifecycleMixin(_OrchestratorBase):
             binding_key=_binding_storage_key(binding),
         )
         result: VerifyResult | None = None
+        # A Claude verify fix turn needs its own per-run credentials — the
+        # implement stage's dir was torn down with that run (Config v2 3/9
+        # review fix). Materialized LAZILY: a green verify_cmd launches no
+        # agent and must not touch (or refresh) credentials at all.
+        verify_claude_env: dict[str, str] = {}
+
+        async def _verify_fix_env() -> dict[str, str]:
+            if not verify_claude_env:
+                verify_claude_env.update(await self._materialize_claude_env(fixer_role.agent))
+                blocked = await self._post_materialize_block_reason(
+                    fixer_role.agent, verify_claude_env
+                )
+                if blocked is not None:
+                    # Raises into run_verify_session; the surrounding
+                    # fail-closed except turns it into a failed verify.
+                    raise RuntimeError(blocked)
+            return dict(verify_claude_env)
+
         try:
             result = await run_verify_session(
                 runner=self._runner,
                 workspace_path=workspace_path,
                 verify_cmd=verify_cmd,
+                extra_env_provider=_verify_fix_env,
                 timeout_secs=binding.resolved_verify_timeout_secs(self.config.command_timeout_secs),
                 parent_run_id=parent_run_id,
                 issue_title=issue.title,
@@ -1997,6 +2020,14 @@ class _LifecycleMixin(_OrchestratorBase):
             log.exception("verify phase raised on %s", issue.identifier)
             result = VerifyResult(ok=False, error=f"verify phase raised: {e}")
         finally:
+            # No-op unless the fix turn actually materialized (lazy above).
+            await self._finalize_claude_env(verify_claude_env)
+            if result is None or not result.ok:
+                # A Claude verify-fix that died on auth must flip the card and
+                # arm the dispatch gate like the stage runners (Config v2 5/9).
+                await self._flag_auth_failure_from_log(
+                    fixer_role.agent, verify_log_path, 1, verify_run_id
+                )
             await self._finalize_verify_run(
                 run_id=verify_run_id,
                 ok=result.ok if result is not None else False,

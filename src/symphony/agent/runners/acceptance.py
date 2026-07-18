@@ -201,6 +201,9 @@ async def run_acceptance(
     codex_model: str = DEFAULT_CODEX_MODEL,
     claude_model: str | None = None,
     effort: str | None = None,
+    # Per-run credential env from the orchestrator (e.g. CLAUDE_CONFIG_DIR,
+    # Config v2 3/9) — merged under every spec's own env.
+    extra_env: dict[str, str] | None = None,
 ) -> AcceptanceVerdict:
     # `{log_root}/{run_id}.log` is the run's tailable log — the acceptance
     # subprocess tees to it in real time (same file the issue-detail API
@@ -238,6 +241,7 @@ async def run_acceptance(
             codex_model=codex_model,
             claude_model=claude_model,
             effort=effort,
+            extra_env=extra_env,
         )
     if mode == _PREVIEW_MODE:
         return await _run_preview_acceptance(
@@ -255,6 +259,7 @@ async def run_acceptance(
             codex_model=codex_model,
             claude_model=claude_model,
             effort=effort,
+            extra_env=extra_env,
         )
     if mode != _CODE_ONLY_MODE:
         return AcceptanceVerdict(
@@ -290,6 +295,7 @@ async def run_acceptance(
             claude_model=claude_model,
             effort=effort,
         ),
+        env=dict(extra_env or {}),
         stall_secs=stall_secs,
         stage="acceptance",
     )
@@ -363,6 +369,7 @@ async def _run_dev_acceptance(
     codex_model: str = DEFAULT_CODEX_MODEL,
     claude_model: str | None = None,
     effort: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> AcceptanceVerdict:
     if not dev_command or dev_port is None:
         return AcceptanceVerdict(
@@ -415,6 +422,7 @@ async def _run_dev_acceptance(
             codex_model=codex_model,
             claude_model=claude_model,
             effort=effort,
+            extra_env=extra_env,
         )
     finally:
         await _stop_dev_server(dev_server)
@@ -436,6 +444,7 @@ async def _run_preview_acceptance(
     codex_model: str = DEFAULT_CODEX_MODEL,
     claude_model: str | None = None,
     effort: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> AcceptanceVerdict:
     if not preview_url:
         return AcceptanceVerdict(
@@ -461,6 +470,7 @@ async def _run_preview_acceptance(
         codex_model=codex_model,
         claude_model=claude_model,
         effort=effort,
+        extra_env=extra_env,
     )
 
 
@@ -481,6 +491,7 @@ async def _run_playwright_acceptance(
     codex_model: str = DEFAULT_CODEX_MODEL,
     claude_model: str | None = None,
     effort: str | None = None,
+    extra_env: dict[str, str] | None = None,
 ) -> AcceptanceVerdict:
     artifacts_dir = workspace_path / ".symphony" / "acceptance" / run_id
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -511,6 +522,7 @@ async def _run_playwright_acceptance(
             effort=effort,
         ),
         env={
+            **(extra_env or {}),
             "SYMPHONY_ACCEPTANCE_PREVIEW_URL": preview_url,
             "SYMPHONY_ACCEPTANCE_ARTIFACT_DIR": str(artifacts_dir),
         },
