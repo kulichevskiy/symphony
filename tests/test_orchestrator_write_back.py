@@ -170,7 +170,7 @@ async def test_near_expiry_refreshes_exactly_once_under_concurrency(tmp_path: Pa
         stored = await db.oauth_connections.get_credential(harness.conn, "claude", cipher)
         assert json.loads(stored)["claudeAiOauth"]["accessToken"] == "tok-new"
         status = await db.oauth_connections.get_status(harness.conn, "claude")
-        assert status is not None and status.updated_by == "auto-refresh"
+        assert status is not None and status.updated_by == "write-back"
     finally:
         await harness.close()
 

@@ -1976,14 +1976,21 @@ class _LifecycleMixin(_OrchestratorBase):
         result: VerifyResult | None = None
         # A Claude verify fix turn needs its own per-run credentials — the
         # implement stage's dir was torn down with that run (Config v2 3/9
-        # review fix).
-        verify_claude_env = await self._materialize_claude_env(fixer_role.agent)
+        # review fix). Materialized LAZILY: a green verify_cmd launches no
+        # agent and must not touch (or refresh) credentials at all.
+        verify_claude_env: dict[str, str] = {}
+
+        async def _verify_fix_env() -> dict[str, str]:
+            if not verify_claude_env:
+                verify_claude_env.update(await self._materialize_claude_env(fixer_role.agent))
+            return dict(verify_claude_env)
+
         try:
             result = await run_verify_session(
                 runner=self._runner,
                 workspace_path=workspace_path,
                 verify_cmd=verify_cmd,
-                extra_env=verify_claude_env,
+                extra_env_provider=_verify_fix_env,
                 timeout_secs=binding.resolved_verify_timeout_secs(self.config.command_timeout_secs),
                 parent_run_id=parent_run_id,
                 issue_title=issue.title,
@@ -2001,6 +2008,7 @@ class _LifecycleMixin(_OrchestratorBase):
             log.exception("verify phase raised on %s", issue.identifier)
             result = VerifyResult(ok=False, error=f"verify phase raised: {e}")
         finally:
+            # No-op unless the fix turn actually materialized (lazy above).
             await self._finalize_claude_env(verify_claude_env)
             await self._finalize_verify_run(
                 run_id=verify_run_id,

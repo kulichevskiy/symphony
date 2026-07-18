@@ -81,7 +81,11 @@ from ...pipeline.cost_guard import (
     UsageCostEstimator,
     UsageDelta,
 )
-from ...pipeline.local_review import StreamApiError, extract_last_agent_message
+from ...pipeline.local_review import (
+    StreamApiError,
+    classify_stream_api_error,
+    extract_last_agent_message,
+)
 from ...pipeline.local_review_loop import LoopOutcome, LoopResult
 from ...pipeline.state_machine import on_runner_event
 from ...tracker import (
@@ -3038,16 +3042,19 @@ class _OrchestratorBase:
                     updated_by="auto-refresh",
                 )
                 return None
-            await db.oauth_connections.set_connection(
-                self._conn,
-                provider="claude",
-                credential=refreshed,
-                cipher=self._cipher,
-                status="connected",
+            # CAS against the blob the refresh started from: an operator
+            # reconnect that landed while the token HTTP exchange was in
+            # flight must win over credentials derived from the stale
+            # refresh token (Config v2 5/9 review fix).
+            wrote = await self._credential_write_back.write_back(
+                "claude",
+                refreshed,
                 expires_at=claude_expires_at(refreshed),
-                updated_at=now,
-                updated_by="auto-refresh",
+                expected_prior=current,
             )
+            if not wrote:
+                log.info("claude refresh raced a reconnect; using the stored credential")
+                return await self._resolve_claude_credential()
             log.info(
                 "claude token refreshed centrally, valid until %s",
                 claude_expires_at(refreshed),
@@ -3070,11 +3077,15 @@ class _OrchestratorBase:
             "Connections page, then retry"
         )
 
-    async def _flag_claude_auth_failure(self, agent: str, api_error: object) -> None:
+    async def _flag_claude_auth_failure(
+        self, agent: str, api_error: object, *, run_started_at: str = ""
+    ) -> None:
         """After a Claude run died on an authentication error, flip the UI
         connection to `expired` so the Connections card surfaces the fix and
         the dispatch gate above stops further runs (Config v2 5/9). A no-op
-        for non-auth errors or when Claude was never UI-connected."""
+        for non-auth errors, when Claude was never UI-connected, or when the
+        stored row changed after the run started (`run_started_at`) — a fresh
+        reconnect/refresh must not be flagged for a stale run's failure."""
         if agent != "claude" or api_error is None:
             return
         message = str(getattr(api_error, "message", "") or "")
@@ -3089,6 +3100,11 @@ class _OrchestratorBase:
         status = await db.oauth_connections.get_status(self._conn, "claude")
         if status is None or status.status not in ("connected", "expired"):
             return
+        if run_started_at and status.updated_at and status.updated_at > run_started_at:
+            log.info(
+                "claude auth failure from a run older than the stored credential; not flagging"
+            )
+            return
         log.warning("claude run failed on authentication; marking the connection expired")
         await db.oauth_connections.update_status(
             self._conn,
@@ -3097,6 +3113,32 @@ class _OrchestratorBase:
             updated_at=self._now().strftime("%Y-%m-%dT%H:%M:%SZ"),
             updated_by="auth-failure",
         )
+
+    async def _post_materialize_block_reason(
+        self, agent: str, claude_env: dict[str, str]
+    ) -> str | None:
+        """Second dispatch gate, after materialization: a proactive refresh that
+        failed inside `_materialize_claude_env` flips the row to `expired` and
+        yields `{}` — the run must then be blocked, not silently started on
+        ambient credentials (Config v2 5/9 review fix)."""
+        if agent != "claude" or claude_env:
+            return None
+        return await self._claude_expired_block_reason(agent)
+
+    async def _flag_auth_failure_from_log(
+        self, agent: str, log_path: Path, returncode: int | None, run_started_at: str
+    ) -> None:
+        """After a failed agent run, recover the provider API error from the
+        run log and flip the connection on an authentication failure — every
+        runner path, not just the rc=0 implement completion gate (Config v2
+        5/9 review fix). Best-effort: an unreadable log is a no-op."""
+        if agent != "claude" or returncode in (0, None):
+            return
+        stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
+        if stdout is None:
+            return
+        api_error = classify_stream_api_error(stdout)
+        await self._flag_claude_auth_failure(agent, api_error, run_started_at=run_started_at)
 
     async def _materialize_claude_env(self, agent: str) -> dict[str, str]:
         """Per-run Claude credential materialization (Config v2 3/9).
@@ -3193,11 +3235,16 @@ class _OrchestratorBase:
             workspace_path=workspace_path,
         )
         run_credentials = await self._resolve_run_credentials(binding)
+        run_started_at = self._now().strftime("%Y-%m-%dT%H:%M:%SZ")
         # Per-run private CLAUDE_CONFIG_DIR from the DB credential (Config v2
         # 3/9); binding env still overrides. Materialized LAST — everything
         # between here and the `finally` that tears it down must be
         # infallible, or a setup failure would leak the dir (review fix).
         claude_env = await self._materialize_claude_env(role.agent)
+        blocked = await self._post_materialize_block_reason(role.agent, claude_env)
+        if blocked is not None:
+            log.warning("run %s not dispatched: %s", run_id, blocked)
+            return UsageDelta(), "spawn_failed", None
         spec = RunnerSpec(
             run_id=run_id,
             workspace_path=workspace_path,
@@ -3262,6 +3309,9 @@ class _OrchestratorBase:
             # the refreshed credential from the per-run dir back to the DB and
             # remove the dir (Config v2 3/9).
             await self._finalize_claude_env(claude_env)
+        await self._flag_auth_failure_from_log(
+            role.agent, log_path, final_returncode, run_started_at
+        )
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
         )
@@ -3497,9 +3547,14 @@ class _OrchestratorBase:
         final_returncode: int | None = None
         cost_estimator = _UsageCostEstimator(agent=role.agent, codex_model=role_codex_model(role))
         run_credentials = await self._resolve_run_credentials(binding)
+        run_started_at = self._now().strftime("%Y-%m-%dT%H:%M:%SZ")
         # See `_run_stage_command`: materialized last so nothing fallible sits
         # between the dir's creation and the `finally` that tears it down.
         claude_env = await self._materialize_claude_env(role.agent)
+        blocked = await self._post_materialize_block_reason(role.agent, claude_env)
+        if blocked is not None:
+            log.warning("run %s not dispatched: %s", run_id, blocked)
+            return UsageDelta(), "spawn_failed", None
         spec = RunnerSpec(
             run_id=run_id,
             workspace_path=workspace_path,
@@ -3576,6 +3631,9 @@ class _OrchestratorBase:
             # See `_run_stage_command`: a Claude fix/review run can also refresh
             # its token in place — write back from the per-run dir + tear down.
             await self._finalize_claude_env(claude_env)
+        await self._flag_auth_failure_from_log(
+            role.agent, log_path, final_returncode, run_started_at
+        )
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
         )
@@ -4248,6 +4306,14 @@ class _OrchestratorBase:
 
 
 log = logging.getLogger(__name__)
+
+
+def _read_log_best_effort(log_path: Path) -> str | None:
+    try:
+        return log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
 
 # Refresh horizon when no wall-clock cap is configured (Config v2 4/9): a
 # token must outlive the longest plausible run so the CLI never refreshes.

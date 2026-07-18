@@ -907,28 +907,41 @@ class _AcceptanceMixin(_OrchestratorBase):
                         # write-back as those (Config v2 3/9).
                         claude_env = await self._materialize_claude_env(accept_role.agent)
                         try:
-                            verdict = await run_acceptance(
-                                runner=self._runner,
-                                run_id=run_id,
-                                workspace_path=workspace_path,
-                                mode=effective_mode,
-                                linear_description=issue.description,
-                                pr_diff_summary=pr_diff_summary,
-                                taste_guide=load_taste_guide(
-                                    binding_taste_guide=binding.acceptance.taste_guide,
-                                ),
-                                criteria=criteria_predicates,
-                                stall_secs=binding.acceptance.time_cap_minutes * 60,
-                                preview_url=preview_url,
-                                dev_command=binding.acceptance.dev_command,
-                                dev_port=binding.acceptance.dev_port,
-                                log_root=self.config.log_root,
-                                agent=accept_role.agent,
-                                codex_model=role_codex_model(accept_role),
-                                claude_model=role_claude_model(accept_role),
-                                effort=accept_role.effort,
-                                extra_env=claude_env,
+                            blocked = await self._post_materialize_block_reason(
+                                accept_role.agent, claude_env
                             )
+                            if blocked is not None:
+                                verdict = AcceptanceVerdict(
+                                    kind="infra_error",
+                                    criteria=list(criteria_predicates),
+                                    cost=0.0,
+                                    hero_screenshot_url="",
+                                    details=blocked,
+                                    preview_url=preview_url,
+                                )
+                            else:
+                                verdict = await run_acceptance(
+                                    runner=self._runner,
+                                    run_id=run_id,
+                                    workspace_path=workspace_path,
+                                    mode=effective_mode,
+                                    linear_description=issue.description,
+                                    pr_diff_summary=pr_diff_summary,
+                                    taste_guide=load_taste_guide(
+                                        binding_taste_guide=binding.acceptance.taste_guide,
+                                    ),
+                                    criteria=criteria_predicates,
+                                    stall_secs=binding.acceptance.time_cap_minutes * 60,
+                                    preview_url=preview_url,
+                                    dev_command=binding.acceptance.dev_command,
+                                    dev_port=binding.acceptance.dev_port,
+                                    log_root=self.config.log_root,
+                                    agent=accept_role.agent,
+                                    codex_model=role_codex_model(accept_role),
+                                    claude_model=role_claude_model(accept_role),
+                                    effort=accept_role.effort,
+                                    extra_env=claude_env,
+                                )
                         finally:
                             await self._finalize_claude_env(claude_env)
                         await _record_run_model_usage(
