@@ -1522,8 +1522,23 @@ class _LifecycleMixin(_OrchestratorBase):
                     verdict=verdict,
                 )
 
+            # Local review builds its own RunnerSpec / collect_runner_output
+            # instead of going through `_run_stage_command`/`_run_runner`, so it
+            # needs the same Claude credential restore-before / write-back-after
+            # when any of its roles runs on Claude — otherwise a UI-connected
+            # Claude (DB-only creds after a redeploy / lost auth volume) leaves
+            # the reviewer/verifier/fixer subprocesses with no credentials file
+            # (OAuth in UI 5/7 review fix).
+            local_review_uses_claude = "claude" in {
+                reviewer_role.agent,
+                verifier_role.agent,
+                fixer_role.agent,
+            }
+
             result: LoopResult | None = None
             try:
+                if local_review_uses_claude:
+                    await self._restore_claude_credentials()
                 result = await run_local_review_session(
                     runner=self._runner,
                     workspace_path=workspace_path,
@@ -1558,6 +1573,8 @@ class _LifecycleMixin(_OrchestratorBase):
                     reviewer_codex_model=reviewer_role.attribution_codex_model(),
                     verifier_codex_model=verifier_role.attribution_codex_model(),
                 )
+                if local_review_uses_claude:
+                    await self._write_back_claude_credentials()
 
             log.info(
                 "local-review phase for %s ended in %s (iterations=%d, strategy=%s, reviewer=%s)",

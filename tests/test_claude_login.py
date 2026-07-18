@@ -18,6 +18,7 @@ import pytest
 from symphony.claude_login import (
     PendingLoginRegistry,
     claude_expires_at,
+    default_claude_credentials_path,
     read_claude_credential,
 )
 
@@ -116,6 +117,27 @@ def test_read_claude_credential_returns_raw_text(tmp_path: Path) -> None:
     payload = '{"claudeAiOauth": {"accessToken": "tok"}}'
     path.write_text(payload, encoding="utf-8")
     assert read_claude_credential(path) == payload
+
+
+def test_read_claude_credential_unreadable_returns_none(tmp_path: Path) -> None:
+    # An unreadable path (here a directory in the file's place — IsADirectoryError
+    # is an OSError) is treated as absent, not raised, so best-effort
+    # restore/write-back callers get to run their own recovery.
+    path = tmp_path / ".credentials.json"
+    path.mkdir()
+    assert read_claude_credential(path) is None
+
+
+def test_default_credentials_path_honors_config_dir(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    assert default_claude_credentials_path() == tmp_path / ".credentials.json"
+
+
+def test_default_credentials_path_without_config_dir(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    assert default_claude_credentials_path() == Path.home() / ".claude" / ".credentials.json"
 
 
 def test_claude_expires_at_parses_epoch_millis() -> None:

@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 import secrets
 import time
@@ -172,9 +173,13 @@ class PendingLoginRegistry:
 
 
 def default_claude_credentials_path() -> Path:
-    """Where the `claude` CLI writes its OAuth credentials (`HOME` is the
-    deployment's persistent auth volume — see docker-compose.yml)."""
-    return Path.home() / ".claude" / ".credentials.json"
+    """Where the `claude` CLI writes its OAuth credentials. Honors
+    `CLAUDE_CONFIG_DIR` (Claude Code stores `.credentials.json` under it when
+    set, per the auth docs); otherwise `~/.claude` (`HOME` is the deployment's
+    persistent auth volume — see docker-compose.yml)."""
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR")
+    base = Path(config_dir) if config_dir else Path.home() / ".claude"
+    return base / ".credentials.json"
 
 
 def read_claude_credential(path: Path) -> str | None:
