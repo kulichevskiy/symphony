@@ -18,6 +18,7 @@ from starlette.types import Scope
 from uvicorn import Config as UvicornConfig
 
 from .auth import Auth0Settings, create_auth_config_router, create_auth_dependency
+from .claude_login import ClaudeLoginProcess, PendingLoginRegistry, SubprocessClaudeLogin
 from .config import Config
 from .crypto import CredentialCipher
 from .db.config_repo_secrets import RepoSecretView
@@ -30,6 +31,7 @@ from .github.webhook import (
 from .linear.client import Linear
 from .oauth import OAuthStateStore
 from .ui.api import CommandSink, PauseController, create_api_router
+from .ui.claude_oauth import create_claude_oauth_router
 from .ui.config_crud import create_config_crud_router
 from .ui.config_view import create_config_router
 from .ui.connections import create_connections_router
@@ -109,6 +111,8 @@ def create_app(
     ui_webhook_public_url: str | None = None,
     auth0_settings: Auth0Settings | None = None,
     oauth_cipher: CredentialCipher | None = None,
+    claude_login_factory: Callable[[], ClaudeLoginProcess] | None = None,
+    claude_credentials_path: Path | None = None,
     clock: Clock | None = None,
 ) -> FastAPI:
     # Publicly-exposed deployments (docker-compose.coolify.yml) set
@@ -255,6 +259,24 @@ def create_app(
                 oauth_cipher
                 if oauth_cipher is not None
                 else CredentialCipher(base_config.symphony_encryption_key)
+            )
+            # Claude code-paste login (5/7): no browser-reachable callback, so
+            # it's a separate router mounted BEFORE the generic engine below —
+            # `/api/oauth/claude/*` must win over `/api/oauth/{provider}/*`
+            # (which doesn't know `claude` and would 404). Gated like the rest.
+            app.include_router(
+                create_claude_oauth_router(
+                    oauth_write_pool.connection,
+                    cipher=cipher,
+                    registry=PendingLoginRegistry(),
+                    login_factory=(
+                        claude_login_factory
+                        or (lambda: SubprocessClaudeLogin(credentials_path=claude_credentials_path))
+                    ),
+                    clock=clock,
+                    credentials_path=claude_credentials_path,
+                ),
+                dependencies=api_dependencies,
             )
             oauth_gated, oauth_public = create_oauth_routers(
                 oauth_write_pool.connection,

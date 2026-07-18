@@ -579,6 +579,42 @@ export async function startOAuth(provider: string): Promise<OAuthStart> {
   return (await response.json()) as OAuthStart;
 }
 
+/** The Claude code-paste login: no browser-reachable redirect callback, so
+ *  `start` returns the CLI's OAuth URL plus a login-session id that ties the
+ *  pasted code back to the live login subprocess (OAuth in UI 5/7). */
+export interface ClaudeLoginStart {
+  authorize_url: string;
+  login_session: string;
+}
+
+export async function startClaudeLogin(): Promise<ClaudeLoginStart> {
+  const response = await fetch("/api/oauth/claude/start", {
+    headers: { Accept: "application/json", ...(await authHeaders()) },
+  });
+  if (!response.ok) {
+    throw new ApiError("Failed to start the Claude login", response.status);
+  }
+  return (await response.json()) as ClaudeLoginStart;
+}
+
+export async function submitClaudeCode(
+  loginSession: string,
+  code: string,
+): Promise<void> {
+  const response = await fetch("/api/oauth/claude/submit-code", {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...(await authHeaders()),
+    },
+    body: JSON.stringify({ login_session: loginSession, code }),
+  });
+  if (!response.ok) {
+    throw new ApiError("Failed to complete the Claude login", response.status);
+  }
+}
+
 export async function disconnectConnection(provider: string): Promise<void> {
   const response = await fetch(`/api/oauth/${provider}/disconnect`, {
     method: "POST",

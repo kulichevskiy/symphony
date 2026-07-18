@@ -901,6 +901,12 @@ class _AcceptanceMixin(_OrchestratorBase):
                             self.config.roles,
                             visual_acceptance=effective_mode in {"dev", "preview"},
                         )
+                        # Acceptance spawns its own runner rather than going
+                        # through `_run_stage_command`/`_run_runner`, so it needs
+                        # the same Claude credential restore-before/write-back-
+                        # after as those (OAuth in UI 5/7 review fix).
+                        if accept_role.agent == "claude":
+                            await self._restore_claude_credentials()
                         verdict = await run_acceptance(
                             runner=self._runner,
                             run_id=run_id,
@@ -922,6 +928,8 @@ class _AcceptanceMixin(_OrchestratorBase):
                             claude_model=role_claude_model(accept_role),
                             effort=accept_role.effort,
                         )
+                        if accept_role.agent == "claude":
+                            await self._write_back_claude_credentials()
                         await _record_run_model_usage(
                             self._conn,
                             run_id,
