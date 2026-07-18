@@ -285,3 +285,36 @@ async def test_db_newer_than_image_refuses_to_boot(tmp_path: Path) -> None:
             await apply_migrations(conn, db_path=path)
     finally:
         await conn.close()
+
+
+async def test_old_image_waits_for_lock_then_refuses_newer_schema(tmp_path: Path) -> None:
+    """Codex r4: while a newer image holds the migration lock applying v002,
+    an older image (head v001) must wait — not take a stale no-op path — and
+    then refuse the now-newer schema."""
+    path = tmp_path / "state.sqlite"
+    conn = await connect(path)  # v1
+    await conn.close()
+
+    holder = await aiosqlite.connect(str(path))
+    try:
+        await holder.execute("BEGIN IMMEDIATE")
+        await holder.execute(
+            "INSERT INTO schema_version (version, name, applied_at)"
+            " VALUES (2, '002_new_stuff', '2026-01-01T00:00:00Z')"
+        )
+
+        old_image = await aiosqlite.connect(str(path))
+        old_image.row_factory = aiosqlite.Row
+        await old_image.execute("PRAGMA busy_timeout = 10000")
+        try:
+            # Old image's migration set = baseline only (head v001).
+            task = asyncio.create_task(apply_migrations(old_image, db_path=path))
+            await asyncio.sleep(0.3)
+            assert not task.done()  # blocked on the newer image's lock
+            await holder.commit()
+            with pytest.raises(RuntimeError, match="newer than this build"):
+                await asyncio.wait_for(task, timeout=10)
+        finally:
+            await old_image.close()
+    finally:
+        await holder.close()

@@ -68,33 +68,29 @@ async def apply_migrations(
     """Apply every migration newer than the DB's recorded version, in order,
     in one transaction. A no-op when the DB is already at head."""
     migrations_dir = migrations_dir or MIGRATIONS_DIR
-    await conn.execute(
-        "CREATE TABLE IF NOT EXISTS schema_version ("
-        "  version    INTEGER PRIMARY KEY,"
-        "  name       TEXT NOT NULL,"
-        "  applied_at TEXT NOT NULL"
-        ")"
-    )
-    await conn.commit()
-
     all_migrations = _discover(migrations_dir)
     head = all_migrations[-1][0] if all_migrations else 0
-    current = await _current_version(conn)
-    _reject_downgrade(current, head)
-    if not any(v > current for v, _ in all_migrations):
-        return
 
+    # Everything — the version-table DDL, the version read, the downgrade
+    # guard, and the no-op decision — happens under one write lock. A boot
+    # that peeks at the version outside the lock can race a deploy-overlap
+    # migrator: two daemons double-create the table on a brand-new DB, or an
+    # older image reads a stale pre-migration version, takes the no-op path,
+    # and boots onto a schema a newer image commits moments later.
     await conn.execute("BEGIN IMMEDIATE")
     try:
-        # Two daemons can race to this point during a deploy overlap: both
-        # read the same `current` above, the loser waits on the winner's
-        # write lock, then must NOT replay the migrations the winner already
-        # applied — re-read the version now that we hold the lock.
+        await conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version ("
+            "  version    INTEGER PRIMARY KEY,"
+            "  name       TEXT NOT NULL,"
+            "  applied_at TEXT NOT NULL"
+            ")"
+        )
         current = await _current_version(conn)
         _reject_downgrade(current, head)
         pending = [(v, p) for v, p in all_migrations if v > current]
         if not pending:
-            await conn.rollback()
+            await conn.commit()  # keep the version table on a fresh DB
             return
         target = pending[-1][0]
         # Belt-and-suspenders next to the surrounding transaction:
