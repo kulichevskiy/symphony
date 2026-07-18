@@ -64,7 +64,7 @@ def create_claude_oauth_router(
     conn_provider: Callable[[], Awaitable[aiosqlite.Connection]],
     *,
     cipher: CredentialCipher,
-    registry: PendingLoginRegistry,
+    registry: PendingLoginRegistry[ClaudeLoginProcess],
     login_factory: Callable[[], ClaudeLoginProcess],
     clock: Callable[[], datetime] | None = None,
     credentials_path: Path | None = None,
