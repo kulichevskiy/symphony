@@ -3100,11 +3100,19 @@ class _OrchestratorBase:
         status = await db.oauth_connections.get_status(self._conn, "claude")
         if status is None or status.status not in ("connected", "expired"):
             return
-        if run_started_at and status.updated_at and status.updated_at > run_started_at:
-            log.info(
-                "claude auth failure from a run older than the stored credential; not flagging"
-            )
-            return
+        if run_started_at and status.updated_at:
+            updated: datetime | None
+            started: datetime | None
+            try:
+                updated = datetime.fromisoformat(status.updated_at.replace("Z", "+00:00"))
+                started = datetime.fromisoformat(run_started_at.replace("Z", "+00:00"))
+            except ValueError:
+                updated = started = None
+            if updated is not None and started is not None and updated > started:
+                log.info(
+                    "claude auth failure from a run older than the stored credential; not flagging"
+                )
+                return
         log.warning("claude run failed on authentication; marking the connection expired")
         await db.oauth_connections.update_status(
             self._conn,
@@ -3126,18 +3134,24 @@ class _OrchestratorBase:
         return await self._claude_expired_block_reason(agent)
 
     async def _flag_auth_failure_from_log(
-        self, agent: str, log_path: Path, returncode: int | None, run_started_at: str
+        self, agent: str, log_path: Path, returncode: int | None, run_id: str
     ) -> None:
         """After a failed agent run, recover the provider API error from the
         run log and flip the connection on an authentication failure — every
         runner path, not just the rc=0 implement completion gate (Config v2
-        5/9 review fix). Best-effort: an unreadable log is a no-op."""
+        5/9 review fix). Best-effort: an unreadable log is a no-op. The run's
+        own started_at (from the runs row) anchors the stale-run guard."""
         if agent != "claude" or returncode in (0, None):
             return
         stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
         if stdout is None:
             return
         api_error = classify_stream_api_error(stdout)
+        if api_error is None:
+            return
+        cur = await self._conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,))
+        row = await cur.fetchone()
+        run_started_at = str(row["started_at"]) if row is not None else ""
         await self._flag_claude_auth_failure(agent, api_error, run_started_at=run_started_at)
 
     async def _materialize_claude_env(self, agent: str) -> dict[str, str]:
@@ -3235,7 +3249,6 @@ class _OrchestratorBase:
             workspace_path=workspace_path,
         )
         run_credentials = await self._resolve_run_credentials(binding)
-        run_started_at = self._now().strftime("%Y-%m-%dT%H:%M:%SZ")
         # Per-run private CLAUDE_CONFIG_DIR from the DB credential (Config v2
         # 3/9); binding env still overrides. Materialized LAST — everything
         # between here and the `finally` that tears it down must be
@@ -3309,9 +3322,7 @@ class _OrchestratorBase:
             # the refreshed credential from the per-run dir back to the DB and
             # remove the dir (Config v2 3/9).
             await self._finalize_claude_env(claude_env)
-        await self._flag_auth_failure_from_log(
-            role.agent, log_path, final_returncode, run_started_at
-        )
+        await self._flag_auth_failure_from_log(role.agent, log_path, final_returncode, run_id)
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
         )
@@ -3547,7 +3558,6 @@ class _OrchestratorBase:
         final_returncode: int | None = None
         cost_estimator = _UsageCostEstimator(agent=role.agent, codex_model=role_codex_model(role))
         run_credentials = await self._resolve_run_credentials(binding)
-        run_started_at = self._now().strftime("%Y-%m-%dT%H:%M:%SZ")
         # See `_run_stage_command`: materialized last so nothing fallible sits
         # between the dir's creation and the `finally` that tears it down.
         claude_env = await self._materialize_claude_env(role.agent)
@@ -3631,9 +3641,7 @@ class _OrchestratorBase:
             # See `_run_stage_command`: a Claude fix/review run can also refresh
             # its token in place — write back from the per-run dir + tear down.
             await self._finalize_claude_env(claude_env)
-        await self._flag_auth_failure_from_log(
-            role.agent, log_path, final_returncode, run_started_at
-        )
+        await self._flag_auth_failure_from_log(role.agent, log_path, final_returncode, run_id)
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
         )
