@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { type ReactNode, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -30,6 +30,9 @@ import {
   type RolesMatrix,
   startClaudeLogin,
   type ClaudeLoginStart,
+  startCodexLogin,
+  type CodexLoginStart,
+  pollCodexLogin,
   startOAuth,
   submitClaudeCode,
   testConnection,
@@ -1320,11 +1323,18 @@ function connectionStatusClass(status: string): string {
 }
 
 // Providers with a wired Connect flow. GitHub (OAuth in UI 2/7) and Linear
-// (3/7) share the redirect engine; Claude (5/7) uses the code-paste login (no
-// browser-reachable callback). Codex arrives in 6/7, so its button stays inert.
-const WIRED_PROVIDERS = new Set(["github", "linear", "claude"]);
+// (3/7) share the redirect engine; Claude (5/7) uses the code-paste login and
+// Codex (6/7) the device-auth login — both because they have no
+// browser-reachable callback.
+const WIRED_PROVIDERS = new Set(["github", "linear", "claude", "codex"]);
 // Providers whose Connect is the code-paste CLI login rather than a redirect.
 const CODE_PASTE_PROVIDERS = new Set(["claude"]);
+// Providers whose Connect is the device-auth CLI login: the operator opens a
+// verification URL + enters a user code, and the daemon polls to completion —
+// nothing is pasted back.
+const DEVICE_AUTH_PROVIDERS = new Set(["codex"]);
+// How often the SPA polls the daemon while a device-auth login is in flight.
+const CODEX_POLL_INTERVAL_MS = 2500;
 
 export function ConnectionCard({
   connection,
@@ -1335,16 +1345,64 @@ export function ConnectionCard({
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Stable callback for the in-flight device-auth poll: a parent rerender
+  // changing `onChanged`'s identity must not cancel/restart the poll.
+  const onChangedRef = useRef(onChanged);
+  useEffect(() => {
+    onChangedRef.current = onChanged;
+  }, [onChanged]);
   const [testResult, setTestResult] = useState<string | null>(null);
   // Set while a Claude code-paste login is in flight: the CLI's OAuth URL to
   // authorize + the login-session tying the pasted code back to the daemon's
   // live subprocess.
   const [claudeLogin, setClaudeLogin] = useState<ClaudeLoginStart | null>(null);
   const [code, setCode] = useState("");
+  // Set while a Codex device-auth login is in flight: the verification URL +
+  // user code to show the operator, plus the login-session the daemon polls to
+  // completion (nothing is pasted back — see the polling effect below).
+  const [codexLogin, setCodexLogin] = useState<CodexLoginStart | null>(null);
   const wired = WIRED_PROVIDERS.has(connection.provider);
   const codePaste = CODE_PASTE_PROVIDERS.has(connection.provider);
+  const deviceAuth = DEVICE_AUTH_PROVIDERS.has(connection.provider);
   const connected =
     connection.status === "connected" || connection.status === "expired";
+
+  // Drive the device-auth poll loop while a Codex login is pending. The CLI
+  // subprocess polls the provider itself; we just ask the daemon for its status
+  // until it reaches a terminal outcome, then clear the panel (connected → let
+  // the parent refetch; failed → surface an error).
+  useEffect(() => {
+    if (codexLogin === null) return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    async function poll(session: string) {
+      try {
+        const { status } = await pollCodexLogin(session);
+        if (cancelled) return;
+        if (status === "connected") {
+          setCodexLogin(null);
+          onChangedRef.current?.();
+        } else if (status === "failed") {
+          setCodexLogin(null);
+          setError("Couldn't complete the login — it may have expired. Try again.");
+        } else {
+          timer = setTimeout(() => poll(session), CODEX_POLL_INTERVAL_MS);
+        }
+      } catch {
+        if (cancelled) return;
+        setCodexLogin(null);
+        setError("Couldn't complete the login — the session may have expired.");
+      }
+    }
+    poll(codexLogin.login_session);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) clearTimeout(timer);
+    };
+    // `onChangedRef` keeps the in-flight poll stable across parent
+    // rerenders — a changed callback identity must not cancel/restart the
+    // device-auth poll (Config v2 6/9 review fix).
+  }, [codexLogin]);
 
   async function connect() {
     setBusy(true);
@@ -1354,6 +1412,14 @@ export function ConnectionCard({
         // No browser-reachable callback: surface the CLI's OAuth URL in a panel
         // and take the pasted authorization code back (see submitCode below).
         setClaudeLogin(await startClaudeLogin());
+        setBusy(false);
+        return;
+      }
+      if (deviceAuth) {
+        // No browser-reachable callback and nothing to paste back: surface the
+        // verification URL + user code, and let the poll effect drive it to
+        // connected as the daemon's login subprocess completes.
+        setCodexLogin(await startCodexLogin());
         setBusy(false);
         return;
       }
@@ -1392,6 +1458,10 @@ export function ConnectionCard({
     setBusy(true);
     setError(null);
     setTestResult(null);
+    // Stop any in-flight device-auth poll first: clearing codexLogin fires the
+    // effect cleanup (cancelled=true) so a success landing mid-disconnect is
+    // ignored client-side, while the server's discard_all kills it there too.
+    setCodexLogin(null);
     try {
       await disconnectConnection(connection.provider);
       onChanged?.();
@@ -1434,7 +1504,7 @@ export function ConnectionCard({
         <Button
           type="button"
           onClick={connect}
-          disabled={!wired || busy || claudeLogin !== null}
+          disabled={!wired || busy || claudeLogin !== null || codexLogin !== null}
         >
           {connected ? "Reconnect" : "Connect"}
         </Button>
@@ -1484,6 +1554,26 @@ export function ConnectionCard({
           >
             Submit
           </Button>
+        </div>
+      ) : null}
+      {codexLogin ? (
+        <div className="mt-4 space-y-2">
+          <p className="text-xs text-muted-foreground">
+            Open this URL, enter the code, then wait here for the connection to
+            complete:
+          </p>
+          <a
+            href={codexLogin.verification_uri}
+            target="_blank"
+            rel="noreferrer"
+            className="block break-all font-mono text-xs text-primary underline"
+          >
+            {codexLogin.verification_uri}
+          </a>
+          <p className="font-mono text-sm">{codexLogin.user_code}</p>
+          <p className="text-xs text-muted-foreground" role="status">
+            Waiting for you to finish authorizing…
+          </p>
         </div>
       ) : null}
       {testResult ? (

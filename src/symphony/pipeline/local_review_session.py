@@ -167,9 +167,10 @@ async def run_local_review_session(
     command_secs: int = 1800,
     wall_clock_secs: int = 0,
     binding_env: dict[str, str] | None = None,
-    # Per-run agent credential env (e.g. CLAUDE_CONFIG_DIR) for the
-    # reviewer/verifier passes; the fix turns get the full binding_env.
-    agent_env: dict[str, str] | None = None,
+    # Per-run agent credential envs keyed by agent ("claude" ->
+    # {CLAUDE_CONFIG_DIR...}, "codex" -> {CODEX_HOME...}); each pass gets only
+    # ITS agent's env — never another agent's credentials.
+    agent_envs: dict[str, dict[str, str]] | None = None,
     mcp_servers: Mapping[str, Any] | None = None,
     last_message_dir: Path,
     head_sha_provider: HeadShaProvider,
@@ -273,12 +274,11 @@ async def run_local_review_session(
             run_id=_safe_run_id(parent_run_id, run_suffix),
             workspace_path=workspace_path,
             command=command,
-            # ONLY the per-run agent credential env (CLAUDE_CONFIG_DIR) — the
-            # reviewer/verifier passes are deliberately isolated from the
-            # binding's secret env (that stays fix-turn-only), and the Claude
-            # credential env goes only to Claude subprocesses: a Codex
-            # reviewer in a mixed config must not see it (Config v2 3/9).
-            env=dict(agent_env or {}) if agent == "claude" else {},
+            # ONLY this pass's own agent credential env — reviewer/verifier
+            # passes are deliberately isolated from the binding's secret env
+            # (that stays fix-turn-only), and one agent's credentials never
+            # reach another agent's subprocess (Config v2 3/9 + 6/9).
+            env=dict((agent_envs or {}).get(agent, {})),
             stall_secs=stall_secs,
             command_secs=command_secs,
             wall_clock_secs=wall_clock_secs,
@@ -509,7 +509,7 @@ async def run_local_review_session(
             # the CLI instead of the OAuth-only MCP dead end. The Claude
             # credential env rides along only for a Claude fixer.
             env={
-                **(agent_env or {} if fixer_role.agent == "claude" else {}),
+                **(agent_envs or {}).get(fixer_role.agent, {}),
                 **(binding_env or {}),
             },
         )
@@ -612,6 +612,7 @@ async def run_local_review_session(
 
     return await run_local_review_loop(
         reviewer_agent=reviewer_role.agent,
+        fixer_agent=fixer_role.agent,
         reviewer=_reviewer,
         fixer=_fixer,
         cap=cap,

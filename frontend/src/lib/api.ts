@@ -625,6 +625,49 @@ export async function submitClaudeCode(
   }
 }
 
+/** The Codex device-auth login: no browser-reachable redirect callback and
+ *  nothing to paste back — `start` returns the verification URL + user code the
+ *  operator enters on the provider site, plus a login-session id the daemon
+ *  polls to completion (OAuth in UI 6/7). */
+export interface CodexLoginStart {
+  verification_uri: string;
+  user_code: string;
+  login_session: string;
+}
+
+export async function startCodexLogin(): Promise<CodexLoginStart> {
+  const response = await fetch("/api/oauth/codex/start", {
+    headers: { Accept: "application/json", ...(await authHeaders()) },
+  });
+  if (!response.ok) {
+    throw new ApiError("Failed to start the Codex login", response.status);
+  }
+  return (await response.json()) as CodexLoginStart;
+}
+
+/** One `poll` outcome: `pending` while the operator finishes on the provider
+ *  site, then `connected` (credentials stored) or `failed`. */
+export interface CodexLoginPoll {
+  status: string;
+  expires_at: string | null;
+}
+
+export async function pollCodexLogin(loginSession: string): Promise<CodexLoginPoll> {
+  const response = await fetch("/api/oauth/codex/poll", {
+    method: "POST",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      ...(await authHeaders()),
+    },
+    body: JSON.stringify({ login_session: loginSession }),
+  });
+  if (!response.ok) {
+    throw new ApiError("Failed to poll the Codex login", response.status);
+  }
+  return (await response.json()) as CodexLoginPoll;
+}
+
 export async function disconnectConnection(provider: string): Promise<void> {
   const response = await fetch(`/api/oauth/${provider}/disconnect`, {
     method: "POST",

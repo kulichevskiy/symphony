@@ -65,6 +65,14 @@ class ClaudeLoginError(Exception):
     router renders this as a failed connect, never a raw traceback."""
 
 
+class SupportsAsyncClose(Protocol):
+    """The one method the registry itself calls on a held login process — the
+    provider-specific protocols (`ClaudeLoginProcess`, `codex_login`'s
+    `CodexLoginProcess`) each add their own `start`/`submit_code`/`poll` on top."""
+
+    async def close(self) -> None: ...
+
+
 class ClaudeLoginProcess(Protocol):
     """One in-flight `claude` login. `start` returns the OAuth URL to show the
     operator; `submit_code` feeds the pasted code and returns the raw credential
@@ -77,10 +85,12 @@ class ClaudeLoginProcess(Protocol):
     async def close(self) -> None: ...
 
 
-class PendingLoginRegistry:
-    """In-memory, single-use registry of live login subprocesses keyed by an
-    unguessable session id. Single-process by design (one daemon); a daemon
-    restart drops any in-flight login.
+class PendingLoginRegistry[LoginProcessT: SupportsAsyncClose]:
+    """In-memory registry of live login subprocesses keyed by an unguessable
+    session id, generic over the provider's login process type (Claude's
+    code-paste `pop`s the handle once; Codex's device-auth `peek`s it across
+    repeated polls). Single-process by design (one daemon); a daemon restart
+    drops any in-flight login.
 
     Entries expire after `ttl_secs` (default `_PENDING_LOGIN_TTL_SECS`): if the
     operator closes the tab, refreshes mid-login, or never pastes a code back,
@@ -97,20 +107,20 @@ class PendingLoginRegistry:
         ttl_secs: float = _PENDING_LOGIN_TTL_SECS,
         clock: Callable[[], float] | None = None,
     ) -> None:
-        self._pending: dict[str, tuple[ClaudeLoginProcess, float]] = {}
+        self._pending: dict[str, tuple[LoginProcessT, float]] = {}
         self._timers: dict[str, asyncio.TimerHandle] = {}
         self._id_factory = id_factory or (lambda: secrets.token_urlsafe(_SESSION_ENTROPY_BYTES))
         self._ttl_secs = ttl_secs
         self._clock = clock or time.monotonic
 
-    def add(self, process: ClaudeLoginProcess) -> str:
+    def add(self, process: LoginProcessT) -> str:
         self._evict_expired()
         session_id = self._id_factory()
         self._pending[session_id] = (process, self._clock() + self._ttl_secs)
         self._arm_timer(session_id)
         return session_id
 
-    def pop(self, session_id: str) -> ClaudeLoginProcess | None:
+    def pop(self, session_id: str) -> LoginProcessT | None:
         """Return and remove the handle for `session_id` (single-use), or `None`
         if it is unknown, already consumed, or expired."""
         entry = self._pending.pop(session_id, None)
@@ -123,12 +133,33 @@ class PendingLoginRegistry:
             return None
         return process
 
+    def peek(self, session_id: str) -> LoginProcessT | None:
+        """Return the handle for `session_id` *without* removing it, or `None` if
+        it is unknown or expired (a past-deadline entry is dropped + closed).
+        Codex's device-auth `poll` peeks the same session repeatedly until the
+        subprocess reaches a terminal outcome, then `pop`s it."""
+        entry = self._pending.get(session_id)
+        if entry is None:
+            return None
+        process, deadline = entry
+        if self._clock() >= deadline:
+            self._expire(session_id)
+            return None
+        return process
+
     async def discard(self, session_id: str) -> None:
         """Drop and tear down an abandoned/failed login."""
         entry = self._pending.pop(session_id, None)
         self._cancel_timer(session_id)
         if entry is not None:
             await entry[0].close()
+
+    async def discard_all(self) -> None:
+        """Tear down every pending login — a Disconnect must kill in-flight
+        device/paste flows so a late poll can't re-persist credentials the
+        operator just cleared (Config v2 6/9 review fix)."""
+        for session_id in list(self._pending):
+            await self.discard(session_id)
 
     def _evict_expired(self) -> None:
         now = self._clock()
@@ -162,7 +193,7 @@ class PendingLoginRegistry:
             handle.cancel()
 
     @staticmethod
-    def _schedule_close(process: ClaudeLoginProcess) -> None:
+    def _schedule_close(process: SupportsAsyncClose) -> None:
         """Fire-and-forget `process.close()`. `add`/`pop` are sync so eviction
         can't await; there's always a running loop in production (callers are
         async route handlers), so this only silently no-ops in sync unit tests

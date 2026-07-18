@@ -1,0 +1,200 @@
+"""Codex device-auth login driver + registry peek (OAuth in UI 6/7).
+
+The daemon drives `codex login --device-auth` as a subprocess: `start` captures
+the printed verification URL + user code, then `poll` reports pending →
+success/failure as the subprocess exits (reading back `~/.codex/auth.json` on
+success). Subprocess interaction is faked in the UI test; these pin the shared
+`PendingLoginRegistry`'s `peek` (used across repeated polls) and the codex
+credential-file helpers.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import json
+from pathlib import Path
+
+import pytest
+
+from symphony.claude_login import PendingLoginRegistry
+from symphony.codex_login import (
+    codex_credential_expired,
+    codex_expires_at,
+    default_codex_credentials_path,
+    read_codex_credential,
+)
+
+
+class _FakeCodexLogin:
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _jwt(exp: int) -> str:
+    def seg(obj: dict[str, object]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    return f"{seg({'alg': 'RS256'})}.{seg({'exp': exp})}.sig"
+
+
+def _auth_json(exp: int) -> str:
+    return json.dumps({"tokens": {"access_token": _jwt(exp), "refresh_token": "r"}})
+
+
+def test_registry_peek_returns_handle_without_consuming() -> None:
+    registry: PendingLoginRegistry[_FakeCodexLogin] = PendingLoginRegistry(
+        id_factory=iter(["s1"]).__next__
+    )
+    proc = _FakeCodexLogin()
+    session_id = registry.add(proc)
+    # Peek is repeatable (device-auth polls the same session many times)…
+    assert registry.peek(session_id) is proc
+    assert registry.peek(session_id) is proc
+    # …and does not consume it, unlike pop.
+    assert registry.pop(session_id) is proc
+    assert registry.peek(session_id) is None
+
+
+def test_registry_peek_unknown_returns_none() -> None:
+    registry: PendingLoginRegistry[_FakeCodexLogin] = PendingLoginRegistry()
+    assert registry.peek("never-issued") is None
+
+
+@pytest.mark.asyncio
+async def test_registry_peek_expired_returns_none_and_closes() -> None:
+    now = [0.0]
+    registry: PendingLoginRegistry[_FakeCodexLogin] = PendingLoginRegistry(
+        id_factory=iter(["s1"]).__next__, ttl_secs=10.0, clock=lambda: now[0]
+    )
+    proc = _FakeCodexLogin()
+    registry.add(proc)
+    now[0] = 10.0
+    assert registry.peek("s1") is None
+    await asyncio.sleep(0)  # let the fire-and-forget close() task run
+    assert proc.closed is True
+
+
+def test_read_codex_credential_missing_returns_none(tmp_path: Path) -> None:
+    assert read_codex_credential(tmp_path / "nope.json") is None
+
+
+def test_read_codex_credential_returns_raw_text(tmp_path: Path) -> None:
+    path = tmp_path / "auth.json"
+    payload = '{"tokens": {"access_token": "tok"}}'
+    path.write_text(payload, encoding="utf-8")
+    assert read_codex_credential(path) == payload
+
+
+def test_default_credentials_path_honors_codex_home(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    assert default_codex_credentials_path() == tmp_path / "auth.json"
+
+
+def test_default_credentials_path_without_codex_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    assert default_codex_credentials_path() == Path.home() / ".codex" / "auth.json"
+
+
+def test_codex_expires_at_parses_jwt_exp() -> None:
+    # 2030-01-01T00:00:00Z == 1893456000 (epoch seconds)
+    assert codex_expires_at(_auth_json(1893456000)) == "2030-01-01T00:00:00Z"
+
+
+def test_codex_expires_at_none_when_absent_or_garbage() -> None:
+    assert codex_expires_at(json.dumps({"tokens": {}})) is None
+    assert codex_expires_at(json.dumps({"tokens": {"access_token": "not-a-jwt"}})) is None
+    assert codex_expires_at("not json") is None
+
+
+def test_codex_credential_expired() -> None:
+    assert codex_credential_expired(_auth_json(1000000000)) is True  # 2001 — past
+    assert codex_credential_expired(_auth_json(1893456000)) is False  # 2030 — future
+    # No parseable expiry → treated as not-expired (don't flip a usable card).
+    assert codex_credential_expired(json.dumps({"tokens": {}})) is False
+
+
+@pytest.mark.asyncio
+async def test_read_device_auth_strips_ansi_escapes() -> None:
+    """The real codex CLI wraps the URL and code in ANSI color escapes — the
+    scraper must strip them so the bare values are captured (Config v2 6/9
+    review fix)."""
+    from symphony.codex_login import SubprocessCodexLogin
+
+    lines = [
+        b"\x1b[1mTo authenticate, visit:\x1b[0m\n",
+        b"  \x1b[36mhttps://auth.openai.com/device\x1b[0m\n",
+        b"  code: \x1b[1;32mWXYZ-1234\x1b[0m\n",
+    ]
+
+    class _Stdout:
+        def __init__(self) -> None:
+            self._it = iter(lines)
+
+        async def readline(self) -> bytes:
+            return next(self._it, b"")
+
+    class _Proc:
+        stdout = _Stdout()
+
+    login = SubprocessCodexLogin()
+    login._proc = _Proc()  # type: ignore[assignment]  # noqa: SLF001
+    device = await login._read_device_auth()  # noqa: SLF001
+    assert device.verification_uri == "https://auth.openai.com/device"
+    assert device.user_code == "WXYZ-1234"
+
+
+@pytest.mark.asyncio
+async def test_read_device_auth_accepts_unhyphenated_code() -> None:
+    from symphony.codex_login import SubprocessCodexLogin
+
+    lines = [b"visit https://auth.openai.com/device\n", b"code: WDJBMJHT\n"]
+
+    class _Stdout:
+        def __init__(self) -> None:
+            self._it = iter(lines)
+
+        async def readline(self) -> bytes:
+            return next(self._it, b"")
+
+    class _Proc:
+        stdout = _Stdout()
+
+    login = SubprocessCodexLogin()
+    login._proc = _Proc()  # type: ignore[assignment]  # noqa: SLF001
+    device = await login._read_device_auth()  # noqa: SLF001
+    assert device.user_code == "WDJBMJHT"
+
+
+def test_pin_file_auth_storage_replaces_keyring(tmp_path: Path) -> None:
+    from symphony.codex_login import pin_file_auth_storage
+
+    config = tmp_path / "config.toml"
+    config.write_text('model = "o3"\ncli_auth_credentials_store = "keyring"\n', encoding="utf-8")
+    pin_file_auth_storage(tmp_path)
+    text = config.read_text(encoding="utf-8")
+    assert 'cli_auth_credentials_store = "file"' in text
+    assert "keyring" not in text
+    assert 'model = "o3"' in text  # unrelated settings preserved
+
+
+def test_pin_file_auth_storage_writes_at_root_not_in_table(tmp_path: Path) -> None:
+    from symphony.codex_login import pin_file_auth_storage
+
+    # config ending inside a [table] — a naive append would nest the key there.
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[mcp_servers.supabase]\ncommand = "npx"\ncli_auth_credentials_store = "keyring"\n',
+        encoding="utf-8",
+    )
+    pin_file_auth_storage(tmp_path)
+    text = config.read_text(encoding="utf-8")
+    # The pin is the first line (root scope), before any table header.
+    assert text.splitlines()[0] == 'cli_auth_credentials_store = "file"'
+    assert "keyring" not in text
+    assert "[mcp_servers.supabase]" in text

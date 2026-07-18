@@ -19,6 +19,7 @@ from uvicorn import Config as UvicornConfig
 
 from .auth import Auth0Settings, create_auth_config_router, create_auth_dependency
 from .claude_login import ClaudeLoginProcess, PendingLoginRegistry, SubprocessClaudeLogin
+from .codex_login import CodexLoginProcess, SubprocessCodexLogin
 from .config import Config
 from .crypto import CredentialCipher, key_fingerprint, resolve_encryption_key
 from .db.config_repo_secrets import RepoSecretView
@@ -32,6 +33,7 @@ from .linear.client import Linear
 from .oauth import OAuthStateStore
 from .ui.api import CommandSink, PauseController, create_api_router
 from .ui.claude_oauth import create_claude_oauth_router
+from .ui.codex_oauth import create_codex_oauth_router
 from .ui.config_crud import create_config_crud_router
 from .ui.config_view import create_config_router
 from .ui.connections import create_connections_router
@@ -113,6 +115,8 @@ def create_app(
     oauth_cipher: CredentialCipher | None = None,
     claude_login_factory: Callable[[], ClaudeLoginProcess] | None = None,
     claude_credentials_path: Path | None = None,
+    codex_login_factory: Callable[[], CodexLoginProcess] | None = None,
+    codex_credentials_path: Path | None = None,
     clock: Clock | None = None,
 ) -> FastAPI:
     # Publicly-exposed deployments (docker-compose.coolify.yml) set
@@ -287,13 +291,30 @@ def create_app(
                 create_claude_oauth_router(
                     oauth_write_pool.connection,
                     cipher=cipher,
-                    registry=PendingLoginRegistry(),
+                    registry=PendingLoginRegistry[ClaudeLoginProcess](),
                     login_factory=(
                         claude_login_factory
                         or (lambda: SubprocessClaudeLogin(credentials_path=claude_credentials_path))
                     ),
                     clock=clock,
                     credentials_path=claude_credentials_path,
+                ),
+                dependencies=api_dependencies,
+            )
+            # Codex device-auth login (6/7): same "no browser-reachable callback"
+            # reason as Claude, so it too mounts BEFORE the generic engine below
+            # (`/api/oauth/codex/*` must win over `/api/oauth/{provider}/*`).
+            app.include_router(
+                create_codex_oauth_router(
+                    oauth_write_pool.connection,
+                    cipher=cipher,
+                    registry=PendingLoginRegistry[CodexLoginProcess](),
+                    login_factory=(
+                        codex_login_factory
+                        or (lambda: SubprocessCodexLogin(credentials_path=codex_credentials_path))
+                    ),
+                    clock=clock,
+                    credentials_path=codex_credentials_path,
                 ),
                 dependencies=api_dependencies,
             )

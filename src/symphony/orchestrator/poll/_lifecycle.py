@@ -43,6 +43,7 @@ from ...pipeline.verify import VerifyResult, run_verify_session
 from ...tokens import effective_tokens
 from ...tracker import Issue as LinearIssue
 from ._base import (
+    _AGENT_CRED_LAYOUT,
     _binding_storage_key,
     _local_review_status_from_result,
     _OrchestratorBase,
@@ -1506,6 +1507,18 @@ class _LifecycleMixin(_OrchestratorBase):
             # full historical cost) and so the runs-history audit trail
             # shows the local-review phase alongside implement/review/
             # merge stages.
+            # Refuse an already-`expired` agent connection BEFORE creating the
+            # run row — a raise after the row is inserted would orphan a
+            # `running` local_review row (blocks later active-run dedupe,
+            # pollutes history). Cheap status check; no materialization/refresh
+            # here (review fix).
+            lr_role_agents = {reviewer_role.agent, verifier_role.agent, fixer_role.agent}
+            for lr_agent in ("claude", "codex"):
+                if lr_agent in lr_role_agents:
+                    pre_blocked = await self._claude_expired_block_reason(lr_agent)
+                    if pre_blocked is not None:
+                        raise RuntimeError(pre_blocked)
+
             local_review_run_id = str(uuid.uuid4())
             await db.runs.create(
                 self._conn,
@@ -1528,21 +1541,28 @@ class _LifecycleMixin(_OrchestratorBase):
 
             # Local review builds its own RunnerSpec / collect_runner_output
             # instead of going through `_run_stage_command`/`_run_runner`, so it
-            # gets the same per-run Claude credential materialization +
-            # write-back (Config v2 3/9) when any of its roles runs on Claude.
-            local_review_agent = (
-                "claude"
-                if "claude" in {reviewer_role.agent, verifier_role.agent, fixer_role.agent}
-                else ""
-            )
-            claude_env = await self._materialize_claude_env(local_review_agent)
-            lr_blocked = await self._post_materialize_block_reason(local_review_agent, claude_env)
-            if lr_blocked is not None:
-                await self._finalize_claude_env(claude_env)
-                raise RuntimeError(lr_blocked)
-
+            # gets the same per-run agent credential materialization +
+            # write-back (Config v2 3/9) when any of its roles runs on a
+            # UI-connected agent. Materialization is INSIDE the try so a
+            # post-materialize block still runs the finally (finalize the run +
+            # tear down the per-run dirs) instead of orphaning either.
+            local_review_started_at = self._now().strftime("%Y-%m-%dT%H:%M:%SZ")
+            claude_env: dict[str, str] = {}
+            agent_envs: dict[str, dict[str, str]] = {}
             result: LoopResult | None = None
             try:
+                for lr_agent in ("claude", "codex"):
+                    if lr_agent not in lr_role_agents:
+                        continue
+                    env_for_agent = await self._materialize_claude_env(lr_agent)
+                    agent_envs[lr_agent] = env_for_agent
+                    claude_env.update(env_for_agent)
+                    # Post-materialize gate: a refresh that failed inside
+                    # materialization flipped the row to `expired` and yielded
+                    # {} — block rather than run on ambient creds.
+                    lr_blocked = await self._post_materialize_block_reason(lr_agent, env_for_agent)
+                    if lr_blocked is not None:
+                        raise RuntimeError(lr_blocked)
                 result = await run_local_review_session(
                     runner=self._runner,
                     workspace_path=workspace_path,
@@ -1559,7 +1579,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     command_secs=self.config.command_timeout_secs,
                     wall_clock_secs=self.config.wall_clock_timeout_secs,
                     binding_env=dict(binding.env),
-                    agent_env=dict(claude_env),
+                    agent_envs=agent_envs,
                     mcp_servers=dict(binding.mcp_servers),
                     last_message_dir=last_message_dir,
                     head_sha_provider=_workspace_head_sha,
@@ -1578,7 +1598,23 @@ class _LifecycleMixin(_OrchestratorBase):
                     reviewer_codex_model=reviewer_role.attribution_codex_model(),
                     verifier_codex_model=verifier_role.attribution_codex_model(),
                 )
+                # Write-back first, THEN flag: an auth-failure expire must
+                # land after finalize's write-back, or the write-back would
+                # re-persist the row as connected (Config v2 6/9 review fix).
                 await self._finalize_claude_env(claude_env)
+                # A local-review subprocess that died on auth surfaces as
+                # LoopResult.api_error tagged with the failing agent — flag ONLY
+                # that provider (a claude reviewer failing must not expire a
+                # codex fixer), flipping the card + arming the dispatch gate.
+                lr_api_error = result.api_error if result is not None else None
+                lr_failed_agent = result.api_error_agent if result is not None else None
+                if lr_api_error is not None and lr_failed_agent in _AGENT_CRED_LAYOUT:
+                    await self._flag_claude_auth_failure(
+                        lr_failed_agent,
+                        lr_api_error,
+                        run_started_at=local_review_started_at,
+                        provider=lr_failed_agent,
+                    )
 
             log.info(
                 "local-review phase for %s ended in %s (iterations=%d, strategy=%s, reviewer=%s)",
