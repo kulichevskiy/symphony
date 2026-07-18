@@ -3224,6 +3224,10 @@ class _OrchestratorBase:
                 "invalid api key",
                 "refresh token expired",
                 "refresh_token_expired",
+                "refresh token was already used",
+                "refresh_token_reused",
+                "refresh token was revoked",
+                "refresh_token_invalidated",
                 "401 unauthorized",
             )
             if any(phrase in low for phrase in _auth_phrases):

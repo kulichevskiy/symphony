@@ -1538,6 +1538,16 @@ class _LifecycleMixin(_OrchestratorBase):
             for lr_agent in ("claude", "codex"):
                 if lr_agent not in lr_role_agents:
                     continue
+                # Gate on an already-`expired` row BEFORE materializing —
+                # materialization can proactively refresh a within-horizon
+                # token and write the row back `connected`, which would defeat
+                # the post-materialize gate and resume without the required
+                # reconnect (Config v2 6/9 review fix). Stage runners gate
+                # pre-materialize too.
+                pre_blocked = await self._claude_expired_block_reason(lr_agent)
+                if pre_blocked is not None:
+                    await self._finalize_claude_env(claude_env)
+                    raise RuntimeError(pre_blocked)
                 env_for_agent = await self._materialize_claude_env(lr_agent)
                 agent_envs[lr_agent] = env_for_agent
                 claude_env.update(env_for_agent)

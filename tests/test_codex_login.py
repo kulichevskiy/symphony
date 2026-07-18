@@ -181,3 +181,20 @@ def test_pin_file_auth_storage_replaces_keyring(tmp_path: Path) -> None:
     assert 'cli_auth_credentials_store = "file"' in text
     assert "keyring" not in text
     assert 'model = "o3"' in text  # unrelated settings preserved
+
+
+def test_pin_file_auth_storage_writes_at_root_not_in_table(tmp_path: Path) -> None:
+    from symphony.codex_login import pin_file_auth_storage
+
+    # config ending inside a [table] — a naive append would nest the key there.
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[mcp_servers.supabase]\ncommand = "npx"\ncli_auth_credentials_store = "keyring"\n',
+        encoding="utf-8",
+    )
+    pin_file_auth_storage(tmp_path)
+    text = config.read_text(encoding="utf-8")
+    # The pin is the first line (root scope), before any table header.
+    assert text.splitlines()[0] == 'cli_auth_credentials_store = "file"'
+    assert "keyring" not in text
+    assert "[mcp_servers.supabase]" in text

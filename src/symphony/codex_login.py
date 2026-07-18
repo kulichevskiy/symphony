@@ -115,9 +115,12 @@ def pin_file_auth_storage(codex_home: Path) -> None:
         config = codex_home / "config.toml"
         existing = config.read_text(encoding="utf-8") if config.exists() else ""
         stripped = _re.sub(r"(?m)^\s*cli_auth_credentials_store\s*=.*$\n?", "", existing)
-        if stripped and not stripped.endswith("\n"):
-            stripped += "\n"
-        config.write_text(stripped + 'cli_auth_credentials_store = "file"\n', encoding="utf-8")
+        if stripped and not stripped.startswith("\n"):
+            stripped = "\n" + stripped
+        # Prepend at the ROOT scope: appending could land the key inside a
+        # trailing [table] (e.g. after mcp_servers entries), where codex would
+        # ignore it. Root keys must precede any table header.
+        config.write_text('cli_auth_credentials_store = "file"' + stripped, encoding="utf-8")
     except OSError:
         log.warning("could not pin codex file auth storage", exc_info=True)
 
