@@ -1458,6 +1458,10 @@ export function ConnectionCard({
     setBusy(true);
     setError(null);
     setTestResult(null);
+    // Stop any in-flight device-auth poll first: clearing codexLogin fires the
+    // effect cleanup (cancelled=true) so a success landing mid-disconnect is
+    // ignored client-side, while the server's discard_all kills it there too.
+    setCodexLogin(null);
     try {
       await disconnectConnection(connection.provider);
       onChanged?.();

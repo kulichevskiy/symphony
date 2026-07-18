@@ -117,3 +117,33 @@ def test_codex_credential_expired() -> None:
     assert codex_credential_expired(_auth_json(1893456000)) is False  # 2030 — future
     # No parseable expiry → treated as not-expired (don't flip a usable card).
     assert codex_credential_expired(json.dumps({"tokens": {}})) is False
+
+
+@pytest.mark.asyncio
+async def test_read_device_auth_strips_ansi_escapes() -> None:
+    """The real codex CLI wraps the URL and code in ANSI color escapes — the
+    scraper must strip them so the bare values are captured (Config v2 6/9
+    review fix)."""
+    from symphony.codex_login import SubprocessCodexLogin
+
+    lines = [
+        b"\x1b[1mTo authenticate, visit:\x1b[0m\n",
+        b"  \x1b[36mhttps://auth.openai.com/device\x1b[0m\n",
+        b"  code: \x1b[1;32mWXYZ-1234\x1b[0m\n",
+    ]
+
+    class _Stdout:
+        def __init__(self) -> None:
+            self._it = iter(lines)
+
+        async def readline(self) -> bytes:
+            return next(self._it, b"")
+
+    class _Proc:
+        stdout = _Stdout()
+
+    login = SubprocessCodexLogin()
+    login._proc = _Proc()  # type: ignore[assignment]  # noqa: SLF001
+    device = await login._read_device_auth()  # noqa: SLF001
+    assert device.verification_uri == "https://auth.openai.com/device"
+    assert device.user_code == "WXYZ-1234"

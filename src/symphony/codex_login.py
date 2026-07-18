@@ -45,6 +45,7 @@ _ISO_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 # Kept permissive so a minor wording change in the CLI doesn't silently break
 # capture: grab the first https URL, and the first code-looking token (an
 # uppercase-alnum block, optionally hyphenated — e.g. `ABCD-1234`).
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 _URL_RE = re.compile(r"https://\S+", re.IGNORECASE)
 _CODE_RE = re.compile(r"\b([A-Z0-9]{4,8}(?:-[A-Z0-9]{4,8})+)\b")
 # How long to wait for the URL + code to appear after spawning the login.
@@ -195,7 +196,26 @@ class SubprocessCodexLogin:
         self._proc: asyncio.subprocess.Process | None = None
         self._drain_task: asyncio.Task[None] | None = None
 
+    def _ensure_file_auth_storage(self) -> None:
+        """Force codex to persist auth to `auth.json`, not the OS keyring.
+
+        codex's `auto` storage prefers a keyring when one is available, which
+        would leave the `auth.json` we read back empty. Pin file storage via
+        the CODEX_HOME config.toml so the device login always writes the blob
+        the daemon stores + materializes (Config v2 6/9 review fix)."""
+        home = self._credentials_path.parent
+        try:
+            home.mkdir(parents=True, exist_ok=True)
+            config = home / "config.toml"
+            existing = config.read_text(encoding="utf-8") if config.exists() else ""
+            if "preferred_auth_method" not in existing:
+                with config.open("a", encoding="utf-8") as fh:
+                    fh.write('\npreferred_auth_method = "apikey"\n')
+        except OSError:
+            log.warning("could not pin codex file auth storage", exc_info=True)
+
     async def start(self) -> CodexDeviceAuth:
+        self._ensure_file_auth_storage()
         try:
             self._proc = await asyncio.create_subprocess_exec(
                 *self._command,
@@ -229,7 +249,9 @@ class SubprocessCodexLogin:
             raw = await self._proc.stdout.readline()
             if not raw:
                 raise CodexLoginError("Codex login exited before printing a device code")
-            line = raw.decode(errors="replace")
+            # The real codex CLI wraps the URL and code in ANSI color
+            # escapes; strip them so the regexes match the bare values.
+            line = _ANSI_RE.sub("", raw.decode(errors="replace"))
             if url is None:
                 match = _URL_RE.search(line)
                 if match is not None:
