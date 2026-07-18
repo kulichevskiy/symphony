@@ -1,4 +1,6 @@
--- Symphony persistence schema. Applied at startup; safe to re-apply.
+-- 001_baseline: the full Symphony schema as of Config v2 (SYM-208).
+-- Applied exactly once by the migration runner on a fresh DB; later schema
+-- changes are new NNN_*.sql/.py files, never edits to this one.
 --
 -- Status values used in `runs.status`:
 --   running      live (subprocess attached or dispatched)
@@ -9,12 +11,12 @@
 --   interrupted  marked dead by startup reconcile (host restarted)
 --   superseded   younger duplicate collapsed by startup reconcile (non-failing)
 
-CREATE TABLE IF NOT EXISTS repos (
+CREATE TABLE repos (
     linear_team_key TEXT PRIMARY KEY,
     github_repo     TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS issues (
+CREATE TABLE issues (
     id               TEXT PRIMARY KEY,
     tracker_issue_id TEXT NOT NULL,
     provider         TEXT NOT NULL DEFAULT 'linear',
@@ -29,7 +31,12 @@ CREATE TABLE IF NOT EXISTS issues (
     granted_token_budget INTEGER DEFAULT 0
 );
 
-CREATE TABLE IF NOT EXISTS runs (
+-- `issues.upsert`'s ON CONFLICT target: one row per tracker identity.
+-- (Previously created by the legacy `_migrate()`, not schema.sql.)
+CREATE UNIQUE INDEX idx_issues_tracker_identity
+    ON issues(provider, site, tracker_issue_id);
+
+CREATE TABLE runs (
     id          TEXT PRIMARY KEY,
     issue_id    TEXT NOT NULL REFERENCES issues(id),
     stage       TEXT NOT NULL,
@@ -54,26 +61,26 @@ CREATE TABLE IF NOT EXISTS runs (
 
 -- Active-run lookup: dedupe in poll (status='running') and reconcile
 -- (status='running' AND pid IS NOT NULL).
-CREATE INDEX IF NOT EXISTS idx_runs_status_pid ON runs(status, pid);
+CREATE INDEX idx_runs_status_pid ON runs(status, pid);
 
 -- Per-issue cost aggregation. Cost is internal-only (Codex token deltas,
 -- runs.cost_usd); it no longer gates runs.
-CREATE INDEX IF NOT EXISTS idx_runs_issue_cost ON runs(issue_id, cost_usd);
+CREATE INDEX idx_runs_issue_cost ON runs(issue_id, cost_usd);
 
 -- "Latest run per issue" lookups and the issue-detail runs ordering
 -- (ORDER BY started_at within an issue).
-CREATE INDEX IF NOT EXISTS idx_runs_issue_started ON runs(issue_id, started_at);
+CREATE INDEX idx_runs_issue_started ON runs(issue_id, started_at);
 
 -- Date-window range scans over run start day (spend summary/heatmap/series,
 -- polled every 30-60s). Lexicographic ISO-UTC compare is sargable on this.
-CREATE INDEX IF NOT EXISTS idx_runs_started ON runs(started_at);
+CREATE INDEX idx_runs_started ON runs(started_at);
 
 -- Per-(provider, model) token attribution for a run. A child of `runs`:
 -- the run-level token columns stay authoritative and the rows here sum
 -- back to them (±0 for Claude's exact `modelUsage` split; within the
 -- token-delta estimate for Codex). Rewritten wholesale per run at run
 -- end, so a re-parse of a growing log never double-counts.
-CREATE TABLE IF NOT EXISTS run_model_usage (
+CREATE TABLE run_model_usage (
     run_id             TEXT NOT NULL REFERENCES runs(id),
     provider           TEXT NOT NULL,
     model              TEXT NOT NULL,
@@ -84,7 +91,7 @@ CREATE TABLE IF NOT EXISTS run_model_usage (
     PRIMARY KEY (run_id, provider, model)
 );
 
-CREATE INDEX IF NOT EXISTS idx_run_model_usage_provider_model
+CREATE INDEX idx_run_model_usage_provider_model
     ON run_model_usage(provider, model);
 
 -- PR opened for an issue. The row bridges the async Review/Merge ticks:
@@ -94,7 +101,7 @@ CREATE INDEX IF NOT EXISTS idx_run_model_usage_provider_model
 -- Symphony is waiting for a human to merge from GitHub.
 -- `review_bypassed` records false/false bindings, which skip Review but still
 -- enter CI-gated Merge polling.
-CREATE TABLE IF NOT EXISTS issue_prs (
+CREATE TABLE issue_prs (
     issue_id    TEXT NOT NULL REFERENCES issues(id),
     github_repo TEXT NOT NULL,
     binding_key TEXT NOT NULL DEFAULT '',
@@ -107,14 +114,14 @@ CREATE TABLE IF NOT EXISTS issue_prs (
     PRIMARY KEY (issue_id, github_repo)
 );
 
-CREATE INDEX IF NOT EXISTS idx_issue_prs_unmerged
+CREATE INDEX idx_issue_prs_unmerged
     ON issue_prs(merged_at, created_at);
 
 -- A successful merge-conflict rebase fix-run may produce a clean PR head
 -- without a fresh review signal. This marker lets the next merge poll bypass
 -- the no-signal verdict for the same PR cycle and reviewed head only, and
 -- survives restarts.
-CREATE TABLE IF NOT EXISTS merge_conflict_fix_marks (
+CREATE TABLE merge_conflict_fix_marks (
     issue_id      TEXT NOT NULL REFERENCES issues(id),
     github_repo   TEXT NOT NULL,
     pr_number     INTEGER NOT NULL,
@@ -129,7 +136,7 @@ CREATE TABLE IF NOT EXISTS merge_conflict_fix_marks (
 -- mergeable only when that exact head was verified. The SHA is a strong key,
 -- so a fix-run that advances HEAD without re-verifying falls back to a wait.
 -- Survives restarts.
-CREATE TABLE IF NOT EXISTS verify_pass_marks (
+CREATE TABLE verify_pass_marks (
     issue_id    TEXT NOT NULL REFERENCES issues(id),
     github_repo TEXT NOT NULL,
     head_sha    TEXT NOT NULL,
@@ -141,7 +148,7 @@ CREATE TABLE IF NOT EXISTS verify_pass_marks (
 -- Combined with a `gte` filter on the next fetch, this prevents losing
 -- comments tied at the boundary timestamp (e.g. bursty creation, pagination
 -- splitting a same-millisecond batch) without re-firing already-handled ones.
-CREATE TABLE IF NOT EXISTS comment_cursors (
+CREATE TABLE comment_cursors (
     issue_id      TEXT PRIMARY KEY REFERENCES issues(id),
     last_seen_at  TEXT NOT NULL,
     last_seen_ids TEXT NOT NULL DEFAULT '[]'
@@ -150,23 +157,22 @@ CREATE TABLE IF NOT EXISTS comment_cursors (
 -- Comment IDs handled by either webhook or poll delivery. This lets webhook
 -- delivery order differ from comment creation order without dropping an older
 -- slash command merely because the cursor has already moved past it.
-CREATE TABLE IF NOT EXISTS comment_events (
+CREATE TABLE comment_events (
     comment_id TEXT PRIMARY KEY,
     issue_id   TEXT NOT NULL REFERENCES issues(id),
     seen_at    TEXT NOT NULL
 );
 
 -- Composite (issue_id, seen_at) serves both the issue-only membership checks
--- and `ORDER BY seen_at DESC LIMIT 1` per issue; supersedes the issue-only index.
-DROP INDEX IF EXISTS idx_comment_events_issue;
-CREATE INDEX IF NOT EXISTS idx_comment_events_issue_seen
+-- and `ORDER BY seen_at DESC LIMIT 1` per issue.
+CREATE INDEX idx_comment_events_issue_seen
     ON comment_events(issue_id, seen_at);
 
 -- Webhook delivery dedupe. `received_at` is ISO-8601 UTC; old rows are
 -- pruned opportunistically before each insert based on the configured TTL.
 -- `status` remains pending until the handler succeeds, so retries are not
 -- acknowledged as duplicates before their side effects are durable.
-CREATE TABLE IF NOT EXISTS webhook_deliveries (
+CREATE TABLE webhook_deliveries (
     id          TEXT PRIMARY KEY,
     received_at TEXT NOT NULL,
     status      TEXT NOT NULL DEFAULT 'pending'
@@ -183,7 +189,7 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 --   github_repo/issue_label binding selected when Review started.
 --   codex_review_requested_at non-empty once the initial remote bot request
 --                          was posted successfully.
-CREATE TABLE IF NOT EXISTS review_state (
+CREATE TABLE review_state (
     issue_id               TEXT PRIMARY KEY REFERENCES issues(id),
     iteration              INTEGER NOT NULL DEFAULT 0,
     last_trigger_signature TEXT NOT NULL DEFAULT '',
@@ -199,7 +205,7 @@ CREATE TABLE IF NOT EXISTS review_state (
 -- Acceptance-stage state per issue. The current code_only runner records
 -- Claude verdicts here; later dev/preview slices can add artifact-backed
 -- criteria without changing schema or poll-loop ownership.
-CREATE TABLE IF NOT EXISTS acceptance_state (
+CREATE TABLE acceptance_state (
     issue_id            TEXT PRIMARY KEY REFERENCES issues(id),
     iteration           INTEGER NOT NULL DEFAULT 0,
     pr_number           INTEGER,
@@ -215,13 +221,13 @@ CREATE TABLE IF NOT EXISTS acceptance_state (
 
 -- Resurrected Review monitor rows whose opportunistic `@codex review`
 -- re-arm was inconclusive and must be retried by the live monitor task.
-CREATE TABLE IF NOT EXISTS review_rearm_retries (
+CREATE TABLE review_rearm_retries (
     run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE
 );
 
 -- Rate-limit/dedupe state for Codex activity comments. The full activity
 -- stream is not stored here; raw JSONL remains in per-run log files.
-CREATE TABLE IF NOT EXISTS activity_comment_marks (
+CREATE TABLE activity_comment_marks (
     run_id                 TEXT PRIMARY KEY REFERENCES runs(id),
     first_unpublished_at   TEXT,
     last_event_at          TEXT,
@@ -230,7 +236,7 @@ CREATE TABLE IF NOT EXISTS activity_comment_marks (
     last_fingerprint       TEXT NOT NULL DEFAULT ''
 );
 
-CREATE TABLE IF NOT EXISTS activity_command_marks (
+CREATE TABLE activity_command_marks (
     run_id             TEXT NOT NULL REFERENCES runs(id),
     item_id            TEXT NOT NULL,
     last_heartbeat_at  TEXT NOT NULL,
@@ -240,7 +246,7 @@ CREATE TABLE IF NOT EXISTS activity_command_marks (
 -- Runs waiting for an explicit operator slash command after the runner has
 -- stopped. Cost-cap breaches and manually stopped review monitors use this so
 -- resume/reject slash commands remain actionable after an orchestrator restart.
-CREATE TABLE IF NOT EXISTS operator_waits (
+CREATE TABLE operator_waits (
     issue_id        TEXT PRIMARY KEY REFERENCES issues(id),
     run_id          TEXT NOT NULL REFERENCES runs(id),
     kind            TEXT NOT NULL,
@@ -257,11 +263,11 @@ CREATE TABLE IF NOT EXISTS operator_waits (
     local_review_outcome TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_operator_waits_run ON operator_waits(run_id);
+CREATE INDEX idx_operator_waits_run ON operator_waits(run_id);
 
 -- Low-volume audit trail for state mutations that are otherwise only visible
 -- as the latest row value. Used by the UI timeline for race-condition debugging.
-CREATE TABLE IF NOT EXISTS state_transitions (
+CREATE TABLE state_transitions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     issue_id    TEXT NOT NULL REFERENCES issues(id),
     table_name  TEXT NOT NULL,
@@ -271,13 +277,13 @@ CREATE TABLE IF NOT EXISTS state_transitions (
     ts          TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_state_transitions_issue_ts
+CREATE INDEX idx_state_transitions_issue_ts
     ON state_transitions(issue_id, ts);
 
 -- Periodic and webhook-triggered observations of external truth. Observation
 -- rows are append-only; when active auto-clear is enabled, the reconciler
 -- records the observation and monotonic local mutation in the same transaction.
-CREATE TABLE IF NOT EXISTS external_observations (
+CREATE TABLE external_observations (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     issue_id      TEXT NOT NULL REFERENCES issues(id),
     source        TEXT NOT NULL,
@@ -287,23 +293,23 @@ CREATE TABLE IF NOT EXISTS external_observations (
     action_taken  TEXT NOT NULL DEFAULT 'observed'
 );
 
-CREATE INDEX IF NOT EXISTS idx_external_observations_issue_ts
+CREATE INDEX idx_external_observations_issue_ts
     ON external_observations(issue_id, observed_at);
 
-CREATE INDEX IF NOT EXISTS idx_external_observations_drift
+CREATE INDEX idx_external_observations_drift
     ON external_observations(drift_kind) WHERE drift_kind IS NOT NULL;
 
 -- Dedupe ledger for outbound attention notifications (SYM-171). One row per
 -- pushed event; the `event_key` a caller composes (e.g.
 -- `pr_merged:<issue>:<run>`) makes repeated polls a no-op.
-CREATE TABLE IF NOT EXISTS sent_notifications (
+CREATE TABLE sent_notifications (
     event_key TEXT PRIMARY KEY,
     sent_at   TEXT NOT NULL
 );
 
 -- A claimed event whose send failed, kept so the next poll tick can retry
 -- it without depending on the (usually one-shot) call site firing again.
-CREATE TABLE IF NOT EXISTS pending_notifications (
+CREATE TABLE pending_notifications (
     event_key TEXT PRIMARY KEY,
     text      TEXT NOT NULL
 );
@@ -316,7 +322,7 @@ CREATE TABLE IF NOT EXISTS pending_notifications (
 -- rows. `blocked_by` is a comma-joined list of open blocker identifiers
 -- (waiting queue only). `seen_at` is the first scan that saw the issue in
 -- its current queue — preserved across rewrites so queue age is honest.
-CREATE TABLE IF NOT EXISTS tracker_queue (
+CREATE TABLE tracker_queue (
     team_key   TEXT NOT NULL,
     scope      TEXT NOT NULL DEFAULT '',
     issue_id   TEXT NOT NULL,
@@ -337,7 +343,7 @@ CREATE TABLE IF NOT EXISTS tracker_queue (
 -- (project key, github repo, issue label, tracker provider, tracker site) —
 -- and `issue_label` is normalized to '' so the unlabeled catch-all binding
 -- can't be configured twice (SQLite treats NULLs as distinct).
-CREATE TABLE IF NOT EXISTS config_bindings (
+CREATE TABLE config_bindings (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     payload          TEXT NOT NULL,
     version          INTEGER NOT NULL DEFAULT 1,
@@ -352,13 +358,13 @@ CREATE TABLE IF NOT EXISTS config_bindings (
     tracker_site     TEXT NOT NULL
 );
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_config_bindings_natural_key
+CREATE UNIQUE INDEX idx_config_bindings_natural_key
     ON config_bindings(project_key, github_repo, issue_label, tracker_provider, tracker_site);
 
 -- Single-document global config: the global roles matrix (JSON) plus the
 -- one-off migration marker (`migrated_at`, empty until the importer runs).
 -- `version` participates in the same optimistic-locking check as bindings.
-CREATE TABLE IF NOT EXISTS config_globals (
+CREATE TABLE config_globals (
     id          INTEGER PRIMARY KEY CHECK (id = 1),
     roles       TEXT NOT NULL DEFAULT '{}',
     migrated_at TEXT NOT NULL DEFAULT '',
@@ -373,7 +379,7 @@ CREATE TABLE IF NOT EXISTS config_globals (
 -- value is write-only: it never leaves the process in an API response, export,
 -- or log (audit diffs redact it to set/cleared/changed flags). An empty
 -- `secret` means "no secret set" (cleared).
-CREATE TABLE IF NOT EXISTS config_repo_secrets (
+CREATE TABLE config_repo_secrets (
     github_repo TEXT PRIMARY KEY,
     secret      TEXT NOT NULL DEFAULT '',
     version     INTEGER NOT NULL DEFAULT 1,
@@ -388,7 +394,7 @@ CREATE TABLE IF NOT EXISTS config_repo_secrets (
 -- process (the API serializes `status` + `expires_at` only). `refresh_token`
 -- is NULL for providers whose access token doesn't expire (e.g. GitHub).
 -- A missing row means "not connected".
-CREATE TABLE IF NOT EXISTS oauth_connections (
+CREATE TABLE oauth_connections (
     provider       TEXT PRIMARY KEY,
     credential     BLOB NOT NULL DEFAULT '',
     refresh_token  BLOB,

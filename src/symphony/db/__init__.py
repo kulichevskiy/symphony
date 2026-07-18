@@ -1,7 +1,8 @@
 """SQLite persistence layer.
 
-Schema lives in `schema.sql` (checked-in, applied idempotently at startup).
-Each table has its own DAO module exposing typed read/write functions:
+Schema lives in versioned `migrations/NNN_*.sql|py` files applied by the
+runner in `schema.py` at startup (Config v2 1/9). Each table has its own DAO
+module exposing typed read/write functions:
 
     from symphony import db
     conn = await db.connect(cfg.db_path)
@@ -34,12 +35,12 @@ from . import (
     tracker_queue,
     webhook_deliveries,
 )
-from .schema import apply_schema, connect
+from .schema import apply_migrations, connect
 
 __all__ = [
     "acceptance_state",
     "activity_comments",
-    "apply_schema",
+    "apply_migrations",
     "comment_cursors",
     "comment_events",
     "config_bindings",
