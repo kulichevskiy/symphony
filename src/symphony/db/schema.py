@@ -26,6 +26,7 @@ Foreign-key enforcement is per-connection in SQLite, so `connect()` issues
 
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import logging
 import re
@@ -76,26 +77,12 @@ async def apply_migrations(
     )
     await conn.commit()
 
-    current = await _current_version(conn)
     all_migrations = _discover(migrations_dir)
-    pending = [(v, p) for v, p in all_migrations if v > current]
-    if not pending:
+    head = all_migrations[-1][0] if all_migrations else 0
+    current = await _current_version(conn)
+    _reject_downgrade(current, head)
+    if not any(v > current for v, _ in all_migrations):
         return
-    target = pending[-1][0]
-
-    # Belt-and-suspenders next to the transaction below: restore-by-copy
-    # covers anything a rollback can't (e.g. a future non-transactional
-    # step). Taken through SQLite's backup API, not a file copy — in WAL
-    # mode committed data can still live in `-wal`, which a bare copy of the
-    # main file would miss. Skipped on first boot — nothing to lose yet.
-    if db_path is not None and current > 0:
-        backup = db_path.with_name(f"{db_path.name}.bak-{target:03d}")
-        backup_conn = await aiosqlite.connect(str(backup))
-        try:
-            await conn.backup(backup_conn)
-        finally:
-            await backup_conn.close()
-        log.info("DB backed up to %s before migrating v%03d -> v%03d", backup, current, target)
 
     await conn.execute("BEGIN IMMEDIATE")
     try:
@@ -104,11 +91,23 @@ async def apply_migrations(
         # write lock, then must NOT replay the migrations the winner already
         # applied — re-read the version now that we hold the lock.
         current = await _current_version(conn)
+        _reject_downgrade(current, head)
         pending = [(v, p) for v, p in all_migrations if v > current]
         if not pending:
             await conn.rollback()
             return
         target = pending[-1][0]
+        # Belt-and-suspenders next to the surrounding transaction:
+        # restore-by-copy covers anything a rollback can't (e.g. a future
+        # non-transactional step). Taken through SQLite's backup API, not a
+        # file copy — in WAL mode committed data can still live in `-wal`.
+        # Taken *under the write lock* so an overlapping old daemon can't
+        # commit rows between the backup and the migration it protects.
+        # Skipped on first boot — nothing to lose yet.
+        if db_path is not None and current > 0:
+            backup = db_path.with_name(f"{db_path.name}.bak-{target:03d}")
+            await asyncio.to_thread(_backup_db, str(db_path), str(backup))
+            log.info("DB backed up to %s before migrating v%03d -> v%03d", backup, current, target)
         for version, path in pending:
             if path.suffix == ".sql":
                 for statement in _split_statements(path.read_text(encoding="utf-8")):
@@ -131,6 +130,37 @@ async def _current_version(conn: aiosqlite.Connection) -> int:
     cur = await conn.execute("SELECT MAX(version) FROM schema_version")
     row = await cur.fetchone()
     return row[0] if row is not None and row[0] is not None else 0
+
+
+def _backup_db(src_path: str, dest_path: str) -> None:
+    """Snapshot `src_path` into `dest_path` via SQLite's backup API on an
+    independent read connection (WAL-safe, unlike a bare file copy). Runs in a
+    thread; the caller holds the migration write lock, so no other writer can
+    slip rows in between the backup and the migration it protects. (Not
+    `aiosqlite`'s `.backup()` on the migrating connection — backing up a
+    connection with an open transaction crashes.)"""
+    src = sqlite3.connect(src_path)
+    try:
+        dest = sqlite3.connect(dest_path)
+        try:
+            src.backup(dest)
+        finally:
+            dest.close()
+    finally:
+        src.close()
+
+
+def _reject_downgrade(current: int, head: int) -> None:
+    """A DB migrated past this image's migration set means the deployment was
+    rolled back to an older image. Old code running on a newer schema corrupts
+    silently — refuse to boot instead."""
+    if current > head:
+        raise RuntimeError(
+            f"the database is at schema version {current:03d}, newer than this "
+            f"build's latest migration {head:03d} — the deployment looks rolled "
+            "back to an older image. Deploy an image at or above the DB's "
+            "version (or restore the matching state.sqlite backup)."
+        )
 
 
 def _discover(migrations_dir: Path) -> list[tuple[int, Path]]:

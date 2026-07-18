@@ -263,3 +263,25 @@ async def test_two_migrators_racing_apply_once(tmp_path: Path) -> None:
         assert await _versions(conn) == [(1, "001_baseline"), (2, "002_add_widgets")]
     finally:
         await conn.close()
+
+
+async def test_db_newer_than_image_refuses_to_boot(tmp_path: Path) -> None:
+    """A DB migrated past this build's migration set (deployment rolled back
+    to an older image) must refuse to boot, not silently run old code on a
+    newer schema."""
+    path = tmp_path / "state.sqlite"
+    conn = await connect(path)  # v1
+    await conn.execute(
+        "INSERT INTO schema_version (version, name, applied_at)"
+        " VALUES (999, '999_from_the_future', '2026-01-01T00:00:00Z')"
+    )
+    await conn.commit()
+    await conn.close()
+
+    conn = await aiosqlite.connect(str(path))
+    conn.row_factory = aiosqlite.Row
+    try:
+        with pytest.raises(RuntimeError, match="newer than this build"):
+            await apply_migrations(conn, db_path=path)
+    finally:
+        await conn.close()
