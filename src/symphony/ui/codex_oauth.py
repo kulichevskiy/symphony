@@ -23,6 +23,7 @@ a `PendingLoginRegistry` (reused from 5/7).
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -56,6 +57,18 @@ _PROVIDER = "codex"
 
 class PollRequest(BaseModel):
     login_session: str
+
+
+def _has_refresh_token(raw: str) -> bool:
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return False
+    tokens = payload.get("tokens") if isinstance(payload, dict) else None
+    if not isinstance(tokens, dict):
+        return False
+    refresh = tokens.get("refresh_token")
+    return isinstance(refresh, str) and bool(refresh)
 
 
 def _now_iso(clock: Callable[[], datetime] | None) -> str:
@@ -135,6 +148,9 @@ def create_codex_oauth_router(
 
     @router.post("/disconnect")
     async def codex_disconnect() -> dict[str, str]:
+        # Kill any in-flight device login first: a late poll after this
+        # disconnect must not re-persist credentials the operator cleared.
+        await registry.discard_all()
         conn = await conn_provider()
         await db.oauth_connections.delete(conn, _PROVIDER)
         # The login subprocess already wrote its own credentials file; clear it
@@ -165,7 +181,10 @@ def create_codex_oauth_router(
             return {"status": "expired"}
         if not credential:
             raise HTTPException(status_code=404, detail=f"{_PROVIDER} is not connected")
-        live = not codex_credential_expired(credential)
+        # A lapsed access-token JWT with a stored refresh token is still a
+        # working connection — the CLI refreshes it inside its per-run dir and
+        # the write-back persists it. Only refreshless expiry is dead.
+        live = not codex_credential_expired(credential) or _has_refresh_token(credential)
         await db.oauth_connections.update_status(
             conn,
             provider=_PROVIDER,

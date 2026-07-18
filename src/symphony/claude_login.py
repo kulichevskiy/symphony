@@ -154,6 +154,13 @@ class PendingLoginRegistry[LoginProcessT: SupportsAsyncClose]:
         if entry is not None:
             await entry[0].close()
 
+    async def discard_all(self) -> None:
+        """Tear down every pending login — a Disconnect must kill in-flight
+        device/paste flows so a late poll can't re-persist credentials the
+        operator just cleared (Config v2 6/9 review fix)."""
+        for session_id in list(self._pending):
+            await self.discard(session_id)
+
     def _evict_expired(self) -> None:
         now = self._clock()
         expired = [sid for sid, (_, deadline) in self._pending.items() if now >= deadline]

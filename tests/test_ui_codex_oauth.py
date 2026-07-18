@@ -207,8 +207,19 @@ async def test_test_reports_live_then_expired(tmp_path: Path) -> None:
             live = await client.post("/api/oauth/codex/test")
         assert live.status_code == 200 and live.json()["status"] == "live"
 
+        # A lapsed access-token JWT with a stored refresh token is still a
+        # working connection — the CLI refreshes in its per-run dir.
         app2 = _app(conn, db_path, login=_FakeLogin(_credential(_PAST), pending_polls=0))
         async with _client(app2) as client:
+            session = (await client.get("/api/oauth/codex/start")).json()["login_session"]
+            await client.post("/api/oauth/codex/poll", json={"login_session": session})
+            refreshable = await client.post("/api/oauth/codex/test")
+        assert refreshable.json()["status"] == "live"
+
+        # Only a lapsed JWT with NO refresh token is dead.
+        refreshless = json.dumps({"tokens": {"access_token": _jwt(_PAST)}})
+        app3 = _app(conn, db_path, login=_FakeLogin(refreshless, pending_polls=0))
+        async with _client(app3) as client:
             session = (await client.get("/api/oauth/codex/start")).json()["login_session"]
             await client.post("/api/oauth/codex/poll", json={"login_session": session})
             expired = await client.post("/api/oauth/codex/test")

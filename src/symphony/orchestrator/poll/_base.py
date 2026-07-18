@@ -54,7 +54,7 @@ from ...claude_login import (
     read_claude_credential,
     refresh_claude_credential,
 )
-from ...codex_login import codex_expires_at
+from ...codex_login import codex_expires_at, default_codex_credentials_path
 from ...config import Config, RepoBinding, ResolvedRole, binding_natural_key
 from ...credentials import (
     CredentialResolver,
@@ -3088,7 +3088,7 @@ class _OrchestratorBase:
         )
 
     async def _flag_claude_auth_failure(
-        self, agent: str, api_error: object, *, run_started_at: str = ""
+        self, agent: str, api_error: object, *, run_started_at: str = "", provider: str = ""
     ) -> None:
         """After a Claude run died on an authentication error, flip the UI
         connection to `expired` so the Connections card surfaces the fix and
@@ -3096,18 +3096,20 @@ class _OrchestratorBase:
         for non-auth errors, when Claude was never UI-connected, or when the
         stored row changed after the run started (`run_started_at`) — a fresh
         reconnect/refresh must not be flagged for a stale run's failure."""
-        if agent != "claude" or api_error is None:
+        provider = provider or agent
+        if provider not in _AGENT_CRED_LAYOUT or api_error is None:
             return
         message = str(getattr(api_error, "message", "") or "")
         status_code = getattr(api_error, "status", None)
         looks_auth = (
             "not logged in" in message.lower()
+            or "unauthorized" in message.lower()
             or "authentication" in message.lower()
             or status_code == 401
         )
         if not looks_auth:
             return
-        status = await db.oauth_connections.get_status(self._conn, "claude")
+        status = await db.oauth_connections.get_status(self._conn, provider)
         if status is None or status.status not in ("connected", "expired"):
             return
         if run_started_at and status.updated_at:
@@ -3130,10 +3132,10 @@ class _OrchestratorBase:
                     "claude auth failure from a run older than the stored credential; not flagging"
                 )
                 return
-        log.warning("claude run failed on authentication; marking the connection expired")
+        log.warning("%s run failed on authentication; marking the connection expired", provider)
         await db.oauth_connections.update_status(
             self._conn,
-            provider="claude",
+            provider=provider,
             status="expired",
             updated_at=self._now().strftime("%Y-%m-%dT%H:%M:%SZ"),
             updated_by="auth-failure",
@@ -3161,7 +3163,7 @@ class _OrchestratorBase:
         runner path, not just the rc=0 implement completion gate (Config v2
         5/9 review fix). Best-effort: an unreadable log is a no-op. The run's
         own started_at (from the runs row) anchors the stale-run guard."""
-        if agent != "claude" or returncode in (0, None):
+        if agent not in _AGENT_CRED_LAYOUT or returncode in (0, None):
             return
         stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
         if stdout is None:
@@ -3176,7 +3178,9 @@ class _OrchestratorBase:
         cur = await self._conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,))
         row = await cur.fetchone()
         run_started_at = str(row["started_at"]) if row is not None else ""
-        await self._flag_claude_auth_failure(agent, api_error, run_started_at=run_started_at)
+        await self._flag_claude_auth_failure(
+            agent, api_error, run_started_at=run_started_at, provider=agent
+        )
 
     async def _materialize_claude_env(self, agent: str) -> dict[str, str]:
         """Per-run Claude credential materialization (Config v2 3/9).
@@ -3213,6 +3217,14 @@ class _OrchestratorBase:
             prior_path = config_dir / f"{filename}.orig"
             prior_path.write_text(credential, encoding="utf-8")
             prior_path.chmod(0o600)
+            if agent == "codex":
+                # CODEX_HOME replaces the CLI's whole config dir, not just its
+                # auth: carry the deployment's config.toml (model/profile
+                # settings) into the per-run home so a UI-connected codex run
+                # doesn't silently drop it (Config v2 6/9 review fix).
+                default_toml = default_codex_credentials_path().parent / "config.toml"
+                if default_toml.exists():
+                    shutil.copy2(default_toml, config_dir / "config.toml")
         except OSError:
             log.warning("%s credential materialization failed", agent, exc_info=True)
             shutil.rmtree(config_dir, ignore_errors=True)

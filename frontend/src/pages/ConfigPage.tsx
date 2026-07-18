@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { type ReactNode, useEffect, useMemo, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -1345,6 +1345,12 @@ export function ConnectionCard({
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Stable callback for the in-flight device-auth poll: a parent rerender
+  // changing `onChanged`'s identity must not cancel/restart the poll.
+  const onChangedRef = useRef(onChanged);
+  useEffect(() => {
+    onChangedRef.current = onChanged;
+  }, [onChanged]);
   const [testResult, setTestResult] = useState<string | null>(null);
   // Set while a Claude code-paste login is in flight: the CLI's OAuth URL to
   // authorize + the login-session tying the pasted code back to the daemon's
@@ -1375,7 +1381,7 @@ export function ConnectionCard({
         if (cancelled) return;
         if (status === "connected") {
           setCodexLogin(null);
-          onChanged?.();
+          onChangedRef.current?.();
         } else if (status === "failed") {
           setCodexLogin(null);
           setError("Couldn't complete the login — it may have expired. Try again.");
@@ -1393,7 +1399,10 @@ export function ConnectionCard({
       cancelled = true;
       if (timer !== undefined) clearTimeout(timer);
     };
-  }, [codexLogin, onChanged]);
+    // `onChangedRef` keeps the in-flight poll stable across parent
+    // rerenders — a changed callback identity must not cancel/restart the
+    // device-auth poll (Config v2 6/9 review fix).
+  }, [codexLogin]);
 
   async function connect() {
     setBusy(true);

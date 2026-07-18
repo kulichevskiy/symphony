@@ -1530,16 +1530,19 @@ class _LifecycleMixin(_OrchestratorBase):
             # instead of going through `_run_stage_command`/`_run_runner`, so it
             # gets the same per-run Claude credential materialization +
             # write-back (Config v2 3/9) when any of its roles runs on Claude.
-            local_review_agent = (
-                "claude"
-                if "claude" in {reviewer_role.agent, verifier_role.agent, fixer_role.agent}
-                else ""
-            )
-            claude_env = await self._materialize_claude_env(local_review_agent)
-            lr_blocked = await self._post_materialize_block_reason(local_review_agent, claude_env)
-            if lr_blocked is not None:
-                await self._finalize_claude_env(claude_env)
-                raise RuntimeError(lr_blocked)
+            lr_role_agents = {reviewer_role.agent, verifier_role.agent, fixer_role.agent}
+            claude_env: dict[str, str] = {}
+            agent_envs: dict[str, dict[str, str]] = {}
+            for lr_agent in ("claude", "codex"):
+                if lr_agent not in lr_role_agents:
+                    continue
+                env_for_agent = await self._materialize_claude_env(lr_agent)
+                agent_envs[lr_agent] = env_for_agent
+                claude_env.update(env_for_agent)
+                lr_blocked = await self._post_materialize_block_reason(lr_agent, env_for_agent)
+                if lr_blocked is not None:
+                    await self._finalize_claude_env(claude_env)
+                    raise RuntimeError(lr_blocked)
 
             result: LoopResult | None = None
             try:
@@ -1559,7 +1562,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     command_secs=self.config.command_timeout_secs,
                     wall_clock_secs=self.config.wall_clock_timeout_secs,
                     binding_env=dict(binding.env),
-                    agent_env=dict(claude_env),
+                    agent_envs=agent_envs,
                     mcp_servers=dict(binding.mcp_servers),
                     last_message_dir=last_message_dir,
                     head_sha_provider=_workspace_head_sha,
