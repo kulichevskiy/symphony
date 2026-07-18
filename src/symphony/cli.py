@@ -1471,6 +1471,9 @@ async def _dispatch(linear_id: str, config_path: Path) -> None:
         except ConfigBootError as e:
             click.echo(str(e), err=True)
             sys.exit(2)
+        # Same effective key as the daemon boot: the Orchestrator this command
+        # constructs builds its cipher off cfg (Config v2 2/9 review fix).
+        cfg = _resolve_key_into(cfg, config_path)
         async with Linear(cfg.linear_api_key) as linear:
             try:
                 issue = await linear.lookup_issue(linear_id)

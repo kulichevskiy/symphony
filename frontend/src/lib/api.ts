@@ -562,6 +562,16 @@ export function fetchConnections(): Promise<Connection[]> {
   );
 }
 
+/** Non-reversible fingerprint of the effective credential encryption key
+ * (Config v2 2/9) — lets the operator verify which key the instance runs. */
+export function fetchConnectionsKey(): Promise<{ fingerprint: string }> {
+  return fetchJson<{ fingerprint: string }>(
+    "/api/connections/key",
+    "Key fingerprint not found",
+    "Failed to load the key fingerprint",
+  );
+}
+
 /** The provider consent URL minted by `start`; the SPA navigates to it (a
  *  cross-origin 302 can't be read back out of `fetch`, so the URL is returned
  *  as JSON — OAuth in UI 2/7). */

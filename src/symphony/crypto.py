@@ -15,6 +15,7 @@ decrypts) is surfaced as an explicit, catchable error the API layer renders as
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import logging
 import os
@@ -87,27 +88,31 @@ def resolve_encryption_key(explicit_key: str, data_dir: Path) -> str:
         existing = ""
     if existing:
         return existing
-    key = secrets.token_hex(32)
     data_dir.mkdir(parents=True, exist_ok=True)
-    # Atomic create-exclusive via a private temp file + hard link: two
-    # overlapping first boots (deploy recreate on a shared volume) must agree
-    # on one key — the loser reads the winner's file instead of silently
-    # overwriting it with a different secret.
-    tmp_path = data_dir / f".encryption_key.tmp-{secrets.token_hex(4)}"
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(key + "\n")
+    # Generation is serialized by an flock on a sidecar lock file: overlapping
+    # first boots (deploy recreate shares one data volume on one host) must
+    # agree on one key — under the lock, whoever arrives second re-reads the
+    # winner's file instead of writing (or replacing it with) a different
+    # secret. The lock also makes the empty-file (truncated write) recovery
+    # race-free.
+    lock_fd = os.open(data_dir / f"{KEY_FILE_NAME}.lock", os.O_WRONLY | os.O_CREAT, 0o600)
     try:
-        os.link(tmp_path, key_path)
-    except FileExistsError:
-        raced = key_path.read_text(encoding="utf-8").strip()
-        if raced:
-            os.unlink(tmp_path)
-            return raced
-        # Existing but empty (a truncated earlier write): replace atomically.
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            existing = key_path.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            existing = ""
+        if existing:
+            return existing
+        key = secrets.token_hex(32)
+        tmp_path = data_dir / f"{KEY_FILE_NAME}.tmp"
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(key + "\n")
         os.replace(tmp_path, key_path)
-    else:
-        os.unlink(tmp_path)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        os.close(lock_fd)
     log.info(
         "generated a new credential encryption key at %s (fingerprint %s)",
         key_path,
