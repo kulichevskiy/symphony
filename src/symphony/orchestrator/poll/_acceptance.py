@@ -944,6 +944,16 @@ class _AcceptanceMixin(_OrchestratorBase):
                                 )
                         finally:
                             await self._finalize_claude_env(claude_env)
+                        if verdict.kind == "infra_error":
+                            # A Claude acceptance run that died on auth must
+                            # flip the card + arm the dispatch gate, same as
+                            # the stage runners (Config v2 5/9 review fix).
+                            await self._flag_auth_failure_from_log(
+                                accept_role.agent,
+                                self.config.log_root / f"{run_id}.log",
+                                1,
+                                run_id,
+                            )
                         await _record_run_model_usage(
                             self._conn,
                             run_id,

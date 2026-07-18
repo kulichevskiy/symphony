@@ -3033,6 +3033,13 @@ class _OrchestratorBase:
             refreshed = await refresh_claude_credential(current)
             now = self._now().strftime("%Y-%m-%dT%H:%M:%SZ")
             if refreshed is None:
+                # A reconnect that landed while the (doomed) token exchange was
+                # in flight must win: only expire the row if it still holds the
+                # credential the failed refresh started from.
+                latest = await self._resolve_claude_credential()
+                if latest is not None and latest != current:
+                    log.info("claude refresh failed but the row was reconnected; using it")
+                    return latest
                 log.warning("claude token refresh failed; marking the connection expired")
                 await db.oauth_connections.update_status(
                     self._conn,
@@ -3108,7 +3115,14 @@ class _OrchestratorBase:
                 started = datetime.fromisoformat(run_started_at.replace("Z", "+00:00"))
             except ValueError:
                 updated = started = None
-            if updated is not None and started is not None and updated > started:
+            # OAuth updated_at has second precision while run started_at can
+            # carry microseconds — floor the start so a same-second reconnect
+            # counts as "after the run started" (conservative: don't flag).
+            if (
+                updated is not None
+                and started is not None
+                and updated >= started.replace(microsecond=0)
+            ):
                 log.info(
                     "claude auth failure from a run older than the stored credential; not flagging"
                 )
@@ -3129,8 +3143,11 @@ class _OrchestratorBase:
         failed inside `_materialize_claude_env` flips the row to `expired` and
         yields `{}` — the run must then be blocked, not silently started on
         ambient credentials (Config v2 5/9 review fix)."""
-        if agent != "claude" or claude_env:
+        if agent != "claude":
             return None
+        # Checked even when materialization produced an env: a row that is
+        # still `expired` after materialization (e.g. a blob with no parseable
+        # expiry that skipped the proactive refresh) must not dispatch.
         return await self._claude_expired_block_reason(agent)
 
     async def _flag_auth_failure_from_log(
@@ -3146,7 +3163,11 @@ class _OrchestratorBase:
         stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
         if stdout is None:
             return
-        api_error = classify_stream_api_error(stdout)
+        api_error: object | None = classify_stream_api_error(stdout)
+        if api_error is None and "not logged in" in stdout.lower():
+            # Claude can also fail auth with a plain-text (often stderr-only)
+            # "Not logged in" line the JSONL classifier skips.
+            api_error = StreamApiError(message="Not logged in", status=401)
         if api_error is None:
             return
         cur = await self._conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,))

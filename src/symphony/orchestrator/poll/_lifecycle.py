@@ -1555,6 +1555,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     command_secs=self.config.command_timeout_secs,
                     wall_clock_secs=self.config.wall_clock_timeout_secs,
                     binding_env={**claude_env, **binding.env},
+                    agent_env=dict(claude_env),
                     mcp_servers=dict(binding.mcp_servers),
                     last_message_dir=last_message_dir,
                     head_sha_provider=_workspace_head_sha,
@@ -1983,6 +1984,13 @@ class _LifecycleMixin(_OrchestratorBase):
         async def _verify_fix_env() -> dict[str, str]:
             if not verify_claude_env:
                 verify_claude_env.update(await self._materialize_claude_env(fixer_role.agent))
+                blocked = await self._post_materialize_block_reason(
+                    fixer_role.agent, verify_claude_env
+                )
+                if blocked is not None:
+                    # Raises into run_verify_session; the surrounding
+                    # fail-closed except turns it into a failed verify.
+                    raise RuntimeError(blocked)
             return dict(verify_claude_env)
 
         try:
