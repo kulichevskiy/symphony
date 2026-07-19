@@ -34,6 +34,34 @@ _STREAM_READ_CHUNK_BYTES = 64 * 1024
 _OVERSIZED_LINE_PREFIX_BYTES = 64 * 1024
 _JSON_ID_RE = re.compile(r'"(?:id|item_id)"\s*:\s*"([^"]+)"')
 
+# When a run is backed by a DB-materialized agent credential (a private
+# CLAUDE_CONFIG_DIR / CODEX_HOME written from `oauth_connections`), the
+# daemon host's own ambient agent-auth env must NOT leak into the child:
+# Claude Code and codex both prefer an ambient API-key/OAuth-token env var
+# over the on-disk credential, so a stray host `ANTHROPIC_API_KEY` would
+# silently win over the UI-connected account (the SYM-206 hazard). We scrub
+# these from the *inherited* env only — a binding that sets one explicitly
+# via `env:` (landing in `spec.env`) still overrides, as always.
+_AGENT_AMBIENT_AUTH_ENV: dict[str, tuple[str, ...]] = {
+    "CLAUDE_CONFIG_DIR": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
+    "CODEX_HOME": ("OPENAI_API_KEY", "CODEX_API_KEY"),
+}
+
+
+def _scrub_ambient_agent_auth(inherited: dict[str, str], spec_env: dict[str, str]) -> None:
+    """Drop host ambient agent-auth vars from `inherited` in place when the
+    run carries a materialized agent credential, so the DB credential wins.
+
+    A key that `spec_env` supplies itself is left for the later merge to
+    override — this only strips values inherited from the daemon process."""
+    for marker, ambient_keys in _AGENT_AMBIENT_AUTH_ENV.items():
+        if marker not in spec_env:
+            continue
+        for key in ambient_keys:
+            if key not in spec_env:
+                inherited.pop(key, None)
+
+
 log = logging.getLogger(__name__)
 
 
@@ -127,6 +155,7 @@ class LocalRunner:
         # inherit the host deployment's posture. spec.env (the per-binding
         # allowlist) still overrides.
         inherited = {k: v for k, v in os.environ.items() if not k.startswith("SYMPHONY_")}
+        _scrub_ambient_agent_auth(inherited, spec.env)
         env = {**inherited, **spec.env}
         # Materialize DB-resolved creds into a private home for this run only
         # (OAuth in UI 4/7). Torn down in `finally` and on spawn failure — never
