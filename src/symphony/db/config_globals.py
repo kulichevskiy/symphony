@@ -17,6 +17,9 @@ import aiosqlite
 @dataclass(frozen=True)
 class ConfigGlobals:
     roles: dict[str, Any] = field(default_factory=dict)
+    # Sparse operator-set operational knob overrides (Config v2 7/9); unset
+    # keys fall back to code defaults.
+    knobs: dict[str, Any] = field(default_factory=dict)
     migrated_at: str = ""
     version: int = 1
 
@@ -35,12 +38,15 @@ class StaleVersionError(Exception):
 
 async def get(conn: aiosqlite.Connection) -> ConfigGlobals | None:
     """Return the global-config document, or `None` if it was never written."""
-    cur = await conn.execute("SELECT roles, migrated_at, version FROM config_globals WHERE id = 1")
+    cur = await conn.execute(
+        "SELECT roles, knobs, migrated_at, version FROM config_globals WHERE id = 1"
+    )
     row = await cur.fetchone()
     if row is None:
         return None
     return ConfigGlobals(
         roles=json.loads(row["roles"]),
+        knobs=json.loads(row["knobs"]),
         migrated_at=str(row["migrated_at"]),
         version=int(row["version"]),
     )
@@ -67,6 +73,8 @@ async def set_globals(
             roles = excluded.roles,
             migrated_at = excluded.migrated_at,
             version = excluded.version
+            -- knobs deliberately untouched: set_globals owns roles/migration
+            -- state only (Config v2 7/9)
         """,
         (json.dumps(roles, separators=(",", ":")), migrated_at, version),
     )
@@ -124,6 +132,45 @@ async def update_roles(
         # transaction even though it matched zero rows; leaving it open would
         # hold the connection's write lock until some later, unrelated
         # commit/rollback (SYM-191 review).
+        await conn.rollback()
+        raise StaleVersionError(current.version if current is not None else 0)
+    if commit:
+        await conn.commit()
+    return new_version
+
+
+async def update_knobs(
+    conn: aiosqlite.Connection,
+    *,
+    knobs: dict[str, Any],
+    expected_version: int,
+    commit: bool = True,
+) -> int:
+    """Replace the operational-knob overrides under the same optimistic
+    locking as `update_roles` (one shared `version` for the whole document).
+    Returns the bumped version; raises `StaleVersionError` on a conflict."""
+    new_version = expected_version + 1
+    payload = json.dumps(knobs, separators=(",", ":"))
+    if expected_version == 0:
+        cur = await conn.execute(
+            """
+            INSERT INTO config_globals (id, roles, knobs, migrated_at, version)
+            SELECT 1, '{}', ?, '', ?
+             WHERE NOT EXISTS (SELECT 1 FROM config_globals WHERE id = 1)
+            """,
+            (payload, new_version),
+        )
+    else:
+        cur = await conn.execute(
+            """
+            UPDATE config_globals
+               SET knobs = ?, version = ?
+             WHERE id = 1 AND version = ?
+            """,
+            (payload, new_version, expected_version),
+        )
+    if cur.rowcount != 1:
+        current = await get(conn)
         await conn.rollback()
         raise StaleVersionError(current.version if current is not None else 0)
     if commit:

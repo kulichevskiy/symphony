@@ -22,6 +22,7 @@ from symphony import db
 from symphony.app import create_app
 from symphony.config import Config
 from symphony.db import config_bindings, config_repo_secrets
+from symphony.effective_config import assemble_effective_config
 from symphony.ui.config_crud import create_config_crud_router
 
 from .test_auth import JWKS_URI, _jwks, _settings, _token
@@ -2326,5 +2327,112 @@ async def test_drained_binding_deletes_cleanly(tmp_path: Path) -> None:
             )
             assert deleted.status_code == 204, deleted.text
             assert (await client.get("/api/config/bindings")).json() == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_knobs_get_reports_defaults_and_ranges(tmp_path: Path) -> None:
+    """Config v2 7/9: fresh DB → every knob at its code default, no override,
+    hot-reloadable, with an accepted range; version 0 for the first PUT."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.get("/api/config/knobs")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["version"] == 0
+        by_name = {k["name"]: k for k in body["knobs"]}
+        poll = by_name["poll_interval_secs"]
+        assert poll["value"] == poll["default"] == 60
+        assert poll["override"] is False
+        assert poll["hot_reload"] is True
+        assert poll["min"] == 5 and poll["max"] == 3600
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_knobs_put_round_trip_and_effective_overlay(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.put(
+                "/api/config/knobs",
+                json={
+                    "knobs": {"poll_interval_secs": 30, "global_max_concurrent": 8},
+                    "version": 0,
+                },
+            )
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["version"] == 1
+            resp = await client.get("/api/config/knobs")
+        by_name = {k["name"]: k for k in resp.json()["knobs"]}
+        assert by_name["poll_interval_secs"]["value"] == 30
+        assert by_name["poll_interval_secs"]["override"] is True
+        # The daemon assembly (hot-reloaded every tick) applies the override.
+        effective = await assemble_effective_config(conn, Config(), boot_gates=False)
+        assert effective.poll_interval_secs == 30
+        assert effective.global_max_concurrent == 8
+        # Unset knobs keep their code defaults.
+        assert effective.stall_timeout_secs == Config().stall_timeout_secs
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_knobs_put_validates_names_and_ranges(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            resp = await client.put(
+                "/api/config/knobs",
+                json={"knobs": {"nonsense": 1, "poll_interval_secs": 1}, "version": 0},
+            )
+        assert resp.status_code == 422
+        msgs = {tuple(e["loc"]): e["msg"] for e in resp.json()["detail"]}
+        assert msgs[("knobs", "nonsense")] == "unknown knob"
+        assert "between 5 and 3600" in msgs[("knobs", "poll_interval_secs")]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_knobs_put_stale_version_conflicts(tmp_path: Path) -> None:
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            first = await client.put(
+                "/api/config/knobs", json={"knobs": {"poll_interval_secs": 30}, "version": 0}
+            )
+            assert first.status_code == 200
+            stale = await client.put(
+                "/api/config/knobs", json={"knobs": {"poll_interval_secs": 45}, "version": 0}
+            )
+        assert stale.status_code == 409
+        assert stale.json()["detail"]["current_version"] == 1
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_hand_edited_knob_rows_never_break_assembly(tmp_path: Path) -> None:
+    """A restored/hand-edited row with junk knobs is skipped with a warning,
+    never a boot failure."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        await db.config_globals.update_knobs(
+            conn,
+            knobs={"poll_interval_secs": "soon", "unknown": 5, "global_max_concurrent": 999999},
+            expected_version=0,
+        )
+        effective = await assemble_effective_config(conn, Config(), boot_gates=False)
+        # Every override was invalid → code defaults all around.
+        assert effective.poll_interval_secs == Config().poll_interval_secs
+        assert effective.global_max_concurrent == Config().global_max_concurrent
     finally:
         await conn.close()

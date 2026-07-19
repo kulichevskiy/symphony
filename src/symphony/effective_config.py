@@ -66,6 +66,48 @@ def _resolve_bindings(cfg: Config) -> None:
         binding.resolve_env(env_source)
 
 
+# Operational knobs an operator may override from the DB (Config v2 7/9):
+# knob name -> (min, max) accepted by the API and the assembly overlay. All
+# are hot-reloaded at the daemon's tick boundary (`_reload_bindings`
+# reassembles the effective config every tick); none require a restart.
+OPERATIONAL_KNOBS: dict[str, tuple[int, int]] = {
+    "poll_interval_secs": (5, 3600),
+    "global_max_concurrent": (1, 64),
+    "stall_timeout_secs": (30, 24 * 3600),
+    # 0 disables the wall-clock cap.
+    "wall_clock_timeout_secs": (0, 24 * 3600),
+    "command_timeout_secs": (30, 24 * 3600),
+    "reconcile_interval_secs": (30, 24 * 3600),
+    "review_iteration_cap": (1, 100),
+    "local_review_iteration_cap": (1, 100),
+    "activity_comment_interval_secs": (30, 24 * 3600),
+}
+
+
+def _apply_knobs(cfg: Config, knobs: dict[str, object]) -> Config:
+    """Overlay DB-stored knob overrides onto `cfg`. Defensive against a
+    hand-edited row: unknown keys and out-of-range/non-int values are skipped
+    with a warning rather than failing the assembly (the API validates
+    strictly on write; this guards restored/edited DBs)."""
+    updates: dict[str, int] = {}
+    for name, raw in knobs.items():
+        spec = OPERATIONAL_KNOBS.get(name)
+        if spec is None:
+            _log.warning("ignoring unknown operational knob %r from the DB", name)
+            continue
+        if isinstance(raw, bool) or not isinstance(raw, int):
+            _log.warning("ignoring non-integer operational knob %r=%r", name, raw)
+            continue
+        lo, hi = spec
+        if not (lo <= raw <= hi):
+            _log.warning("ignoring out-of-range operational knob %r=%r", name, raw)
+            continue
+        updates[name] = raw
+    if not updates:
+        return cfg
+    return cfg.model_copy(update=updates)
+
+
 async def assemble_effective_config(
     conn: aiosqlite.Connection,
     base: Config,
@@ -121,10 +163,14 @@ async def assemble_effective_config(
             # collapse to an empty topology rather than falling through to the
             # one-shot-CLI "degrade to YAML" behavior below, which would leave
             # `base.repos` (the *previous* effective config's bindings) intact.
-            return base.model_copy(update={"repos": [], "roles": {}})
+            return _apply_knobs(
+                base.model_copy(update={"repos": [], "roles": {}}),
+                globals_row.knobs if globals_row else {},
+            )
         if not boot_gates:
-            # One-shot CLI, empty DB: operate over the YAML topology as-is.
-            return base
+            # One-shot CLI, empty DB: operate over the YAML topology as-is
+            # (knob overrides still apply — they're DB state, not topology).
+            return _apply_knobs(base, globals_row.knobs if globals_row else {})
         if await _has_unresolved_work(conn):
             raise ConfigBootError(
                 "the config DB has zero bindings but still holds unresolved work "
@@ -142,7 +188,10 @@ async def assemble_effective_config(
                 f"`repos:` section (now ignored); {_IMPORT_HINT} before starting"
             )
         # True fresh install: no bindings, no work, no YAML topology.
-        return base.model_copy(update={"repos": [], "roles": {}})
+        return _apply_knobs(
+            base.model_copy(update={"repos": [], "roles": {}}),
+            globals_row.knobs if globals_row else {},
+        )
 
     if yaml_has_repos_topology:
         _log.warning(
@@ -160,7 +209,10 @@ async def assemble_effective_config(
             RepoBinding.model_validate({**row.payload, "enabled": row.enabled}) for row in stored
         ]
         global_roles = _GlobalRolesAdapter.validate_python(globals_row.roles) if globals_row else {}
-        effective = base.model_copy(update={"repos": bindings, "roles": global_roles})
+        effective = _apply_knobs(
+            base.model_copy(update={"repos": bindings, "roles": global_roles}),
+            globals_row.knobs if globals_row else {},
+        )
         _resolve_bindings(effective)
         # `model_copy` skips `Config`'s model_validators, so DB-sourced role
         # combos (family/effort mismatches, legacy-field conflicts) never ran
