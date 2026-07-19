@@ -1807,8 +1807,10 @@ export function ConfigPage() {
       <div className="mb-4">
         <h2 className="text-lg font-semibold">Connections</h2>
         <p className="mt-0.5 text-sm text-muted-foreground">
-          Credentials for the providers Symphony talks to. Connect GitHub and
-          Linear here; the other providers arrive in later releases.
+          Credentials for the providers Symphony talks to. Connect GitHub,
+          Linear, Claude, and Codex here — GitHub and Linear via a browser
+          redirect (needs their OAuth app client ID/secret in the environment),
+          Claude by pasting an authorization code, Codex via device login.
         </p>
         {connectionsKey.data?.fingerprint ? (
           <p
