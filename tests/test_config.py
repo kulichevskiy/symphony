@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import warnings
 from datetime import timedelta
 from pathlib import Path
@@ -1465,3 +1466,57 @@ def test_review_verify_codex_override_does_not_inherit_claude_implement_model() 
     assert rv.agent == "codex"
     assert rv.model != "sonnet"
     assert rv.model == binding.resolved_reviewer_codex_model()
+
+
+def test_from_env_reads_paths_from_dotenv_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Path/port env vars may live in `.env` (the same file secrets use), so an
+    operator has one config source. `.env` is read, not injected into
+    os.environ (it must not leak into agent subprocesses)."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "SYMPHONY_DB_PATH=/data/db/state.sqlite\n"
+        "SYMPHONY_LOG_ROOT=/data/logs\n"
+        "SYMPHONY_WORKSPACE_ROOT=/data/workspaces\n"
+        "SYMPHONY_WEBHOOK_PORT=9191\n"
+    )
+    # Not exported into the process env — proving the values come from `.env`.
+    for var in (
+        "SYMPHONY_DB_PATH",
+        "SYMPHONY_LOG_ROOT",
+        "SYMPHONY_WORKSPACE_ROOT",
+        "SYMPHONY_WEBHOOK_PORT",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    assert "SYMPHONY_DB_PATH" not in os.environ
+
+    assert Config.db_path_from_env() == Path("/data/db/state.sqlite")
+    cfg = Config.from_env()
+    assert cfg.db_path == Path("/data/db/state.sqlite")
+    assert cfg.log_root == Path("/data/logs")
+    assert cfg.workspace_root == Path("/data/workspaces")
+    assert cfg.webhook_port == 9191
+
+
+def test_from_env_process_env_wins_over_dotenv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Process env overrides `.env` (pydantic-settings precedence: a container's
+    `environment:` block must win over a mounted `.env`)."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("SYMPHONY_DB_PATH=/data/db/from-dotenv.sqlite\n")
+    monkeypatch.setenv("SYMPHONY_DB_PATH", "/data/db/from-process.sqlite")
+    assert Config.db_path_from_env() == Path("/data/db/from-process.sqlite")
+
+
+def test_from_env_falls_back_to_model_defaults_without_env_or_dotenv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No env var and no `.env` entry → the model default (~-expanded)."""
+    monkeypatch.chdir(tmp_path)  # no .env here
+    for var in ("SYMPHONY_DB_PATH", "SYMPHONY_LOG_ROOT", "SYMPHONY_WORKSPACE_ROOT"):
+        monkeypatch.delenv(var, raising=False)
+    cfg = Config.from_env()
+    assert cfg.db_path == Path("~/symphony/state.sqlite").expanduser()
+    assert cfg.webhook_port == 8787
