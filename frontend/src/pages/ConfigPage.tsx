@@ -24,6 +24,8 @@ import {
   fetchConfigView,
   fetchConnections,
   fetchConnectionsKey,
+  fetchKnobs,
+  saveKnobs,
   fetchRoles,
   type FieldError,
   type RoleCell,
@@ -1590,6 +1592,81 @@ export function ConnectionCard({
   );
 }
 
+export function KnobsPanel() {
+  const query = useQuery({ queryKey: ["knobs"], queryFn: fetchKnobs });
+  const [draft, setDraft] = useState<Record<string, number>>({});
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!query.data) {
+    return query.isLoading ? (
+      <p className="text-sm text-muted-foreground">Loading…</p>
+    ) : null;
+  }
+  const knobs = query.data.knobs;
+  const dirty = Object.keys(draft).length > 0;
+
+  const save = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      // Sparse write: current overrides + edits (an edit back to the default
+      // still counts as an explicit override; clearing is a later nicety).
+      const next: Record<string, number> = {};
+      for (const k of knobs) {
+        if (k.override) next[k.name] = k.value;
+      }
+      Object.assign(next, draft);
+      await saveKnobs(next, query.data.version);
+      setDraft({});
+      await query.refetch();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to save knobs");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div>
+      <div className="grid gap-3 sm:grid-cols-3">
+        {knobs.map((k) => (
+          <label key={k.name} className="block text-sm">
+            <span className="mb-1 block font-mono text-xs text-muted-foreground">
+              {k.name}
+              {k.hot_reload ? " · hot" : " · restart"}
+            </span>
+            <input
+              type="number"
+              min={k.min}
+              max={k.max}
+              className="w-full rounded-md border border-border bg-background px-2 py-1"
+              value={draft[k.name] ?? k.value}
+              onChange={(e) =>
+                setDraft((d) => ({ ...d, [k.name]: Number(e.target.value) }))
+              }
+            />
+            <span className="mt-0.5 block text-xs text-muted-foreground">
+              default {k.default} · {k.min}–{k.max}
+            </span>
+          </label>
+        ))}
+      </div>
+      <div className="mt-3 flex items-center gap-3">
+        <button
+          type="button"
+          disabled={!dirty || saving}
+          onClick={() => void save()}
+          className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-50"
+        >
+          {saving ? "Saving…" : "Save knobs"}
+        </button>
+        {error ? <span className="text-sm text-destructive">{error}</span> : null}
+      </div>
+    </div>
+  );
+}
+
 export function ConnectionsPanel({
   connections,
   onChanged,
@@ -1718,6 +1795,16 @@ export function ConfigPage() {
       ) : null}
 
       <div className="mb-2 mt-6">
+        <h2 className="text-lg font-semibold">Runtime knobs</h2>
+        <p className="mt-0.5 text-sm text-muted-foreground">
+          Operational overrides stored in the DB; hot-reloaded by the daemon at
+          the next tick. Unset knobs run on code defaults.
+        </p>
+      </div>
+      <div className="mb-8">
+        <KnobsPanel />
+      </div>
+      <div className="mb-4">
         <h2 className="text-lg font-semibold">Connections</h2>
         <p className="mt-0.5 text-sm text-muted-foreground">
           Credentials for the providers Symphony talks to. Connect GitHub and

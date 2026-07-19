@@ -106,6 +106,7 @@ from ..db import (
     runs,
 )
 from ..db.config_repo_secrets import RepoSecretView
+from ..effective_config import OPERATIONAL_KNOBS
 
 _ROLES_ADAPTER: TypeAdapter[dict[RoleName, RoleConfig]] = TypeAdapter(dict[RoleName, RoleConfig])
 
@@ -142,6 +143,15 @@ class BindingWrite(BaseModel):
     version: int | None = None
     webhook_secret_clear: bool = False
     webhook_secret_version: int | None = None
+
+
+class KnobsWrite(BaseModel):
+    """Operational-knob overrides write (Config v2 7/9). `knobs` is a sparse
+    `{name: int}` object — unset knobs fall back to code defaults; `version`
+    is the shared config-globals optimistic-lock version."""
+
+    knobs: dict[str, int]
+    version: int
 
 
 class RolesWrite(BaseModel):
@@ -1068,6 +1078,64 @@ def create_config_crud_router(
         wgs = [str(w.message) for w in caught if issubclass(w.category, UserWarning)]
         _log.info("config roles matrix updated by %s → version %s", updated_by, new_version)
         return {"roles": stored, "version": new_version, "warnings": wgs}
+
+    @router.get("/knobs")
+    async def get_knobs() -> dict[str, Any]:
+        conn = await conn_provider()
+        row = await config_globals.get(conn)
+        base = _base_config()
+        # Effective view: the operator sees the value each knob actually runs
+        # with (override or code/YAML default), which overrides are set, and
+        # the accepted range. Everything here hot-reloads at the next tick.
+        knobs = row.knobs if row is not None else {}
+        return {
+            "knobs": [
+                {
+                    "name": name,
+                    "value": knobs.get(name, getattr(base, name)),
+                    "override": name in knobs,
+                    "default": getattr(base, name),
+                    "min": lo,
+                    "max": hi,
+                    "hot_reload": True,
+                }
+                for name, (lo, hi) in OPERATIONAL_KNOBS.items()
+            ],
+            "version": row.version if row is not None else 0,
+        }
+
+    @router.put("/knobs")
+    async def put_knobs(
+        body: KnobsWrite = Body(...),  # noqa: B008
+        updated_by: str = Depends(_updated_by),  # noqa: B008
+    ) -> dict[str, Any]:
+        errors = []
+        for name, value in body.knobs.items():
+            spec = OPERATIONAL_KNOBS.get(name)
+            if spec is None:
+                errors.append({"loc": ["knobs", name], "msg": "unknown knob"})
+                continue
+            lo, hi = spec
+            if not (lo <= value <= hi):
+                errors.append({"loc": ["knobs", name], "msg": f"must be between {lo} and {hi}"})
+        if errors:
+            raise HTTPException(status_code=422, detail=errors)
+        conn = await conn_provider()
+        async with lock:
+            try:
+                new_version = await config_globals.update_knobs(
+                    conn, knobs=dict(body.knobs), expected_version=body.version
+                )
+            except config_globals.StaleVersionError as e:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "msg": "config was modified by another writer; reload and retry",
+                        "current_version": e.current_version,
+                    },
+                ) from e
+        _log.info("operational knobs updated by %s -> version %s", updated_by, new_version)
+        return {"knobs": body.knobs, "version": new_version}
 
     @router.get("/bindings")
     async def list_bindings() -> list[dict[str, Any]]:

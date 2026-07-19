@@ -554,6 +554,46 @@ export interface Connection {
   expires_at: string | null;
 }
 
+export interface KnobView {
+  name: string;
+  value: number;
+  override: boolean;
+  default: number;
+  min: number;
+  max: number;
+  hot_reload: boolean;
+}
+
+export interface KnobsResponse {
+  knobs: KnobView[];
+  version: number;
+}
+
+/** Operational knobs (Config v2 7/9): DB-stored overrides over code defaults,
+ * hot-reloaded by the daemon at the next tick. */
+export function fetchKnobs(): Promise<KnobsResponse> {
+  return fetchJson<KnobsResponse>(
+    "/api/config/knobs",
+    "Knobs not found",
+    "Failed to load knobs",
+  );
+}
+
+export async function saveKnobs(
+  knobs: Record<string, number>,
+  version: number,
+): Promise<KnobsResponse> {
+  const resp = await fetch("/api/config/knobs", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...(await authHeaders()) },
+    body: JSON.stringify({ knobs, version }),
+  });
+  if (!resp.ok) {
+    throw new Error(`Failed to save knobs (${resp.status})`);
+  }
+  return (await resp.json()) as KnobsResponse;
+}
+
 export function fetchConnections(): Promise<Connection[]> {
   return fetchJson<Connection[]>(
     "/api/connections",

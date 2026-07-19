@@ -31,11 +31,23 @@ async def _versions(conn: aiosqlite.Connection) -> list[tuple[int, str]]:
     return [(row["version"], row["name"]) for row in await cur.fetchall()]
 
 
+# The real migration set's head version + applied (version, name) rows —
+# tests assert against these instead of hardcoding "001" so adding a real
+# migration doesn't rewrite the suite.
+_REAL = sorted(
+    (int(f.name[:3]), f.stem) for f in MIGRATIONS_DIR.iterdir() if f.suffix in (".sql", ".py")
+)
+_HEAD = _REAL[-1][0]
+_NEXT = _HEAD + 1
+
+
 def _dir_with_baseline(tmp_path: Path) -> Path:
-    """A migrations dir seeded with the real baseline, ready for extra files."""
+    """A migrations dir seeded with the real migration set, ready for extras."""
     migrations = tmp_path / "migrations"
     migrations.mkdir()
-    shutil.copy2(MIGRATIONS_DIR / "001_baseline.sql", migrations / "001_baseline.sql")
+    for f in MIGRATIONS_DIR.iterdir():
+        if f.suffix in (".sql", ".py"):
+            shutil.copy2(f, migrations / f.name)
     return migrations
 
 
@@ -44,7 +56,7 @@ async def test_fresh_db_boots_at_head(tmp_path: Path) -> None:
     try:
         tables = await _table_names(conn)
         assert {"issues", "runs", "oauth_connections", "config_bindings"} <= tables
-        assert await _versions(conn) == [(1, "001_baseline")]
+        assert await _versions(conn) == _REAL
     finally:
         await conn.close()
 
@@ -55,7 +67,7 @@ async def test_reboot_is_noop_and_makes_no_backup(tmp_path: Path) -> None:
     await conn.close()
     conn = await connect(path)
     try:
-        assert await _versions(conn) == [(1, "001_baseline")]
+        assert await _versions(conn) == _REAL
     finally:
         await conn.close()
     assert not [name for name in os.listdir(tmp_path) if ".bak-" in name]
@@ -67,7 +79,7 @@ async def test_pending_migration_applies_and_backs_up(tmp_path: Path) -> None:
     await conn.close()
 
     migrations = _dir_with_baseline(tmp_path)
-    (migrations / "002_add_widgets.sql").write_text(
+    (migrations / f"{_NEXT:03d}_add_widgets.sql").write_text(
         "-- adds the widgets table\n"
         "CREATE TABLE widgets (id INTEGER PRIMARY KEY, note TEXT NOT NULL DEFAULT '');\n"
     )
@@ -76,10 +88,10 @@ async def test_pending_migration_applies_and_backs_up(tmp_path: Path) -> None:
     try:
         await apply_migrations(conn, db_path=path, migrations_dir=migrations)
         assert "widgets" in await _table_names(conn)
-        assert await _versions(conn) == [(1, "001_baseline"), (2, "002_add_widgets")]
+        assert await _versions(conn) == [*_REAL, (_NEXT, f"{_NEXT:03d}_add_widgets")]
     finally:
         await conn.close()
-    assert (tmp_path / "state.sqlite.bak-002").exists()
+    assert (tmp_path / f"state.sqlite.bak-{_NEXT:03d}").exists()
 
 
 async def test_failing_migration_rolls_back(tmp_path: Path) -> None:
@@ -88,7 +100,7 @@ async def test_failing_migration_rolls_back(tmp_path: Path) -> None:
     await conn.close()
 
     migrations = _dir_with_baseline(tmp_path)
-    (migrations / "002_broken.sql").write_text(
+    (migrations / f"{_NEXT:03d}_broken.sql").write_text(
         "CREATE TABLE almost (id INTEGER PRIMARY KEY);\n"
         "CREATE TABLE broken (id INTEGER PRIMARY KEY, CONSTRAINT nonsense;\n"
     )
@@ -99,11 +111,11 @@ async def test_failing_migration_rolls_back(tmp_path: Path) -> None:
             await apply_migrations(conn, db_path=path, migrations_dir=migrations)
         # Rolled back: the partial table is gone and the version untouched.
         assert "almost" not in await _table_names(conn)
-        assert await _versions(conn) == [(1, "001_baseline")]
+        assert await _versions(conn) == _REAL
     finally:
         await conn.close()
     # The pre-upgrade backup exists for restore-by-copy recovery.
-    assert (tmp_path / "state.sqlite.bak-002").exists()
+    assert (tmp_path / f"state.sqlite.bak-{_NEXT:03d}").exists()
 
 
 async def test_python_migration_escape_hatch(tmp_path: Path) -> None:
@@ -112,7 +124,7 @@ async def test_python_migration_escape_hatch(tmp_path: Path) -> None:
     await conn.close()
 
     migrations = _dir_with_baseline(tmp_path)
-    (migrations / "002_seed_repo.py").write_text(
+    (migrations / f"{_NEXT:03d}_seed_repo.py").write_text(
         "async def migrate(conn):\n"
         "    await conn.execute(\n"
         "        \"INSERT INTO repos (linear_team_key, github_repo) VALUES ('T', 'o/r')\"\n"
@@ -125,19 +137,21 @@ async def test_python_migration_escape_hatch(tmp_path: Path) -> None:
         cur = await conn.execute("SELECT github_repo FROM repos WHERE linear_team_key = 'T'")
         row = await cur.fetchone()
         assert row is not None and row["github_repo"] == "o/r"
-        assert await _versions(conn) == [(1, "001_baseline"), (2, "002_seed_repo")]
+        assert await _versions(conn) == [*_REAL, (_NEXT, f"{_NEXT:03d}_seed_repo")]
     finally:
         await conn.close()
 
 
 async def test_duplicate_versions_rejected(tmp_path: Path) -> None:
     migrations = _dir_with_baseline(tmp_path)
-    (migrations / "002_first.sql").write_text("CREATE TABLE a (id INTEGER PRIMARY KEY);\n")
-    (migrations / "002_second.sql").write_text("CREATE TABLE b (id INTEGER PRIMARY KEY);\n")
+    (migrations / f"{_NEXT:03d}_first.sql").write_text("CREATE TABLE a (id INTEGER PRIMARY KEY);\n")
+    (migrations / f"{_NEXT:03d}_second.sql").write_text(
+        "CREATE TABLE b (id INTEGER PRIMARY KEY);\n"
+    )
     conn = await aiosqlite.connect(str(tmp_path / "state.sqlite"))
     conn.row_factory = aiosqlite.Row
     try:
-        with pytest.raises(RuntimeError, match="duplicate migration version 002"):
+        with pytest.raises(RuntimeError, match=f"duplicate migration version {_NEXT:03d}"):
             await apply_migrations(conn, migrations_dir=migrations)
     finally:
         await conn.close()
@@ -152,7 +166,7 @@ async def test_concurrent_writer_waits_instead_of_crashing(tmp_path: Path) -> No
     await conn.close()
 
     migrations = _dir_with_baseline(tmp_path)
-    (migrations / "002_add_widgets.sql").write_text(
+    (migrations / f"{_NEXT:03d}_add_widgets.sql").write_text(
         "CREATE TABLE widgets (id INTEGER PRIMARY KEY);\n"
     )
 
@@ -182,7 +196,7 @@ async def test_concurrent_writer_waits_instead_of_crashing(tmp_path: Path) -> No
 async def test_db_facade_exports_runner(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "state.sqlite")
     try:
-        assert await _versions(conn) == [(1, "001_baseline")]
+        assert await _versions(conn) == _REAL
         assert db.apply_migrations is apply_migrations
     finally:
         await conn.close()
@@ -196,7 +210,7 @@ async def test_same_line_statements_split_correctly(tmp_path: Path) -> None:
     await conn.close()
 
     migrations = _dir_with_baseline(tmp_path)
-    (migrations / "002_same_line.sql").write_text(
+    (migrations / f"{_NEXT:03d}_same_line.sql").write_text(
         "CREATE TABLE a (id INTEGER PRIMARY KEY); CREATE TABLE b (note TEXT DEFAULT 'x; y');\n"
     )
     conn = await aiosqlite.connect(str(path))
@@ -217,13 +231,15 @@ async def test_backup_is_wal_aware(tmp_path: Path) -> None:
     await conn.commit()
 
     migrations = _dir_with_baseline(tmp_path)
-    (migrations / "002_noop_table.sql").write_text("CREATE TABLE c (id INTEGER PRIMARY KEY);\n")
+    (migrations / f"{_NEXT:03d}_noop_table.sql").write_text(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY);\n"
+    )
     try:
         await apply_migrations(conn, db_path=path, migrations_dir=migrations)
     finally:
         await conn.close()
 
-    backup = await aiosqlite.connect(str(tmp_path / "state.sqlite.bak-002"))
+    backup = await aiosqlite.connect(str(tmp_path / f"state.sqlite.bak-{_NEXT:03d}"))
     try:
         cur = await backup.execute("SELECT github_repo FROM repos WHERE linear_team_key = 'T'")
         row = await cur.fetchone()
@@ -241,7 +257,7 @@ async def test_two_migrators_racing_apply_once(tmp_path: Path) -> None:
     await conn.close()
 
     migrations = _dir_with_baseline(tmp_path)
-    (migrations / "002_add_widgets.sql").write_text(
+    (migrations / f"{_NEXT:03d}_add_widgets.sql").write_text(
         "CREATE TABLE widgets (id INTEGER PRIMARY KEY);\n"
     )
 
@@ -260,7 +276,7 @@ async def test_two_migrators_racing_apply_once(tmp_path: Path) -> None:
     conn.row_factory = aiosqlite.Row
     try:
         assert "widgets" in await _table_names(conn)
-        assert await _versions(conn) == [(1, "001_baseline"), (2, "002_add_widgets")]
+        assert await _versions(conn) == [*_REAL, (_NEXT, f"{_NEXT:03d}_add_widgets")]
     finally:
         await conn.close()
 
@@ -300,7 +316,7 @@ async def test_old_image_waits_for_lock_then_refuses_newer_schema(tmp_path: Path
         await holder.execute("BEGIN IMMEDIATE")
         await holder.execute(
             "INSERT INTO schema_version (version, name, applied_at)"
-            " VALUES (2, '002_new_stuff', '2026-01-01T00:00:00Z')"
+            f" VALUES ({_NEXT}, '{_NEXT:03d}_new_stuff', '2026-01-01T00:00:00Z')"
         )
 
         old_image = await aiosqlite.connect(str(path))
