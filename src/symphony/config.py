@@ -22,6 +22,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Self
 
+from dotenv import dotenv_values
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -982,13 +983,26 @@ class Config(BaseModel):
                     stacklevel=2,
                 )
 
+    @staticmethod
+    def _env_value(var: str) -> str | None:
+        """`var` from the process env, else from `.env` — the same file
+        `Secrets` reads — so paths/ports can live in one place alongside
+        secrets. The real process env wins (matches pydantic-settings
+        precedence: a container's `environment:` overrides a mounted `.env`).
+        `.env` is read here, not injected into `os.environ`, so it never leaks
+        into agent subprocesses."""
+        raw = os.environ.get(var)
+        if raw is not None:
+            return raw
+        return dotenv_values(".env").get(var)
+
     @classmethod
     def _path_from_env(cls, var: str, field: str) -> Path:
-        """A filesystem path from env `var`, falling back to `field`'s model
-        default, `~`-expanded. Container deployments set the env var to a data
-        volume (`/data/...`); a bare local run gets the `~/symphony/...`
-        default."""
-        raw = os.environ.get(var)
+        """A filesystem path from env `var` (process env or `.env`), falling
+        back to `field`'s model default, `~`-expanded. Container deployments
+        set the env var to a data volume (`/data/...`); a bare local run gets
+        the `~/symphony/...` default."""
+        raw = cls._env_value(var)
         default = cls.model_fields[field].default
         return _expand(Path(raw) if raw else Path(default))
 
@@ -1002,16 +1016,16 @@ class Config(BaseModel):
     @classmethod
     def from_env(cls) -> Config:
         """Assemble the config from env vars + code defaults. Paths/ports come
-        from env (with model defaults); secrets are layered from `Secrets`;
-        operational knobs keep their defaults here and are overlaid from
-        `config_globals` at runtime; the bindings topology lives in the DB, so
-        `repos`/`roles` stay empty."""
+        from the process env or `.env` (with model defaults); secrets are
+        layered from `Secrets`; operational knobs keep their defaults here and
+        are overlaid from `config_globals` at runtime; the bindings topology
+        lives in the DB, so `repos`/`roles` stay empty."""
         overrides: dict[str, Any] = {
             "db_path": cls.db_path_from_env(),
             "log_root": cls._path_from_env("SYMPHONY_LOG_ROOT", "log_root"),
             "workspace_root": cls._path_from_env("SYMPHONY_WORKSPACE_ROOT", "workspace_root"),
         }
-        port = os.environ.get("SYMPHONY_WEBHOOK_PORT")
+        port = cls._env_value("SYMPHONY_WEBHOOK_PORT")
         if port:
             overrides["webhook_port"] = int(port)
         cfg = cls.model_validate(overrides)
