@@ -7,6 +7,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
 from symphony.config import (
@@ -32,39 +33,6 @@ _BINDING_STATES = """
 """
 
 
-def test_loads_example_config(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.setenv("LINEAR_API_KEY", "lin_api_test")
-    raw = f"""
-poll_interval_secs: 30
-global_max_concurrent: 2
-workspace_root: /tmp/symphony/workspaces
-log_root: /tmp/symphony/logs
-db_path: /tmp/symphony/state.sqlite
-repos:
-  - linear_team_key: ENG
-    github_repo: org/api-svc
-    issue_label: symphony
-{_BINDING_STATES}
-"""
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
-    assert cfg.poll_interval_secs == 30
-    assert cfg.global_max_concurrent == 2
-    assert len(cfg.repos) == 1
-    assert cfg.repos[0].linear_team_key == "ENG"
-    assert cfg.repos[0].github_repo == "org/api-svc"
-    assert cfg.repos[0].agent == "claude"  # default
-    assert cfg.repos[0].merge_strategy == "squash"  # default
-    assert cfg.repos[0].auto_merge is True  # default
-    assert cfg.repos[0].issue_label == "symphony"
-    assert cfg.linear_api_key == "lin_api_test"
-    assert cfg.repos[0].linear_states.ready == "Todo"
-    assert cfg.repos[0].linear_states.code_review == "In Review"
-    assert cfg.repos[0].linear_states.waiting is None
-    assert cfg.ui.enabled is True
-
-
 def test_repo_binding_accepts_legacy_linear_aliases(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "lin_api_test")
     raw = """
@@ -75,10 +43,8 @@ repos:
       ready: Todo
       code_review: In Review
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
 
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     binding = cfg.repos[0]
 
     assert binding.provider == "linear"
@@ -124,10 +90,8 @@ repos:
       ready: To Do
       code_review: In Review
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
 
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     binding = cfg.repos[0]
     secrets = Secrets()
 
@@ -142,10 +106,10 @@ repos:
     assert secrets.jira_webhook_secret == "jira-webhook-secret"
 
 
-def test_jira_binding_can_use_env_base_url(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.setenv("JIRA_BASE_URL", "https://jira.example.test")
-    monkeypatch.setenv("JIRA_EMAIL", "bot@example.test")
-    monkeypatch.setenv("JIRA_API_TOKEN", "jira-token")
+def test_jira_binding_can_use_env_base_url() -> None:
+    """A jira binding without an explicit base_url picks up the deployment's
+    JIRA_BASE_URL at assembly time (`apply_tracker_secret_defaults`, called by
+    `effective_config._resolve_bindings`)."""
     raw = """
 repos:
   - provider: jira
@@ -155,13 +119,12 @@ repos:
       ready: To Do
       code_review: In Review
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
 
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     binding = cfg.repos[0]
-
     assert binding.base_url is None
+
+    binding.apply_tracker_secret_defaults(jira_base_url="https://jira.example.test")
     assert binding.tracker_provider == "jira"
     assert binding.tracker_site == "https://jira.example.test"
 
@@ -173,9 +136,7 @@ ui:
   enabled: false
 repos: []
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.ui.enabled is False
 
 
@@ -200,9 +161,7 @@ ui:
     pr_no_progress_threshold_secs: 1800
 repos: []
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     thresholds = cfg.ui.status_stuck_thresholds.to_timedeltas()
     assert thresholds[CanonicalState.PAUSED] == timedelta(seconds=120)
     assert thresholds[CanonicalState.AWAITING_MERGE] == timedelta(seconds=7200)
@@ -222,18 +181,15 @@ ui:
     awaiting_operator_secs: 300
 repos: []
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     thresholds = cfg.ui.status_stuck_thresholds.to_timedeltas()
     assert thresholds[CanonicalState.PAUSED] == timedelta(seconds=300)
 
 
 def test_repo_runner_defaults_to_local(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
-    p = tmp_path / "cfg.yaml"
-    p.write_text(f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}")
-    cfg = Config.load(p)
+    raw = f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}"
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.repos[0].runner == "local"
     assert cfg.repos[0].codex_model == "gpt-5.1-codex"
 
@@ -275,9 +231,7 @@ repos:
       code_review: In Review
       in_acceptance: QA Acceptance
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
 
     assert cfg.repos[0].acceptance.mode == "code_only"
     assert cfg.repos[0].acceptance.preview_url_pattern == "https://preview.example/{issue}"
@@ -299,9 +253,7 @@ repos:
     codex_model: gpt-5.1-codex-max
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.repos[0].codex_model == "gpt-5.1-codex-max"
 
 
@@ -324,9 +276,7 @@ repos:
     activity_comment_event_threshold: 5
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.activity_comment_interval_secs == 300
     assert cfg.activity_comment_long_running_repeat_secs == 600
     assert cfg.repos[0].activity_comments_enabled is False
@@ -334,8 +284,7 @@ repos:
     assert cfg.repos[0].activity_comment_event_threshold == 5
 
 
-def test_github_webhook_config_defaults_and_overrides(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.setenv("LINEAR_API_KEY", "x")
+def test_github_webhook_config_defaults_and_overrides(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("GITHUB_WEBHOOK_SECRET", "global-secret")
     raw = f"""
 repos:
@@ -348,10 +297,10 @@ repos:
     webhook_enabled: false
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
-    assert cfg.github_webhook_secret == "global-secret"
+    cfg = Config.model_validate(yaml.safe_load(raw))
+    # The global webhook secret is sourced from env via `Secrets` (layered onto
+    # the config by `Config.from_env`), not the validated topology.
+    assert Secrets().github_webhook_secret == "global-secret"
     assert cfg.repos[0].webhook_enabled is True
     assert cfg.repos[0].webhook_secret == "repo-secret"
     assert cfg.repos[1].webhook_enabled is False
@@ -371,9 +320,7 @@ repos:
     reconcile_enabled: false
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.reconcile_interval_secs == 120
     assert cfg.reconcile_max_per_tick == 7
     assert cfg.reconcile_max_actions_per_tick == 3
@@ -405,64 +352,8 @@ repos:
     codex_model: future-codex
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
     with pytest.raises(ValidationError, match="unknown Codex model"):
-        Config.load(p)
-
-
-def test_resolve_repos_false_ignores_stale_yaml_roles_too(
-    tmp_path: Path,
-    monkeypatch,  # type: ignore[no-untyped-def]
-) -> None:
-    """When the DB owns bindings *and* the global roles matrix, a leftover
-    YAML `roles:` block is ignored just like `repos:` — it shouldn't be able
-    to crash boot with a now-invalid agent literal (SYM-188 review)."""
-    monkeypatch.setenv("LINEAR_API_KEY", "x")
-    raw = """
-roles:
-  implement:
-    agent: not-a-real-agent
-repos:
-  - linear_team_key: ENG
-    github_repo: org/repo
-"""
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    with pytest.raises(ValidationError):
-        Config.load(p)
-
-    cfg = Config.load(p, resolve_repos=False)
-    assert cfg.repos == []
-    assert cfg.roles == {}
-
-
-def test_peek_db_path_null_falls_back_to_default(tmp_path: Path) -> None:
-    """An explicit `db_path: null` must fall back to the default, not crash
-    `Path(None)` — `.get(key, default)` only falls back when the key is
-    absent, not when it's present with a null value (SYM-188 review)."""
-    absent = tmp_path / "absent.yaml"
-    absent.write_text("poll_interval_secs: 60\n")
-    explicit_null = tmp_path / "null.yaml"
-    explicit_null.write_text("db_path: null\n")
-    assert Config.peek_db_path(explicit_null) == Config.peek_db_path(absent)
-
-
-def test_peek_repos_topology(tmp_path: Path) -> None:
-    p = tmp_path / "cfg.yaml"
-    p.write_text("repos: []\n")
-    assert Config.peek_repos_topology(p) is False
-
-    p.write_text(f"""
-repos:
-  - linear_team_key: ENG
-    github_repo: org/repo
-{_BINDING_STATES}
-""")
-    assert Config.peek_repos_topology(p) is True
-
-    p.write_text("roles:\n  implement:\n    agent: codex\n")
-    assert Config.peek_repos_topology(p) is True
+        Config.model_validate(yaml.safe_load(raw))
 
 
 def test_linear_states_ready_has_no_default() -> None:
@@ -504,9 +395,7 @@ repos:
       blocked: Blocked
       done: Done
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.repos[0].linear_states.ready == "Backlog"
     assert cfg.repos[0].linear_states.in_progress == "Doing"
     assert cfg.repos[0].linear_states.code_review == "Review"
@@ -517,9 +406,8 @@ repos:
 def test_review_strategy_defaults_to_remote(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Default behavior must keep today's @codex-bot loop until operators opt in."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
-    p = tmp_path / "cfg.yaml"
-    p.write_text(f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}")
-    cfg = Config.load(p)
+    raw = f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}"
+    cfg = Config.model_validate(yaml.safe_load(raw))
     binding = cfg.repos[0]
     assert binding.review_strategy == "remote"
     assert binding.reviewer_agent is None
@@ -538,9 +426,7 @@ repos:
     local_review_claude_model: claude-sonnet-4-6
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.repos[0].local_review_claude_model == "claude-sonnet-4-6"
     # Verifier model is independent; unset → None (CLI default / Opus).
     assert cfg.repos[0].local_review_verifier_claude_model is None
@@ -558,9 +444,7 @@ repos:
     local_review_verifier_claude_model: claude-opus-4-8
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.repos[0].local_review_claude_model == "claude-sonnet-4-6"
     assert cfg.repos[0].local_review_verifier_claude_model == "claude-opus-4-8"
 
@@ -577,9 +461,7 @@ repos:
     reviewer_codex_model: gpt-5.1-codex-max
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     binding = cfg.repos[0]
     assert binding.review_strategy == "hybrid"
     assert binding.reviewer_agent == "codex"
@@ -599,9 +481,7 @@ repos:
     agent: codex
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.repos[0].resolved_reviewer_agent() == "codex"
     assert cfg.repos[1].resolved_reviewer_agent() == "claude"
 
@@ -617,9 +497,7 @@ repos:
     reviewer_agent: claude
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.repos[0].resolved_reviewer_agent() == "claude"
 
 
@@ -635,9 +513,7 @@ repos:
     codex_model: gpt-5.1-codex-max
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.repos[0].resolved_reviewer_codex_model() == "gpt-5.1-codex-max"
 
 
@@ -652,10 +528,8 @@ repos:
     reviewer_codex_model: future-codex
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
     with pytest.raises(ValidationError, match="unknown reviewer Codex model"):
-        Config.load(p)
+        Config.model_validate(yaml.safe_load(raw))
 
 
 def test_invalid_review_strategy_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -667,10 +541,8 @@ repos:
     review_strategy: rubber_stamp
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
     with pytest.raises(ValidationError):
-        Config.load(p)
+        Config.model_validate(yaml.safe_load(raw))
 
 
 def _review_binding(**overrides) -> RepoBinding:  # type: ignore[no-untyped-def]
@@ -761,9 +633,8 @@ def test_local_review_iteration_cap_default_global_is_3(tmp_path: Path, monkeypa
     local loop converges in 1–3 rounds empirically (138 sessions); the
     expensive 5–6 round tail escalates to a human instead."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
-    p = tmp_path / "cfg.yaml"
-    p.write_text(f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}")
-    cfg = Config.load(p)
+    raw = f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}"
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.local_review_iteration_cap == 3
     # Remote cap unchanged.
     assert cfg.review_iteration_cap == 12
@@ -786,9 +657,7 @@ repos:
     github_repo: org/web
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.local_review_iteration_cap == 8
     # ENG overrides; WEB inherits.
     assert cfg.repos[0].local_review_iteration_cap == 3
@@ -808,18 +677,15 @@ repos:
     local_review_iteration_cap: 0
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
     with pytest.raises(ValidationError):
-        Config.load(p)
+        Config.model_validate(yaml.safe_load(raw))
 
 
 def test_per_issue_token_budget_default_off(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Off by default: global `None` and per-binding `None` → gate disabled."""
     monkeypatch.setenv("LINEAR_API_KEY", "x")
-    p = tmp_path / "cfg.yaml"
-    p.write_text(f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}")
-    cfg = Config.load(p)
+    raw = f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}"
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.per_issue_token_budget is None
     binding = cfg.repos[0]
     assert binding.per_issue_token_budget is None
@@ -839,9 +705,7 @@ repos:
     github_repo: org/web
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.per_issue_token_budget == 20_000_000
     # ENG overrides; WEB inherits the global default.
     assert cfg.repos[0].per_issue_token_budget == 5_000_000
@@ -860,17 +724,14 @@ repos:
     github_repo: org/repo
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
     with pytest.raises(ValidationError):
-        Config.load(p)
+        Config.model_validate(yaml.safe_load(raw))
 
 
 def test_post_local_review_pr_summary_default_global_true(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
-    p = tmp_path / "cfg.yaml"
-    p.write_text(f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}")
-    cfg = Config.load(p)
+    raw = f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}"
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.post_local_review_pr_summary is True
     assert cfg.repos[0].post_local_review_pr_summary is None
     assert (
@@ -892,9 +753,7 @@ repos:
     github_repo: org/web
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.post_local_review_pr_summary is True
     # ENG overrides off; WEB inherits global True.
     assert cfg.repos[0].post_local_review_pr_summary is False
@@ -921,9 +780,7 @@ repos:
     post_local_review_pr_summary: true
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.post_local_review_pr_summary is False
     assert (
         cfg.repos[0].resolved_post_local_review_pr_summary(cfg.post_local_review_pr_summary) is True
@@ -944,10 +801,8 @@ repos:
       blocked: Blocked
       done: Done
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
     with pytest.raises(ValidationError):
-        Config.load(p)
+        Config.model_validate(yaml.safe_load(raw))
 
 
 def test_yaml_missing_code_review_uses_legacy_needs_approval(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -964,9 +819,7 @@ repos:
       blocked: Blocked
       done: Done
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.repos[0].linear_states.code_review == "In Review"
     assert cfg.repos[0].linear_states.needs_approval == "In Review"
 
@@ -986,9 +839,7 @@ repos:
       blocked: Blocked
       done: Done
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.repos[0].linear_states.code_review == "Needs Approval"
     assert cfg.repos[0].linear_states.needs_approval == "Needs Approval"
 
@@ -1002,9 +853,7 @@ repos:
     auto_merge: false
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.repos[0].auto_merge is False
 
 
@@ -1082,9 +931,7 @@ repos:
         model: opus
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     binding = cfg.repos[0]
     impl = binding.resolved_role("implement", cfg.roles)
     # agent inherited from global, model overridden per-field by binding.
@@ -1107,10 +954,8 @@ repos:
         model: gpt-5.1-codex
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
     with pytest.raises(ValidationError, match="unknown Claude model"):
-        Config.load(p)
+        Config.model_validate(yaml.safe_load(raw))
 
 
 def test_roles_unknown_codex_model_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1125,10 +970,8 @@ repos:
         model: future-codex
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
     with pytest.raises(ValidationError, match="unknown Codex model"):
-        Config.load(p)
+        Config.model_validate(yaml.safe_load(raw))
 
 
 def test_roles_same_family_review_warns(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1144,10 +987,8 @@ repos:
         agent: claude
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
     with pytest.warns(UserWarning, match="cross-family review diversity"):
-        Config.load(p)
+        Config.model_validate(yaml.safe_load(raw))
 
 
 def test_roles_config_builds_implement_command_with_model(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1170,9 +1011,7 @@ repos:
     agent: claude
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
 
     def implement_command(binding: RepoBinding) -> list[str]:
         role = binding.resolved_role("implement", cfg.roles)
@@ -1207,9 +1046,7 @@ repos:
         effort: high
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     role = cfg.repos[0].resolved_role("implement", cfg.roles)
     assert role.effort == "high"
     command = build_runner_command(
@@ -1239,9 +1076,7 @@ repos:
         effort: high
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     role = cfg.repos[0].resolved_role("implement", cfg.roles)
     assert role.effort == "high"
     command = build_runner_command(
@@ -1267,10 +1102,8 @@ repos:
         effort: turbo
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
     with pytest.raises(ValidationError, match="unknown Claude effort"):
-        Config.load(p)
+        Config.model_validate(yaml.safe_load(raw))
 
 
 def test_roles_unknown_codex_effort_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1286,10 +1119,8 @@ repos:
         effort: turbo
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
     with pytest.raises(ValidationError, match="unknown Codex effort"):
-        Config.load(p)
+        Config.model_validate(yaml.safe_load(raw))
 
 
 def test_roles_effort_without_model_validates_resolved_role(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1307,9 +1138,7 @@ repos:
         effort: high
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.repos[0].resolved_role("implement", cfg.roles).effort == "high"
 
 
@@ -1328,10 +1157,8 @@ repos:
         effort: xhigh
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
     with pytest.raises(ValidationError, match="unknown Codex effort"):
-        Config.load(p)
+        Config.model_validate(yaml.safe_load(raw))
 
 
 def test_roles_effort_without_model_claude_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1350,10 +1177,8 @@ repos:
         effort: max
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
     with pytest.raises(ValidationError, match="no resolved model"):
-        Config.load(p)
+        Config.model_validate(yaml.safe_load(raw))
 
 
 def test_roles_config_builds_fix_command_with_model(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1379,9 +1204,7 @@ repos:
     agent: claude
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
 
     def fix_claude_model(binding: RepoBinding) -> str | None:
         role = binding.resolved_role("fix", cfg.roles)
@@ -1455,10 +1278,8 @@ repos:
         agent: codex
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
     with pytest.raises(ValidationError, match="conflicts"):
-        Config.load(p)
+        Config.model_validate(yaml.safe_load(raw))
 
 
 def test_legacy_field_and_global_matrix_conflict_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1474,10 +1295,8 @@ repos:
     local_review_claude_model: haiku
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
     with pytest.raises(ValidationError, match="conflicts"):
-        Config.load(p)
+        Config.model_validate(yaml.safe_load(raw))
 
 
 def test_legacy_agent_with_matrix_model_does_not_conflict(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1493,9 +1312,7 @@ repos:
         model: sonnet
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.repos[0].resolved_role("implement", cfg.roles).model == "sonnet"
 
 
@@ -1516,9 +1333,7 @@ repos:
         agent: claude
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.repos[0].resolved_role("review_verify", cfg.roles).agent == "claude"
 
 
@@ -1556,9 +1371,7 @@ repos:
     github_repo: org/web
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.repos[0].resolved_role("implement", cfg.roles).effort == "low"
     assert cfg.repos[1].resolved_role("implement", cfg.roles).effort == "medium"
 
@@ -1579,9 +1392,7 @@ repos:
         effort: high
 {_BINDING_STATES}
 """
-    p = tmp_path / "cfg.yaml"
-    p.write_text(raw)
-    cfg = Config.load(p)
+    cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.repos[0].resolved_role(role, cfg.roles).effort == "high"
 
 

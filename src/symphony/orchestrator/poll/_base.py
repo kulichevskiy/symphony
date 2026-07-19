@@ -872,9 +872,8 @@ class _OrchestratorBase:
         assembled from the DB) so that path keeps working unchanged. Never
         falls back once `_reload_bindings_from_db` is set: the DB owns
         topology past boot there, so a zero count means every binding was
-        deleted, not that the importer never ran, and the daemon's stale
-        `self.config.repos` must not revive it (SYM-193 review; mirrors
-        `_db_owns_topology`'s reasoning in `cli.py`)."""
+        deleted, and the daemon's stale `self.config.repos` must not revive it
+        (SYM-193 review)."""
         key = _binding_key(binding)
         stored = await db.config_bindings.get_by_natural_key(self._conn, key)
         if stored is not None:

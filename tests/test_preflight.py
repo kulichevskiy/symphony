@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,7 @@ import httpx
 import pytest
 from click.testing import CliRunner
 
+from symphony import db
 from symphony.agent.claude_models import fetch_claude_effort_capabilities
 from symphony.cli import main
 
@@ -50,63 +52,6 @@ def _isolate_codex_home(tmp_path: Path, monkeypatch) -> Path:  # type: ignore[no
     return codex_home
 
 
-def _db_path_lines(tmp_path: Path) -> str:
-    return (
-        f"db_path: {tmp_path / 'state.sqlite'}\n"
-        f"workspace_root: {tmp_path / 'workspaces'}\n"
-        f"log_root: {tmp_path / 'logs'}\n"
-    )
-
-
-def _yaml_with_ready(tmp_path: Path, ready: str = "Todo", *, waiting: str | None = None) -> str:
-    waiting_line = f"      waiting: {waiting}\n" if waiting is not None else ""
-    return f"""
-{_db_path_lines(tmp_path)}
-repos:
-  - linear_team_key: ENG
-    github_repo: org/api-svc
-    agent: claude
-    review_strategy: remote
-    linear_states:
-      ready: {ready}
-      in_progress: In Progress
-      code_review: Needs Approval
-      needs_approval: Needs Approval
-      blocked: Blocked
-{waiting_line}      done: Done
-"""
-
-
-def _yaml_with_review_lanes(
-    tmp_path: Path,
-    *,
-    local_review: bool,
-    remote_review: bool,
-    code_review: str | None = "In Review",
-    local_code_review: str | None = "Local Code Review",
-) -> str:
-    code_review_line = f"      code_review: {code_review}\n" if code_review is not None else ""
-    local_code_review_line = (
-        f"      local_code_review: {local_code_review}\n" if local_code_review is not None else ""
-    )
-    return f"""
-{_db_path_lines(tmp_path)}
-repos:
-  - linear_team_key: ENG
-    github_repo: org/api-svc
-    agent: claude
-    reviewer_agent: claude
-    local_review: {str(local_review).lower()}
-    remote_review: {str(remote_review).lower()}
-    linear_states:
-      ready: Todo
-      in_progress: In Progress
-{code_review_line}{local_code_review_line}      needs_approval: Manual Approval
-      blocked: Blocked
-      done: Done
-"""
-
-
 _STD_STATES = {
     "Todo": "id1",
     "In Progress": "id2",
@@ -115,29 +60,104 @@ _STD_STATES = {
     "Done": "id5",
 }
 
+_READY_STATES = {
+    "ready": "Todo",
+    "in_progress": "In Progress",
+    "code_review": "Needs Approval",
+    "needs_approval": "Needs Approval",
+    "blocked": "Blocked",
+    "done": "Done",
+}
 
-def _yaml_with_role_effort(
-    tmp_path: Path, effort: str, *, agent: str = "claude", model: str
-) -> str:
-    return f"""
-{_db_path_lines(tmp_path)}
-repos:
-  - linear_team_key: ENG
-    github_repo: org/api-svc
-    agent: {agent}
-    review_strategy: remote
-    roles:
-      implement:
-        model: {model}
-        effort: {effort}
-    linear_states:
-      ready: Todo
-      in_progress: In Progress
-      code_review: Needs Approval
-      needs_approval: Needs Approval
-      blocked: Blocked
-      done: Done
-"""
+
+def _seed_preflight_db(tmp_path: Path, monkeypatch, payloads: list[dict[str, Any]]) -> None:  # type: ignore[no-untyped-def]
+    """Seed `config_bindings` into a tmp DB and point the env-driven config at
+    it — preflight boots its topology from SQLite now (Config v2 9/9)."""
+    monkeypatch.setenv("SYMPHONY_DB_PATH", str(tmp_path / "state.sqlite"))
+    monkeypatch.setenv("SYMPHONY_LOG_ROOT", str(tmp_path / "logs"))
+    monkeypatch.setenv("SYMPHONY_WORKSPACE_ROOT", str(tmp_path / "workspaces"))
+
+    async def _seed() -> None:
+        conn = await db.connect(tmp_path / "state.sqlite")
+        try:
+            for i, payload in enumerate(payloads):
+                project = payload.get("project_key") or payload["linear_team_key"]
+                key = (
+                    project,
+                    payload["github_repo"],
+                    payload.get("issue_label") or "",
+                    "linear",
+                    "default",
+                )
+                await db.config_bindings.insert(conn, payload=payload, key=key, priority=i)
+        finally:
+            await conn.close()
+
+    asyncio.run(_seed())
+
+
+def _ready_binding(ready: str = "Todo", *, waiting: str | None = None) -> dict[str, Any]:
+    states = dict(_READY_STATES)
+    states["ready"] = ready
+    if waiting is not None:
+        states["waiting"] = waiting
+    return {"linear_team_key": "ENG", "github_repo": "org/api-svc", "linear_states": states}
+
+
+def _role_effort_binding(effort: str, *, agent: str = "claude", model: str) -> dict[str, Any]:
+    role: dict[str, str] = {"model": model, "effort": effort}
+    if agent == "codex":
+        role["agent"] = "codex"
+    return {
+        "linear_team_key": "ENG",
+        "github_repo": "org/api-svc",
+        "roles": {"implement": role},
+        "linear_states": dict(_READY_STATES),
+    }
+
+
+def _sonnet_high_binding(
+    team: str, repo: str, *, env: dict[str, str] | None = None
+) -> dict[str, Any]:
+    """A claude binding whose `implement` role pins sonnet + effort high — the
+    shape the capability-validation tests exercise. `env:` maps a key name the
+    binding resolves from the process/.env (e.g. ANTHROPIC_API_KEY)."""
+    payload: dict[str, Any] = {
+        "linear_team_key": team,
+        "github_repo": repo,
+        "roles": {"implement": {"model": "sonnet", "effort": "high"}},
+        "linear_states": dict(_READY_STATES),
+    }
+    if env is not None:
+        payload["env"] = env
+    return payload
+
+
+def _review_lane_binding(
+    *,
+    local_review: bool,
+    remote_review: bool,
+    code_review: str | None = "In Review",
+    local_code_review: str | None = "Local Code Review",
+) -> dict[str, Any]:
+    states: dict[str, str] = {
+        "ready": "Todo",
+        "in_progress": "In Progress",
+        "needs_approval": "Manual Approval",
+        "blocked": "Blocked",
+        "done": "Done",
+    }
+    if code_review is not None:
+        states["code_review"] = code_review
+    if local_code_review is not None:
+        states["local_code_review"] = local_code_review
+    return {
+        "linear_team_key": "ENG",
+        "github_repo": "org/api-svc",
+        "local_review": local_review,
+        "remote_review": remote_review,
+        "linear_states": states,
+    }
 
 
 def _install_mock_transport(monkeypatch, handler) -> None:  # type: ignore[no-untyped-def]
@@ -404,9 +424,8 @@ def test_preflight_exits_cleanly_when_fetcher_http_errors(tmp_path: Path, monkey
         raise ValueError("Models API returned HTTP 401 for claude model 'sonnet'")
 
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _raise)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_role_effort(tmp_path, "high", model="sonnet"))
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    _seed_preflight_db(tmp_path, monkeypatch, [_role_effort_binding("high", model="sonnet")])
+    result = CliRunner().invoke(main, ["preflight"])
     assert result.exit_code == 2
     assert result.exception is None or isinstance(result.exception, SystemExit)
     assert "HTTP 401" in result.output
@@ -424,9 +443,8 @@ def test_preflight_accepts_supported_model_effort_pair(tmp_path: Path, monkeypat
     _isolate_codex_home(tmp_path, monkeypatch)
     _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
     _fake_claude_caps(monkeypatch, ["low", "medium", "high", "max"])
-    p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_role_effort(tmp_path, "high", model="sonnet"))
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    _seed_preflight_db(tmp_path, monkeypatch, [_role_effort_binding("high", model="sonnet")])
+    result = CliRunner().invoke(main, ["preflight"])
     assert result.exit_code == 0, result.output
     assert "claude model 'sonnet' supports effort 'high'" in result.output
 
@@ -443,9 +461,8 @@ def test_preflight_skips_claude_check_when_api_key_missing(tmp_path: Path, monke
         return None
 
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _no_key)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_role_effort(tmp_path, "high", model="sonnet"))
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    _seed_preflight_db(tmp_path, monkeypatch, [_role_effort_binding("high", model="sonnet")])
+    result = CliRunner().invoke(main, ["preflight"])
     assert result.exit_code == 0, result.output
     assert "skipping claude model 'sonnet' effort validation" in result.output
     assert "ANTHROPIC_API_KEY not set" in result.output
@@ -468,31 +485,12 @@ def test_preflight_validates_with_binding_supplied_api_key(tmp_path: Path, monke
         return ["low", "medium", "high"]
 
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _fetch)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        f"""
-{_db_path_lines(tmp_path)}
-repos:
-  - linear_team_key: ENG
-    github_repo: org/api-svc
-    agent: claude
-    review_strategy: remote
-    env:
-      ANTHROPIC_API_KEY: MY_ANTHROPIC_KEY
-    roles:
-      implement:
-        model: sonnet
-        effort: high
-    linear_states:
-      ready: Todo
-      in_progress: In Progress
-      code_review: Needs Approval
-      needs_approval: Needs Approval
-      blocked: Blocked
-      done: Done
-"""
+    _seed_preflight_db(
+        tmp_path,
+        monkeypatch,
+        [_sonnet_high_binding("ENG", "org/api-svc", env={"ANTHROPIC_API_KEY": "MY_ANTHROPIC_KEY"})],
     )
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    result = CliRunner().invoke(main, ["preflight"])
     assert result.exit_code == 0, result.output
     assert "claude model 'sonnet' supports effort 'high'" in result.output
     assert "skipping" not in result.output
@@ -523,48 +521,15 @@ def test_preflight_exercises_each_binding_api_key(tmp_path: Path, monkeypatch) -
         return ["low", "medium", "high"]
 
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _fetch)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        f"""
-{_db_path_lines(tmp_path)}
-repos:
-  - linear_team_key: ENG
-    github_repo: org/api-svc
-    agent: claude
-    review_strategy: remote
-    env:
-      ANTHROPIC_API_KEY: KEY_A
-    roles:
-      implement:
-        model: sonnet
-        effort: high
-    linear_states:
-      ready: Todo
-      in_progress: In Progress
-      code_review: Needs Approval
-      needs_approval: Needs Approval
-      blocked: Blocked
-      done: Done
-  - linear_team_key: OPS
-    github_repo: org/ops-svc
-    agent: claude
-    review_strategy: remote
-    env:
-      ANTHROPIC_API_KEY: KEY_B
-    roles:
-      implement:
-        model: sonnet
-        effort: high
-    linear_states:
-      ready: Todo
-      in_progress: In Progress
-      code_review: Needs Approval
-      needs_approval: Needs Approval
-      blocked: Blocked
-      done: Done
-"""
+    _seed_preflight_db(
+        tmp_path,
+        monkeypatch,
+        [
+            _sonnet_high_binding("ENG", "org/api-svc", env={"ANTHROPIC_API_KEY": "KEY_A"}),
+            _sonnet_high_binding("OPS", "org/ops-svc", env={"ANTHROPIC_API_KEY": "KEY_B"}),
+        ],
     )
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    result = CliRunner().invoke(main, ["preflight"])
     assert result.exit_code == 2, result.output
     assert "HTTP 401" in result.output
     # Both distinct binding keys were exercised (not just the first).
@@ -598,46 +563,17 @@ def test_preflight_honors_binding_specific_claude_alias_pin(tmp_path: Path, monk
         return ["low", "medium", "high"] if model == "claude-sonnet-4-6" else ["low"]
 
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _fetch)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        f"""
-{_db_path_lines(tmp_path)}
-repos:
-  - linear_team_key: ENG
-    github_repo: org/api-svc
-    agent: claude
-    review_strategy: remote
-    env:
-      ANTHROPIC_DEFAULT_SONNET_MODEL: PINNED_SONNET
-    roles:
-      implement:
-        model: sonnet
-        effort: high
-    linear_states:
-      ready: Todo
-      in_progress: In Progress
-      code_review: Needs Approval
-      needs_approval: Needs Approval
-      blocked: Blocked
-      done: Done
-  - linear_team_key: OPS
-    github_repo: org/ops-svc
-    agent: claude
-    review_strategy: remote
-    roles:
-      implement:
-        model: sonnet
-        effort: high
-    linear_states:
-      ready: Todo
-      in_progress: In Progress
-      code_review: Needs Approval
-      needs_approval: Needs Approval
-      blocked: Blocked
-      done: Done
-"""
+    _seed_preflight_db(
+        tmp_path,
+        monkeypatch,
+        [
+            _sonnet_high_binding(
+                "ENG", "org/api-svc", env={"ANTHROPIC_DEFAULT_SONNET_MODEL": "PINNED_SONNET"}
+            ),
+            _sonnet_high_binding("OPS", "org/ops-svc"),
+        ],
     )
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    result = CliRunner().invoke(main, ["preflight"])
     # Both bindings' distinct resolved models were exercised — not collapsed
     # into one cache entry keyed on the bare "sonnet" alias.
     assert set(seen_models) == {"claude-sonnet-4-6", "claude-sonnet-5"}
@@ -665,31 +601,12 @@ def test_preflight_empty_binding_key_override_is_not_masked_by_parent(
         return None if not api_key else ["low", "medium", "high"]
 
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _fetch)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        f"""
-{_db_path_lines(tmp_path)}
-repos:
-  - linear_team_key: ENG
-    github_repo: org/api-svc
-    agent: claude
-    review_strategy: remote
-    env:
-      ANTHROPIC_API_KEY: EMPTY_SECRET
-    roles:
-      implement:
-        model: sonnet
-        effort: high
-    linear_states:
-      ready: Todo
-      in_progress: In Progress
-      code_review: Needs Approval
-      needs_approval: Needs Approval
-      blocked: Blocked
-      done: Done
-"""
+    _seed_preflight_db(
+        tmp_path,
+        monkeypatch,
+        [_sonnet_high_binding("ENG", "org/api-svc", env={"ANTHROPIC_API_KEY": "EMPTY_SECRET"})],
     )
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    result = CliRunner().invoke(main, ["preflight"])
     assert result.exit_code == 0, result.output
     assert "skipping claude model 'sonnet' effort validation" in result.output
     # Validated with the binding's empty override, never the parent key.
@@ -702,9 +619,8 @@ def test_preflight_rejects_unsupported_model_effort_pair(tmp_path: Path, monkeyp
     _isolate_codex_home(tmp_path, monkeypatch)
     _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
     _fake_claude_caps(monkeypatch, ["low", "medium", "high", "max"])
-    p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_role_effort(tmp_path, "xhigh", model="sonnet"))
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    _seed_preflight_db(tmp_path, monkeypatch, [_role_effort_binding("xhigh", model="sonnet")])
+    result = CliRunner().invoke(main, ["preflight"])
     assert result.exit_code != 0
     assert (
         "effort 'xhigh' not supported by claude model 'sonnet'; "
@@ -723,9 +639,12 @@ def test_preflight_checks_codex_pair_via_family_enum(tmp_path: Path, monkeypatch
         raise AssertionError("claude Models API must not be queried for codex")
 
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _boom)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_role_effort(tmp_path, "high", agent="codex", model="gpt-5.1-codex"))
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    _seed_preflight_db(
+        tmp_path,
+        monkeypatch,
+        [_role_effort_binding("high", agent="codex", model="gpt-5.1-codex")],
+    )
+    result = CliRunner().invoke(main, ["preflight"])
     assert result.exit_code == 0, result.output
     assert "codex model 'gpt-5.1-codex' supports effort 'high'" in result.output
 
@@ -748,9 +667,8 @@ def test_preflight_skips_codex_profile_when_bindings_do_not_use_codex(
         },
     )
     _install_fake(monkeypatch, fake)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_ready(tmp_path, "Todo"))
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    _seed_preflight_db(tmp_path, monkeypatch, [_ready_binding("Todo")])
+    result = CliRunner().invoke(main, ["preflight"])
     assert result.exit_code == 0, result.output
     assert not (codex_home / "config.toml").exists()
     assert "codex CLI not used by configured repos" in result.output
@@ -762,22 +680,21 @@ def test_preflight_allows_jira_binding_without_linear_key(tmp_path: Path, monkey
     monkeypatch.setenv("JIRA_EMAIL", "bot@example.test")
     monkeypatch.setenv("JIRA_API_TOKEN", "jira-token")
     _isolate_codex_home(tmp_path, monkeypatch)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        f"""
-{_db_path_lines(tmp_path)}
-repos:
-  - provider: jira
-    project_key: SYM
-    base_url: https://jira.example.test
-    github_repo: org/api-svc
-    states:
-      ready: To Do
-      code_review: In Review
-"""
+    _seed_preflight_db(
+        tmp_path,
+        monkeypatch,
+        [
+            {
+                "provider": "jira",
+                "project_key": "SYM",
+                "base_url": "https://jira.example.test",
+                "github_repo": "org/api-svc",
+                "states": {"ready": "To Do", "code_review": "In Review"},
+            }
+        ],
     )
 
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    result = CliRunner().invoke(main, ["preflight"])
 
     assert result.exit_code == 0, result.output
     assert "jira projects visible to this key: ['SYM']" in result.output
@@ -802,9 +719,12 @@ def test_preflight_notes_codex_bypass_when_binding_uses_codex_agent(
         },
     )
     _install_fake(monkeypatch, fake)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_ready(tmp_path, "Todo").replace("agent: claude", "agent: codex"))
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    _seed_preflight_db(
+        tmp_path,
+        monkeypatch,
+        [{**_ready_binding("Todo"), "roles": {"implement": {"agent": "codex"}}}],
+    )
+    result = CliRunner().invoke(main, ["preflight"])
     assert result.exit_code == 0, result.output
     # codex runs bypass its OS sandbox; no permissions profile is provisioned.
     assert not (codex_home / "config.toml").exists()
@@ -830,11 +750,8 @@ def test_preflight_notes_codex_bypass_when_local_reviewer_uses_codex(
         },
     )
     _install_fake(monkeypatch, fake)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        _yaml_with_ready(tmp_path, "Todo").replace("review_strategy: remote", "local_review: true")
-    )
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    _seed_preflight_db(tmp_path, monkeypatch, [{**_ready_binding("Todo"), "local_review": True}])
+    result = CliRunner().invoke(main, ["preflight"])
     assert result.exit_code == 0, result.output
     # codex runs bypass its OS sandbox; no permissions profile is provisioned.
     assert not (codex_home / "config.toml").exists()
@@ -858,10 +775,9 @@ def test_preflight_fails_when_ready_not_in_team_states(tmp_path: Path, monkeypat
         },
     )
     _install_fake(monkeypatch, fake)
-    p = tmp_path / "cfg.yaml"
     # Binding asks for a "Backlog" ready state that the team's workflow lacks.
-    p.write_text(_yaml_with_ready(tmp_path, "Backlog"))
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    _seed_preflight_db(tmp_path, monkeypatch, [_ready_binding("Backlog")])
+    result = CliRunner().invoke(main, ["preflight"])
     assert result.exit_code != 0
     assert "Backlog" in result.output
 
@@ -882,9 +798,8 @@ def test_preflight_fails_when_waiting_not_in_team_states(tmp_path: Path, monkeyp
         },
     )
     _install_fake(monkeypatch, fake)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(_yaml_with_ready(tmp_path, "Todo", waiting="Waiting"))
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    _seed_preflight_db(tmp_path, monkeypatch, [_ready_binding("Todo", waiting="Waiting")])
+    result = CliRunner().invoke(main, ["preflight"])
     assert result.exit_code != 0
     assert "Waiting" in result.output
 
@@ -908,17 +823,17 @@ def test_preflight_checks_local_code_review_when_local_review_enabled(
         },
     )
     _install_fake(monkeypatch, fake)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        _yaml_with_review_lanes(
-            tmp_path,
-            local_review=True,
-            remote_review=True,
-            local_code_review="Local Review",
-        )
+    _seed_preflight_db(
+        tmp_path,
+        monkeypatch,
+        [
+            _review_lane_binding(
+                local_review=True, remote_review=True, local_code_review="Local Review"
+            )
+        ],
     )
 
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    result = CliRunner().invoke(main, ["preflight"])
 
     assert result.exit_code != 0
     assert "local_code_review state 'Local Review'" in result.output
@@ -942,18 +857,17 @@ def test_preflight_allows_empty_review_lanes_when_both_reviews_disabled(
         },
     )
     _install_fake(monkeypatch, fake)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        _yaml_with_review_lanes(
-            tmp_path,
-            local_review=False,
-            remote_review=False,
-            code_review='""',
-            local_code_review='""',
-        )
+    _seed_preflight_db(
+        tmp_path,
+        monkeypatch,
+        [
+            _review_lane_binding(
+                local_review=False, remote_review=False, code_review="", local_code_review=""
+            )
+        ],
     )
 
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    result = CliRunner().invoke(main, ["preflight"])
 
     assert result.exit_code == 0, result.output
     assert "ENG → org/api-svc: states ok" in result.output
@@ -977,18 +891,17 @@ def test_preflight_allows_omitted_review_lanes_when_both_reviews_disabled(
         },
     )
     _install_fake(monkeypatch, fake)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        _yaml_with_review_lanes(
-            tmp_path,
-            local_review=False,
-            remote_review=False,
-            code_review=None,
-            local_code_review=None,
-        )
+    _seed_preflight_db(
+        tmp_path,
+        monkeypatch,
+        [
+            _review_lane_binding(
+                local_review=False, remote_review=False, code_review=None, local_code_review=None
+            )
+        ],
     )
 
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    result = CliRunner().invoke(main, ["preflight"])
 
     assert result.exit_code == 0, result.output
     assert "ENG → org/api-svc: states ok" in result.output
@@ -1011,18 +924,20 @@ def test_preflight_allows_local_only_without_code_review_lane(tmp_path: Path, mo
         },
     )
     _install_fake(monkeypatch, fake)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        _yaml_with_review_lanes(
-            tmp_path,
-            local_review=True,
-            remote_review=False,
-            code_review='""',
-            local_code_review="Local Review",
-        )
+    _seed_preflight_db(
+        tmp_path,
+        monkeypatch,
+        [
+            _review_lane_binding(
+                local_review=True,
+                remote_review=False,
+                code_review="",
+                local_code_review="Local Review",
+            )
+        ],
     )
 
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    result = CliRunner().invoke(main, ["preflight"])
 
     assert result.exit_code == 0, result.output
     assert "ENG → org/api-svc: states ok" in result.output
@@ -1047,18 +962,20 @@ def test_preflight_allows_remote_only_without_local_code_review_lane(
         },
     )
     _install_fake(monkeypatch, fake)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        _yaml_with_review_lanes(
-            tmp_path,
-            local_review=False,
-            remote_review=True,
-            code_review="In Review",
-            local_code_review='""',
-        )
+    _seed_preflight_db(
+        tmp_path,
+        monkeypatch,
+        [
+            _review_lane_binding(
+                local_review=False,
+                remote_review=True,
+                code_review="In Review",
+                local_code_review="",
+            )
+        ],
     )
 
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    result = CliRunner().invoke(main, ["preflight"])
 
     assert result.exit_code == 0, result.output
     assert "ENG → org/api-svc: states ok" in result.output
@@ -1082,18 +999,17 @@ def test_preflight_requires_code_review_when_remote_review_enabled(
         },
     )
     _install_fake(monkeypatch, fake)
-    p = tmp_path / "cfg.yaml"
-    p.write_text(
-        _yaml_with_review_lanes(
-            tmp_path,
-            local_review=False,
-            remote_review=True,
-            code_review='""',
-            local_code_review='""',
-        )
+    _seed_preflight_db(
+        tmp_path,
+        monkeypatch,
+        [
+            _review_lane_binding(
+                local_review=False, remote_review=True, code_review="", local_code_review=""
+            )
+        ],
     )
 
-    result = CliRunner().invoke(main, ["preflight", "--config", str(p)])
+    result = CliRunner().invoke(main, ["preflight"])
 
     assert result.exit_code != 0
     assert "code_review state ''" in result.output

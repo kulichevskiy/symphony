@@ -124,32 +124,33 @@ def test_cli_rejects_enabled_github_webhook_repo_without_secret() -> None:
 
 @pytest.mark.asyncio
 async def test_migrated_repo_secret_reaches_verifier(tmp_path: Path) -> None:
-    """Post-cutover (SYM-194): a per-binding YAML webhook secret imported into
-    the repo-secret table is loaded into the view at boot and reaches the
-    verifier settings, so verification keeps working without manual re-entry."""
-    from symphony.config_import import import_config
-    from symphony.db.config_repo_secrets import load_view
+    """Post-cutover (SYM-194): a repo's webhook secret stored in the DB
+    repo-secret table is loaded into the view at boot and reaches the verifier
+    settings, so verification keeps working without manual re-entry."""
+    from symphony.db.config_repo_secrets import load_view, set_secret
 
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        yaml_path = tmp_path / "config.yaml"
-        yaml_path.write_text(
-            "repos:\n"
-            "  - linear_team_key: ENG\n"
-            "    github_repo: org/repo\n"
-            "    webhook_enabled: true\n"
-            "    webhook_secret: yaml-secret\n"
-            "    linear_states: {ready: Todo, code_review: Needs Approval}\n"
+        # The binding topology is DB-owned; the secret lives in its own table.
+        await db.config_bindings.insert(
+            conn,
+            payload={
+                "linear_team_key": "ENG",
+                "github_repo": "org/repo",
+                "webhook_enabled": True,
+                "linear_states": {"ready": "Todo", "code_review": "Needs Approval"},
+            },
+            key=("ENG", "org/repo", "", "linear", "default"),
         )
-        await import_config(yaml_path, conn, now="t")
+        await set_secret(conn, github_repo="org/repo", secret="stored-secret", expected_version=0)
         view = await load_view(conn)
-        # The migrated binding no longer carries the secret itself.
+        # The binding no longer carries the secret itself.
         cfg = Config(repos=[_binding(webhook_secret=None)])
         settings = _github_webhook_settings(cfg, view.as_map())
     finally:
         await conn.close()
     assert settings is not None
-    assert settings.secrets_for_repo("org/repo") == ("yaml-secret",)
+    assert settings.secrets_for_repo("org/repo") == ("stored-secret",)
 
 
 def test_cli_skips_github_webhook_settings_when_repos_are_disabled() -> None:

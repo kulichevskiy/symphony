@@ -1,31 +1,24 @@
-"""Config export: DB bindings + global roles matrix → YAML (SYM-195).
+"""Config export: DB bindings + global roles matrix → YAML backup (SYM-195).
 
-Two modes serve two distinct recovery scenarios (comments don't survive YAML
-parsing, so one format can't serve both — see docs/config-db-ui-design.md):
+A read-only, human-readable snapshot of the config DB. Since Config v2 9/9
+there is no importer to feed it back through — YAML is no longer a config
+source — so an operator restoring from a backup reads this file and recreates
+the bindings on the Config page in the UI. Two shapes remain, both valid text:
 
-  * ``restore`` (default): a document fed back through the import script in
-    ``--replace`` mode on a DB-backed build. Disabled bindings are emitted as
-    real YAML with ``enabled: false`` so the round-trip preserves them. The
-    install's actual ``db_path`` is stamped in too — the import script reads
-    ``db_path`` straight off this file (``Config.peek_db_path``), so an install
-    with a non-default path would otherwise import into the wrong DB.
-  * ``downgrade``: a ``repos:``/``roles:`` section to paste into
-    ``config.local.yaml`` on a pre-DB build whose loader still reads them.
-    Disabled bindings are commented out with an explicit note — the pre-DB
-    build has no ``enabled`` semantics and would silently re-enable a paused
-    binding, so re-enabling is a deliberate uncomment.
+  * ``restore`` (default): the full binding + roles document, disabled bindings
+    emitted as real YAML with ``enabled: false`` so a snapshot reflects them.
+    The install's actual ``db_path`` is stamped in for reference.
+  * ``downgrade``: a ``repos:``/``roles:`` section shaped for a pre-DB build's
+    loader. Disabled bindings are commented out with an explicit note.
 
-Both modes carry the global roles matrix (sparse binding payloads inherit from
-it, so a bindings-only export would silently revert fleet-wide defaults on
-restore) and emit write-only webhook secrets as an explicit placeholder — never
-the stored value (the no-secrets-in-responses contract holds everywhere). The
-affected bindings are marked and the operator re-enters each by hand. The
-importer treats the placeholder as absence, so an un-edited restore never
-installs a bogus secret (see ``config_import``). ``mcp_servers`` entries carry
-their own literal credentials (a stdio server's ``env``, an http/sse server's
-auth ``headers``) with no such name-indirection — those are redacted to
-per-key ``true`` the same way the loaded-config read view redacts them (see
-``ui.config_crud``), and re-entered by hand the same way.
+Both shapes carry the global roles matrix (sparse binding payloads inherit from
+it) and emit write-only webhook secrets as an explicit placeholder — never the
+stored value (the no-secrets-in-responses contract holds everywhere). The
+affected bindings are marked and the operator re-enters each by hand.
+``mcp_servers`` entries carry their own literal credentials (a stdio server's
+``env``, an http/sse server's auth ``headers``) with no such name-indirection —
+those are redacted to per-key ``true`` the same way the loaded-config read view
+redacts them (see ``ui.config_crud``), and re-entered by hand the same way.
 """
 
 from __future__ import annotations
@@ -121,15 +114,13 @@ def _binding_flow_line(d: dict[str, Any]) -> str:
 
 _HEADERS: dict[ExportMode, list[str]] = {
     "restore": [
-        "# Symphony config export — mode: restore",
-        "# Feed back through `symphony config-import --config <this> --replace`.",
-        "# `db_path` below is this install's actual DB path (carried so the importer",
-        "# targets it even if the main config sets a non-default path) — do not edit it.",
+        "# Symphony config export — backup snapshot (mode: restore)",
+        "# Read-only backup: recreate these bindings on the Config page in the UI.",
+        "# `db_path` below is this install's actual DB path, carried for reference.",
         "# Webhook secret VALUES are never exported; bindings needing one carry a",
         f"# `webhook_secret: {WEBHOOK_SECRET_PLACEHOLDER}` placeholder — re-enter each by hand.",
         "# mcp_servers env/headers credential VALUES are never exported either; each",
-        "# redacted key carries `true` in place of the value — re-enter each by hand;",
-        "# the importer refuses to restore an un-edited `true` marker.",
+        "# redacted key carries `true` in place of the value — re-enter each by hand.",
     ],
     "downgrade": [
         "# Symphony config export — mode: downgrade",
@@ -151,16 +142,12 @@ def export_config(
     mode: ExportMode = "restore",
     db_path: Path | None = None,
 ) -> str:
-    """Render the effective config as a YAML document. Bindings are ordered by
-    ``priority`` then natural key (the same stable order dispatch uses and the
-    importer stamps priority back from), so a restore reproduces routing
-    bit-for-bit.
+    """Render the effective config as a YAML backup document. Bindings are
+    ordered by ``priority`` then natural key (the same stable order dispatch
+    uses), so a snapshot reflects routing faithfully.
 
-    ``db_path`` (restore mode only) is stamped into the document as a
-    top-level field so ``Config.peek_db_path`` — which ``config-import``
-    calls straight on this export file — resolves the install's actual DB
-    path rather than silently falling back to the default when the main
-    config sets a custom one."""
+    ``db_path`` (restore mode only) is stamped into the document as a top-level
+    field for reference — it records which DB this backup was taken from."""
     ordered = sorted(
         rows,
         key=lambda r: (

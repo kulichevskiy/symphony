@@ -8,18 +8,14 @@
 # published ports up even when the daemon restarts.
 #
 # Before `docker compose up`:
-#   cp .env.example .env                       # fill in secrets
-#   cp examples/config.docker.yaml config.local.yaml
-# Auth the CLIs into the named volumes once (they persist across restarts).
-# All three are headless (paste-back / device code) — no inbound port needed,
-# so they work in-container and on a remote VPS. codex MUST use --device-auth:
-# its default flow opens a localhost:1455 callback server the browser can't
-# reach from outside the container (Caddy publishes only 443/80).
-#   docker compose run --rm --entrypoint claude symphony auth login
-#   docker compose run --rm --entrypoint codex symphony login --device-auth
+#   cp .env.example .env                       # fill in secrets (Auth0 triple + optional webhook secrets)
+# Then open the UI, log in via Auth0, and connect GitHub / Linear / Claude /
+# Codex on the Connections page. Provider + agent credentials live in the
+# config DB (Config v2) — no config file, no mounted CLI-auth volumes.
+#
+# GitHub can alternatively authenticate via the gh CLI volume (env/volume
+# fallback still supported for GitHub):
 #   docker compose run --rm --entrypoint gh symphony auth login --git-protocol https --web
-# Org disables device-code auth? Use ./scripts/codex-login-docker.sh (default
-# browser flow via a port bridge; see the script header). Local machine only.
 
 services:
   symphony:
@@ -40,18 +36,23 @@ services:
     security_opt:
       - apparmor=unconfined
       - seccomp=unconfined
+    # Paths into the data volumes. SYMPHONY_*-prefixed so LocalRunner strips
+    # them from agent subprocess env (the daemon deploy posture must not leak
+    # into an agent working on this repo — see app.py / runners/local.py).
+    environment:
+      SYMPHONY_DB_PATH: /data/db/state.sqlite
+      SYMPHONY_LOG_ROOT: /data/logs
+      SYMPHONY_WORKSPACE_ROOT: /data/workspaces
     volumes:
-      # Operator config — read-only, never baked into the image.
-      - ./config.local.yaml:/app/config.local.yaml:ro
       # Secrets — mounted as a FILE (read by pydantic-settings + dotenv_values),
       # NOT `env_file:`. env_file would put every secret into the container's
       # os.environ, and LocalRunner starts agents with {**os.environ, ...} — so
       # every agent would inherit every token, bypassing the per-binding `env:`
       # allowlist. Mounting the file keeps secrets out of the process env.
       - ./.env:/app/.env:ro
-      # CLI auth dirs — persisted, so a one-time login survives rebuilds.
-      - claude_auth:/home/symphony/.claude
-      - codex_auth:/home/symphony/.codex
+      # GitHub CLI auth — persisted so a one-time login survives rebuilds
+      # (env/volume fallback for GitHub). claude/codex auth is DB-only now
+      # (Config v2): connect them on the UI Connections page, no volume needed.
       - gh_auth:/home/symphony/.config/gh
       # Daemon state: SQLite DB, per-issue workspaces, run logs.
       - symphony_db:/data/db
@@ -74,8 +75,6 @@ services:
       - caddy_config:/config
 
 volumes:
-  claude_auth:
-  codex_auth:
   gh_auth:
   symphony_db:
   symphony_workspaces:

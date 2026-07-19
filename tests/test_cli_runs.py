@@ -37,21 +37,56 @@ class _FakeRunner:
         pass
 
 
-def _seed_bindings_from_yaml(cfg_path: Path, db_path: Path) -> None:
-    """Import a YAML config's bindings into the config DB — the daemon boots
-    its topology from SQLite (SYM-188)."""
-    import asyncio
+_STD_STATES_PAYLOAD = {
+    "ready": "Todo",
+    "in_progress": "In Progress",
+    "code_review": "Needs Approval",
+    "needs_approval": "Needs Approval",
+    "blocked": "Blocked",
+    "done": "Done",
+}
 
-    from symphony.config_import import import_config
+
+def _binding_payload(team: str, repo: str, *, issue_label: str | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "linear_team_key": team,
+        "github_repo": repo,
+        "linear_states": dict(_STD_STATES_PAYLOAD),
+    }
+    if issue_label is not None:
+        payload["issue_label"] = issue_label
+    return payload
+
+
+def _seed_bindings(db_path: Path, payloads: list[dict[str, Any]]) -> None:
+    """Seed `config_bindings` rows directly — the daemon/CLI boot their
+    topology from SQLite now (Config v2 9/9). Priority follows list order so
+    the first payload wins the dispatch tiebreak."""
 
     async def _seed() -> None:
         conn = await db.connect(db_path)
         try:
-            await import_config(cfg_path, conn, now="seed")
+            for i, payload in enumerate(payloads):
+                key = (
+                    payload["linear_team_key"],
+                    payload["github_repo"],
+                    payload.get("issue_label") or "",
+                    "linear",
+                    "default",
+                )
+                await db.config_bindings.insert(conn, payload=payload, key=key, priority=i)
         finally:
             await conn.close()
 
     asyncio.run(_seed())
+
+
+def _use_db(monkeypatch, db_path: Path) -> None:  # type: ignore[no-untyped-def]
+    """Point the env-driven config (Config v2 9/9) at a tmp DB + tmp dirs."""
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    monkeypatch.setenv("SYMPHONY_DB_PATH", str(db_path))
+    monkeypatch.setenv("SYMPHONY_LOG_ROOT", str(db_path.parent / "logs"))
+    monkeypatch.setenv("SYMPHONY_WORKSPACE_ROOT", str(db_path.parent / "workspaces"))
 
 
 def _install_fake_runtime(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -369,32 +404,11 @@ class _FakePollLinear(_FakeLinear):
         return [self.issue]
 
 
-def _yaml(team: str, db_path: Path) -> str:
-    return f"""
-db_path: {db_path}
-log_root: {db_path.parent / "logs"}
-workspace_root: {db_path.parent / "workspaces"}
-repos:
-  - linear_team_key: {team}
-    github_repo: org/api-svc
-    linear_states:
-      ready: Todo
-      in_progress: In Progress
-      code_review: Needs Approval
-      needs_approval: Needs Approval
-      blocked: Blocked
-      done: Done
-"""
-
-
 def test_once_drains_scheduled_dispatch_before_exit(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.setenv("LINEAR_API_KEY", "x")
     db_path = tmp_path / "state.sqlite"
-    cfg_path = tmp_path / "cfg.yaml"
-    cfg_path.write_text(_yaml(team="ENG", db_path=db_path))
-    # The daemon boots bindings from the DB (SYM-188), so import the YAML
-    # topology first — mirrors the operator's one-off `config-import`.
-    _seed_bindings_from_yaml(cfg_path, db_path)
+    _use_db(monkeypatch, db_path)
+    # The daemon boots bindings from the DB (Config v2 9/9).
+    _seed_bindings(db_path, [_binding_payload("ENG", "org/api-svc")])
 
     issue = LinearIssue(
         id="iss-once",
@@ -411,7 +425,7 @@ def test_once_drains_scheduled_dispatch_before_exit(tmp_path: Path, monkeypatch)
     _install_fake_linear(monkeypatch, fake)
     _install_fake_runtime(monkeypatch)
 
-    result = CliRunner().invoke(main, ["--config", str(cfg_path), "--once"])
+    result = CliRunner().invoke(main, ["--once"])
     assert result.exit_code == 0, result.output
 
     async def _check() -> None:
@@ -433,33 +447,13 @@ def test_once_drains_scheduled_dispatch_before_exit(tmp_path: Path, monkeypatch)
     ]
 
 
-def _yaml_two_bindings(team: str, db_path: Path) -> str:
+def _two_binding_payloads(team: str) -> list[dict[str, Any]]:
     """One Linear team fanned out to two repos via labels — the config
     shape that exposed the dispatch label-matching bug."""
-    return f"""
-db_path: {db_path}
-repos:
-  - linear_team_key: {team}
-    github_repo: org/api-svc
-    issue_label: api
-    linear_states:
-      ready: Todo
-      in_progress: In Progress
-      code_review: Needs Approval
-      needs_approval: Needs Approval
-      blocked: Blocked
-      done: Done
-  - linear_team_key: {team}
-    github_repo: org/web-app
-    issue_label: web
-    linear_states:
-      ready: Todo
-      in_progress: In Progress
-      code_review: Needs Approval
-      needs_approval: Needs Approval
-      blocked: Blocked
-      done: Done
-"""
+    return [
+        _binding_payload(team, "org/api-svc", issue_label="api"),
+        _binding_payload(team, "org/web-app", issue_label="web"),
+    ]
 
 
 def _install_fake_linear(monkeypatch, fake: _FakeLinear) -> None:  # type: ignore[no-untyped-def]
@@ -475,21 +469,12 @@ def _install_fake_linear(monkeypatch, fake: _FakeLinear) -> None:  # type: ignor
     monkeypatch.setattr("symphony.cli.for_binding", _for_binding)
 
 
-def test_dispatch_resolves_binding_from_db_not_yaml(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_dispatch_resolves_binding_from_db(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """Manual dispatch operates over the assembled config: the binding lives
-    only in the DB and the YAML carries no `repos:` at all (SYM-188)."""
-    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    only in the DB (Config v2 9/9)."""
     db_path = tmp_path / "state.sqlite"
-    # Import the topology, then hand dispatch a config file with NO repos:.
-    seed_yaml = tmp_path / "seed.yaml"
-    seed_yaml.write_text(_yaml(team="ENG", db_path=db_path))
-    _seed_bindings_from_yaml(seed_yaml, db_path)
-    cfg_path = tmp_path / "cfg.yaml"
-    cfg_path.write_text(
-        f"db_path: {db_path}\n"
-        f"log_root: {db_path.parent / 'logs'}\n"
-        f"workspace_root: {db_path.parent / 'workspaces'}\n"
-    )
+    _use_db(monkeypatch, db_path)
+    _seed_bindings(db_path, [_binding_payload("ENG", "org/api-svc")])
 
     issue = LinearIssue(
         id="iss-db",
@@ -506,7 +491,7 @@ def test_dispatch_resolves_binding_from_db_not_yaml(tmp_path: Path, monkeypatch)
     _install_fake_linear(monkeypatch, fake)
     _install_fake_runtime(monkeypatch)
 
-    result = CliRunner().invoke(main, ["dispatch", "ENG-7", "--config", str(cfg_path)])
+    result = CliRunner().invoke(main, ["dispatch", "ENG-7"])
     assert result.exit_code == 0, result.output
     assert "org/api-svc" in result.output
 
@@ -522,10 +507,9 @@ def test_dispatch_resolves_binding_from_db_not_yaml(tmp_path: Path, monkeypatch)
 
 
 def test_dispatch_creates_run_for_known_team_binding(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.setenv("LINEAR_API_KEY", "x")
     db_path = tmp_path / "state.sqlite"
-    cfg_path = tmp_path / "cfg.yaml"
-    cfg_path.write_text(_yaml(team="ENG", db_path=db_path))
+    _use_db(monkeypatch, db_path)
+    _seed_bindings(db_path, [_binding_payload("ENG", "org/api-svc")])
 
     issue = LinearIssue(
         id="iss-1",
@@ -542,7 +526,7 @@ def test_dispatch_creates_run_for_known_team_binding(tmp_path: Path, monkeypatch
     _install_fake_linear(monkeypatch, fake)
     _install_fake_runtime(monkeypatch)
 
-    result = CliRunner().invoke(main, ["dispatch", "ENG-42", "--config", str(cfg_path)])
+    result = CliRunner().invoke(main, ["dispatch", "ENG-42"])
     assert result.exit_code == 0, result.output
 
     async def _check() -> None:
@@ -592,34 +576,17 @@ def test_dispatch_first_matching_binding_in_cfg_order_wins(tmp_path: Path, monke
     catch-all scan would claim the issue first. The CLI must pick the same
     binding so that `dispatch` can't route differently than the automated
     path for the same issue."""
-    monkeypatch.setenv("LINEAR_API_KEY", "x")
     db_path = tmp_path / "state.sqlite"
-    cfg_path = tmp_path / "cfg.yaml"
-    # Catch-all FIRST, labeled second — under cfg order, the catch-all wins
-    # even though the issue carries the labeled binding's label.
-    cfg_path.write_text(f"""
-db_path: {db_path}
-repos:
-  - linear_team_key: ENG
-    github_repo: org/catchall
-    linear_states:
-      ready: Todo
-      in_progress: In Progress
-      code_review: Needs Approval
-      needs_approval: Needs Approval
-      blocked: Blocked
-      done: Done
-  - linear_team_key: ENG
-    github_repo: org/web-app
-    issue_label: web
-    linear_states:
-      ready: Todo
-      in_progress: In Progress
-      code_review: Needs Approval
-      needs_approval: Needs Approval
-      blocked: Blocked
-      done: Done
-""")
+    _use_db(monkeypatch, db_path)
+    # Catch-all FIRST (priority 0), labeled second — under priority order, the
+    # catch-all wins even though the issue carries the labeled binding's label.
+    _seed_bindings(
+        db_path,
+        [
+            _binding_payload("ENG", "org/catchall"),
+            _binding_payload("ENG", "org/web-app", issue_label="web"),
+        ],
+    )
 
     issue = LinearIssue(
         id="iss-web",
@@ -637,9 +604,9 @@ repos:
     _install_fake_linear(monkeypatch, fake)
     _install_fake_runtime(monkeypatch)
 
-    result = CliRunner().invoke(main, ["dispatch", "ENG-200", "--config", str(cfg_path)])
+    result = CliRunner().invoke(main, ["dispatch", "ENG-200"])
     assert result.exit_code == 0, result.output
-    # cfg order wins: catch-all (listed first) claims it, not the labeled binding.
+    # priority order wins: catch-all (seeded first) claims it, not the labeled binding.
     assert "org/catchall" in result.output
     assert "org/web-app" not in result.output
 
@@ -649,10 +616,9 @@ def test_dispatch_picks_binding_by_issue_label(tmp_path: Path, monkeypatch) -> N
     the CLI must pick the repo whose label is on the issue — selecting by
     `linear_team_key` alone routes the run to the wrong repo and posts the
     start comment in the wrong context."""
-    monkeypatch.setenv("LINEAR_API_KEY", "x")
     db_path = tmp_path / "state.sqlite"
-    cfg_path = tmp_path / "cfg.yaml"
-    cfg_path.write_text(_yaml_two_bindings(team="ENG", db_path=db_path))
+    _use_db(monkeypatch, db_path)
+    _seed_bindings(db_path, _two_binding_payloads("ENG"))
 
     issue = LinearIssue(
         id="iss-web",
@@ -670,7 +636,7 @@ def test_dispatch_picks_binding_by_issue_label(tmp_path: Path, monkeypatch) -> N
     _install_fake_linear(monkeypatch, fake)
     _install_fake_runtime(monkeypatch)
 
-    result = CliRunner().invoke(main, ["dispatch", "ENG-100", "--config", str(cfg_path)])
+    result = CliRunner().invoke(main, ["dispatch", "ENG-100"])
     assert result.exit_code == 0, result.output
     # The success message names the repo, so it doubles as a routing assertion.
     assert "org/web-app" in result.output
@@ -682,10 +648,9 @@ def test_dispatch_errors_when_no_binding_label_matches(tmp_path: Path, monkeypat
     labels match, dispatch must refuse — silently picking an arbitrary
     binding would route the run to a repo that isn't supposed to handle it.
     """
-    monkeypatch.setenv("LINEAR_API_KEY", "x")
     db_path = tmp_path / "state.sqlite"
-    cfg_path = tmp_path / "cfg.yaml"
-    cfg_path.write_text(_yaml_two_bindings(team="ENG", db_path=db_path))
+    _use_db(monkeypatch, db_path)
+    _seed_bindings(db_path, _two_binding_payloads("ENG"))
 
     issue = LinearIssue(
         id="iss-other",
@@ -702,29 +667,18 @@ def test_dispatch_errors_when_no_binding_label_matches(tmp_path: Path, monkeypat
     fake = _FakeLinear(issue)
     _install_fake_linear(monkeypatch, fake)
 
-    result = CliRunner().invoke(main, ["dispatch", "ENG-101", "--config", str(cfg_path)])
+    result = CliRunner().invoke(main, ["dispatch", "ENG-101"])
     assert result.exit_code != 0, result.output
     assert "ENG-101" in result.output
-
-
-def test_dispatch_rejects_directory_for_config_path(tmp_path: Path) -> None:
-    """Same fail-fast contract as `--db`: passing a directory must fail at
-    click validation, not deeper inside `Config.load()` with `IsADirectoryError`."""
-    a_dir = tmp_path / "not_a_config_dir"
-    a_dir.mkdir()
-    result = CliRunner().invoke(main, ["dispatch", "ENG-1", "--config", str(a_dir)])
-    assert result.exit_code != 0
-    assert "directory" in result.output.lower()
 
 
 def test_dispatch_refuses_when_issue_already_has_active_run(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """`dispatch` must respect the same dedupe oracle as the poll loop;
     otherwise an operator retrying it for an issue that's already mid-run
     creates a duplicate `running` row and a duplicate "starting" comment."""
-    monkeypatch.setenv("LINEAR_API_KEY", "x")
     db_path = tmp_path / "state.sqlite"
-    cfg_path = tmp_path / "cfg.yaml"
-    cfg_path.write_text(_yaml(team="ENG", db_path=db_path))
+    _use_db(monkeypatch, db_path)
+    _seed_bindings(db_path, [_binding_payload("ENG", "org/api-svc")])
 
     issue = LinearIssue(
         id="iss-existing",
@@ -765,7 +719,7 @@ def test_dispatch_refuses_when_issue_already_has_active_run(tmp_path: Path, monk
     fake = _FakeLinear(issue)
     _install_fake_linear(monkeypatch, fake)
 
-    result = CliRunner().invoke(main, ["dispatch", "ENG-50", "--config", str(cfg_path)])
+    result = CliRunner().invoke(main, ["dispatch", "ENG-50"])
     assert result.exit_code != 0, result.output
     assert "ENG-50" in result.output
     # No new comment posted (the existing run already announced).
@@ -791,10 +745,9 @@ def test_dispatch_errors_when_announce_comment_fails(tmp_path: Path, monkeypatch
     live run actually started."""
     from symphony.linear.client import LinearError
 
-    monkeypatch.setenv("LINEAR_API_KEY", "x")
     db_path = tmp_path / "state.sqlite"
-    cfg_path = tmp_path / "cfg.yaml"
-    cfg_path.write_text(_yaml(team="ENG", db_path=db_path))
+    _use_db(monkeypatch, db_path)
+    _seed_bindings(db_path, [_binding_payload("ENG", "org/api-svc")])
 
     issue = LinearIssue(
         id="iss-3",
@@ -815,7 +768,7 @@ def test_dispatch_errors_when_announce_comment_fails(tmp_path: Path, monkeypatch
     fake = _BrokenAnnounce(issue)
     _install_fake_linear(monkeypatch, fake)
 
-    result = CliRunner().invoke(main, ["dispatch", "ENG-77", "--config", str(cfg_path)])
+    result = CliRunner().invoke(main, ["dispatch", "ENG-77"])
     assert result.exit_code != 0, result.output
     # The error must be on stderr/output and identify the issue so the
     # operator knows which dispatch did not actually start.
@@ -833,10 +786,9 @@ def test_dispatch_errors_when_announce_comment_fails(tmp_path: Path, monkeypatch
 
 
 def test_dispatch_errors_when_no_binding_matches_team_key(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    monkeypatch.setenv("LINEAR_API_KEY", "x")
     db_path = tmp_path / "state.sqlite"
-    cfg_path = tmp_path / "cfg.yaml"
-    cfg_path.write_text(_yaml(team="ENG", db_path=db_path))
+    _use_db(monkeypatch, db_path)
+    _seed_bindings(db_path, [_binding_payload("ENG", "org/api-svc")])
 
     issue = LinearIssue(
         id="iss-2",
@@ -852,7 +804,7 @@ def test_dispatch_errors_when_no_binding_matches_team_key(tmp_path: Path, monkey
     fake = _FakeLinear(issue)
     _install_fake_linear(monkeypatch, fake)
 
-    result = CliRunner().invoke(main, ["dispatch", "WEB-99", "--config", str(cfg_path)])
+    result = CliRunner().invoke(main, ["dispatch", "WEB-99"])
     assert result.exit_code != 0
     # Error must name the unmatched team key so the operator can fix the config.
     assert "WEB" in result.output
@@ -866,38 +818,3 @@ def test_dispatch_errors_when_no_binding_matches_team_key(tmp_path: Path, monkey
             await conn.close()
 
     asyncio.run(_check())
-
-
-async def test_db_owns_topology_true_after_migration_with_zero_bindings(
-    tmp_path: Path,
-) -> None:
-    """A migrated DB with all bindings since deleted (e.g. via the UI) must
-    still be treated as the topology source — leftover YAML `repos:` stays
-    ignored, not re-resolved/validated (SYM-188 review)."""
-    from symphony.cli import _db_owns_topology
-
-    conn = await db.connect(tmp_path / "state.sqlite")
-    try:
-        # Not yet migrated, and the YAML still declares `repos:` — legacy
-        # YAML deployment, DB doesn't own topology yet.
-        assert await _db_owns_topology(conn, yaml_has_repos_topology=True) is False
-        await db.config_globals.set_globals(conn, roles={}, migrated_at="t")
-        assert await _db_owns_topology(conn, yaml_has_repos_topology=True) is True
-    finally:
-        await conn.close()
-
-
-async def test_db_owns_topology_true_for_fresh_install_with_no_yaml_topology(
-    tmp_path: Path,
-) -> None:
-    """A true fresh install — zero bindings, never migrated, no YAML
-    `repos:` to fall back to — must still count as DB-owned so `_run`'s
-    tick-boundary reload (SYM-189) stays enabled and a binding added via the
-    UI/importer after boot is scanned without a restart."""
-    from symphony.cli import _db_owns_topology
-
-    conn = await db.connect(tmp_path / "state.sqlite")
-    try:
-        assert await _db_owns_topology(conn, yaml_has_repos_topology=False) is True
-    finally:
-        await conn.close()

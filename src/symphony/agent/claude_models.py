@@ -4,7 +4,7 @@ Unlike codex — whose effort scale is a fixed enum pinned in `codex_models` —
 claude's per-model effort support is read from the Anthropic Models API
 `capabilities.effort.<level>` tree at preflight time. This is an *online*
 check, run manually via `symphony preflight`; daemon boot stays structural
-(`Config.load` only) and never reaches the network.
+(roles-matrix validation only) and never reaches the network.
 """
 
 from __future__ import annotations
@@ -124,8 +124,8 @@ async def fetch_claude_effort_capabilities(
     via the CLI's own auth (OAuth in the containerized deployment) with no API
     key present — the caller treats `None` as "cannot validate, skip with a
     warning" rather than a hard failure, letting such a deployment still pass
-    preflight. A genuinely-broken pair is still caught structurally at
-    `Config.load`.
+    preflight. A genuinely-broken pair is still caught structurally by the
+    roles-matrix validation.
 
     Raises `ValueError` — not a bare `httpx` error — when a key IS available but
     the request fails (auth, network, timeout), so preflight reports a clean

@@ -31,7 +31,7 @@ from .config import Config, RepoBinding, RoleConfig, RoleName
 
 _log = logging.getLogger(__name__)
 
-_IMPORT_HINT = "run the importer (`symphony config-import --config <yaml>`)"
+_ADD_BINDING_HINT = "add a binding on the Config page in the UI"
 
 # `TypeAdapter` gets us the same "unknown role name" rejection YAML gets for
 # free from `dict[RoleName, RoleConfig]` field typing — `config_globals.roles`
@@ -56,7 +56,7 @@ async def _has_unresolved_work(conn: aiosqlite.Connection) -> bool:
 
 def _resolve_bindings(cfg: Config) -> None:
     """Apply tracker-context defaults and resolve `env:` key names to values on
-    each assembled binding — mirrors what `Config.load` does for YAML repos."""
+    each DB-assembled binding (`.env` + process env → secret values)."""
     env_source: dict[str, str] = {
         key: value for key, value in dotenv_values(".env").items() if value is not None
     }
@@ -113,34 +113,22 @@ async def assemble_effective_config(
     base: Config,
     *,
     boot_gates: bool = True,
-    yaml_has_repos_topology: bool = False,
     is_reload: bool = False,
 ) -> Config:
-    """Assemble the effective `Config` from `base` (YAML system knobs) + the DB.
+    """Assemble the effective `Config` from `base` (env system knobs) + the DB.
 
-    `base` is a `Config.load`-produced config; its `repos`/`roles` are replaced
-    by the DB's bindings and global matrix.
+    `base` is a `Config.from_env`-produced config; its `repos`/`roles` are
+    always empty (the bindings topology lives only in the DB now, Config v2
+    9/9) and get replaced by the DB's bindings and global matrix.
 
-    `yaml_has_repos_topology` reports whether the source YAML still declares a
-    `repos:`/`roles:` section, per `Config.peek_repos_topology`. It must come
-    from the caller rather than `base.repos`: once the DB owns bindings,
-    callers load `base` with `resolve_repos=False`, which strips `repos:`/
-    `roles:` before validation — so `base.repos` is always empty at that point
-    and can never reveal a leftover YAML topology.
+    `boot_gates` (the daemon path) enforces the zero-binding gate — refuse a
+    start that would orphan live work. The non-daemon one-shot CLI paths
+    (preflight, manual dispatch) pass `boot_gates=False`: they operate over
+    whatever the DB holds, empty or not.
 
-    `boot_gates` (the daemon path) enforces the two zero-binding gates — refuse
-    a start that would orphan live work or silently dispatch nothing. The
-    non-daemon one-shot CLI paths (preflight, manual dispatch) pass
-    `boot_gates=False`: they still prefer DB bindings when present, but degrade
-    gracefully to the YAML topology on an empty DB so they keep working during
-    the transition (before the operator has run the importer).
-
-    `is_reload` (the daemon's mid-run tick reload, SYM-189) also implies
-    `boot_gates=False` semantics but must never degrade to the YAML topology
-    on an empty DB: the DB already owns topology past boot, so "zero bindings"
-    here means every binding was deleted, not "importer never ran". Returning
-    `base` unchanged in that case would keep serving a deleted binding's
-    `repos` forever, so this returns an empty topology instead.
+    `is_reload` (the daemon's mid-run tick reload, SYM-189) collapses to an
+    empty topology on an empty DB — every binding was deleted since boot, and
+    returning `base` unchanged would keep serving a deleted binding's `repos`.
     """
     try:
         stored = await db.config_bindings.list_all(conn)
@@ -158,46 +146,17 @@ async def assemble_effective_config(
         raise ConfigBootError(f"malformed config globals payload in the DB: {e}") from e
 
     if not stored:
-        if is_reload:
-            # Mid-run reload, empty DB: every binding was deleted since boot —
-            # collapse to an empty topology rather than falling through to the
-            # one-shot-CLI "degrade to YAML" behavior below, which would leave
-            # `base.repos` (the *previous* effective config's bindings) intact.
-            return _apply_knobs(
-                base.model_copy(update={"repos": [], "roles": {}}),
-                globals_row.knobs if globals_row else {},
-            )
-        if not boot_gates:
-            # One-shot CLI, empty DB: operate over the YAML topology as-is
-            # (knob overrides still apply — they're DB state, not topology).
-            return _apply_knobs(base, globals_row.knobs if globals_row else {})
-        if await _has_unresolved_work(conn):
+        knobs = globals_row.knobs if globals_row else {}
+        # Daemon boot with zero bindings but live work would orphan it — refuse.
+        # One-shot CLI (boot_gates=False) and mid-run reload (is_reload) both
+        # tolerate an empty DB and collapse to an empty topology.
+        if boot_gates and not is_reload and await _has_unresolved_work(conn):
             raise ConfigBootError(
                 "the config DB has zero bindings but still holds unresolved work "
                 "(active runs, tracked open PRs, or parked operator waits); "
-                f"refusing to start and orphan it — {_IMPORT_HINT}"
+                f"refusing to start and orphan it — {_ADD_BINDING_HINT}"
             )
-        # A migrated DB already owns topology — a lingering YAML `repos:` here
-        # just means the operator hasn't cleaned up the file, not that the
-        # importer was never run (e.g. every binding was later deleted via the
-        # UI). Only gate on it pre-migration, where it signals a forgotten
-        # importer run.
-        if yaml_has_repos_topology and not (globals_row and globals_row.migrated_at):
-            raise ConfigBootError(
-                "the config DB has zero bindings but the YAML still contains a "
-                f"`repos:` section (now ignored); {_IMPORT_HINT} before starting"
-            )
-        # True fresh install: no bindings, no work, no YAML topology.
-        return _apply_knobs(
-            base.model_copy(update={"repos": [], "roles": {}}),
-            globals_row.knobs if globals_row else {},
-        )
-
-    if yaml_has_repos_topology:
-        _log.warning(
-            "YAML `repos:`/`roles:` are ignored; %d binding(s) load from the DB",
-            len(stored),
-        )
+        return _apply_knobs(base.model_copy(update={"repos": [], "roles": {}}), knobs)
 
     # `list_all` already returns dispatch-evaluation order (priority, then the
     # stable natural-key tiebreak). The row's `enabled` column is stamped onto

@@ -1,25 +1,27 @@
 """Configuration loader.
 
-Two layers:
-  1. Secrets via env vars (LINEAR_API_KEY, etc.) — `pydantic-settings`.
-  2. Topology via YAML file (repo bindings, caps, paths) — `yaml.safe_load`
-     into the same model.
+Config assembles from two sources only (Config v2 9/9 — YAML is gone):
+  1. Secrets + bootstrap via env vars (LINEAR_API_KEY, AUTH0_*, paths/ports)
+     — `pydantic-settings` for secrets, plain env reads for paths/ports.
+  2. Operational knobs (intervals, caps, timeouts, UI thresholds) keep their
+     code defaults here and are overlaid at runtime from `config_globals`
+     (SYM-214); the bindings topology (repos/roles) lives in the DB.
 
-Splitting these keeps secrets out of the repo without forcing every config
-knob into the env. The YAML is what an operator edits day-to-day; env vars
-are what `systemd EnvironmentFile=` (or the managed-platform equivalent)
-provides at boot.
+Nothing is read from a config file. Paths and ports come from env vars with
+container defaults (`SYMPHONY_DB_PATH`, `SYMPHONY_LOG_ROOT`,
+`SYMPHONY_WORKSPACE_ROOT`, `SYMPHONY_WEBHOOK_PORT`); unset falls back to the
+model default below.
 """
 
 from __future__ import annotations
 
+import os
 import warnings
 from collections.abc import Mapping
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Self
 
-import yaml
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -91,7 +93,7 @@ class RoleConfig(BaseModel):
     (`role = merge(global[role], binding[role])`). `model=None` falls back to
     the back-compat default for the role, which may itself be `None` (no
     `--model`, CLI default). `effort` is a family-specific literal (like
-    `model`) validated in `Config.load`; `effort=None` passes no flag.
+    `model`) validated by the roles matrix; `effort=None` passes no flag.
 
     `extra="forbid"`: a typo'd key (e.g. `effr`) would otherwise silently drop
     under pydantic's default `extra="ignore"`, persisting a cell the operator
@@ -293,11 +295,11 @@ class RepoBinding(BaseModel):
     # Wall-clock cap for one `verify_cmd` invocation. `None` falls back to
     # `Config.command_timeout_secs`.
     verify_timeout_secs: int | None = Field(default=None, ge=1)
-    # Extra env injected into this binding's agent subprocesses. YAML values
-    # name keys in symphony's `.env` (or the process env) — the secrets
-    # themselves never live in the YAML. `Config.load` replaces each value
-    # with the resolved secret via `resolve_env`; an unresolvable key fails
-    # the load so the daemon dies loudly at boot, not mid-run.
+    # Extra env injected into this binding's agent subprocesses. Values name
+    # keys in symphony's `.env` (or the process env) — the secrets themselves
+    # are never stored on the binding. `assemble_effective_config` replaces
+    # each value with the resolved secret via `resolve_env`; an unresolvable
+    # key fails assembly so the daemon dies loudly at boot, not mid-run.
     env: dict[str, str] = Field(default_factory=dict)
     # MCP servers this binding's agents may see. Entries are claude
     # `--mcp-config` server definitions, passed through verbatim. Spawns use
@@ -764,7 +766,9 @@ class UIConfig(BaseModel):
 
 
 class Config(BaseModel):
-    """Top-level config. Loaded from YAML, secrets layered on at the end."""
+    """Top-level config. Assembled from env (paths/ports/secrets) + code
+    defaults; operational knobs are overlaid from `config_globals` at runtime
+    and the bindings topology lives in the DB. No config file is read."""
 
     poll_interval_secs: int = 60
     global_max_concurrent: int = 4
@@ -979,47 +983,40 @@ class Config(BaseModel):
                 )
 
     @classmethod
-    def peek_db_path(cls, path: Path) -> Path:
-        """Read just `db_path` from `path`'s YAML, without validating or
-        resolving `repos:` (family/effort checks, `env:` secret lookups).
-
-        Callers use this to check whether the DB already owns the bindings
-        topology *before* deciding whether `load`'s `repos:` resolution is
-        needed at all — a migrated deployment's leftover YAML `repos:` can
-        reference `env:` secrets an operator has since removed, or otherwise
-        fail validation, even though that YAML is now ignored.
-        """
-        raw = yaml.safe_load(path.read_text()) or {}
-        default = cls.model_fields["db_path"].default
-        # `.get(..., default)` only falls back when the key is absent; an
-        # explicit `db_path: null` still returns `None` and crashes `Path()`.
-        return _expand(Path(raw.get("db_path") or default))
+    def _path_from_env(cls, var: str, field: str) -> Path:
+        """A filesystem path from env `var`, falling back to `field`'s model
+        default, `~`-expanded. Container deployments set the env var to a data
+        volume (`/data/...`); a bare local run gets the `~/symphony/...`
+        default."""
+        raw = os.environ.get(var)
+        default = cls.model_fields[field].default
+        return _expand(Path(raw) if raw else Path(default))
 
     @classmethod
-    def peek_repos_topology(cls, path: Path) -> bool:
-        """Whether `path`'s YAML still declares a non-empty `repos:`/`roles:`
-        topology, without validating or resolving it.
-
-        Independent of `resolve_repos`: `load(resolve_repos=False)` strips
-        those keys before validation, so the resulting `Config`'s `repos`/
-        `roles` can never reflect a leftover YAML topology once the DB owns
-        bindings. Callers that need to warn/gate on that leftover topology
-        must check the raw YAML instead of the loaded `Config`.
-        """
-        raw = yaml.safe_load(path.read_text()) or {}
-        return bool(raw.get("repos")) or bool(raw.get("roles"))
+    def db_path_from_env(cls) -> Path:
+        """The DB path (`SYMPHONY_DB_PATH` or the default), resolved without a
+        full config assembly — callers locate the DB / encryption-key file
+        before the daemon is up."""
+        return cls._path_from_env("SYMPHONY_DB_PATH", "db_path")
 
     @classmethod
-    def load(cls, path: Path, *, resolve_repos: bool = True) -> Config:
-        raw = yaml.safe_load(path.read_text())
-        if not resolve_repos:
-            # The DB already owns the topology (bindings + global roles);
-            # don't validate or resolve a `repos:`/`roles:` section that's
-            # now ignored.
-            raw = {k: v for k, v in (raw or {}).items() if k not in ("repos", "roles")}
-        cfg = cls.model_validate(raw)
+    def from_env(cls) -> Config:
+        """Assemble the config from env vars + code defaults. Paths/ports come
+        from env (with model defaults); secrets are layered from `Secrets`;
+        operational knobs keep their defaults here and are overlaid from
+        `config_globals` at runtime; the bindings topology lives in the DB, so
+        `repos`/`roles` stay empty."""
+        overrides: dict[str, Any] = {
+            "db_path": cls.db_path_from_env(),
+            "log_root": cls._path_from_env("SYMPHONY_LOG_ROOT", "log_root"),
+            "workspace_root": cls._path_from_env("SYMPHONY_WORKSPACE_ROOT", "workspace_root"),
+        }
+        port = os.environ.get("SYMPHONY_WEBHOOK_PORT")
+        if port:
+            overrides["webhook_port"] = int(port)
+        cfg = cls.model_validate(overrides)
         secrets = Secrets()
-        cfg = cfg.model_copy(
+        return cfg.model_copy(
             update={
                 "linear_api_key": secrets.linear_api_key,
                 "linear_webhook_secret": secrets.linear_webhook_secret,
@@ -1041,27 +1038,3 @@ class Config(BaseModel):
                 "symphony_oauth_public_origin": secrets.symphony_oauth_public_origin,
             }
         )
-        # Per-binding agent env: same `.env` file pydantic-settings reads,
-        # with the real process env winning on conflicts (mirrors
-        # pydantic-settings precedence). Resolution happens here so a typo'd
-        # key kills the daemon at boot instead of stranding a run.
-        import os
-
-        from dotenv import dotenv_values
-
-        env_source: dict[str, str] = {
-            key: value for key, value in dotenv_values(".env").items() if value is not None
-        }
-        env_source.update(os.environ)
-        for binding in cfg.repos:
-            binding.apply_tracker_secret_defaults(jira_base_url=cfg.jira_base_url)
-            binding.resolve_env(env_source)
-        # Expand ~ now so downstream code can assume absolute paths.
-        cfg = cfg.model_copy(
-            update={
-                "workspace_root": _expand(cfg.workspace_root),
-                "log_root": _expand(cfg.log_root),
-                "db_path": _expand(cfg.db_path),
-            }
-        )
-        return cfg

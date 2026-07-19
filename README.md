@@ -56,10 +56,11 @@ claude --version             # or: codex --version
 
 ## Configure
 
-Configuration is split in two: **secrets** go in `.env`, **topology and
-behavior** go in a YAML file.
+Configuration comes from exactly two places: **`.env`** for bootstrap secrets,
+and the **web UI** for everything operational (provider connections, bindings,
+the roles matrix, runtime knobs). There is no config file.
 
-### 1. Secrets — `.env`
+### 1. Secrets and bootstrap — `.env`
 
 ```bash
 cp .env.example .env
@@ -67,14 +68,25 @@ $EDITOR .env
 ```
 
 ```bash
-LINEAR_API_KEY=lin_api_paste_here
+# Auth0 gates the UI/API (mandatory for any exposed deployment).
+AUTH0_DOMAIN=your-tenant.auth0.com
+AUTH0_CLIENT_ID=...
+AUTH0_ALLOWED_EMAILS=you@example.com
 
-# Optional. Set this to enable the loopback webhook receiver (faster pickup
-# than polling). Generate once: openssl rand -hex 32
-LINEAR_WEBHOOK_SECRET=
+# Encryption key for stored provider credentials. Optional — auto-generated
+# into the data volume (0600) on first boot if unset. Set it to pin the key.
+# SYMPHONY_ENCRYPTION_KEY=
 
-# Optional. If unset, the daemon falls back to `gh auth token`.
-# GH_TOKEN=
+# Optional. Set to enable the loopback webhook receiver (faster than polling).
+# Generate once: openssl rand -hex 32
+# LINEAR_WEBHOOK_SECRET=
+# GITHUB_WEBHOOK_SECRET=
+
+# Optional path overrides (defaults: ~/symphony/{state.sqlite,logs,workspaces}).
+# The container sets these to /data/* — see docker-compose.yml.
+# SYMPHONY_DB_PATH=~/symphony/state.sqlite
+# SYMPHONY_LOG_ROOT=~/symphony/logs
+# SYMPHONY_WORKSPACE_ROOT=~/symphony/workspaces
 ```
 
 `.env` is also the home for any secret a binding's `env:` mapping references
@@ -86,54 +98,32 @@ MASHA2_SUPABASE_ACCESS_TOKEN=sbp_...
 MASHA2_SUPABASE_PROJECT_REF=abcdefghijklmnop
 ```
 
-### 2. Topology — `config.local.yaml`
+### 2. Providers and topology — the web UI
 
-```bash
-cp examples/config.yaml config.local.yaml
-$EDITOR config.local.yaml
-```
+Everything operational lives in the DB and is edited in the UI — no file to
+copy or hand-edit:
 
-A minimal working binding:
+- **Connections page** — connect **GitHub**, **Linear**, **Claude**, and
+  **Codex**. Provider and agent credentials are stored encrypted in the DB;
+  agent runs consume them through per-run credential dirs. (GitHub may
+  alternatively authenticate via `gh`/`GH_TOKEN` — see the Docker section.)
+- **Config page** — add **bindings** (Linear team key → GitHub repo, issue
+  label, branch prefix, per-lane Linear state names, review booleans,
+  concurrency, `agent`/`reviewer_agent`), edit the **roles matrix**
+  (agent/model/effort per role, with per-binding overrides), and tune
+  **runtime knobs** (poll/reconcile intervals, caps, timeouts).
 
-```yaml
-poll_interval_secs: 60
-global_max_concurrent: 4
-workspace_root: ~/symphony/workspaces
-log_root: ~/symphony/logs
-db_path: ~/symphony/state.sqlite
-
-repos:
-  - linear_team_key: YOUR_TEAM_KEY     # e.g. ENG
-    github_repo: owner/repo            # where PRs are opened
-    agent: claude                      # builder: implement + local-review fixes
-    # reviewer_agent: codex            # local reviewer; default is opposite agent
-    local_review: false                # in-workspace pre-PR reviewer loop
-    remote_review: true                # @codex GitHub-bot PR review
-    issue_label: symphony              # only issues with this label are picked up
-    branch_prefix: symphony
-    max_concurrent: 2
-    runner: local
-    linear_states:
-      ready: Todo                      # SOURCE state — no default, you MUST set it
-      in_progress: In Progress
-      local_code_review: Local Code Review
-      code_review: In Review
-      needs_approval: Needs Approval
-      blocked: Blocked
-      done: Done
-```
+A fresh install boots with **zero bindings**; you add them in the UI after
+connecting providers. `preflight` (below) verifies each binding's team keys and
+Linear state names.
 
 Notes:
 
-- **State names must match your Linear workflow exactly.** `ready` has no
-  default — every binding must declare which state issues are picked up from.
-  `preflight` (below) verifies team keys and state names before anything runs.
-- The full, line-commented reference for every field (cost caps, review
-  booleans, multiple bindings, webhook tuning, the optional dependency-wait
-  lane) lives in **[`examples/config.yaml`](examples/config.yaml)**.
-- Using `agent: codex`? Add `codex_model` to the binding (e.g.
-  `codex_model: gpt-5.1-codex`). `preflight` will set up and verify the Codex
-  permissions profile it needs for unattended commits — no manual TOML editing.
+- **State names must match your Linear workflow exactly.** Every binding must
+  declare which state issues are picked up from (`ready`); there is no default.
+- Using `agent: codex` on a binding? Set its `codex_model` (e.g.
+  `gpt-5.1-codex`). `preflight` sets up and verifies the Codex permissions
+  profile needed for unattended commits — no manual TOML editing.
   **Requires Codex CLI 0.136+:** the profile grants workspace + `.git` writes
   via the `:workspace_roots` filesystem token. Older builds used `:project_roots`,
   which current Codex silently ignores — leaving the workspace read-only so the
@@ -154,9 +144,9 @@ hanging the run. Two binding-level knobs keep agents on non-interactive paths:
   only see servers the binding explicitly grants. The default is **none**:
   user-level MCP servers (including OAuth-only ones like Supabase's) are
   invisible. Only grant servers that authenticate headlessly.
-- **`env:`** — extra environment variables injected into the binding's agent
-  processes. Values name keys in `.env`; secrets never live in the YAML, and a
-  key missing at startup fails config load.
+- **`env`** — extra environment variables injected into the binding's agent
+  processes. Values name keys in `.env`; the secret itself is never stored on
+  the binding, and a key missing at startup fails config assembly.
 
 Example — make Supabase schema tasks autonomously completable via the
 `supabase` CLI (`supabase db push`, `supabase gen types typescript`) instead of
@@ -166,12 +156,14 @@ the OAuth-only Supabase MCP server:
    <https://supabase.com/dashboard/account/tokens>.
 2. Put it in symphony's `.env`, e.g. `MASHA2_SUPABASE_ACCESS_TOKEN=sbp_...`
    (plus `MASHA2_SUPABASE_PROJECT_REF=<project-ref>`).
-3. Reference it from the binding:
+3. Reference it from the binding's `env` mapping (Config page → binding →
+   advanced), keying each agent-visible variable to its `.env` name:
 
-```yaml
-    env:
-      SUPABASE_ACCESS_TOKEN: MASHA2_SUPABASE_ACCESS_TOKEN
-      SUPABASE_PROJECT_REF: MASHA2_SUPABASE_PROJECT_REF
+```json
+"env": {
+  "SUPABASE_ACCESS_TOKEN": "MASHA2_SUPABASE_ACCESS_TOKEN",
+  "SUPABASE_PROJECT_REF": "MASHA2_SUPABASE_PROJECT_REF"
+}
 ```
 
 The agent's `supabase` CLI picks up `SUPABASE_ACCESS_TOKEN` and never needs a
@@ -201,19 +193,23 @@ lane, while local review uses the `local_code_review` lane
 ## Run
 
 ```bash
-# 1. Validate config, Linear auth, team keys and state names. Always run first.
-uv run symphony preflight --config config.local.yaml
+# 1. Validate provider auth, team keys and state names for the bindings in the
+#    DB. Always run first (after connecting providers + adding bindings).
+uv run symphony preflight
 
 # 2. Single poll tick — a safe smoke test. Picks up at most a tick's worth of
 #    work, waits for scheduled tasks, then exits.
-uv run symphony --config config.local.yaml --once
+uv run symphony --once
 
 # 3. Run the daemon. It stays resident, polling Linear and driving issues
 #    through to merge. Stop with Ctrl-C.
-uv run symphony --config config.local.yaml
+uv run symphony
 ```
 
-If `preflight` fails, fix `.env` / YAML before starting the daemon.
+Config assembles from `.env` + the DB — there is no config-file argument. The
+daemon serves the UI, so the first run of a fresh install is: start the daemon,
+open the UI, log in, connect providers, add a binding. If `preflight` fails,
+fix `.env` or the binding in the UI before starting the daemon.
 
 ### Run with Docker Compose (daemon + Caddy)
 
@@ -223,60 +219,40 @@ toolchain (`claude`, `codex`, `gh`, `git`, `uv`, `node`); named volumes persist
 all CLI auth and daemon state, so nothing sensitive is baked into the image.
 
 ```bash
-cp .env.example .env                        # fill in secrets
-cp examples/config.docker.yaml config.local.yaml
-$EDITOR config.local.yaml                   # set team keys / repos
-
-# One-time: log the CLIs into their (persisted) named volumes. All three use
-# headless flows (device code / paste-back code), so nothing needs a reachable
-# localhost port — these work unchanged in the container and on a remote VPS
-# where the browser is on a different machine.
-docker compose run --rm --entrypoint claude symphony auth login          # opens a URL, paste the code back
-docker compose run --rm --entrypoint codex symphony login --device-auth  # prints a URL + one-time code
-docker compose run --rm --entrypoint gh symphony auth login --git-protocol https --web  # github.com/login/device
-
+cp .env.example .env                        # fill in secrets (Auth0 triple + optional webhook secrets)
 docker compose up -d
 ```
 
-> `codex login` **must** use `--device-auth`. The default flow starts an OAuth
-> callback server on `localhost:1455`; inside the container (which owns no
-> published port — Caddy only exposes 443/80) the browser redirect can't reach
-> it, so login silently fails. `--device-auth` needs no inbound port.
->
-> If your OpenAI org **disables device-code auth** (the one-time code is
-> rejected by admin policy), use `./scripts/codex-login-docker.sh` instead: it
-> runs the default browser flow in a one-off container with a port bridge
-> (codex binds its callback to the container's loopback, which plain
-> `-p 1455:1455` can't reach — the script forwards published traffic to it).
-> On a remote VPS, run the same script through an SSH tunnel — the browser's
-> `localhost:1455` redirect then lands on the VPS:
+Then open `https://localhost/ui/` (Caddy's internal cert — accept the warning
+or trust the CA once), log in via Auth0, and on the **Connections** page
+connect GitHub, Linear, Claude, and Codex. Add your bindings on the **Config**
+page. Provider and agent credentials live encrypted in the DB (a named volume)
+— nothing is baked into the image and no CLI login step is needed.
+
+> **GitHub via `gh` (optional).** Instead of connecting GitHub in the UI you
+> can authenticate the `gh` CLI into its persisted volume — the env/volume
+> fallback for GitHub still works:
 >
 > ```bash
-> ssh -L 1455:localhost:1455 <vps>   # then, on the VPS:
-> ./scripts/codex-login-docker.sh
+> docker compose run --rm --entrypoint gh symphony auth login --git-protocol https --web
 > ```
->
-> Alternatives for headless setups: an API key
-> (`codex login --with-api-key`) or copying a working `~/.codex/auth.json`
-> into the `codex_auth` volume.
 
-The UI is then at `https://localhost/ui/` (Caddy's internal cert — accept the
-warning or trust the CA once), and the `/linear/webhook` + `/github/webhook`
-receivers are reachable through the same origin. The daemon's http surface
-stays bound to `127.0.0.1` inside the shared network namespace; only Caddy is
-published. This is the foundation for the VPS move — the same stack runs there
-with a public hostname swapped into the `Caddyfile`.
+The `/linear/webhook` + `/github/webhook` receivers are reachable through the
+same origin. The daemon's http surface stays bound to `127.0.0.1` inside the
+shared network namespace; only Caddy is published. This is the foundation for
+the VPS move — the same stack runs there with a public hostname swapped into
+the `Caddyfile`.
 
 ### Deploy on Coolify
 
 Use `docker-compose.coolify.yml` (compose-file path in the resource settings).
 It keeps the same caddy⇄daemon topology but drops host port publishing —
 Coolify's proxy terminates TLS on the public domain and forwards to caddy:80.
-The file's header comment is the deployment guide: file mounts for `.env` +
-`config.local.yaml` (they're gitignored, so they're absent from the clone —
-and secrets must NOT go through Coolify's env-vars UI), the
-"Connect To Predefined Network" toggle, and the one-time CLI logins over ssh.
-After the first deploy, point the Linear/GitHub webhooks and the Auth0
+The file's header comment is the deployment guide: the file mount for `.env`
+(gitignored, so absent from the clone — and secrets must NOT go through
+Coolify's env-vars UI) and the "Connect To Predefined Network" toggle. After
+the first deploy, log in and connect the four providers on the UI Connections
+page, then point the Linear/GitHub webhooks and the Auth0
 callback/logout/origin URLs at the new domain.
 
 ---
