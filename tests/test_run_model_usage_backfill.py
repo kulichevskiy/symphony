@@ -12,16 +12,6 @@ from symphony import db
 from symphony.cli import main
 from symphony.db.token_backfill import CodexModels, run_model_usage_backfill
 
-_BINDING_STATES = """
-    linear_states:
-      ready: Todo
-      in_progress: In Progress
-      code_review: In Review
-      needs_approval: Needs Approval
-      blocked: Blocked
-      done: Done
-"""
-
 
 async def _seed_run(
     db_path: Path,
@@ -559,25 +549,32 @@ def test_cli_backfill_model_usage_config_resolves_fix_and_accept_models(
             },
         )
 
-    config_path = tmp_path / "cfg.yaml"
-    config_path.write_text(
-        f"""
-roles:
-  implement:
-    agent: codex
-    model: gpt-5.1-codex-max
-  fix:
-    agent: codex
-    model: gpt-5.5
-  accept:
-    agent: codex
-    model: gpt-5.5
-repos:
-  - linear_team_key: ENG
-    github_repo: org/repo
-{_BINDING_STATES}
-"""
-    )
+    async def _seed_db_config() -> None:
+        conn = await db.connect(db_path)
+        try:
+            await db.config_bindings.insert(
+                conn,
+                payload={
+                    "linear_team_key": "ENG",
+                    "github_repo": "org/repo",
+                    "linear_states": {"ready": "Todo", "code_review": "In Review"},
+                },
+                key=("ENG", "org/repo", "", "linear", "default"),
+                priority=0,
+            )
+            await db.config_globals.set_globals(
+                conn,
+                roles={
+                    "implement": {"agent": "codex", "model": "gpt-5.1-codex-max"},
+                    "fix": {"agent": "codex", "model": "gpt-5.5"},
+                    "accept": {"agent": "codex", "model": "gpt-5.5"},
+                },
+                migrated_at="t",
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(_seed_db_config())
 
     result = CliRunner().invoke(
         main,
@@ -588,8 +585,6 @@ repos:
             str(db_path),
             "--log-root",
             str(log_root),
-            "--config",
-            str(config_path),
         ],
     )
     assert result.exit_code == 0, result.output

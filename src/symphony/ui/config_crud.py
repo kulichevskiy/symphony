@@ -402,8 +402,7 @@ def _validate_binding(payload: dict[str, Any], *, jira_base_url: str) -> RepoBin
     # so a Jira binding relying on that global (no per-binding `base_url`)
     # would key on the "default" placeholder instead of the site it actually
     # resolves to at runtime — re-derive it here so the persisted natural key
-    # matches `assemble_effective_config`'s resolution byte-for-byte (same fix
-    # as `config_import.py`).
+    # matches `assemble_effective_config`'s resolution byte-for-byte.
     binding.apply_tracker_secret_defaults(jira_base_url=jira_base_url)
     source = _env_key_source()
     unknown = sorted(name for name in binding.env.values() if name not in source)
@@ -967,11 +966,13 @@ def create_config_crud_router(
 
     @router.get("/export")
     async def export_bindings(mode: str = Query("restore")) -> Response:
-        """YAML backup of every binding + the global roles matrix (SYM-195).
-        ``restore`` (default) round-trips through the import script in replace
-        mode; ``downgrade`` is a paste-back section for a pre-DB build (disabled
-        bindings commented out). Webhook secret *values* never appear — a repo
-        with a secret gets an explicit placeholder to re-enter by hand."""
+        """YAML backup snapshot of every binding + the global roles matrix
+        (SYM-195). Read-only: since Config v2 9/9 there is no importer, so an
+        operator restores by recreating the bindings on the Config page in the
+        UI. ``restore`` (default) is the full document; ``downgrade`` is a
+        paste-back section for a pre-DB build (disabled bindings commented out).
+        Webhook secret *values* never appear — a repo with a secret gets an
+        explicit placeholder to re-enter by hand."""
         if mode not in get_args(ExportMode):
             raise _validation_error(
                 ["mode"], f"mode must be one of {', '.join(get_args(ExportMode))}"

@@ -1,9 +1,11 @@
 """CLI entrypoint.
 
+Config assembles from env vars + the DB — no config file (Config v2 9/9).
+
 ```
-uv run python -m symphony --config examples/config.yaml
-uv run symphony preflight                    # validate auth + states
-uv run symphony --config ... --once          # one poll cycle then exit (smoke test)
+uv run python -m symphony                     # run the daemon
+uv run symphony preflight                     # validate auth + states
+uv run symphony --once                        # one poll cycle then exit (smoke test)
 ```
 """
 
@@ -261,14 +263,14 @@ def _config_has_linear_bindings(cfg: Config) -> bool:
     return any(binding.provider == "linear" for binding in cfg.repos)
 
 
-def _resolve_key_into(cfg: Config, config_path: Path) -> Config:
+def _resolve_key_into(cfg: Config) -> Config:
     """The effective encryption key resolved onto cfg (Config v2 2/9): explicit
     env/.env key wins, else the auto-provisioned file next to the DB. Shared by
     every CLI entry point that builds ciphers off cfg (daemon, preflight)."""
     return cfg.model_copy(
         update={
             "symphony_encryption_key": resolve_encryption_key(
-                cfg.symphony_encryption_key, Config.peek_db_path(config_path).parent
+                cfg.symphony_encryption_key, Config.db_path_from_env().parent
             )
         }
     )
@@ -327,30 +329,6 @@ async def _resolve_db_linear_api_key(conn: aiosqlite.Connection, cfg: Config) ->
     return await resolver.resolve_linear_auth_header()
 
 
-async def _db_owns_topology(conn: aiosqlite.Connection, *, yaml_has_repos_topology: bool) -> bool:
-    """Whether the DB is the topology source of truth: bindings exist now, the
-    importer has migrated it before (`config_globals.migrated_at` set), or
-    there is no YAML `repos:` topology to fall back to (a true fresh install).
-
-    The marker matters on its own because a migrated DB can have zero
-    *current* bindings — e.g. every binding was deleted via the UI — and
-    leftover YAML `repos:` must stay ignored (not resolved/validated) in that
-    case too, same as when bindings are still present. A true fresh install
-    (no bindings, never migrated, and no YAML `repos:` either) must also
-    count as DB-owned — otherwise `_run`'s tick-boundary reload (SYM-189)
-    stays disabled forever and a binding added via the UI/importer after boot
-    is never picked up without a restart. Only a not-yet-migrated legacy YAML
-    deployment (bindings absent, `repos:` still present in the YAML) stays
-    YAML-owned until the importer runs.
-    """
-    if await db.config_bindings.count(conn) > 0:
-        return True
-    globals_row = await db.config_globals.get(conn)
-    if globals_row and globals_row.migrated_at:
-        return True
-    return not yaml_has_repos_topology
-
-
 @asynccontextmanager
 async def _configured_tracker_registry(
     cfg: Config,
@@ -394,23 +372,13 @@ def _external_linear_tracker(trackers: TrackerRegistry) -> Linear | None:
 
 
 @click.group(invoke_without_command=True)
-@click.option(
-    "--config",
-    "config_path",
-    type=click.Path(path_type=Path, exists=True),
-    default=None,
-    help="Path to config YAML.",
-)
 @click.option("--once", is_flag=True, help="Run one poll tick and exit.")
 @click.pass_context
-def main(ctx: click.Context, config_path: Path | None, once: bool) -> None:
+def main(ctx: click.Context, once: bool) -> None:
     """symphony — headless Symphony port."""
     _setup_logging()
     if ctx.invoked_subcommand is None:
-        if config_path is None:
-            click.echo("--config is required when no subcommand is given", err=True)
-            sys.exit(2)
-        asyncio.run(_run(config_path, once=once))
+        asyncio.run(_run(once=once))
 
 
 def _enforce_require_auth0(cfg: Config) -> None:
@@ -435,20 +403,16 @@ def _enforce_require_auth0(cfg: Config) -> None:
         sys.exit(2)
 
 
-async def _run(config_path: Path, *, once: bool) -> None:
-    conn = await db.connect(Config.peek_db_path(config_path))
+async def _run(*, once: bool) -> None:
+    conn = await db.connect(Config.db_path_from_env())
     try:
-        # A migrated deployment's leftover YAML `repos:` is ignored — don't
-        # pay for (or risk boot-crashing on) validating/resolving it.
-        yaml_has_repos_topology = Config.peek_repos_topology(config_path)
-        db_owns_topology = await _db_owns_topology(
-            conn, yaml_has_repos_topology=yaml_has_repos_topology
-        )
-        base = Config.load(config_path, resolve_repos=not db_owns_topology)
+        # Config v2 9/9: YAML is gone, so the DB always owns the bindings
+        # topology (a fresh install boots with zero bindings; the operator
+        # adds them in the UI). The tick-boundary reload (SYM-189) is always on.
+        db_owns_topology = True
+        base = Config.from_env()
         try:
-            cfg = await assemble_effective_config(
-                conn, base, yaml_has_repos_topology=yaml_has_repos_topology
-            )
+            cfg = await assemble_effective_config(conn, base)
         except ConfigBootError as e:
             click.echo(str(e), err=True)
             sys.exit(2)
@@ -456,7 +420,7 @@ async def _run(config_path: Path, *, once: bool) -> None:
         # else auto-provisioned from/into the data volume next to the DB. The
         # resolved key rides on cfg so every downstream cipher (orchestrator,
         # UI routers via ui_external_config, the auth gates below) agrees.
-        cfg = _resolve_key_into(cfg, config_path)
+        cfg = _resolve_key_into(cfg)
         # Fail the boot loudly when stored credentials no longer decrypt (key
         # lost/rotated) — never silent OAuth 503s at runtime.
         try:
@@ -501,9 +465,9 @@ async def _run(config_path: Path, *, once: bool) -> None:
             # cleared through the UI reaches the verifier without a restart
             # (SYM-194). Loaded before the orchestrator so it can also be
             # refreshed on every binding reload tick — otherwise a secret row
-            # written by `config-import` directly into the DB (not through the
-            # CRUD hot-swap path) would need a restart to verify against on an
-            # already-running DB-owned daemon (SYM-194 review fix).
+            # written directly into the DB (not through the CRUD hot-swap path)
+            # would need a restart to verify against on an already-running
+            # daemon (SYM-194 review fix).
             repo_secret_view = await db.config_repo_secrets.load_view(conn)
             orch = Orchestrator(
                 cfg,
@@ -614,91 +578,11 @@ async def _run(config_path: Path, *, once: bool) -> None:
         await conn.close()
 
 
-@main.command("config-import")
-@click.option(
-    "--config",
-    "config_path",
-    type=click.Path(path_type=Path, exists=True, dir_okay=False),
-    required=True,
-    help="YAML topology to import (repos + roles).",
-)
-@click.option(
-    "--replace",
-    is_flag=True,
-    help="Overwrite existing bindings (restore path). Without it, a second import is refused.",
-)
-@click.option(
-    "--issue-bindings",
-    "issue_bindings_path",
-    type=click.Path(path_type=Path, exists=True, dir_okay=False),
-    default=None,
-    help=(
-        "JSON file mapping issue identifier → binding natural key "
-        "([project_key, github_repo, issue_label, provider, site]) to attribute "
-        "in-flight work the importer can't disambiguate automatically."
-    ),
-)
-def config_import_cmd(config_path: Path, replace: bool, issue_bindings_path: Path | None) -> None:
-    """One-off: import YAML repo bindings + roles matrix into the config DB."""
-    import json
-
-    _setup_logging()
-    issue_bindings = None
-    if issue_bindings_path is not None:
-        try:
-            issue_bindings = json.loads(issue_bindings_path.read_text())
-        except json.JSONDecodeError as e:
-            click.echo(f"invalid --issue-bindings JSON: {e}", err=True)
-            sys.exit(2)
-        if not isinstance(issue_bindings, dict):
-            click.echo(
-                "--issue-bindings must be a JSON object mapping identifier -> binding key", err=True
-            )
-            sys.exit(2)
-    asyncio.run(_config_import(config_path, replace=replace, issue_bindings=issue_bindings))
-
-
-async def _config_import(
-    config_path: Path, *, replace: bool, issue_bindings: dict[str, Any] | None = None
-) -> None:
-    from datetime import UTC, datetime
-
-    from .config_import import ConfigImportError, import_config
-
-    # The importer re-validates the YAML itself (`Config.model_validate`,
-    # no secrets); don't require a fully-resolvable `.env` just to import.
-    db_path = Config.peek_db_path(config_path)
-    conn = await db.connect(db_path)
-    try:
-        now = datetime.now(UTC).isoformat()
-        result = await import_config(
-            config_path, conn, replace=replace, now=now, issue_bindings=issue_bindings
-        )
-    except ConfigImportError as e:
-        click.echo(str(e), err=True)
-        sys.exit(2)
-    finally:
-        await conn.close()
-    verb = "replaced" if result.replaced else "imported"
-    click.echo(f"{verb} {result.bindings} binding(s) into {db_path}")
-    if result.runs_backfilled or result.prs_backfilled:
-        click.echo(
-            f"backfilled binding keys onto {result.runs_backfilled} run(s) "
-            f"and {result.prs_backfilled} open PR(s)"
-        )
-
-
 @main.command()
-@click.option(
-    "--config",
-    "config_path",
-    type=click.Path(path_type=Path, exists=True),
-    required=True,
-)
-def preflight(config_path: Path) -> None:
+def preflight() -> None:
     """Validate issue tracker auth and confirm configured states exist."""
     _setup_logging()
-    asyncio.run(_preflight(config_path))
+    asyncio.run(_preflight())
 
 
 async def _preflight_configured_bindings(cfg: Config, trackers: TrackerRegistry) -> bool:
@@ -766,12 +650,12 @@ async def _preflight_validate_capabilities(cfg: Config) -> bool:
 
     claude pairs are checked against the Models API `capabilities.effort`
     tree; codex pairs against the fixed family enum. This is the *online*
-    check — preflight only. Daemon boot stays structural (`Config.load`'s
+    check — preflight only. Daemon boot stays structural (the roles matrix's
     family-enum check) and never queries the network.
     """
     # Each binding runs claude with the key the runner injects: its own `env:`
-    # ANTHROPIC_API_KEY (resolved from `.env` by Config.load) takes precedence
-    # over the process env, matching `{**os.environ, **spec.env}` in the runner.
+    # ANTHROPIC_API_KEY (resolved from `.env` when assembling DB bindings) takes
+    # precedence over the process env, matching `{**os.environ, **spec.env}`.
     env_key = os.environ.get("ANTHROPIC_API_KEY", "")
     codex_pairs: set[tuple[str, str]] = set()
     # (key, model, effort, resolved_model); key "" means no API key is available
@@ -822,7 +706,7 @@ async def _preflight_validate_capabilities(cfg: Config) -> bool:
                 # No key for this binding — claude runs via CLI auth, so skip the
                 # online effort check with a warning rather than hard-failing an
                 # otherwise-valid deployment (the pair is still validated
-                # structurally at Config.load). Warn once per model.
+                # structurally by the roles matrix). Warn once per model.
                 warned_models.add(model)
                 click.echo(
                     f"  ⚠ skipping claude model {model!r} effort validation: "
@@ -850,25 +734,16 @@ def _report_effort_support(agent: str, model: str, effort: str, supported: list[
     return False
 
 
-async def _preflight(config_path: Path) -> None:
-    conn = await db.connect(Config.peek_db_path(config_path))
+async def _preflight() -> None:
+    conn = await db.connect(Config.db_path_from_env())
     try:
         try:
-            yaml_has_repos_topology = Config.peek_repos_topology(config_path)
-            db_owns_topology = await _db_owns_topology(
-                conn, yaml_has_repos_topology=yaml_has_repos_topology
-            )
-            base = Config.load(config_path, resolve_repos=not db_owns_topology)
-            cfg = await assemble_effective_config(
-                conn,
-                base,
-                boot_gates=False,
-                yaml_has_repos_topology=yaml_has_repos_topology,
-            )
+            base = Config.from_env()
+            cfg = await assemble_effective_config(conn, base, boot_gates=False)
             # Same key resolution as the daemon boot — a DB-only deployment
             # (auto-provisioned key, no env var) must preflight with the same
             # cipher the daemon will run with (Config v2 2/9 review fix).
-            cfg = _resolve_key_into(cfg, config_path)
+            cfg = _resolve_key_into(cfg)
             has_usable_linear_auth = await _config_has_usable_linear_auth(conn, cfg)
         except ConfigBootError as e:
             click.echo(str(e), err=True)
@@ -1177,22 +1052,12 @@ def runs_backfill_tokens(db_path: Path, log_root: Path) -> None:
     required=True,
     help="Directory containing historical stdout logs.",
 )
-@click.option(
-    "--config",
-    "config_path",
-    type=click.Path(path_type=Path, exists=True, dir_okay=False),
-    required=False,
-    help="YAML system-knobs file, used as the legacy topology fallback for "
-    "any team not yet migrated to the config DB. Per-team roles resolve "
-    "from `--db`'s config tables when present there; without either "
-    "source, Codex usage is attributed to `unknown`.",
-)
-def runs_backfill_model_usage(db_path: Path, log_root: Path, config_path: Path | None) -> None:
+def runs_backfill_model_usage(db_path: Path, log_root: Path) -> None:
     """Backfill per-(provider, model) token attribution from historical logs."""
     from .db.token_backfill import run_model_usage_backfill
 
     try:
-        codex_models_by_team = asyncio.run(_backfill_model_usage_codex_models(db_path, config_path))
+        codex_models_by_team = asyncio.run(_backfill_model_usage_codex_models(db_path))
     except ConfigBootError as e:
         raise click.ClickException(str(e)) from e
 
@@ -1208,37 +1073,17 @@ def runs_backfill_model_usage(db_path: Path, log_root: Path, config_path: Path |
     click.echo(f"skipped: {result.skipped}")
 
 
-async def _backfill_model_usage_codex_models(
-    db_path: Path, config_path: Path | None
-) -> dict[str, CodexModels]:
+async def _backfill_model_usage_codex_models(db_path: Path) -> dict[str, CodexModels]:
     """Per-team Codex models for `backfill-model-usage`, from the same DB-backed
-    effective config the daemon dispatches through (SYM-192 review).
-
-    Reading a static `--config` YAML here would miss (or stale-attribute) any
-    team whose roles now live only in the config DB, since a matrix edit made
-    through the UI never touches the YAML file.
+    effective config the daemon dispatches through (SYM-192 review). Per-team
+    roles resolve from `--db`'s config tables; a team absent there attributes
+    Codex usage to `unknown`.
     """
     from .db.token_backfill import CodexModels
 
     conn = await db.connect(db_path)
     try:
-        yaml_has_repos_topology = (
-            Config.peek_repos_topology(config_path) if config_path is not None else False
-        )
-        db_owns_topology = await _db_owns_topology(
-            conn, yaml_has_repos_topology=yaml_has_repos_topology
-        )
-        base = (
-            Config.load(config_path, resolve_repos=not db_owns_topology)
-            if config_path is not None
-            else Config()
-        )
-        cfg = await assemble_effective_config(
-            conn,
-            base,
-            boot_gates=False,
-            yaml_has_repos_topology=yaml_has_repos_topology,
-        )
+        cfg = await assemble_effective_config(conn, Config(), boot_gates=False)
     finally:
         await conn.close()
 
@@ -1438,42 +1283,27 @@ _DRY_RUN_RUNNER_FACTORY: Callable[[], Runner] = _default_dry_run_runner
 
 @main.command()
 @click.argument("linear_id")
-@click.option(
-    "--config",
-    "config_path",
-    type=click.Path(path_type=Path, exists=True, dir_okay=False),
-    required=True,
-)
-def dispatch(linear_id: str, config_path: Path) -> None:
+def dispatch(linear_id: str) -> None:
     """Hand-launch a run for a Linear issue, regardless of its state."""
     _setup_logging()
-    asyncio.run(_dispatch(linear_id, config_path))
+    asyncio.run(_dispatch(linear_id))
 
 
-async def _dispatch(linear_id: str, config_path: Path) -> None:
-    conn = await db.connect(Config.peek_db_path(config_path))
+async def _dispatch(linear_id: str) -> None:
+    conn = await db.connect(Config.db_path_from_env())
     try:
-        yaml_has_repos_topology = Config.peek_repos_topology(config_path)
-        db_owns_topology = await _db_owns_topology(
-            conn, yaml_has_repos_topology=yaml_has_repos_topology
-        )
-        base = Config.load(config_path, resolve_repos=not db_owns_topology)
+        base = Config.from_env()
         if not base.linear_api_key:
             click.echo("LINEAR_API_KEY is empty", err=True)
             sys.exit(2)
         try:
-            cfg = await assemble_effective_config(
-                conn,
-                base,
-                boot_gates=False,
-                yaml_has_repos_topology=yaml_has_repos_topology,
-            )
+            cfg = await assemble_effective_config(conn, base, boot_gates=False)
         except ConfigBootError as e:
             click.echo(str(e), err=True)
             sys.exit(2)
         # Same effective key as the daemon boot: the Orchestrator this command
         # constructs builds its cipher off cfg (Config v2 2/9 review fix).
-        cfg = _resolve_key_into(cfg, config_path)
+        cfg = _resolve_key_into(cfg)
         async with Linear(cfg.linear_api_key) as linear:
             try:
                 issue = await linear.lookup_issue(linear_id)

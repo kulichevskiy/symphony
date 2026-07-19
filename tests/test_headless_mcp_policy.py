@@ -5,8 +5,8 @@ Three guarantees:
    `SYMPHONY_BLOCKED` escape hatch.
 2. Claude spawns use a strict MCP allowlist derived from the binding —
    unlisted servers are invisible; the default allowlist is empty.
-3. Per-binding `env:` is resolved from symphony's `.env` (secrets never in
-   YAML) and injected into the agent process env.
+3. Per-binding `env:` is resolved from symphony's `.env` (secrets never stored
+   on the binding) and injected into the agent process env.
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ from symphony.agent.prompt import (
 )
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding, ResolvedRole
+from symphony.effective_config import _resolve_bindings
 from symphony.linear.client import LinearIssue
 from symphony.orchestrator.poll import Orchestrator, build_runner_command
 from symphony.pipeline.local_review import VERDICT_CHANGES_REQUESTED_MARKER
@@ -217,54 +218,48 @@ def test_resolve_env_missing_key_fails_loudly() -> None:
         binding.resolve_env({})
 
 
-def _write_config_yaml(path: Path) -> None:
-    path.write_text(
-        """
-repos:
-  - linear_team_key: ENG
-    github_repo: org/repo
-    env:
-      SUPABASE_ACCESS_TOKEN: MASHA2_SUPABASE_TOKEN
-    linear_states:
-      ready: Todo
-""",
-        encoding="utf-8",
+def _config_with_env_binding(tmp_path: Path) -> Config:
+    """A `from_env`-shaped Config carrying one binding whose `env:` maps a
+    process/`.env` key name — the shape `assemble_effective_config` feeds to
+    `_resolve_bindings` for DB bindings."""
+    return Config(
+        repos=[_binding(env={"SUPABASE_ACCESS_TOKEN": "MASHA2_SUPABASE_TOKEN"})],
+        workspace_root=tmp_path / "ws",
+        log_root=tmp_path / "logs",
+        db_path=tmp_path / "state.sqlite",
     )
 
 
-def test_config_load_resolves_binding_env_from_dotenv(
+def test_resolve_bindings_resolves_binding_env_from_dotenv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MASHA2_SUPABASE_TOKEN", raising=False)
     (tmp_path / ".env").write_text("MASHA2_SUPABASE_TOKEN=sbp-from-dotenv\n")
-    config_path = tmp_path / "config.yaml"
-    _write_config_yaml(config_path)
-    cfg = Config.load(config_path)
+    cfg = _config_with_env_binding(tmp_path)
+    _resolve_bindings(cfg)
     assert cfg.repos[0].env == {"SUPABASE_ACCESS_TOKEN": "sbp-from-dotenv"}
 
 
-def test_config_load_prefers_process_env_over_dotenv(
+def test_resolve_bindings_prefers_process_env_over_dotenv(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text("MASHA2_SUPABASE_TOKEN=sbp-from-dotenv\n")
     monkeypatch.setenv("MASHA2_SUPABASE_TOKEN", "sbp-from-process")
-    config_path = tmp_path / "config.yaml"
-    _write_config_yaml(config_path)
-    cfg = Config.load(config_path)
+    cfg = _config_with_env_binding(tmp_path)
+    _resolve_bindings(cfg)
     assert cfg.repos[0].env == {"SUPABASE_ACCESS_TOKEN": "sbp-from-process"}
 
 
-def test_config_load_fails_on_unresolvable_env_key(
+def test_resolve_bindings_fails_on_unresolvable_env_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MASHA2_SUPABASE_TOKEN", raising=False)
-    config_path = tmp_path / "config.yaml"
-    _write_config_yaml(config_path)
+    cfg = _config_with_env_binding(tmp_path)
     with pytest.raises(ValueError, match="MASHA2_SUPABASE_TOKEN"):
-        Config.load(config_path)
+        _resolve_bindings(cfg)
 
 
 # --- Spawn integration: env + MCP config reach the RunnerSpec ---------------

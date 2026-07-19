@@ -7,17 +7,16 @@
 #     127.0.0.1:443, which would EADDRINUSE against Traefik's 0.0.0.0:443.)
 #   * Caddy uses Caddyfile.coolify (`:80`, `auto_https off`) instead of the
 #     local `localhost { tls internal }` site.
-#   * `.env` and `config.local.yaml` mount from /opt/symphony/ — absolute
-#     host paths the operator provisions ONCE (see the volumes comment in
-#     the symphony service). They are deliberately NOT Coolify-managed file
-#     mounts: Coolify resets managed mounts to their compose placeholders on
-#     every re-parse, which clobbers operator-supplied content. Do NOT move
-#     secrets into Coolify's env-vars UI either: env vars land in the
-#     container's os.environ and leak into agent subprocesses past the
-#     per-binding `env:` allowlist; host files keep secrets out of the
-#     process env. (The Caddyfile still uses Coolify's `content:` extension,
-#     so this file passes only Coolify's pre-processor, not a plain
-#     `docker compose config`.)
+#   * `.env` mounts from /opt/symphony/ — an absolute host path the operator
+#     provisions ONCE (see the volumes comment in the symphony service). It is
+#     deliberately NOT a Coolify-managed file mount: Coolify resets managed
+#     mounts to their compose placeholders on every re-parse, which clobbers
+#     operator-supplied content. Do NOT move secrets into Coolify's env-vars UI
+#     either: env vars land in the container's os.environ and leak into agent
+#     subprocesses past the per-binding `env:` allowlist; host files keep
+#     secrets out of the process env. (The Caddyfile still uses Coolify's
+#     `content:` extension, so this file passes only Coolify's pre-processor,
+#     not a plain `docker compose config`.)
 #   * SYMPHONY_REQUIRE_AUTH0=1 makes the daemon fail closed at boot if the
 #     AUTH0_* triple is missing from .env — this variant is publicly routed,
 #     and without the gate /api/* (including the mutating
@@ -33,17 +32,15 @@
 # the network namespace, symphony joins it, and the daemon's 127.0.0.1:8787
 # surface (a security invariant) is reachable only by caddy over loopback.
 #
-# One-time CLI logins after the first deploy (over ssh to the server; the
-# named volumes persist across redeploys) — find the real volume/image names
-# with `docker volume ls` / `docker ps` (Coolify prefixes them):
-#   claude: docker run --rm -it -v <claude_auth-vol>:/home/symphony/.claude \
-#             --entrypoint claude <image> auth login        # paste-back code
-#   gh:     docker run --rm -it -v <gh_auth-vol>:/home/symphony/.config/gh \
-#             --entrypoint gh <image> auth login --git-protocol https --web
-#   codex:  ssh -L 1455:localhost:1455 <server>, then on the server:
-#             CODEX_AUTH_VOLUME=<codex_auth-vol> SYMPHONY_IMAGE=<image> \
-#               ./scripts/codex-login-docker.sh
-#           (default `codex login --device-auth` if your org allows it)
+# After the first deploy: open the public URL, log in via Auth0, and connect
+# GitHub / Linear / Claude / Codex on the UI Connections page — provider +
+# agent credentials live in the config DB (Config v2), not in mounted volumes.
+#
+# GitHub can alternatively use the gh CLI volume (env/volume fallback for
+# GitHub only). Find the real volume/image names with `docker volume ls` /
+# `docker ps` (Coolify prefixes them):
+#   gh: docker run --rm -it -v <gh_auth-vol>:/home/symphony/.config/gh \
+#         --entrypoint gh <image> auth login --git-protocol https --web
 
 services:
   symphony:
@@ -69,27 +66,30 @@ services:
       # Fail closed at boot when AUTH0_* is not configured — this stack is
       # publicly routed (see header). Non-secret flag; safe in os.environ.
       SYMPHONY_REQUIRE_AUTH0: "1"
+      # Data-volume paths. SYMPHONY_*-prefixed so LocalRunner strips them from
+      # agent subprocess env (deploy posture must not leak into agent runs).
+      SYMPHONY_DB_PATH: /data/db/state.sqlite
+      SYMPHONY_LOG_ROOT: /data/logs
+      SYMPHONY_WORKSPACE_ROOT: /data/workspaces
     volumes:
-      # Operator config + secrets: ABSOLUTE host paths, deliberately outside
-      # Coolify's managed application dir. Coolify re-parses the compose on
-      # every deploy/restart and resets its managed file mounts (relative or
-      # `content:` ones) back to the compose placeholders — verified live:
-      # a real .env uploaded into the storage record was clobbered to the
-      # placeholder on the next restart. Secrets can't live as compose
-      # `content:` (they'd be committed), so these two files are provisioned
-      # once by the operator on the host and Coolify never touches them:
+      # Secrets: an ABSOLUTE host path, deliberately outside Coolify's managed
+      # application dir. Coolify re-parses the compose on every deploy/restart
+      # and resets its managed file mounts (relative or `content:` ones) back
+      # to the compose placeholders — verified live: a real .env uploaded into
+      # the storage record was clobbered to the placeholder on the next
+      # restart. Secrets can't live as compose `content:` (they'd be
+      # committed), so .env is provisioned once by the operator on the host and
+      # Coolify never touches it:
       #   sudo install -d -m 755 /opt/symphony
-      #   sudo install -m 444 -o 1000 -g 1000 <config> /opt/symphony/config.local.yaml
-      #   sudo install -m 400 -o 1000 -g 1000 <env>    /opt/symphony/.env
-      # (uid 1000 = the container's `symphony` user; the daemon reads both.)
+      #   sudo install -m 400 -o 1000 -g 1000 <env> /opt/symphony/.env
+      # (uid 1000 = the container's `symphony` user; the daemon reads it.)
       # The Caddyfile below CAN stay `content:`-managed because its real
       # content is static and lives in this file — the placeholder IS the
       # config, so Coolify's reset is a no-op for it.
-      - /opt/symphony/config.local.yaml:/app/config.local.yaml:ro
       - /opt/symphony/.env:/app/.env:ro
-      # CLI auth dirs — persisted, so a one-time login survives redeploys.
-      - claude_auth:/home/symphony/.claude
-      - codex_auth:/home/symphony/.codex
+      # GitHub CLI auth — persisted so a one-time login survives redeploys
+      # (env/volume fallback for GitHub). claude/codex auth is DB-only now
+      # (Config v2): connect them on the UI Connections page.
       - gh_auth:/home/symphony/.config/gh
       # Daemon state: SQLite DB, per-issue workspaces, run logs.
       - symphony_db:/data/db
@@ -138,8 +138,6 @@ networks:
     external: true
 
 volumes:
-  claude_auth:
-  codex_auth:
   gh_auth:
   symphony_db:
   symphony_workspaces:

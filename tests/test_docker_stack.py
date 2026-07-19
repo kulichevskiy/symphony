@@ -7,12 +7,9 @@ loopback — no code change to the loopback guard is needed.
 
 from __future__ import annotations
 
-import warnings
 from pathlib import Path
 
 import yaml
-
-from symphony.config import Config
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -72,19 +69,32 @@ def test_dockerfile_copies_taste_guide_so_acceptance_has_global_guide() -> None:
     assert "COPY taste-guide.md ./" in text
 
 
-def test_dockerfile_auth_dirs_are_precreated_and_owned_by_symphony() -> None:
+def test_dockerfile_precreates_only_gh_and_data_dirs() -> None:
     text = _read("Dockerfile")
 
-    # Empty named volumes mounted over paths absent from the image are
-    # created by Docker as root:root, breaking the non-root user's logins.
-    auth_dirs = (
-        "/home/symphony/.claude",
-        "/home/symphony/.codex",
+    # An empty named volume mounted over a path absent from the image is
+    # created by Docker as root:root, breaking the non-root user. Only the gh
+    # auth dir and the data-volume mount points are pre-created (symphony-owned).
+    for created in (
         "/home/symphony/.config/gh",
-    )
-    for auth_dir in auth_dirs:
-        assert auth_dir in text
+        "/data/workspaces",
+        "/data/logs",
+        "/data/db",
+    ):
+        assert created in text
     assert "chown -R symphony:symphony" in text
+    # claude/codex auth is DB-only now (Config v2) — no auth volumes/dirs.
+    assert "/home/symphony/.claude" not in text
+    assert "/home/symphony/.codex" not in text
+
+
+def test_dockerfile_runs_daemon_with_no_config_file_arg() -> None:
+    text = _read("Dockerfile")
+
+    # Config assembles from env + the DB (Config v2 9/9): no `--config` default
+    # arg, and the removed YAML config file is never referenced.
+    assert "CMD []" in text
+    assert "config.local.yaml" not in text
 
 
 def test_dockerfile_sets_home_for_symphony_user() -> None:
@@ -120,19 +130,27 @@ def test_compose_defines_symphony_and_caddy_services() -> None:
 def test_compose_named_volumes_persist_all_state() -> None:
     compose = _compose()
     declared = set(compose.get("volumes", {}))
-
-    # Named volumes for CLI auth dirs, the DB, workspace_root and log_root —
-    # none baked into the image.
     symphony_mounts = "\n".join(compose["services"]["symphony"]["volumes"])
-    assert "/.claude" in symphony_mounts
-    assert "/.codex" in symphony_mounts
-    assert "/.config/gh" in symphony_mounts
 
-    # Each persisted path is backed by a *named* volume, not a host bind.
-    for name in declared:
-        assert isinstance(name, str)
-    # At least six named volumes: three auth dirs + db + workspaces + logs.
-    assert len(declared) >= 6
+    # GitHub CLI auth persists via a named volume (env/volume fallback for
+    # GitHub). claude/codex auth is DB-only now (Config v2) — no auth volumes.
+    assert "gh_auth:" in symphony_mounts
+    assert "/.config/gh" in symphony_mounts
+    assert "/.claude" not in symphony_mounts
+    assert "/.codex" not in symphony_mounts
+
+    # Daemon state (DB, workspaces, logs) + gh auth are each backed by a
+    # *named* volume, not a host bind.
+    for name in ("gh_auth", "symphony_db", "symphony_workspaces", "symphony_logs"):
+        assert name in declared
+
+
+def test_compose_sets_symphony_path_env_vars() -> None:
+    # Paths come from env now (no config file): the daemon reads these three.
+    env = _compose()["services"]["symphony"]["environment"]
+    assert env["SYMPHONY_DB_PATH"] == "/data/db/state.sqlite"
+    assert env["SYMPHONY_LOG_ROOT"] == "/data/logs"
+    assert env["SYMPHONY_WORKSPACE_ROOT"] == "/data/workspaces"
 
 
 def test_compose_mounts_env_as_file_not_env_file() -> None:
@@ -146,7 +164,8 @@ def test_compose_mounts_env_as_file_not_env_file() -> None:
     assert "env_file" not in symphony
     mounts = "\n".join(symphony["volumes"])
     assert "/app/.env" in mounts
-    assert "config.local.yaml" in mounts
+    # No config file mount — YAML config is gone (Config v2 9/9).
+    assert "config.local.yaml" not in mounts
 
 
 def test_compose_caddy_fronts_the_daemon_and_publishes_https() -> None:
@@ -168,18 +187,6 @@ def test_compose_caddy_fronts_the_daemon_and_publishes_https() -> None:
     # unauthenticated UI/API surface is not reachable from other hosts.
     for mapping in published:
         assert mapping.startswith("127.0.0.1:"), mapping
-
-
-# --- examples/config.docker.yaml ------------------------------------------
-
-
-def test_docker_config_template_loads_without_deprecation_warning() -> None:
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        Config.load(ROOT / "examples" / "config.docker.yaml")
-
-    deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
-    assert not deprecations, [str(w.message) for w in deprecations]
 
 
 # --- Caddyfile ------------------------------------------------------------

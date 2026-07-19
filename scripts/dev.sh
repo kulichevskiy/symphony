@@ -13,18 +13,11 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-CONFIG="${SYMPHONY_CONFIG:-config.local.yaml}"
+# Config assembles from env + the DB (Config v2 9/9) — no config file. Paths
+# default to ~/symphony/* locally; override with SYMPHONY_DB_PATH etc.
 
-if [[ ! -f "$CONFIG" ]]; then
-  echo "config not found: $CONFIG (override with SYMPHONY_CONFIG=)" >&2
-  exit 2
-fi
-
-# Port the webhook receiver binds to — pulled from config, overridable.
-# `|| true` so a config that omits webhook_port (relying on the daemon's
-# built-in default) doesn't trip `set -euo pipefail` via grep's non-zero exit.
-WEBHOOK_PORT="${SYMPHONY_WEBHOOK_PORT:-$(grep -E '^[[:space:]]*webhook_port:' "$CONFIG" | head -1 | awk '{print $2}' || true)}"
-WEBHOOK_PORT="${WEBHOOK_PORT:-8787}"
+# Port the webhook receiver binds to — the daemon's default, overridable.
+WEBHOOK_PORT="${SYMPHONY_WEBHOOK_PORT:-8787}"
 
 START_TUNNEL="${SYMPHONY_TUNNEL:-1}"
 
@@ -121,5 +114,5 @@ elif [[ "$START_TUNNEL" != "0" ]]; then
   fi
 fi
 
-echo "› starting symphony (config=$CONFIG)"
-uv run python -m symphony --config "$CONFIG"
+echo "› starting symphony"
+uv run python -m symphony

@@ -55,11 +55,11 @@ RUN uv sync --frozen --no-dev
 COPY --from=frontend /build/frontend/dist ./frontend/dist
 
 # Data dirs (mount points for named volumes) owned by the runtime user.
-# Auth dirs are created here too: an empty named volume mounted over a path
-# that doesn't exist in the image gets created by Docker as root:root, which
-# breaks the non-root `symphony` user's one-time CLI logins.
-RUN mkdir -p /data/workspaces /data/logs /data/db \
-        /home/symphony/.claude /home/symphony/.codex /home/symphony/.config/gh \
+# The gh auth dir is created here too: an empty named volume mounted over a
+# path that doesn't exist in the image gets created by Docker as root:root,
+# which breaks the non-root `symphony` user's one-time gh login. claude/codex
+# auth is DB-only now (Config v2) — no auth volumes, no dirs to pre-create.
+RUN mkdir -p /data/workspaces /data/logs /data/db /home/symphony/.config/gh \
     && chown -R symphony:symphony /app /data /home/symphony
 
 USER symphony
@@ -80,5 +80,8 @@ RUN git config --global user.name "Symphony" \
 RUN git config --global credential."https://github.com".helper "!gh auth git-credential" \
     && git config --global credential."https://gist.github.com".helper "!gh auth git-credential"
 
+# No args: the bare `symphony` group runs the daemon. Config assembles from
+# env vars + the DB (Config v2 9/9) — paths come from SYMPHONY_DB_PATH etc.,
+# set in the compose `environment:` block.
 ENTRYPOINT ["uv", "run", "--frozen", "--no-sync", "--no-dev", "symphony"]
-CMD ["--config", "/app/config.local.yaml"]
+CMD []
