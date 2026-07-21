@@ -18,7 +18,9 @@ Boot behavior:
     older code built it from a monolithic `schema.sql`) is *adopted*: the
     baseline is recorded as applied rather than replayed, and later files apply
     on top. Without this, first boot on such a DB crashed re-running the
-    baseline ("table repos already exists").
+    baseline ("table repos already exists"). Adoption requires *every* baseline
+    table to be present; a legacy DB missing some baseline objects is refused
+    (an operator-facing error) rather than stamped at head with a gap.
 
 Migration files: `NNN_name.sql` (plain SQL, split on complete statements) or
 `NNN_name.py` (data-move escape hatch exposing `async def migrate(conn)`;
@@ -92,13 +94,14 @@ async def apply_migrations(
             ")"
         )
         current = await _current_version(conn)
-        if current == 0 and all_migrations and await _has_pre_versioning_schema(conn):
+        baseline = all_migrations[0] if all_migrations else None
+        if current == 0 and baseline is not None and await _should_adopt_baseline(conn, baseline):
             # A DB created before this runner existed (older code applied a
             # monolithic schema.sql, with no `schema_version` table). Its schema
             # already matches the baseline, so *record* the baseline version
             # instead of replaying its DDL — re-running it would collide
             # ("table repos already exists"). Later files apply normally on top.
-            current = await _adopt_baseline(conn, all_migrations[0])
+            current = await _adopt_baseline(conn, baseline)
         _reject_downgrade(current, head)
         pending = [(v, p) for v, p in all_migrations if v > current]
         if not pending:
@@ -140,16 +143,51 @@ async def _current_version(conn: aiosqlite.Connection) -> int:
     return row[0] if row is not None and row[0] is not None else 0
 
 
-async def _has_pre_versioning_schema(conn: aiosqlite.Connection) -> bool:
-    """Whether the DB already carries application tables despite an empty
-    `schema_version` — i.e. it predates this runner (older code built the schema
-    from a monolithic `schema.sql`). SQLite internal tables and `schema_version`
-    itself don't count; on a genuinely fresh DB this is False."""
+_CREATE_TABLE_RE = re.compile(r"(?im)^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\"'`\[]?(\w+)")
+
+
+async def _application_tables(conn: aiosqlite.Connection) -> set[str]:
+    """Table names the DB carries, excluding SQLite internals and the runner's
+    own `schema_version`."""
     cur = await conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table'"
-        " AND name NOT LIKE 'sqlite_%' AND name != 'schema_version' LIMIT 1"
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+        " AND name NOT LIKE 'sqlite_%' AND name != 'schema_version'"
     )
-    return await cur.fetchone() is not None
+    return {row[0] for row in await cur.fetchall()}
+
+
+def _baseline_table_names(baseline_path: Path) -> set[str]:
+    """Tables the baseline migration creates, read statically from its SQL — the
+    invariant a pre-versioning DB must already satisfy in full to be adopted. A
+    `.py` baseline can't be read this way; return empty (validation skipped)."""
+    if baseline_path.suffix != ".sql":
+        return set()
+    return set(_CREATE_TABLE_RE.findall(baseline_path.read_text(encoding="utf-8")))
+
+
+async def _should_adopt_baseline(conn: aiosqlite.Connection, baseline: tuple[int, Path]) -> bool:
+    """Whether a version-0 DB should be adopted at baseline rather than have the
+    baseline replayed. True only for a *complete* pre-versioning DB — one that
+    predates this runner (older code built it from a monolithic `schema.sql`,
+    leaving no `schema_version`) and carries every baseline table.
+
+    A DB with no application tables is genuinely fresh → False (replay baseline).
+    A DB with some application tables but missing baseline objects is an
+    inconsistent legacy state: adopting it would stamp `schema_version` at head
+    while a table the app queries is absent (a runtime crash later), so refuse
+    to boot with an operator-facing error instead."""
+    present = await _application_tables(conn)
+    if not present:
+        return False
+    missing = _baseline_table_names(baseline[1]) - present
+    if missing:
+        raise RuntimeError(
+            "database carries application tables but has no schema_version and is "
+            f"missing baseline objects {sorted(missing)} — an unexpected "
+            "pre-versioning state this runner won't silently adopt. Restore a "
+            "known-good backup or migrate the DB to the full baseline manually."
+        )
+    return True
 
 
 async def _adopt_baseline(conn: aiosqlite.Connection, baseline: tuple[int, Path]) -> int:

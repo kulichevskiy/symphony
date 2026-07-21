@@ -306,6 +306,28 @@ async def test_adopts_pre_versioning_db(tmp_path: Path) -> None:
         await conn.close()
 
 
+async def test_partial_pre_versioning_db_refuses_to_boot(tmp_path: Path) -> None:
+    """A legacy DB with only *some* baseline tables and no `schema_version` is
+    an inconsistent state — the runner must refuse it, not stamp it at head
+    while a table the app queries is missing (a later runtime crash)."""
+    path = tmp_path / "state.sqlite"
+    pre = await aiosqlite.connect(str(path))
+    try:
+        # One baseline table present; the rest (repos, issues, …) are missing.
+        await pre.execute("CREATE TABLE config_globals (id INTEGER PRIMARY KEY)")
+        await pre.commit()
+    finally:
+        await pre.close()
+
+    conn = await aiosqlite.connect(str(path))
+    conn.row_factory = aiosqlite.Row
+    try:
+        with pytest.raises(RuntimeError, match="missing baseline objects"):
+            await apply_migrations(conn, db_path=path)
+    finally:
+        await conn.close()
+
+
 async def test_db_newer_than_image_refuses_to_boot(tmp_path: Path) -> None:
     """A DB migrated past this build's migration set (deployment rolled back
     to an older image) must refuse to boot, not silently run old code on a
