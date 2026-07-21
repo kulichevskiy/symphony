@@ -13,7 +13,14 @@ Boot behavior:
     one writer, one commit; a crash mid-migration rolls back cleanly;
   * before an *upgrade* (pending work on an already-versioned DB) the DB file
     is copied aside as `<name>.bak-<target>`, so even a migration failure
-    outside the transaction's reach is recoverable by copying one file back.
+    outside the transaction's reach is recoverable by copying one file back;
+  * a DB that predates this runner (schema present, but no `schema_version` —
+    older code built it from a monolithic `schema.sql`) is *adopted*: the
+    baseline is recorded as applied rather than replayed, and later files apply
+    on top. Without this, first boot on such a DB crashed re-running the
+    baseline ("table repos already exists"). Adoption requires *every* baseline
+    object (tables and indexes) to be present; a legacy DB missing any is
+    refused (an operator-facing error) rather than stamped at head with a gap.
 
 Migration files: `NNN_name.sql` (plain SQL, split on complete statements) or
 `NNN_name.py` (data-move escape hatch exposing `async def migrate(conn)`;
@@ -87,6 +94,14 @@ async def apply_migrations(
             ")"
         )
         current = await _current_version(conn)
+        baseline = all_migrations[0] if all_migrations else None
+        if current == 0 and baseline is not None and await _should_adopt_baseline(conn, baseline):
+            # A DB created before this runner existed (older code applied a
+            # monolithic schema.sql, with no `schema_version` table). Its schema
+            # already matches the baseline, so *record* the baseline version
+            # instead of replaying its DDL — re-running it would collide
+            # ("table repos already exists"). Later files apply normally on top.
+            current = await _adopt_baseline(conn, baseline)
         _reject_downgrade(current, head)
         pending = [(v, p) for v, p in all_migrations if v > current]
         if not pending:
@@ -126,6 +141,84 @@ async def _current_version(conn: aiosqlite.Connection) -> int:
     cur = await conn.execute("SELECT MAX(version) FROM schema_version")
     row = await cur.fetchone()
     return row[0] if row is not None and row[0] is not None else 0
+
+
+# Named schema objects a migration creates: CREATE [UNIQUE] TABLE|INDEX|VIEW|
+# TRIGGER [IF NOT EXISTS] <name>. Indexes matter as much as tables — a missing
+# baseline UNIQUE index breaks the ON CONFLICT target it backs.
+_CREATE_OBJECT_RE = re.compile(
+    r"(?im)^\s*CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX|VIEW|TRIGGER)\s+"
+    r"(?:IF\s+NOT\s+EXISTS\s+)?[\"'`\[]?(\w+)"
+)
+
+
+async def _application_tables(conn: aiosqlite.Connection) -> set[str]:
+    """Table names the DB carries, excluding SQLite internals and the runner's
+    own `schema_version`."""
+    cur = await conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table'"
+        " AND name NOT LIKE 'sqlite_%' AND name != 'schema_version'"
+    )
+    return {row[0] for row in await cur.fetchall()}
+
+
+async def _schema_object_names(conn: aiosqlite.Connection) -> set[str]:
+    """Every named object the DB carries (tables, indexes, views, triggers),
+    excluding SQLite internals (`sqlite_autoindex_*` for PK/UNIQUE constraints)
+    and the runner's own `schema_version`."""
+    cur = await conn.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table', 'index', 'view', 'trigger')"
+        " AND name NOT LIKE 'sqlite_%' AND name != 'schema_version'"
+    )
+    return {row[0] for row in await cur.fetchall()}
+
+
+def _baseline_object_names(baseline_path: Path) -> set[str]:
+    """Every object the baseline migration creates (tables *and* indexes), read
+    statically from its SQL — the invariant a pre-versioning DB must satisfy in
+    full to be adopted. A `.py` baseline can't be read this way; return empty
+    (validation skipped)."""
+    if baseline_path.suffix != ".sql":
+        return set()
+    return set(_CREATE_OBJECT_RE.findall(baseline_path.read_text(encoding="utf-8")))
+
+
+async def _should_adopt_baseline(conn: aiosqlite.Connection, baseline: tuple[int, Path]) -> bool:
+    """Whether a version-0 DB should be adopted at baseline rather than have the
+    baseline replayed. True only for a *complete* pre-versioning DB — one that
+    predates this runner (older code built it from a monolithic `schema.sql`,
+    leaving no `schema_version`) and carries every baseline object.
+
+    A DB with no application tables is genuinely fresh → False (replay baseline).
+    A DB with some tables but missing baseline objects (a table *or* an index —
+    e.g. the UNIQUE index an `ON CONFLICT` target needs) is an inconsistent
+    legacy state: adopting it would stamp `schema_version` at head while an
+    object the app relies on is absent (a runtime crash later), so refuse to
+    boot with an operator-facing error instead."""
+    if not await _application_tables(conn):
+        return False
+    missing = _baseline_object_names(baseline[1]) - await _schema_object_names(conn)
+    if missing:
+        raise RuntimeError(
+            "database carries application tables but has no schema_version and is "
+            f"missing baseline objects {sorted(missing)} — an unexpected "
+            "pre-versioning state this runner won't silently adopt. Restore a "
+            "known-good backup or migrate the DB to the full baseline manually."
+        )
+    return True
+
+
+async def _adopt_baseline(conn: aiosqlite.Connection, baseline: tuple[int, Path]) -> int:
+    """Record the baseline migration as already applied without running its DDL,
+    adopting a pre-versioning DB into the runner. Returns the baseline version."""
+    version, path = baseline
+    await conn.execute(
+        "INSERT INTO schema_version (version, name, applied_at)"
+        " VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+        (version, path.stem),
+    )
+    log.info("adopted pre-versioning DB at baseline v%03d (%s)", version, path.stem)
+    return version
 
 
 def _backup_db(src_path: str, dest_path: str) -> None:
