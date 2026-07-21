@@ -328,6 +328,29 @@ async def test_partial_pre_versioning_db_refuses_to_boot(tmp_path: Path) -> None
         await conn.close()
 
 
+async def test_pre_versioning_db_missing_baseline_index_refuses_to_boot(tmp_path: Path) -> None:
+    """A legacy DB with every baseline table but a missing baseline index (e.g.
+    the UNIQUE index an ON CONFLICT target needs) must be refused too — adopting
+    it would skip the index and the app would fail on the first upsert."""
+    path = tmp_path / "state.sqlite"
+    baseline_file = next(f for f in MIGRATIONS_DIR.iterdir() if f.stem == _REAL[0][1])
+    pre = await aiosqlite.connect(str(path))
+    try:
+        await pre.executescript(baseline_file.read_text(encoding="utf-8"))
+        await pre.execute("DROP INDEX idx_issues_tracker_identity")
+        await pre.commit()
+    finally:
+        await pre.close()
+
+    conn = await aiosqlite.connect(str(path))
+    conn.row_factory = aiosqlite.Row
+    try:
+        with pytest.raises(RuntimeError, match="idx_issues_tracker_identity"):
+            await apply_migrations(conn, db_path=path)
+    finally:
+        await conn.close()
+
+
 async def test_db_newer_than_image_refuses_to_boot(tmp_path: Path) -> None:
     """A DB migrated past this build's migration set (deployment rolled back
     to an older image) must refuse to boot, not silently run old code on a

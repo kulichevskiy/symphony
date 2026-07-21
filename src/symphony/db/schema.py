@@ -19,8 +19,8 @@ Boot behavior:
     baseline is recorded as applied rather than replayed, and later files apply
     on top. Without this, first boot on such a DB crashed re-running the
     baseline ("table repos already exists"). Adoption requires *every* baseline
-    table to be present; a legacy DB missing some baseline objects is refused
-    (an operator-facing error) rather than stamped at head with a gap.
+    object (tables and indexes) to be present; a legacy DB missing any is
+    refused (an operator-facing error) rather than stamped at head with a gap.
 
 Migration files: `NNN_name.sql` (plain SQL, split on complete statements) or
 `NNN_name.py` (data-move escape hatch exposing `async def migrate(conn)`;
@@ -143,7 +143,13 @@ async def _current_version(conn: aiosqlite.Connection) -> int:
     return row[0] if row is not None and row[0] is not None else 0
 
 
-_CREATE_TABLE_RE = re.compile(r"(?im)^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[\"'`\[]?(\w+)")
+# Named schema objects a migration creates: CREATE [UNIQUE] TABLE|INDEX|VIEW|
+# TRIGGER [IF NOT EXISTS] <name>. Indexes matter as much as tables — a missing
+# baseline UNIQUE index breaks the ON CONFLICT target it backs.
+_CREATE_OBJECT_RE = re.compile(
+    r"(?im)^\s*CREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX|VIEW|TRIGGER)\s+"
+    r"(?:IF\s+NOT\s+EXISTS\s+)?[\"'`\[]?(\w+)"
+)
 
 
 async def _application_tables(conn: aiosqlite.Connection) -> set[str]:
@@ -156,30 +162,42 @@ async def _application_tables(conn: aiosqlite.Connection) -> set[str]:
     return {row[0] for row in await cur.fetchall()}
 
 
-def _baseline_table_names(baseline_path: Path) -> set[str]:
-    """Tables the baseline migration creates, read statically from its SQL — the
-    invariant a pre-versioning DB must already satisfy in full to be adopted. A
-    `.py` baseline can't be read this way; return empty (validation skipped)."""
+async def _schema_object_names(conn: aiosqlite.Connection) -> set[str]:
+    """Every named object the DB carries (tables, indexes, views, triggers),
+    excluding SQLite internals (`sqlite_autoindex_*` for PK/UNIQUE constraints)
+    and the runner's own `schema_version`."""
+    cur = await conn.execute(
+        "SELECT name FROM sqlite_master WHERE type IN ('table', 'index', 'view', 'trigger')"
+        " AND name NOT LIKE 'sqlite_%' AND name != 'schema_version'"
+    )
+    return {row[0] for row in await cur.fetchall()}
+
+
+def _baseline_object_names(baseline_path: Path) -> set[str]:
+    """Every object the baseline migration creates (tables *and* indexes), read
+    statically from its SQL — the invariant a pre-versioning DB must satisfy in
+    full to be adopted. A `.py` baseline can't be read this way; return empty
+    (validation skipped)."""
     if baseline_path.suffix != ".sql":
         return set()
-    return set(_CREATE_TABLE_RE.findall(baseline_path.read_text(encoding="utf-8")))
+    return set(_CREATE_OBJECT_RE.findall(baseline_path.read_text(encoding="utf-8")))
 
 
 async def _should_adopt_baseline(conn: aiosqlite.Connection, baseline: tuple[int, Path]) -> bool:
     """Whether a version-0 DB should be adopted at baseline rather than have the
     baseline replayed. True only for a *complete* pre-versioning DB — one that
     predates this runner (older code built it from a monolithic `schema.sql`,
-    leaving no `schema_version`) and carries every baseline table.
+    leaving no `schema_version`) and carries every baseline object.
 
     A DB with no application tables is genuinely fresh → False (replay baseline).
-    A DB with some application tables but missing baseline objects is an
-    inconsistent legacy state: adopting it would stamp `schema_version` at head
-    while a table the app queries is absent (a runtime crash later), so refuse
-    to boot with an operator-facing error instead."""
-    present = await _application_tables(conn)
-    if not present:
+    A DB with some tables but missing baseline objects (a table *or* an index —
+    e.g. the UNIQUE index an `ON CONFLICT` target needs) is an inconsistent
+    legacy state: adopting it would stamp `schema_version` at head while an
+    object the app relies on is absent (a runtime crash later), so refuse to
+    boot with an operator-facing error instead."""
+    if not await _application_tables(conn):
         return False
-    missing = _baseline_table_names(baseline[1]) - present
+    missing = _baseline_object_names(baseline[1]) - await _schema_object_names(conn)
     if missing:
         raise RuntimeError(
             "database carries application tables but has no schema_version and is "
