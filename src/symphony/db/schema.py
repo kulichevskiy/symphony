@@ -13,7 +13,12 @@ Boot behavior:
     one writer, one commit; a crash mid-migration rolls back cleanly;
   * before an *upgrade* (pending work on an already-versioned DB) the DB file
     is copied aside as `<name>.bak-<target>`, so even a migration failure
-    outside the transaction's reach is recoverable by copying one file back.
+    outside the transaction's reach is recoverable by copying one file back;
+  * a DB that predates this runner (schema present, but no `schema_version` —
+    older code built it from a monolithic `schema.sql`) is *adopted*: the
+    baseline is recorded as applied rather than replayed, and later files apply
+    on top. Without this, first boot on such a DB crashed re-running the
+    baseline ("table repos already exists").
 
 Migration files: `NNN_name.sql` (plain SQL, split on complete statements) or
 `NNN_name.py` (data-move escape hatch exposing `async def migrate(conn)`;
@@ -87,6 +92,13 @@ async def apply_migrations(
             ")"
         )
         current = await _current_version(conn)
+        if current == 0 and all_migrations and await _has_pre_versioning_schema(conn):
+            # A DB created before this runner existed (older code applied a
+            # monolithic schema.sql, with no `schema_version` table). Its schema
+            # already matches the baseline, so *record* the baseline version
+            # instead of replaying its DDL — re-running it would collide
+            # ("table repos already exists"). Later files apply normally on top.
+            current = await _adopt_baseline(conn, all_migrations[0])
         _reject_downgrade(current, head)
         pending = [(v, p) for v, p in all_migrations if v > current]
         if not pending:
@@ -126,6 +138,31 @@ async def _current_version(conn: aiosqlite.Connection) -> int:
     cur = await conn.execute("SELECT MAX(version) FROM schema_version")
     row = await cur.fetchone()
     return row[0] if row is not None and row[0] is not None else 0
+
+
+async def _has_pre_versioning_schema(conn: aiosqlite.Connection) -> bool:
+    """Whether the DB already carries application tables despite an empty
+    `schema_version` — i.e. it predates this runner (older code built the schema
+    from a monolithic `schema.sql`). SQLite internal tables and `schema_version`
+    itself don't count; on a genuinely fresh DB this is False."""
+    cur = await conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table'"
+        " AND name NOT LIKE 'sqlite_%' AND name != 'schema_version' LIMIT 1"
+    )
+    return await cur.fetchone() is not None
+
+
+async def _adopt_baseline(conn: aiosqlite.Connection, baseline: tuple[int, Path]) -> int:
+    """Record the baseline migration as already applied without running its DDL,
+    adopting a pre-versioning DB into the runner. Returns the baseline version."""
+    version, path = baseline
+    await conn.execute(
+        "INSERT INTO schema_version (version, name, applied_at)"
+        " VALUES (?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))",
+        (version, path.stem),
+    )
+    log.info("adopted pre-versioning DB at baseline v%03d (%s)", version, path.stem)
+    return version
 
 
 def _backup_db(src_path: str, dest_path: str) -> None:

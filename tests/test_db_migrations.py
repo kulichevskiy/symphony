@@ -281,6 +281,31 @@ async def test_two_migrators_racing_apply_once(tmp_path: Path) -> None:
         await conn.close()
 
 
+async def test_adopts_pre_versioning_db(tmp_path: Path) -> None:
+    """A DB created before this runner existed (schema present, no
+    `schema_version`) is adopted at baseline and pending files apply on top —
+    instead of crashing by re-running baseline DDL ('table repos already
+    exists'). Reproduces the 2026-07-21 prod boot failure."""
+    path = tmp_path / "state.sqlite"
+    baseline_file = next(f for f in MIGRATIONS_DIR.iterdir() if f.stem == _REAL[0][1])
+    # Simulate the old code: apply the baseline schema directly, no version table.
+    pre = await aiosqlite.connect(str(path))
+    try:
+        await pre.executescript(baseline_file.read_text(encoding="utf-8"))
+        await pre.commit()
+    finally:
+        await pre.close()
+
+    conn = await aiosqlite.connect(str(path))
+    conn.row_factory = aiosqlite.Row
+    try:
+        await apply_migrations(conn, db_path=path)  # must not raise
+        # Baseline recorded (adopted), and every later migration applied on top.
+        assert await _versions(conn) == _REAL
+    finally:
+        await conn.close()
+
+
 async def test_db_newer_than_image_refuses_to_boot(tmp_path: Path) -> None:
     """A DB migrated past this build's migration set (deployment rolled back
     to an older image) must refuse to boot, not silently run old code on a
