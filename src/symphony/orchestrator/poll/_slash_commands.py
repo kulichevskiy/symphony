@@ -158,6 +158,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
             approved_head_sha: str = "",
             skip_review: bool = False,
             on_started: Callable[[str], Awaitable[None]] | None = None,
+            storage_issue_id: str | None = None,
         ) -> asyncio.Task[None]: ...
 
         async def _stop_review_monitor(self, issue_id: str, run_id: str) -> None: ...

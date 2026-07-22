@@ -551,6 +551,7 @@ class _ReviewMixin(_OrchestratorBase):
             approved_head_sha: str = "",
             skip_review: bool = False,
             on_started: Callable[[str], Awaitable[None]] | None = None,
+            storage_issue_id: str | None = None,
         ) -> asyncio.Task[None]: ...
 
         @staticmethod
@@ -3625,13 +3626,13 @@ class _ReviewMixin(_OrchestratorBase):
         # behind the operator's back. It still routes to
         # `_handle_merge_needs_approval_slash_intent`: `$approve`
         # force-advances to merge, `$reject`/`$stop` halt to blocked.
-        self._dispatch_run_ids[issue.id] = run.id
+        self._dispatch_run_ids[run.issue_id] = run.id
         self._operator_wait_run_ids.add(run.id)
         self._merge_needs_approval_bindings[run.id] = binding
         try:
             await db.operator_waits.upsert(
                 self._conn,
-                issue_id=issue.id,
+                issue_id=run.issue_id,
                 run_id=run.id,
                 kind=db.operator_waits.KIND_REVIEW_CAP,
                 linear_team_key=binding.linear_team_key,

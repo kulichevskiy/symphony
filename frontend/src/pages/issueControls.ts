@@ -71,15 +71,18 @@ export function applicability(status: string, waitingOn?: string | null): Applic
       break;
     case "awaiting_merge":
       on("approve");
-      on("skip-acceptance");
-      on("retry-acceptance");
       on("stop");
-      // A review-cap park (Needs Input) still accepts $reject to halt —
-      // only a genuine post-review merge wait has already passed review.
+      // A review-cap park (Needs Input) only honors $approve/$reject — the
+      // backend routes it through the merge-needs-approval handler, which
+      // silently no-ops skip-acceptance/retry-acceptance for this wait kind.
       if (waitingOn === "review_cap") {
         on("reject");
+        off("skip-acceptance", "Not supported for a review-cap park");
+        off("retry-acceptance", "Not supported for a review-cap park");
       } else {
         off("reject", "Already past review");
+        on("skip-acceptance");
+        on("retry-acceptance");
       }
       off("skip-review", "Review already complete");
       off("retry", "Nothing has failed");

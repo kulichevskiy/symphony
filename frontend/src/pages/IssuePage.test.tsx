@@ -80,6 +80,18 @@ describe("applicability", () => {
     const { en } = applicability("awaiting_merge", "review_cap");
     expect(en.reject).toBe(true);
   });
+
+  it("disables skip-acceptance/retry-acceptance for a review-cap park", () => {
+    const { en } = applicability("awaiting_merge", "review_cap");
+    expect(en["skip-acceptance"]).toBe(false);
+    expect(en["retry-acceptance"]).toBe(false);
+  });
+
+  it("enables skip-acceptance/retry-acceptance for a plain awaiting-merge wait", () => {
+    const { en } = applicability("awaiting_merge");
+    expect(en["skip-acceptance"]).toBe(true);
+    expect(en["retry-acceptance"]).toBe(true);
+  });
 });
 
 describe("CmdButton", () => {

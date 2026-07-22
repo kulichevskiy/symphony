@@ -1667,6 +1667,7 @@ class _MergeMixin(_OrchestratorBase):
                 pr_number=pr_number,
                 pr_url=pr_url,
                 on_started=on_merge_started,
+                storage_issue_id=issue_id,
             )
 
     async def _parked_closed_unmerged_pr_for_event(
@@ -2549,9 +2550,17 @@ class _MergeMixin(_OrchestratorBase):
         approved_head_sha: str = "",
         skip_review: bool = False,
         on_started: Callable[[str], Awaitable[None]] | None = None,
+        storage_issue_id: str | None = None,
     ) -> asyncio.Task[None]:
+        # `issue.id` is the tracker's own id, which for a scoped tracker
+        # setup differs from the `issues` table storage id. All persisted
+        # follow-up state (`runs`, `_dispatch_run_ids`, `_scheduled_issue_ids`)
+        # must key off the storage id so other lookups (operator_waits,
+        # `db.runs.has_active`, ...) that already use it can see this
+        # in-flight merge (SYM-114 review).
+        storage_issue_id = storage_issue_id or issue.id
         binding_key = _binding_key(binding)
-        self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
+        self._reserve_scheduled_slot(issue_id=storage_issue_id, binding_key=binding_key)
         task = asyncio.create_task(
             self._merge_with_limits(
                 binding=binding,
@@ -2561,13 +2570,14 @@ class _MergeMixin(_OrchestratorBase):
                 approved_head_sha=approved_head_sha,
                 skip_review=skip_review,
                 on_started=on_started,
+                storage_issue_id=storage_issue_id,
             )
         )
         self._dispatch_tasks.add(task)
         task.add_done_callback(
             partial(
                 self._dispatch_task_done,
-                issue_id=issue.id,
+                issue_id=storage_issue_id,
                 binding_key=binding_key,
             )
         )
@@ -2583,7 +2593,9 @@ class _MergeMixin(_OrchestratorBase):
         approved_head_sha: str = "",
         skip_review: bool = False,
         on_started: Callable[[str], Awaitable[None]] | None = None,
+        storage_issue_id: str | None = None,
     ) -> None:
+        storage_issue_id = storage_issue_id or issue.id
         key = _binding_key(binding)
         binding_sem = self._binding_dispatch_sems.setdefault(
             key,
@@ -2603,9 +2615,10 @@ class _MergeMixin(_OrchestratorBase):
                         approved_head_sha=approved_head_sha,
                         skip_review=skip_review,
                         on_started=on_started,
+                        storage_issue_id=storage_issue_id,
                     )
         except asyncio.CancelledError:
-            run_id = self._dispatch_run_ids.get(issue.id)
+            run_id = self._dispatch_run_ids.get(storage_issue_id)
             if run_id is not None:
                 await self._fail_run(run_id, "merge cancelled")
             raise
@@ -2776,7 +2789,9 @@ class _MergeMixin(_OrchestratorBase):
         approved_head_sha: str = "",
         skip_review: bool = False,
         on_started: Callable[[str], Awaitable[None]] | None = None,
+        storage_issue_id: str | None = None,
     ) -> str | None:
+        storage_issue_id = storage_issue_id or issue.id
         run_id = str(uuid.uuid4())
         now = self._now().isoformat()
         # Launch gate: merge is a follow-up stage (drains in-flight work even
@@ -2790,7 +2805,7 @@ class _MergeMixin(_OrchestratorBase):
             inserted = await db.runs.create_if_no_active(
                 self._conn,
                 id=run_id,
-                issue_id=issue.id,
+                issue_id=storage_issue_id,
                 stage="merge",
                 status="running",
                 pid=None,
@@ -2803,7 +2818,7 @@ class _MergeMixin(_OrchestratorBase):
             return None
 
         await self._complete_review_monitors_for_merge(issue)
-        self._dispatch_run_ids[issue.id] = run_id
+        self._dispatch_run_ids[storage_issue_id] = run_id
         if on_started is not None:
             try:
                 await on_started(run_id)
@@ -2887,7 +2902,7 @@ class _MergeMixin(_OrchestratorBase):
         finally:
             if workspace_path is not None:
                 self._workspace.release(binding, issue)
-            self._dispatch_run_ids.pop(issue.id, None)
+            self._dispatch_run_ids.pop(storage_issue_id, None)
 
     async def _acquire_merge_workspace(
         self,
