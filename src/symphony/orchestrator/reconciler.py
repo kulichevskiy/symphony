@@ -407,11 +407,24 @@ class Reconciler:
                 tracker_ctx,
             )
             github_prs, github_payload = await self._github_payload(prs)
-            orphans = await self._orphan_open_prs(
-                issue_row=issue_row,
-                wait=wait,
-                matched_bindings=matched_bindings,
-                recorded_observations=github_prs,
+            linear_drift = classify_linear_drift(
+                has_operator_wait=wait is not None,
+                state_name=linear_issue.state_name if linear_issue is not None else None,
+                state_type=linear_issue.state_type if linear_issue is not None else None,
+                done_state_names=done_state_names,
+            )
+            # Canceled always wins over orphan-PR adoption (see below), so skip the
+            # GitHub head-branch probe entirely rather than spend the call only to
+            # discard its result.
+            orphans = (
+                []
+                if linear_drift == DRIFT_LINEAR_CANCELED
+                else await self._orphan_open_prs(
+                    issue_row=issue_row,
+                    wait=wait,
+                    matched_bindings=matched_bindings,
+                    recorded_observations=github_prs,
+                )
             )
         except _BackoffRequested:
             raise
@@ -421,12 +434,6 @@ class Reconciler:
             github_payload = {"prs": [pr.to_payload() for pr in combined]}
 
         drift_prs = _github_prs_for_drift(wait=wait, github_prs=github_prs)
-        linear_drift = classify_linear_drift(
-            has_operator_wait=wait is not None,
-            state_name=linear_issue.state_name if linear_issue is not None else None,
-            state_type=linear_issue.state_type if linear_issue is not None else None,
-            done_state_names=done_state_names,
-        )
         github_drift = classify_github_drift(
             has_merge_wait=wait is not None and wait.kind == db.operator_waits.KIND_MERGE,
             prs=drift_prs,
@@ -475,6 +482,13 @@ class Reconciler:
                     remaining -= 1
             else:
                 actions_deferred += 1
+        elif active and github_clearable and linear_action == ACTION_CLEARED:
+            # Same wait, same cancel event: the PR cleanup rides along with the
+            # cancel-clear's budget slot instead of needing its own. Otherwise a
+            # cancel-clear that spends the tick's last slot would delete the wait
+            # here and strand the closed/merged PR row forever — `_github_clearable`
+            # requires the wait to still exist, and it won't on the next tick.
+            github_action = ACTION_CLEARED
         elif active and github_clearable:
             if remaining is None or remaining > 0:
                 github_action = ACTION_CLEARED
@@ -1171,8 +1185,10 @@ class Reconciler:
         """Clear a parked wait for an issue that is canceled in the tracker.
 
         Deletes the operator wait (which records its own removal transition),
-        supersedes the parked run so the stale failure does not re-surface in
-        the "Needs attention" lane once the wait is gone, and notes the external
+        supersedes every terminal-non-success run for the issue — not just the
+        one the wait was parked on — so an earlier failed attempt (e.g. a
+        failed retry that failed again) does not re-surface in the "Needs
+        attention" lane once the wait is gone, and notes the external
         cancellation for the audit timeline. All writes stay in the caller's
         transaction (``commit=False``) so a later failure rolls the whole clear
         back.
@@ -1185,7 +1201,7 @@ class Reconciler:
             wait.run_id,
             commit=False,
         )
-        await self._supersede_canceled_run(run_id=wait.run_id, ts=ts)
+        await self._supersede_canceled_runs(issue_id=issue_id, ts=ts)
         await self._note_external_state_change(
             issue_id=issue_id,
             source=SOURCE_LINEAR,
@@ -1193,23 +1209,20 @@ class Reconciler:
             ts=ts,
         )
 
-    async def _supersede_canceled_run(self, *, run_id: str, ts: str) -> None:
-        cur = await self._conn.execute(
-            "SELECT status FROM runs WHERE id = ?",
-            (run_id,),
-        )
-        row = await cur.fetchone()
-        if row is None or str(row["status"]) not in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
-            return
-        await db.runs.update_status(
-            self._conn,
-            run_id,
-            db.runs.SUPERSEDED_STATUS,
-            ended_at=ts,
-            kind="tracker_canceled",
-            detail="Tracker issue canceled; superseding parked run",
-            commit=False,
-        )
+    async def _supersede_canceled_runs(self, *, issue_id: str, ts: str) -> None:
+        history = await db.runs.history_for_issue(self._conn, issue_id)
+        for run in history:
+            if run.status not in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
+                continue
+            await db.runs.update_status(
+                self._conn,
+                run.id,
+                db.runs.SUPERSEDED_STATUS,
+                ended_at=ts,
+                kind="tracker_canceled",
+                detail="Tracker issue canceled; superseding parked run",
+                commit=False,
+            )
 
     async def _apply_github_clear(
         self,

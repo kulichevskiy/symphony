@@ -759,6 +759,54 @@ async def test_active_pr_closed_no_merge_clears_wait_without_marking_merged(
 
 
 @pytest.mark.asyncio
+async def test_active_linear_canceled_last_budget_slot_still_clears_pr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canceled issue with a merge wait for a closed-unmerged PR must have
+
+    both the wait AND the stale PR record cleared even when the shared action
+    budget only has one slot left for this tick. The cancel-clear must not
+    consume the only slot and leave the PR cleanup stranded — once the wait is
+    gone, `_github_clearable` can never fire for it again.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_merge_wait(conn)
+        await _seed_pr(conn)
+        reconciler = Reconciler(
+            Config(repos=[_binding()], reconcile_max_actions_per_tick=1),
+            conn,
+            _FakeLinear(state_name="Canceled", state_type="canceled"),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "CLOSED",
+                    "mergeable": None,
+                    "merged": False,
+                    "mergedAt": None,
+                    "url": "https://github.com/org/repo/pull/42",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+        )
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert pr is None
+
+
+@pytest.mark.asyncio
 async def test_active_linear_done_notes_transition_without_clearing_wait(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -838,6 +886,55 @@ async def test_active_linear_canceled_clears_wait_and_supersedes_run(
 
 
 @pytest.mark.asyncio
+async def test_active_linear_canceled_supersedes_older_failed_run_too(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed -> retried -> failed-again issue that then gets canceled must
+
+    have both the earlier and the current parked run superseded, or the
+    earlier failure keeps the issue in the "Needs attention" lane even
+    though its wait is gone.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-iss-1-attempt-1",
+            issue_id="iss-1",
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-05-16T10:00:00Z",
+        )
+        await _seed_implement_failed_wait(conn)
+        fake = _FakeLinear(state_name="Canceled", state_type="canceled")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        cur = await conn.execute(
+            "SELECT id, status FROM runs WHERE issue_id = ? ORDER BY id",
+            ("iss-1",),
+        )
+        run_rows = {str(row["id"]): str(row["status"]) for row in await cur.fetchall()}
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert run_rows["run-iss-1"] == db.runs.SUPERSEDED_STATUS
+    assert run_rows["run-iss-1-attempt-1"] == db.runs.SUPERSEDED_STATUS
+
+
+@pytest.mark.asyncio
 async def test_active_linear_canceled_with_orphan_pr_only_clears_no_adoption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -887,6 +984,9 @@ async def test_active_linear_canceled_with_orphan_pr_only_clears_no_adoption(
     assert rows[0][1] == DRIFT_LINEAR_CANCELED
     assert rows[0][2] == ACTION_CLEARED
     assert ("operator_waits", "__row__", "removed", None) in transitions
+    # Canceled wins outright, so the orphan head-branch probe must never fire —
+    # not just have its result discarded.
+    assert fake_gh.head_calls == []
 
 
 @pytest.mark.asyncio
