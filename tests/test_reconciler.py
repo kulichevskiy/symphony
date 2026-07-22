@@ -1026,6 +1026,89 @@ async def test_active_linear_canceled_clears_despite_github_backoff(
 
 
 @pytest.mark.asyncio
+async def test_active_linear_canceled_budgeted_out_preserves_github_backoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the shared action budget is already spent before a canceled
+
+    issue's PR is fetched, its cancel-clear is deferred to a later tick — so a
+    transient GitHub 429/5xx here must not be swallowed as if a clear were
+    happening. Swallowing it would let `tick()` keep hammering GitHub instead
+    of entering backoff.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn, "iss-1")
+        await _seed_implement_failed_wait(conn, "iss-1")
+        await _seed_issue(conn, "iss-2")
+        await _seed_merge_wait(conn, "iss-2")
+        await _seed_pr(conn, "iss-2")
+        fake = _FakeLinear(state_name="Canceled", state_type="canceled")
+        fake_gh = _FakeGitHub(error=GitHubError("HTTP 429 too many requests"))
+        reconciler = Reconciler(
+            Config(repos=[_binding()], reconcile_max_actions_per_tick=1),
+            conn,
+            fake,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        await reconciler.tick()
+        wait_1 = await db.operator_waits.get(conn, "iss-1")
+        wait_2 = await db.operator_waits.get(conn, "iss-2")
+    finally:
+        await conn.close()
+
+    assert wait_1 is None
+    assert wait_2 is not None
+    assert reconciler._backoff_active() is True
+
+
+@pytest.mark.asyncio
+async def test_active_linear_canceled_open_pr_later_closed_unmerged_is_cleared_without_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PR still open when the wait was cleared on an earlier tick, later
+
+    closed without merging, must still be cleaned up even though there is no
+    operator wait left for this issue.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(conn)
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(state_name="Canceled", state_type="canceled"),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "CLOSED",
+                    "mergeable": None,
+                    "merged": False,
+                    "mergedAt": None,
+                    "url": "https://github.com/org/repo/pull/42",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        await reconciler.tick()
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        rows = await _observation_rows(conn)
+    finally:
+        await conn.close()
+
+    assert pr is None
+    assert rows[-1][1] == DRIFT_PR_CLOSED_NO_MERGE
+    assert rows[-1][2] == ACTION_CLEARED
+
+
+@pytest.mark.asyncio
 async def test_active_linear_canceled_respects_wait_binding_opt_out(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -231,11 +231,17 @@ def classify_github_drift(
     *,
     has_merge_wait: bool,
     prs: list[GithubPrObservation],
+    linear_canceled: bool = False,
 ) -> str | None:
     valid_prs = [pr for pr in prs if pr.error is None]
     if has_merge_wait and any(pr.merged for pr in valid_prs):
         return DRIFT_MERGE_ZOMBIE
-    if has_merge_wait and any(pr.state.upper() == "CLOSED" and not pr.merged for pr in valid_prs):
+    # A canceled tracker issue never regains an operator wait, so closed-unmerged
+    # cleanup can't wait for one — gate on the cancellation itself instead, or the
+    # PR row becomes a reconcile candidate with no way to ever clear it.
+    if (has_merge_wait or linear_canceled) and any(
+        pr.state.upper() == "CLOSED" and not pr.merged for pr in valid_prs
+    ):
         return DRIFT_PR_CLOSED_NO_MERGE
     if any(pr.merged for pr in valid_prs):
         return DRIFT_PR_LOCALLY_MERGED
@@ -411,6 +417,7 @@ class Reconciler:
         done_state_names = self._done_state_names(matched_bindings)
         tracker_ctx = self._tracker_context_from_issue_row(issue_row, matched_bindings)
         post_commit_review_request: _PostCommitReviewRequest | None = None
+        active = reconcile_auto_clear_enabled()
         try:
             tracker_issue_id = str(issue_row["tracker_issue_id"] or issue_id)
             linear_issue, linear_payload = await self._tracker_payload(
@@ -423,7 +430,22 @@ class Reconciler:
                 state_type=linear_issue.state_type if linear_issue is not None else None,
                 done_state_names=done_state_names,
             )
-            cancel_clearing = linear_drift == DRIFT_LINEAR_CANCELED and wait is not None
+            linear_is_canceled = (
+                linear_issue is not None and linear_issue.state_type == _CANCELED_STATE_TYPE
+            )
+            cancel_wait_eligible = (
+                active
+                and linear_drift == DRIFT_LINEAR_CANCELED
+                and wait is not None
+                and any(binding.reconcile_enabled for binding in self._wait_matched_bindings(wait))
+            )
+            # Only swallow a GitHub backoff for the cancel clear when it can actually
+            # run this tick — if the shared action budget is already spent, the clear
+            # is deferred anyway, so re-raising here (instead of masking the error)
+            # lets `tick()` enter backoff instead of hammering a rate-limited GitHub.
+            cancel_clearing = cancel_wait_eligible and (
+                action_budget_remaining is None or action_budget_remaining > 0
+            )
             try:
                 github_prs, github_payload = await self._github_payload(prs)
             except _BackoffRequested:
@@ -458,6 +480,7 @@ class Reconciler:
         github_drift = classify_github_drift(
             has_merge_wait=wait is not None and wait.kind == db.operator_waits.KIND_MERGE,
             prs=drift_prs,
+            linear_canceled=linear_is_canceled,
         )
         if (
             github_drift is None
@@ -465,7 +488,6 @@ class Reconciler:
             and orphans
         ):
             github_drift = DRIFT_ORPHAN_PR_OPEN
-        active = reconcile_auto_clear_enabled()
         remaining = action_budget_remaining
         actions_taken = 0
         actions_deferred = 0
@@ -480,12 +502,7 @@ class Reconciler:
                     remaining -= 1
             else:
                 actions_deferred += 1
-        elif (
-            active
-            and linear_drift == DRIFT_LINEAR_CANCELED
-            and wait is not None
-            and any(binding.reconcile_enabled for binding in self._wait_matched_bindings(wait))
-        ):
+        elif cancel_wait_eligible:
             if remaining is None or remaining > 0:
                 linear_action = ACTION_CLEARED
                 actions_taken += 1
@@ -1273,17 +1290,18 @@ class Reconciler:
         github_prs: list[GithubPrObservation],
     ) -> None:
         if drift_kind == DRIFT_PR_CLOSED_NO_MERGE:
-            if wait is None:
-                raise RuntimeError("cannot clear closed PR drift without an operator wait")
             closed_prs = _closed_unmerged_prs(github_prs)
             if not closed_prs:
                 raise RuntimeError("cannot clear closed PR drift without a closed PR")
-            await db.operator_waits.delete(
-                self._conn,
-                issue_id,
-                wait.run_id,
-                commit=False,
-            )
+            # `wait` is None for a canceled issue's closed-unmerged PR once its own
+            # wait was already cleared by the cancel-clear on an earlier tick.
+            if wait is not None:
+                await db.operator_waits.delete(
+                    self._conn,
+                    issue_id,
+                    wait.run_id,
+                    commit=False,
+                )
             for pr in closed_prs:
                 deleted = await db.issue_prs.delete(
                     self._conn,
@@ -1382,11 +1400,9 @@ def _github_clearable(
     github_prs: list[GithubPrObservation],
 ) -> bool:
     if github_drift == DRIFT_PR_CLOSED_NO_MERGE:
-        return (
-            wait is not None
-            and wait.kind == db.operator_waits.KIND_MERGE
-            and bool(_closed_unmerged_prs(github_prs))
-        )
+        if wait is not None and wait.kind != db.operator_waits.KIND_MERGE:
+            return False
+        return bool(_closed_unmerged_prs(github_prs))
     if github_drift == DRIFT_MERGE_ZOMBIE:
         return (
             wait is not None
