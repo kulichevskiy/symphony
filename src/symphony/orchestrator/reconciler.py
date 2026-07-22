@@ -46,8 +46,26 @@ SOURCE_GITHUB = "github"
 DRIFT_MERGE_ZOMBIE = "merge_zombie"
 DRIFT_PR_CLOSED_NO_MERGE = "pr_closed_no_merge"
 DRIFT_LINEAR_STATE_DONE = "linear_state_done"
+DRIFT_LINEAR_CANCELED = "linear_state_canceled"
 DRIFT_PR_LOCALLY_MERGED = "pr_locally_merged"
 DRIFT_ORPHAN_PR_OPEN = "orphan_pr_open"
+
+# Linear state_type for an abandoned/terminal-negative issue. A canceled issue
+# will never re-enter a polled active lane, so its parked operator wait can
+# never be cleared by a slash command — the reconciler clears it instead.
+_CANCELED_STATE_TYPE = "canceled"
+
+# Run statuses that surface an issue in the "Needs attention" (FAILED) lane once
+# its operator wait is gone. Superseding the parked run when the tracker issue
+# is canceled keeps the lane from inheriting the stale failure.
+_DEAD_RUN_STATUSES = frozenset({db.runs.FAILED_STATUS, db.runs.INTERRUPTED_STATUS})
+
+_CANCELED_CLEAR_BODY = (
+    "🧹 **Auto-cleared — issue canceled**\n\n"
+    "This issue is canceled in the tracker, so Symphony cleared its parked "
+    "operator wait and the associated run state. The dashboard lane empties on "
+    "its own; no action needed.\n"
+)
 
 ACTION_OBSERVED = "observed"
 ACTION_WOULD_CLEAR = "would_clear"
@@ -192,8 +210,13 @@ def classify_linear_drift(
     has_operator_wait: bool,
     state_name: str | None,
     done_state_names: set[str],
+    state_type: str | None = None,
 ) -> str | None:
-    if has_operator_wait and state_name is not None and state_name in done_state_names:
+    if not has_operator_wait:
+        return None
+    if state_type == _CANCELED_STATE_TYPE:
+        return DRIFT_LINEAR_CANCELED
+    if state_name is not None and state_name in done_state_names:
         return DRIFT_LINEAR_STATE_DONE
     return None
 
@@ -406,6 +429,7 @@ class Reconciler:
         linear_drift = classify_linear_drift(
             has_operator_wait=wait is not None,
             state_name=linear_issue.state_name if linear_issue is not None else None,
+            state_type=linear_issue.state_type if linear_issue is not None else None,
             done_state_names=done_state_names,
         )
         github_drift = classify_github_drift(
@@ -418,11 +442,20 @@ class Reconciler:
         remaining = action_budget_remaining
         actions_taken = 0
         actions_deferred = 0
+        post_cancel_comment = False
 
         linear_action = _passive_action_for(linear_drift)
         if active and linear_drift == DRIFT_LINEAR_STATE_DONE:
             if remaining is None or remaining > 0:
                 linear_action = ACTION_NOTED
+                actions_taken += 1
+                if remaining is not None:
+                    remaining -= 1
+            else:
+                actions_deferred += 1
+        elif active and linear_drift == DRIFT_LINEAR_CANCELED and wait is not None:
+            if remaining is None or remaining > 0:
+                linear_action = ACTION_CLEARED
                 actions_taken += 1
                 if remaining is not None:
                     remaining -= 1
@@ -490,6 +523,18 @@ class Reconciler:
                     state_name=linear_issue.state_name,
                     ts=observed_at,
                 )
+            if (
+                linear_action == ACTION_CLEARED
+                and linear_drift == DRIFT_LINEAR_CANCELED
+                and linear_issue is not None
+            ):
+                await self._apply_linear_canceled_clear(
+                    issue_id=issue_id,
+                    wait=wait,
+                    state_name=linear_issue.state_name,
+                    ts=observed_at,
+                )
+                post_cancel_comment = True
             if github_action == ACTION_CLEARED:
                 await self._apply_github_clear(
                     issue_id=issue_id,
@@ -526,6 +571,16 @@ class Reconciler:
                     post_commit_review_request.github_repo,
                     post_commit_review_request.pr_number,
                     e,
+                )
+
+        if post_cancel_comment:
+            try:
+                await self.tracker(tracker_ctx).post_comment(
+                    tracker_issue_id, _CANCELED_CLEAR_BODY
+                )
+            except LinearError as e:
+                log.warning(
+                    "could not post canceled auto-clear comment on %s: %s", issue_id, e
                 )
 
         return _ReconcileIssueResult(
@@ -1110,6 +1165,57 @@ class Reconciler:
             ts=ts,
         )
 
+    async def _apply_linear_canceled_clear(
+        self,
+        *,
+        issue_id: str,
+        wait: db.operator_waits.OperatorWait | None,
+        state_name: str,
+        ts: str,
+    ) -> None:
+        """Clear a parked wait for an issue that is canceled in the tracker.
+
+        Deletes the operator wait (which records its own removal transition),
+        supersedes the parked run so the stale failure does not re-surface in
+        the "Needs attention" lane once the wait is gone, and notes the external
+        cancellation for the audit timeline. All writes stay in the caller's
+        transaction (``commit=False``) so a later failure rolls the whole clear
+        back.
+        """
+        if wait is None:
+            raise RuntimeError("cannot clear canceled drift without an operator wait")
+        await db.operator_waits.delete(
+            self._conn,
+            issue_id,
+            wait.run_id,
+            commit=False,
+        )
+        await self._supersede_canceled_run(run_id=wait.run_id, ts=ts)
+        await self._note_external_state_change(
+            issue_id=issue_id,
+            source=SOURCE_LINEAR,
+            state_name=state_name,
+            ts=ts,
+        )
+
+    async def _supersede_canceled_run(self, *, run_id: str, ts: str) -> None:
+        cur = await self._conn.execute(
+            "SELECT status FROM runs WHERE id = ?",
+            (run_id,),
+        )
+        row = await cur.fetchone()
+        if row is None or str(row["status"]) not in _DEAD_RUN_STATUSES:
+            return
+        await db.runs.update_status(
+            self._conn,
+            run_id,
+            db.runs.SUPERSEDED_STATUS,
+            ended_at=ts,
+            kind="tracker_canceled",
+            detail="Tracker issue canceled; superseding parked run",
+            commit=False,
+        )
+
     async def _apply_github_clear(
         self,
         *,
@@ -1287,6 +1393,7 @@ __all__ = [
     "ACTION_NOTED",
     "ACTION_OBSERVED",
     "ACTION_WOULD_CLEAR",
+    "DRIFT_LINEAR_CANCELED",
     "DRIFT_LINEAR_STATE_DONE",
     "DRIFT_MERGE_ZOMBIE",
     "DRIFT_ORPHAN_PR_OPEN",

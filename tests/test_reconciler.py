@@ -24,6 +24,7 @@ from symphony.orchestrator.reconciler import (
     ACTION_NOTED,
     ACTION_OBSERVED,
     ACTION_WOULD_CLEAR,
+    DRIFT_LINEAR_CANCELED,
     DRIFT_LINEAR_STATE_DONE,
     DRIFT_MERGE_ZOMBIE,
     DRIFT_ORPHAN_PR_OPEN,
@@ -41,10 +42,13 @@ NOW = datetime(2026, 5, 17, 12, 0, tzinfo=UTC)
 @dataclass
 class _FakeLinear:
     state_name: str = "In Progress"
+    state_type: str | None = None
     error: Exception | None = None
     move_error: Exception | None = None
+    comment_error: Exception | None = None
     calls: int = 0
     moves: list[tuple[str, str]] = field(default_factory=list)
+    comments: list[tuple[str, str]] = field(default_factory=list)
     states_map: dict[str, str] = field(
         default_factory=lambda: {
             "In Progress": "state-in-progress",
@@ -67,7 +71,8 @@ class _FakeLinear:
             url="https://linear.app/issue/ENG-1",
             state_id="state",
             state_name=self.state_name,
-            state_type="completed" if self.state_name == "Done" else "started",
+            state_type=self.state_type
+            or ("completed" if self.state_name == "Done" else "started"),
             team_key="ENG",
             labels=["symphony"],
             updated_at="2026-05-17T11:58:00Z",
@@ -80,6 +85,12 @@ class _FakeLinear:
         if self.move_error is not None:
             raise self.move_error
         self.moves.append((issue_id_or_identifier, state_id))
+
+    async def post_comment(self, issue_uuid: str, body: str) -> str:
+        if self.comment_error is not None:
+            raise self.comment_error
+        self.comments.append((issue_uuid, body))
+        return "cmt-1"
 
 
 class _FakeGitHub:
@@ -354,6 +365,24 @@ def test_classifies_all_drift_kinds() -> None:
             done_state_names={"Done"},
         )
         == DRIFT_LINEAR_STATE_DONE
+    )
+    assert (
+        classify_linear_drift(
+            has_operator_wait=True,
+            state_name="Canceled",
+            state_type="canceled",
+            done_state_names={"Done"},
+        )
+        == DRIFT_LINEAR_CANCELED
+    )
+    assert (
+        classify_linear_drift(
+            has_operator_wait=False,
+            state_name="Canceled",
+            state_type="canceled",
+            done_state_names={"Done"},
+        )
+        is None
     )
     assert classify_github_drift(has_merge_wait=True, prs=[merged_pr]) == DRIFT_MERGE_ZOMBIE
     assert classify_github_drift(has_merge_wait=True, prs=[closed_pr]) == DRIFT_PR_CLOSED_NO_MERGE
@@ -764,6 +793,84 @@ async def test_active_linear_done_notes_transition_without_clearing_wait(
         "linear",
         "linear:Done",
     ) in transitions
+
+
+@pytest.mark.asyncio
+async def test_active_linear_canceled_clears_wait_and_supersedes_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake = _FakeLinear(state_name="Canceled", state_type="canceled")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        transitions = await _transition_rows(conn)
+        cur = await conn.execute("SELECT status FROM runs WHERE id = ?", ("run-iss-1",))
+        run_row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert run_row is not None
+    assert str(run_row["status"]) == db.runs.SUPERSEDED_STATUS
+    assert rows[0][1] == DRIFT_LINEAR_CANCELED
+    assert rows[0][2] == ACTION_CLEARED
+    assert ("operator_waits", "__row__", "removed", None) in transitions
+    assert (
+        "external_observations",
+        "external_state_change",
+        "linear",
+        "linear:Canceled",
+    ) in transitions
+    assert fake.comments and fake.comments[0][0] == "iss-1"
+
+
+@pytest.mark.asyncio
+async def test_active_linear_still_started_retains_wait_and_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake = _FakeLinear(state_name="In Progress")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        cur = await conn.execute("SELECT status FROM runs WHERE id = ?", ("run-iss-1",))
+        run_row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    assert wait is not None
+    assert run_row is not None
+    assert str(run_row["status"]) == "failed"
+    assert rows[0][1] is None
+    assert rows[0][2] == ACTION_OBSERVED
+    assert fake.comments == []
 
 
 @pytest.mark.asyncio
