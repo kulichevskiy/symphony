@@ -311,7 +311,10 @@ _STANCE_BLOCK = (
 _WHAT_TO_LOOK_FOR_BLOCK = (
     "# What to look for (in priority order)\n\n"
     "1. The change satisfies the stated issue, including any "
-    "explicit acceptance criteria.\n"
+    "explicit acceptance criteria. Probe it three ways: (a) requirements "
+    "the issue asked for that are missing or only partially done; (b) "
+    "behavior in the diff that nobody asked for (scope creep); (c) "
+    "requirements that look implemented but are actually wrong.\n"
     "2. Correctness bugs: missing edge cases, off-by-one, incorrect "
     "error types, swallowed exceptions, races, broken invariants.\n"
     "3. Test coverage: new behavior has tests; tests would actually "
@@ -339,9 +342,10 @@ _LENSES_BLOCK = (
     "(missing or over-broad deps), and debounce/race conditions on "
     "rapidly-changing inputs.\n\n"
     "Be strict but practical. Style nits are NOT blocking — do not "
-    "demand stylistic churn the fixer has to chase. Spend the depth on "
-    "correctness, and flag only issues a careful human reviewer would "
-    "block merge on.\n\n"
+    "demand stylistic churn the fixer has to chase, and skip anything "
+    "tooling already enforces (ruff, mypy, formatting, the verify gate). "
+    "Spend the depth on correctness, and flag only issues a careful human "
+    "reviewer would block merge on.\n\n"
 )
 
 # Final-message contract: enumerate-then-approve, or `## Findings` + marker.
