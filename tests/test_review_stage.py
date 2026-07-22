@@ -1164,6 +1164,212 @@ async def test_red_ci_local_only_blocks_local_review_infra_failure(
         await conn.close()
 
 
+def _validate_orch(conn: object, tmp_path: Path) -> Orchestrator:
+    cfg = Config(
+        repos=[_binding()],
+        log_root=tmp_path / "logs",
+        workspace_root=tmp_path / "ws",
+        db_path=tmp_path / "s.sqlite",
+    )
+    return Orchestrator(
+        cfg,
+        AsyncMock(),
+        conn,  # type: ignore[arg-type]
+        runner=MagicMock(),
+        gh=MagicMock(),
+        workspace=MagicMock(),
+        push_fn=AsyncMock(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_review_fix_dirty_tree_no_commit_recovers_via_commit_turn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SYM-223: a review fix-run that edits files but ends its turn without
+    committing (e.g. it backgrounded a check and "waited" for a wakeup that
+    never fires in a one-shot subprocess) must not silently park as
+    non-convergence. The validator dispatches one commit fix turn; once that
+    commits, HEAD advances and the run is treated as a normal advance."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        orch = _validate_orch(conn, tmp_path)
+
+        # Uncommitted edits present; HEAD only advances once the commit turn runs.
+        committed = {"done": False}
+
+        async def fake_dirty_files(_ws: Path) -> list[str]:
+            if committed["done"]:
+                return []
+            return [" M reconciler.py", " M _slash_commands.py"]
+
+        async def fake_head_sha(_ws: Path) -> str:
+            return "after-commit-sha" if committed["done"] else "before-fix-sha"
+
+        monkeypatch.setattr(review_module, "_workspace_dirty_files", fake_dirty_files)
+        monkeypatch.setattr(review_module, "_workspace_head_sha", fake_head_sha)
+
+        async def fake_commit_turn(**_kwargs: object) -> None:
+            committed["done"] = True
+
+        commit_turn = AsyncMock(side_effect=fake_commit_turn)
+        monkeypatch.setattr(orch, "_run_dirty_tree_fix_turn", commit_turn)
+        fail = AsyncMock()
+        monkeypatch.setattr(orch, "_fail_review_run", fail)
+
+        run = MagicMock()
+        run.id = "review-run"
+        run.issue_id = "iss-1"
+
+        result = await orch._validate_review_fix_advanced(  # noqa: SLF001
+            run=run,
+            fix_run_id="review-fix",
+            binding=_binding(),
+            issue=_issue_in_progress(),
+            workspace_path=tmp_path,
+            branch="symphony/eng-1",
+            start_sha="before-fix-sha",
+        )
+
+        assert result == "after-commit-sha"
+        commit_turn.assert_awaited_once()
+        # A recovered advance is NOT a failure — no operator-wait escalation.
+        fail.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_fix_dirty_tree_commit_turn_no_op_escalates_with_uncommitted_reason(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the commit fix turn still leaves the tree dirty (no HEAD advance),
+    escalate with a reason that names the leftover uncommitted changes rather
+    than the plain "completed without advancing" non-convergence string."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        orch = _validate_orch(conn, tmp_path)
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="review-fix",
+            issue_id="iss-1",
+            stage="review_fix",
+            status="running",
+            pid=None,
+            started_at=datetime.now(UTC).isoformat(),
+        )
+
+        async def fake_dirty_files(_ws: Path) -> list[str]:
+            return [" M reconciler.py"]
+
+        async def fake_head_sha(_ws: Path) -> str:
+            return "before-fix-sha"
+
+        async def fake_status_short(_ws: Path) -> str:
+            return " M reconciler.py"
+
+        monkeypatch.setattr(review_module, "_workspace_dirty_files", fake_dirty_files)
+        monkeypatch.setattr(review_module, "_workspace_head_sha", fake_head_sha)
+        monkeypatch.setattr(review_module, "_git_status_short", fake_status_short)
+
+        commit_turn = AsyncMock()  # simulates a turn that fails to commit
+        monkeypatch.setattr(orch, "_run_dirty_tree_fix_turn", commit_turn)
+        fail = AsyncMock()
+        monkeypatch.setattr(orch, "_fail_review_run", fail)
+
+        run = MagicMock()
+        run.id = "review-run"
+        run.issue_id = "iss-1"
+
+        result = await orch._validate_review_fix_advanced(  # noqa: SLF001
+            run=run,
+            fix_run_id="review-fix",
+            binding=_binding(),
+            issue=_issue_in_progress(),
+            workspace_path=tmp_path,
+            branch="symphony/eng-1",
+            start_sha="before-fix-sha",
+        )
+
+        assert result == ""
+        commit_turn.assert_awaited_once()
+        fail.assert_awaited_once()
+        reason = fail.await_args.kwargs["error"]
+        assert "uncommitted" in reason
+        assert "completed without advancing" not in reason
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_fix_clean_tree_no_op_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AC #4: the genuine no-op path (clean tree, no HEAD advance) is
+    untouched — no commit fix turn is dispatched, and it escalates exactly as
+    before with the plain non-convergence reason."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        orch = _validate_orch(conn, tmp_path)
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="review-fix",
+            issue_id="iss-1",
+            stage="review_fix",
+            status="running",
+            pid=None,
+            started_at=datetime.now(UTC).isoformat(),
+        )
+
+        async def fake_dirty_files(_ws: Path) -> list[str]:
+            return []
+
+        async def fake_head_sha(_ws: Path) -> str:
+            return "before-fix-sha"
+
+        async def fake_status_short(_ws: Path) -> str:
+            return ""
+
+        monkeypatch.setattr(review_module, "_workspace_dirty_files", fake_dirty_files)
+        monkeypatch.setattr(review_module, "_workspace_head_sha", fake_head_sha)
+        monkeypatch.setattr(review_module, "_git_status_short", fake_status_short)
+
+        commit_turn = AsyncMock()
+        monkeypatch.setattr(orch, "_run_dirty_tree_fix_turn", commit_turn)
+        fail = AsyncMock()
+        monkeypatch.setattr(orch, "_fail_review_run", fail)
+
+        run = MagicMock()
+        run.id = "review-run"
+        run.issue_id = "iss-1"
+
+        result = await orch._validate_review_fix_advanced(  # noqa: SLF001
+            run=run,
+            fix_run_id="review-fix",
+            binding=_binding(),
+            issue=_issue_in_progress(),
+            workspace_path=tmp_path,
+            branch="symphony/eng-1",
+            start_sha="before-fix-sha",
+        )
+
+        assert result == ""
+        commit_turn.assert_not_awaited()
+        fail.assert_awaited_once()
+        assert "completed without advancing" in fail.await_args.kwargs["error"]
+    finally:
+        await conn.close()
+
+
 @pytest.mark.asyncio
 async def test_red_ci_defers_signature_until_fix_run_succeeds(
     tmp_path: Path,
