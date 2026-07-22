@@ -99,6 +99,7 @@ from ...pipeline.review_classifier import (
 )
 from ...pipeline.state_machine import (
     on_runner_event,
+    parse_completion_marker,
 )
 from ...tracker import (
     Issue as LinearIssue,
@@ -111,6 +112,7 @@ from ._base import (
     _binding_key,
     _binding_storage_key,
     _OrchestratorBase,
+    _read_run_final_message,
     _tracker_context_for_binding,
 )
 from ._git import (
@@ -122,6 +124,7 @@ from ._git import (
     _git_rebase,
     _git_status_short,
     _sync_workspace_to_remote,
+    _workspace_dirty_files,
     _workspace_head_sha,
     _workspace_ref_sha,
 )
@@ -2766,6 +2769,68 @@ class _ReviewMixin(_OrchestratorBase):
             await self._clear_review_rearm_retry(run.id)
             self._clear_review_no_signal_rearm_heads(run.id)
             return ""
+        # SYM-223: a clean rc=0 exit (no transient API error) that left the
+        # worktree dirty without advancing HEAD means the fixer made edits and
+        # ended its turn without committing — e.g. it backgrounded a long check
+        # and "waited" for a ScheduleWakeup/Monitor resume that never fires in a
+        # one-shot fix-run subprocess. That is distinct from a genuine no-op
+        # (clean tree). Dispatch one commit fix turn to land the pending work;
+        # if it commits, HEAD advances and this is a normal advance rather than
+        # a silent non-convergence park.
+        if api_error is None:
+            dirty_files = await _workspace_dirty_files(workspace_path)
+            if dirty_files:
+                role = binding.resolved_role("fix", self.config.roles)
+                final_message = _read_run_final_message(log_path, agent=role.agent)
+                marker = parse_completion_marker(final_message)
+                if marker.kind == "blocked":
+                    # The fixer explicitly ended SYMPHONY_BLOCKED on a human
+                    # action rather than forgetting to commit. Forcing a
+                    # commit turn over blocked, possibly-incomplete work would
+                    # land it anyway; preserve the dirty tree as-is and park
+                    # for the operator with the agent's own reason instead.
+                    reason = (
+                        f"review fix-run on {branch} ended blocked on a human "
+                        "action with uncommitted changes: "
+                        f"{marker.blocked_reason or '(no reason given)'}"
+                    )
+                else:
+                    log.warning(
+                        "review fix-run for %s ended with %d uncommitted change(s) and "
+                        "no HEAD advance; dispatching one commit fix turn (SYM-223)",
+                        issue.identifier,
+                        len(dirty_files),
+                    )
+                    await self._run_dirty_tree_fix_turn(
+                        binding=binding,
+                        issue=issue,
+                        storage_issue_id=issue.id,
+                        workspace_path=workspace_path,
+                        parent_run_id=fix_run_id,
+                        dirty_files=dirty_files,
+                    )
+                    current_sha = await _workspace_head_sha(workspace_path)
+                    remaining_dirty = (
+                        await _workspace_dirty_files(workspace_path)
+                        if current_sha and current_sha != start_sha
+                        else dirty_files
+                    )
+                    if current_sha and current_sha != start_sha and not remaining_dirty:
+                        return current_sha
+                    short_sha = (current_sha or start_sha)[:12] or "(unknown)"
+                    status_short = await _git_status_short(workspace_path)
+                    last_log = f"git status --short:\n{status_short}" if status_short else ""
+                    if current_sha and current_sha != start_sha:
+                        reason = (
+                            f"review fix-run left uncommitted changes on {branch}; the "
+                            f"commit fix turn advanced HEAD to {short_sha} but "
+                            f"{len(remaining_dirty)} file(s) remain uncommitted"
+                        )
+                    else:
+                        reason = (
+                            f"review fix-run left uncommitted changes on {branch} and one "
+                            f"commit fix turn did not resolve them; HEAD stayed at {short_sha}"
+                        )
         await db.runs.update_status(
             self._conn,
             fix_run_id,

@@ -44,3 +44,4 @@ GitHub branch protection is blocking PR #{pr_number} because a required status c
 # Headless environment
 
 You run headless. Never start an interactive auth flow (OAuth URLs, browser logins, device codes). If a tool requires one, stop and report `SYMPHONY_BLOCKED: <what the operator must authorize and where>`.
+This is a one-shot subprocess: there is no scheduled wakeup or monitor resume. Run any checks synchronously (foreground) and `git commit` your changes before ending your turn. Never background a long task and wait for a notification — the turn just ends and your work is lost.
