@@ -477,6 +477,11 @@ class Reconciler:
             github_payload = {"prs": [pr.to_payload() for pr in combined]}
 
         drift_prs = _github_prs_for_drift(wait=wait, github_prs=github_prs)
+        drift_prs = self._reconcile_enabled_prs(
+            team_key=str(issue_row["team_key"]),
+            local_prs=prs,
+            observations=drift_prs,
+        )
         github_drift = classify_github_drift(
             has_merge_wait=wait is not None and wait.kind == db.operator_waits.KIND_MERGE,
             prs=drift_prs,
@@ -1165,6 +1170,36 @@ class Reconciler:
             tracker_site=wait.tracker_site,
         )
 
+    def _reconcile_enabled_prs(
+        self,
+        *,
+        team_key: str,
+        local_prs: list[LocalIssuePr],
+        observations: list[GithubPrObservation],
+    ) -> list[GithubPrObservation]:
+        """Drop observations for a PR row whose own binding opted out.
+
+        A canceled issue with no active wait falls back to the full PR list
+        for drift/clearing (`_github_prs_for_drift` only scopes by repo for a
+        merge wait), so without this a closed-unmerged PR under a
+        `reconcile_enabled=False` binding would get swept up and deleted just
+        because a sibling PR row on an enabled binding made the issue
+        eligible.
+        """
+        disabled = {
+            (pr.github_repo.casefold(), pr.pr_number)
+            for pr in local_prs
+            if (bindings := self._bindings_for_pr(team_key=team_key, pr=pr))
+            and not any(binding.reconcile_enabled for binding in bindings)
+        }
+        if not disabled:
+            return observations
+        return [
+            obs
+            for obs in observations
+            if (obs.github_repo.casefold(), obs.pr_number) not in disabled
+        ]
+
     def _bindings_for_pr(
         self,
         *,
@@ -1279,8 +1314,11 @@ class Reconciler:
                 # suppressed its polling would otherwise sit live until the next
                 # unrelated review-poll tick notices the wait is gone — retire
                 # it here so the cancel-clear leaves a consistent audit trail
-                # immediately instead of depending on that side effect.
-                target_status = "completed"
+                # immediately instead of depending on that side effect. Use
+                # SUPERSEDED_STATUS (not "completed") so the kind/detail below
+                # actually persist instead of being cleared by the
+                # SUCCESS_STATUSES path in `update_status`.
+                target_status = db.runs.SUPERSEDED_STATUS
             else:
                 continue
             await db.runs.update_status(

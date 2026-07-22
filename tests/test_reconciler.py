@@ -1109,6 +1109,77 @@ async def test_active_linear_canceled_open_pr_later_closed_unmerged_is_cleared_w
 
 
 @pytest.mark.asyncio
+async def test_active_linear_canceled_respects_pr_binding_opt_out_without_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canceled issue with multiple linked PR rows and no active wait must
+
+    only clear the closed-unmerged PR whose own binding has reconcile
+    enabled — a sibling PR row on a `reconcile_enabled=False` binding must
+    not be swept up just because it shares the issue.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(
+            conn,
+            github_repo="org/repo",
+            binding_key='["ENG","org/repo","symphony"]',
+            pr_number=42,
+        )
+        await _seed_pr(
+            conn,
+            github_repo="org/other",
+            binding_key='["ENG","org/other","frontend"]',
+            pr_number=99,
+        )
+        reconciler = Reconciler(
+            Config(
+                repos=[
+                    _binding(issue_label="symphony", github_repo="org/repo"),
+                    _binding(
+                        issue_label="frontend",
+                        github_repo="org/other",
+                        reconcile_enabled=False,
+                    ),
+                ]
+            ),
+            conn,
+            _FakeLinear(state_name="Canceled", state_type="canceled"),  # type: ignore[arg-type]
+            _FakeGitHub(
+                views_by_repo={
+                    "org/repo": {
+                        "state": "CLOSED",
+                        "mergeable": None,
+                        "merged": False,
+                        "mergedAt": None,
+                        "url": "https://github.com/org/repo/pull/42",
+                    },
+                    "org/other": {
+                        "state": "CLOSED",
+                        "mergeable": None,
+                        "merged": False,
+                        "mergedAt": None,
+                        "url": "https://github.com/org/other/pull/99",
+                    },
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        await reconciler.tick()
+        enabled_pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        disabled_pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/other")
+    finally:
+        await conn.close()
+
+    assert enabled_pr is None
+    assert disabled_pr is not None
+
+
+@pytest.mark.asyncio
 async def test_active_linear_canceled_respects_wait_binding_opt_out(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1189,13 +1260,18 @@ async def test_active_linear_canceled_retires_live_review_monitor(
         )
 
         await reconciler.tick()
-        cur = await conn.execute("SELECT status FROM runs WHERE id = ?", ("run-iss-1-review",))
+        cur = await conn.execute(
+            "SELECT status, termination_kind, termination_detail FROM runs WHERE id = ?",
+            ("run-iss-1-review",),
+        )
         review_row = await cur.fetchone()
     finally:
         await conn.close()
 
     assert review_row is not None
-    assert str(review_row["status"]) == "completed"
+    assert str(review_row["status"]) == db.runs.SUPERSEDED_STATUS
+    assert str(review_row["termination_kind"]) == "tracker_canceled"
+    assert "canceled" in str(review_row["termination_detail"]).lower()
 
 
 @pytest.mark.asyncio
