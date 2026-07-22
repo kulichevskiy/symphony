@@ -839,6 +839,58 @@ async def test_active_linear_canceled_clears_wait_and_supersedes_run(
 
 
 @pytest.mark.asyncio
+async def test_active_linear_canceled_with_orphan_pr_only_clears_no_adoption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        fake = _FakeLinear(state_name="Canceled", state_type="canceled")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        review = await db.review_state.get(conn, "iss-1")
+        transitions = await _transition_rows(conn)
+        cur = await conn.execute("SELECT status FROM runs WHERE id = ?", ("run-iss-1",))
+        run_row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    # The cancel-clear must win outright: no adoption, no review run, no
+    # `@codex review`, and the issue is never moved back into an active lane.
+    assert wait is None
+    assert pr is None
+    assert review.pr_number is None
+    assert fake_gh.comments == []
+    assert fake.moves == []
+    assert run_row is not None
+    assert str(run_row["status"]) == db.runs.SUPERSEDED_STATUS
+    assert rows[0][1] == DRIFT_LINEAR_CANCELED
+    assert rows[0][2] == ACTION_CLEARED
+    assert ("operator_waits", "__row__", "removed", None) in transitions
+
+
+@pytest.mark.asyncio
 async def test_active_linear_still_started_retains_wait_and_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

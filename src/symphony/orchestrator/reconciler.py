@@ -55,11 +55,6 @@ DRIFT_ORPHAN_PR_OPEN = "orphan_pr_open"
 # never be cleared by a slash command — the reconciler clears it instead.
 _CANCELED_STATE_TYPE = "canceled"
 
-# Run statuses that surface an issue in the "Needs attention" (FAILED) lane once
-# its operator wait is gone. Superseding the parked run when the tracker issue
-# is canceled keeps the lane from inheriting the stale failure.
-_DEAD_RUN_STATUSES = frozenset({db.runs.FAILED_STATUS, db.runs.INTERRUPTED_STATUS})
-
 _CANCELED_CLEAR_BODY = (
     "🧹 **Auto-cleared — issue canceled**\n\n"
     "This issue is canceled in the tracker, so Symphony cleared its parked "
@@ -436,7 +431,11 @@ class Reconciler:
             has_merge_wait=wait is not None and wait.kind == db.operator_waits.KIND_MERGE,
             prs=drift_prs,
         )
-        if github_drift is None and linear_drift != DRIFT_LINEAR_STATE_DONE and orphans:
+        if (
+            github_drift is None
+            and linear_drift not in (DRIFT_LINEAR_STATE_DONE, DRIFT_LINEAR_CANCELED)
+            and orphans
+        ):
             github_drift = DRIFT_ORPHAN_PR_OPEN
         active = reconcile_auto_clear_enabled()
         remaining = action_budget_remaining
@@ -1204,7 +1203,7 @@ class Reconciler:
             (run_id,),
         )
         row = await cur.fetchone()
-        if row is None or str(row["status"]) not in _DEAD_RUN_STATUSES:
+        if row is None or str(row["status"]) not in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
             return
         await db.runs.update_status(
             self._conn,
