@@ -196,13 +196,26 @@ def reconcile_autoclear_disabled(env: Mapping[str, str] | None = None) -> bool:
 
 
 def reconcile_auto_clear_enabled(env: Mapping[str, str] | None = None) -> bool:
+    """Whether the reconciler actually clears drifted state (vs. observing only).
+
+    Auto-clear is **on by default** for every deployment. Two escape hatches
+    turn it off:
+
+    * `SYMPHONY_RECONCILE_AUTOCLEAR_DISABLED` truthy — hard kill-switch:
+      observe only, record `ACTION_OBSERVED`, never act.
+    * `SYMPHONY_RECONCILE_DRYRUN` truthy — dry-run: detect drift and record
+      `ACTION_WOULD_CLEAR`, but don't act.
+
+    With neither set, the reconciler clears. (The former rollout default was
+    the reverse — off unless `SYMPHONY_RECONCILE_DRYRUN` was explicitly a
+    falsey value; that gate is retired now that the feature is trusted.)
+    """
     values = env or os.environ
     if reconcile_autoclear_disabled(values):
         return False
-    value = values.get("SYMPHONY_RECONCILE_DRYRUN")
-    if value is None:
+    if reconcile_dry_run_enabled(values):
         return False
-    return value.strip().casefold() in {"0", "false", "no", "off"}
+    return True
 
 
 def _parse_rfc3339(s: str) -> datetime:
