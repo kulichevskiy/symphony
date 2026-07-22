@@ -3613,6 +3613,37 @@ class _ReviewMixin(_OrchestratorBase):
             ended_at=self._now().isoformat(),
         )
         await self._clear_review_rearm_retry(run.id)
+        # Register a merge needs-approval wait so the slash loop watches the
+        # parked issue for the `$approve`/`$reject` replies the stuck-loop
+        # comment invites. Without it the review run has ended, no operator
+        # wait exists, and the PR is not merge-parked, so `_poll_slash_commands`
+        # never fetches the issue's comments and every reply is silently
+        # dropped (SYM-114). Reusing KIND_MERGE routes to the existing
+        # `_handle_merge_needs_approval_slash_intent`: `$approve` force-advances
+        # to merge, `$reject`/`$stop` halt to blocked.
+        self._dispatch_run_ids[issue.id] = run.id
+        self._operator_wait_run_ids.add(run.id)
+        self._merge_needs_approval_bindings[run.id] = binding
+        try:
+            await db.operator_waits.upsert(
+                self._conn,
+                issue_id=issue.id,
+                run_id=run.id,
+                kind=db.operator_waits.KIND_MERGE,
+                linear_team_key=binding.linear_team_key,
+                github_repo=binding.github_repo,
+                issue_label=binding.issue_label or "",
+                created_at=self._now().isoformat(),
+                provider=binding.provider,
+                tracker_provider=binding.tracker_provider,
+                tracker_site=binding.tracker_site,
+            )
+        except Exception:  # noqa: BLE001 — a persistence hiccup must not crash the poll loop
+            log.warning(
+                "could not persist review-cap operator_wait for %s run %s",
+                issue.identifier,
+                run.id,
+            )
 
     async def _maybe_post_codex_lgtm(
         self,
