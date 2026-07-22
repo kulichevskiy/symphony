@@ -34,6 +34,9 @@ from symphony.orchestrator.reconciler import (
     Reconciler,
     classify_github_drift,
     classify_linear_drift,
+    reconcile_auto_clear_enabled,
+    reconcile_autoclear_disabled,
+    reconcile_dry_run_enabled,
 )
 
 NOW = datetime(2026, 5, 17, 12, 0, tzinfo=UTC)
@@ -458,12 +461,38 @@ async def test_linear_done_drift_uses_candidate_binding_done_state(
     assert rows[0][1] is None
 
 
+def test_reconcile_auto_clear_enabled_truth_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Non-empty env dicts are isolated from the process env (a truthy mapping
+    # short-circuits `env or os.environ`), so these three assert directly.
+    # Hard kill-switch wins.
+    assert reconcile_auto_clear_enabled({"SYMPHONY_RECONCILE_AUTOCLEAR_DISABLED": "1"}) is False
+    # Dry-run turns off actual clearing.
+    assert reconcile_auto_clear_enabled({"SYMPHONY_RECONCILE_DRYRUN": "on"}) is False
+    # A falsey dry-run value is not dry-run, so clearing stays on.
+    assert reconcile_auto_clear_enabled({"SYMPHONY_RECONCILE_DRYRUN": "0"}) is True
+    # Default (neither escape hatch set): auto-clear is ON for everyone. Scrub
+    # the process env rather than pass `{}` — an empty mapping is falsey, so
+    # `env or os.environ` would fall through to the real env and leak whatever
+    # the runner exports.
+    monkeypatch.delenv("SYMPHONY_RECONCILE_DRYRUN", raising=False)
+    monkeypatch.delenv("SYMPHONY_RECONCILE_AUTOCLEAR_DISABLED", raising=False)
+    assert reconcile_auto_clear_enabled() is True
+    assert reconcile_dry_run_enabled() is False
+    assert reconcile_autoclear_disabled() is False
+
+
 @pytest.mark.asyncio
-async def test_drift_without_dry_run_keeps_observed_action(
+async def test_drift_with_autoclear_disabled_keeps_observed_action(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Observe-only is now reached via the hard kill-switch, not by leaving the
+    # (retired) dry-run default unset: with auto-clear off, a drifted-but-merged
+    # PR is recorded as ACTION_OBSERVED and never acted on.
     monkeypatch.delenv("SYMPHONY_RECONCILE_DRYRUN", raising=False)
+    monkeypatch.setenv("SYMPHONY_RECONCILE_AUTOCLEAR_DISABLED", "1")
     conn = await db.connect(tmp_path / "state.sqlite")
     try:
         await _seed_issue(conn)
