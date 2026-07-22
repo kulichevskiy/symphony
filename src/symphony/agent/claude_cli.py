@@ -7,7 +7,10 @@ can import it without creating a pipeline→orchestrator import cycle.
 
 from __future__ import annotations
 
+import json
+import sys
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 # Pre-approved tool surface for mutating claude runs (implement / fix /
@@ -46,4 +49,58 @@ def claude_builder_allowed_tools(mcp_servers: Mapping[str, Any] | None = None) -
     return ",".join(entries)
 
 
-__all__ = ["CLAUDE_BUILDER_TOOLS", "claude_builder_allowed_tools"]
+# --- PreToolUse deny-hook for builder runs (SYM-224) ----------------------
+# Builder spawns dispatch one-shot (`claude --print`, no resume), so an agent
+# that defers work behind a self-wakeup or a background task strands the run:
+# the commit never lands, HEAD stays put, the issue parks in Needs Input.
+# A prompt is advisory; a PreToolUse deny-hook is enforcement. The hook script
+# is stdlib-only, ships in the container image under this package (Dockerfile
+# `COPY src/ ./src/`), and is invoked by the claude CLI — not imported here.
+BUILDER_DENY_HOOK_SCRIPT: Path = (
+    Path(__file__).resolve().parent / "hooks" / "deny_builder_background_tasks.py"
+)
+
+# Empty = load NO ambient setting sources for the builder run, so our inline
+# `--settings` is the only layer: a project `.claude/settings.json` can neither
+# add `disableAllHooks: true` (which would silence our deny-hook) nor otherwise
+# interfere. Mirrors the read-only reviewer's hermetic delivery.
+BUILDER_SETTING_SOURCES = ""
+
+
+def claude_builder_settings() -> str:
+    """Inline `--settings` JSON for a mutating claude run.
+
+    Registers a PreToolUse deny-hook over all tools that blocks the
+    background-task machinery a one-shot dispatch cannot honor (background
+    Bash, ScheduleWakeup, BashOutput, KillShell). We do NOT set
+    `disableAllHooks` here — that would silence the very hook we're adding
+    (the read-only reviewer keeps its own `disableAllHooks` settings).
+    """
+    return json.dumps(
+        {
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "*",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": f"{sys.executable} {BUILDER_DENY_HOOK_SCRIPT}",
+                            }
+                        ],
+                    }
+                ]
+            }
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+__all__ = [
+    "BUILDER_DENY_HOOK_SCRIPT",
+    "BUILDER_SETTING_SOURCES",
+    "CLAUDE_BUILDER_TOOLS",
+    "claude_builder_allowed_tools",
+    "claude_builder_settings",
+]

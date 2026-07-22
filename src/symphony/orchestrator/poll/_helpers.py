@@ -19,7 +19,11 @@ from typing import Any, TypedDict
 import aiosqlite
 
 from ... import db
-from ...agent.claude_cli import claude_builder_allowed_tools
+from ...agent.claude_cli import (
+    BUILDER_SETTING_SOURCES,
+    claude_builder_allowed_tools,
+    claude_builder_settings,
+)
 from ...agent.codex_cli import build_codex_workspace_write_command
 from ...agent.codex_models import DEFAULT_CODEX_MODEL
 from ...config import ResolvedRole
@@ -132,6 +136,14 @@ def build_runner_command(
             "stream-json",
             "--verbose",
             "--strict-mcp-config",
+            # PreToolUse deny-hook: hard-block the background-task machinery a
+            # one-shot dispatch cannot honor (SYM-224). --setting-sources ""
+            # keeps our inline hook the only settings layer, so no project
+            # settings can disable it.
+            "--setting-sources",
+            BUILDER_SETTING_SOURCES,
+            "--settings",
+            claude_builder_settings(),
             # Pre-approve the full builder surface, plus mcp__<name>__* for
             # each MCP server the binding grants — see agent/claude_cli.py
             # for why a fresh containerized auth volume otherwise auto-denies
