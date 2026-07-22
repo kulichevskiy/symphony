@@ -464,15 +464,18 @@ async def test_linear_done_drift_uses_candidate_binding_done_state(
 def test_reconcile_auto_clear_enabled_truth_table(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Default (neither escape hatch set): auto-clear is ON for everyone.
-    assert reconcile_auto_clear_enabled({}) is True
+    # Non-empty env dicts are isolated from the process env (a truthy mapping
+    # short-circuits `env or os.environ`), so these three assert directly.
     # Hard kill-switch wins.
     assert reconcile_auto_clear_enabled({"SYMPHONY_RECONCILE_AUTOCLEAR_DISABLED": "1"}) is False
     # Dry-run turns off actual clearing.
     assert reconcile_auto_clear_enabled({"SYMPHONY_RECONCILE_DRYRUN": "on"}) is False
     # A falsey dry-run value is not dry-run, so clearing stays on.
     assert reconcile_auto_clear_enabled({"SYMPHONY_RECONCILE_DRYRUN": "0"}) is True
-    # Falls back to the process env when none is passed.
+    # Default (neither escape hatch set): auto-clear is ON for everyone. Scrub
+    # the process env rather than pass `{}` — an empty mapping is falsey, so
+    # `env or os.environ` would fall through to the real env and leak whatever
+    # the runner exports.
     monkeypatch.delenv("SYMPHONY_RECONCILE_DRYRUN", raising=False)
     monkeypatch.delenv("SYMPHONY_RECONCILE_AUTOCLEAR_DISABLED", raising=False)
     assert reconcile_auto_clear_enabled() is True
