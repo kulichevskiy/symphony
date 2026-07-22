@@ -1490,7 +1490,7 @@ def _github_prs_for_drift(
     wait: db.operator_waits.OperatorWait | None,
     github_prs: list[GithubPrObservation],
 ) -> list[GithubPrObservation]:
-    if not _is_merge_like_wait(wait):
+    if wait is None or not _is_merge_like_wait(wait):
         return github_prs
     return [pr for pr in github_prs if pr.github_repo.casefold() == wait.github_repo.casefold()]
 
