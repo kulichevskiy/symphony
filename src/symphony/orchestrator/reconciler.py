@@ -62,6 +62,17 @@ _CANCELED_CLEAR_BODY = (
     "its own; no action needed.\n"
 )
 
+# Used instead of _CANCELED_CLEAR_BODY when a linked PR is still open — the
+# wait clear moves the dashboard row out of Needs Input/Halted/Paused, but it
+# does not close or merge that PR, so we must not promise the lane is done.
+_CANCELED_CLEAR_BODY_PR_OPEN = (
+    "🧹 **Auto-cleared — issue canceled**\n\n"
+    "This issue is canceled in the tracker, so Symphony cleared its parked "
+    "operator wait and the associated run state. A linked pull request is "
+    "still open and was left untouched by this clear — close or merge it "
+    "separately if needed.\n"
+)
+
 ACTION_OBSERVED = "observed"
 ACTION_WOULD_CLEAR = "would_clear"
 ACTION_CLEARED = "cleared"
@@ -406,13 +417,23 @@ class Reconciler:
                 tracker_issue_id,
                 tracker_ctx,
             )
-            github_prs, github_payload = await self._github_payload(prs)
             linear_drift = classify_linear_drift(
                 has_operator_wait=wait is not None,
                 state_name=linear_issue.state_name if linear_issue is not None else None,
                 state_type=linear_issue.state_type if linear_issue is not None else None,
                 done_state_names=done_state_names,
             )
+            cancel_clearing = linear_drift == DRIFT_LINEAR_CANCELED and wait is not None
+            try:
+                github_prs, github_payload = await self._github_payload(prs)
+            except _BackoffRequested:
+                if not cancel_clearing:
+                    raise
+                # The Linear cancellation is already confirmed — don't let a
+                # transient GitHub 429/5xx gate clearing the parked wait. Treat
+                # GitHub as unobserved this tick; any ride-along PR cleanup
+                # happens on a later tick once GitHub recovers.
+                github_prs, github_payload = [], {"error": "github unavailable; deferred"}
             # Canceled always wins over orphan-PR adoption (see below), so skip the
             # GitHub head-branch probe entirely rather than spend the call only to
             # discard its result.
@@ -459,7 +480,12 @@ class Reconciler:
                     remaining -= 1
             else:
                 actions_deferred += 1
-        elif active and linear_drift == DRIFT_LINEAR_CANCELED and wait is not None:
+        elif (
+            active
+            and linear_drift == DRIFT_LINEAR_CANCELED
+            and wait is not None
+            and any(binding.reconcile_enabled for binding in self._wait_matched_bindings(wait))
+        ):
             if remaining is None or remaining > 0:
                 linear_action = ACTION_CLEARED
                 actions_taken += 1
@@ -587,8 +613,10 @@ class Reconciler:
                 )
 
         if post_cancel_comment:
+            pr_remains_open = bool(prs) and github_action != ACTION_CLEARED
+            body = _CANCELED_CLEAR_BODY_PR_OPEN if pr_remains_open else _CANCELED_CLEAR_BODY
             try:
-                await self.tracker(tracker_ctx).post_comment(tracker_issue_id, _CANCELED_CLEAR_BODY)
+                await self.tracker(tracker_ctx).post_comment(tracker_issue_id, body)
             except LinearError as e:
                 log.warning("could not post canceled auto-clear comment on %s: %s", issue_id, e)
 
@@ -1098,18 +1126,21 @@ class Reconciler:
         wait: db.operator_waits.OperatorWait | None,
         prs: list[LocalIssuePr],
     ) -> list[RepoBinding]:
-        matched: list[RepoBinding] = []
-        if wait is not None:
-            matched.extend(
-                self._matching_bindings(
-                    team_key=wait.linear_team_key,
-                    github_repo=wait.github_repo,
-                    issue_label=wait.issue_label,
-                )
-            )
+        matched: list[RepoBinding] = list(self._wait_matched_bindings(wait))
         for pr in prs:
             matched.extend(self._bindings_for_pr(team_key=team_key, pr=pr))
         return matched
+
+    def _wait_matched_bindings(
+        self, wait: db.operator_waits.OperatorWait | None
+    ) -> list[RepoBinding]:
+        if wait is None:
+            return []
+        return self._matching_bindings(
+            team_key=wait.linear_team_key,
+            github_repo=wait.github_repo,
+            issue_label=wait.issue_label,
+        )
 
     def _bindings_for_pr(
         self,
@@ -1212,12 +1243,21 @@ class Reconciler:
     async def _supersede_canceled_runs(self, *, issue_id: str, ts: str) -> None:
         history = await db.runs.history_for_issue(self._conn, issue_id)
         for run in history:
-            if run.status not in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
+            if run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
+                target_status = db.runs.SUPERSEDED_STATUS
+            elif run.stage == "review" and run.status in db.runs.LIVE_STATUSES:
+                # A review monitor left "running" while a deliver_failed wait
+                # suppressed its polling would otherwise sit live until the next
+                # unrelated review-poll tick notices the wait is gone — retire
+                # it here so the cancel-clear leaves a consistent audit trail
+                # immediately instead of depending on that side effect.
+                target_status = "completed"
+            else:
                 continue
             await db.runs.update_status(
                 self._conn,
                 run.id,
-                db.runs.SUPERSEDED_STATUS,
+                target_status,
                 ended_at=ts,
                 kind="tracker_canceled",
                 detail="Tracker issue canceled; superseding parked run",

@@ -990,6 +990,132 @@ async def test_active_linear_canceled_with_orphan_pr_only_clears_no_adoption(
 
 
 @pytest.mark.asyncio
+async def test_active_linear_canceled_clears_despite_github_backoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient GitHub 429/5xx while fetching the linked PR must not block
+    clearing an already-confirmed Linear cancellation.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        await _seed_pr(conn)
+        fake = _FakeLinear(state_name="Canceled", state_type="canceled")
+        fake_gh = _FakeGitHub(error=GitHubError("HTTP 429 too many requests"))
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert fake.comments and fake.comments[0][0] == "iss-1"
+    # PR state was unknown this tick, so the wording must not claim the PR
+    # side is resolved.
+    assert "still open" in fake.comments[0][1]
+
+
+@pytest.mark.asyncio
+async def test_active_linear_canceled_respects_wait_binding_opt_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wait's own binding opting out of reconcile must not be overridden by
+    an unrelated PR binding that happens to be enabled.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn, issue_label="symphony", github_repo="org/repo")
+        await _seed_pr(
+            conn,
+            github_repo="org/other",
+            binding_key='["ENG","org/other","frontend"]',
+            pr_number=99,
+        )
+        fake = _FakeLinear(state_name="Canceled", state_type="canceled")
+        reconciler = Reconciler(
+            Config(
+                repos=[
+                    _binding(
+                        issue_label="symphony",
+                        github_repo="org/repo",
+                        reconcile_enabled=False,
+                    ),
+                    _binding(
+                        issue_label="frontend",
+                        github_repo="org/other",
+                        reconcile_enabled=True,
+                    ),
+                ]
+            ),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        await reconciler.tick()
+        wait = await db.operator_waits.get(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert wait is not None
+
+
+@pytest.mark.asyncio
+async def test_active_linear_canceled_retires_live_review_monitor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A review monitor left `running` while a deliver_failed wait suppressed
+    its polling must be retired immediately on cancel-clear, not left live.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_deliver_failed_wait(conn)
+        await db.runs.create(
+            conn,
+            id="run-iss-1-review",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-17T09:00:00Z",
+        )
+        fake = _FakeLinear(state_name="Canceled", state_type="canceled")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        await reconciler.tick()
+        cur = await conn.execute("SELECT status FROM runs WHERE id = ?", ("run-iss-1-review",))
+        review_row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    assert review_row is not None
+    assert str(review_row["status"]) == "completed"
+
+
+@pytest.mark.asyncio
 async def test_active_linear_still_started_retains_wait_and_run(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
