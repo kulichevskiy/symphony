@@ -103,7 +103,7 @@ def claude_builder_settings() -> str:
                         ],
                     }
                 ]
-            }
+            },
         },
         sort_keys=True,
         separators=(",", ":"),
