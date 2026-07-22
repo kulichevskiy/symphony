@@ -1538,7 +1538,10 @@ class _MergeMixin(_OrchestratorBase):
                 issue_id,
                 run_id,
                 intent,
-                expected_kinds=(db.operator_waits.KIND_MERGE,),
+                expected_kinds=(
+                    db.operator_waits.KIND_MERGE,
+                    db.operator_waits.KIND_REVIEW_CAP,
+                ),
             )
             if binding is None:
                 return

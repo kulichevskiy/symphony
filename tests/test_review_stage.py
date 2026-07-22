@@ -5095,7 +5095,7 @@ async def test_review_cap_park_registers_watched_operator_wait(
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is not None
         assert wait.run_id == "review-run"
-        assert wait.kind == db.operator_waits.KIND_MERGE
+        assert wait.kind == db.operator_waits.KIND_REVIEW_CAP
         assert orch._dispatch_run_ids["iss-1"] == "review-run"  # noqa: SLF001
         assert "review-run" in orch._operator_wait_run_ids  # noqa: SLF001
         assert orch._merge_needs_approval_bindings["review-run"] is binding  # noqa: SLF001

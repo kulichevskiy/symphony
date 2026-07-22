@@ -503,7 +503,10 @@ class _SlashCommandsMixin(_OrchestratorBase):
             ):
                 await self._handle_review_failed_slash_intent(issue_id, run_id, intent)
                 return
-            if wait.kind == db.operator_waits.KIND_MERGE:
+            if wait.kind in (
+                db.operator_waits.KIND_MERGE,
+                db.operator_waits.KIND_REVIEW_CAP,
+            ):
                 await self._handle_merge_needs_approval_slash_intent(issue_id, run_id, intent)
                 return
             if wait.kind == db.operator_waits.KIND_ACCEPTANCE_BLOCKED:

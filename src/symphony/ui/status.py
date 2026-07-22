@@ -102,6 +102,7 @@ OPERATOR_WAIT_STATES: Mapping[str, CanonicalState] = {
     operator_waits.KIND_REVIEW_FAILED: CanonicalState.HALTED,
     operator_waits.KIND_REVIEW_STOPPED: CanonicalState.PAUSED,
     operator_waits.KIND_MERGE: CanonicalState.AWAITING_MERGE,
+    operator_waits.KIND_REVIEW_CAP: CanonicalState.AWAITING_MERGE,
     # Soft token-budget park: awaiting a human `$approve`/`$reject`, not halted.
     operator_waits.KIND_BUDGET_EXCEEDED: CanonicalState.PAUSED,
 }

@@ -3613,14 +3613,18 @@ class _ReviewMixin(_OrchestratorBase):
             ended_at=self._now().isoformat(),
         )
         await self._clear_review_rearm_retry(run.id)
-        # Register a merge needs-approval wait so the slash loop watches the
-        # parked issue for the `$approve`/`$reject` replies the stuck-loop
-        # comment invites. Without it the review run has ended, no operator
-        # wait exists, and the PR is not merge-parked, so `_poll_slash_commands`
+        # Register an operator wait so the slash loop watches the parked
+        # issue for the `$approve`/`$reject` replies the stuck-loop comment
+        # invites. Without it the review run has ended, no operator wait
+        # exists, and the PR is not merge-parked, so `_poll_slash_commands`
         # never fetches the issue's comments and every reply is silently
-        # dropped (SYM-114). Reusing KIND_MERGE routes to the existing
-        # `_handle_merge_needs_approval_slash_intent`: `$approve` force-advances
-        # to merge, `$reject`/`$stop` halt to blocked.
+        # dropped (SYM-114). This uses its own KIND_REVIEW_CAP (rather than
+        # KIND_MERGE) so the periodic auto-recoverable-merge-wait reconciler
+        # (`_reconcile_auto_recoverable_merge_waits`), which only iterates
+        # KIND_MERGE waits, does not silently auto-merge a review-cap park
+        # behind the operator's back. It still routes to
+        # `_handle_merge_needs_approval_slash_intent`: `$approve`
+        # force-advances to merge, `$reject`/`$stop` halt to blocked.
         self._dispatch_run_ids[issue.id] = run.id
         self._operator_wait_run_ids.add(run.id)
         self._merge_needs_approval_bindings[run.id] = binding
@@ -3629,7 +3633,7 @@ class _ReviewMixin(_OrchestratorBase):
                 self._conn,
                 issue_id=issue.id,
                 run_id=run.id,
-                kind=db.operator_waits.KIND_MERGE,
+                kind=db.operator_waits.KIND_REVIEW_CAP,
                 linear_team_key=binding.linear_team_key,
                 github_repo=binding.github_repo,
                 issue_label=binding.issue_label or "",
