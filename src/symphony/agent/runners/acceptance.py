@@ -14,6 +14,10 @@ from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from symphony.agent.claude_cli import (
+    BUILDER_SETTING_SOURCES,
+    claude_builder_settings,
+)
 from symphony.agent.codex_models import DEFAULT_CODEX_MODEL
 from symphony.agent.process import parse_event_line
 from symphony.agent.runner import Runner, RunnerEvent, RunnerSpec
@@ -1067,6 +1071,14 @@ def build_acceptance_command(
         "--permission-mode",
         _CLAUDE_ACCEPTANCE_PERMISSION_MODE,
         "--strict-mcp-config",
+        # PreToolUse deny-hook: hard-block background-task machinery a one-shot
+        # dispatch cannot honor (SYM-224). This verdict spawn is one-shot like
+        # every other builder run; the acceptance-fix spawn gets the same hook
+        # via build_runner_command.
+        "--setting-sources",
+        BUILDER_SETTING_SOURCES,
+        "--settings",
+        claude_builder_settings(),
         "--disallowedTools",
         (
             _CLAUDE_DEV_ACCEPTANCE_DISALLOWED_TOOLS

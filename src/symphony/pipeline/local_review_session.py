@@ -39,7 +39,11 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
-from ..agent.claude_cli import claude_builder_allowed_tools
+from ..agent.claude_cli import (
+    BUILDER_SETTING_SOURCES,
+    claude_builder_allowed_tools,
+    claude_builder_settings,
+)
 from ..agent.codex_cli import build_codex_workspace_write_command
 from ..agent.codex_models import DEFAULT_CODEX_MODEL
 from ..agent.prompt import review_comment_fix_prompt
@@ -130,6 +134,13 @@ def _build_fix_command(
             "stream-json",
             "--verbose",
             "--strict-mcp-config",
+            # PreToolUse deny-hook: hard-block background-task machinery a
+            # one-shot dispatch cannot honor (SYM-224); mirrors
+            # build_runner_command.
+            "--setting-sources",
+            BUILDER_SETTING_SOURCES,
+            "--settings",
+            claude_builder_settings(),
             "--allowedTools",
             claude_builder_allowed_tools(mcp_servers),
         ]
