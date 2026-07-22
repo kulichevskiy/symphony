@@ -27,6 +27,20 @@ HEADLESS_RULES = (
     "for a notification — the turn just ends and your work is lost.\n"
 )
 
+# Variant for prompts where the agent is explicitly told not to run git
+# commands at all (e.g. conflict-marker resolution, where the orchestrator
+# owns the commit). Omits the `git commit` instruction so it never
+# contradicts the prompt's own "do not run git commands" rule.
+HEADLESS_RULES_NO_COMMIT = (
+    "\n# Headless environment\n\n"
+    "You run headless. Never start an interactive auth flow (OAuth URLs, "
+    "browser logins, device codes). If a tool requires one, stop and report "
+    "`SYMPHONY_BLOCKED: <what the operator must authorize and where>`.\n"
+    "This is a one-shot subprocess: there is no scheduled wakeup or monitor "
+    "resume. Never background a long task and wait for a notification — the "
+    "turn just ends and your work is lost.\n"
+)
+
 # Appended to every prompt that drives code changes (implement + fix runs).
 # rc=0 alone cannot tell "done" from "politely blocked on a human action"
 # (MCH-14), so the agent must end with a machine-readable marker. Shared by
@@ -272,7 +286,7 @@ def merge_conflict_fix_prompt(
         "  integrating any new upstream changes from the base branch.\n"
         "- Do not edit files that are not in the conflicted list above.\n"
         "- Do not run git commands.\n"
-        f"{HEADLESS_RULES}"
+        f"{HEADLESS_RULES_NO_COMMIT}"
     )
 
 

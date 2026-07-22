@@ -1371,6 +1371,162 @@ async def test_review_fix_clean_tree_no_op_unchanged(
 
 
 @pytest.mark.asyncio
+async def test_review_fix_dirty_tree_blocked_marker_preserved_not_committed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fix-run that made edits but ended SYMPHONY_BLOCKED on a human action
+    is not the "forgot to commit" pattern: forcing a commit turn over it would
+    land possibly-incomplete work. The dirty tree must be preserved and the
+    run parked with the agent's own blocked reason instead."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        orch = _validate_orch(conn, tmp_path)
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="review-fix",
+            issue_id="iss-1",
+            stage="review_fix",
+            status="running",
+            pid=None,
+            started_at=datetime.now(UTC).isoformat(),
+        )
+
+        log_root = tmp_path / "logs"
+        log_root.mkdir(parents=True, exist_ok=True)
+        (log_root / "review-fix.log").write_text(
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": (
+                        "I made partial edits but need you to authorize the "
+                        "staging API key before I can finish.\n"
+                        "SYMPHONY_BLOCKED: authorize the staging API key"
+                    ),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        async def fake_dirty_files(_ws: Path) -> list[str]:
+            return [" M reconciler.py"]
+
+        async def fake_head_sha(_ws: Path) -> str:
+            return "before-fix-sha"
+
+        async def fake_status_short(_ws: Path) -> str:
+            return " M reconciler.py"
+
+        monkeypatch.setattr(review_module, "_workspace_dirty_files", fake_dirty_files)
+        monkeypatch.setattr(review_module, "_workspace_head_sha", fake_head_sha)
+        monkeypatch.setattr(review_module, "_git_status_short", fake_status_short)
+
+        commit_turn = AsyncMock()
+        monkeypatch.setattr(orch, "_run_dirty_tree_fix_turn", commit_turn)
+        fail = AsyncMock()
+        monkeypatch.setattr(orch, "_fail_review_run", fail)
+
+        run = MagicMock()
+        run.id = "review-run"
+        run.issue_id = "iss-1"
+
+        result = await orch._validate_review_fix_advanced(  # noqa: SLF001
+            run=run,
+            fix_run_id="review-fix",
+            binding=_binding(),
+            issue=_issue_in_progress(),
+            workspace_path=tmp_path,
+            branch="symphony/eng-1",
+            start_sha="before-fix-sha",
+        )
+
+        assert result == ""
+        commit_turn.assert_not_awaited()
+        fail.assert_awaited_once()
+        reason = fail.await_args.kwargs["error"]
+        assert "blocked" in reason
+        assert "authorize the staging API key" in reason
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_fix_dirty_tree_commit_turn_partial_commit_still_escalates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the commit fix turn advances HEAD but leaves some of the original
+    edits uncommitted, that is not a clean recovery: escalate rather than
+    returning success solely because HEAD moved."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        orch = _validate_orch(conn, tmp_path)
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="review-fix",
+            issue_id="iss-1",
+            stage="review_fix",
+            status="running",
+            pid=None,
+            started_at=datetime.now(UTC).isoformat(),
+        )
+
+        committed = {"done": False}
+
+        async def fake_dirty_files(_ws: Path) -> list[str]:
+            if committed["done"]:
+                return [" M leftover.py"]
+            return [" M reconciler.py", " M leftover.py"]
+
+        async def fake_head_sha(_ws: Path) -> str:
+            return "after-commit-sha" if committed["done"] else "before-fix-sha"
+
+        async def fake_status_short(_ws: Path) -> str:
+            return " M leftover.py"
+
+        monkeypatch.setattr(review_module, "_workspace_dirty_files", fake_dirty_files)
+        monkeypatch.setattr(review_module, "_workspace_head_sha", fake_head_sha)
+        monkeypatch.setattr(review_module, "_git_status_short", fake_status_short)
+
+        async def fake_commit_turn(**_kwargs: object) -> None:
+            committed["done"] = True
+
+        commit_turn = AsyncMock(side_effect=fake_commit_turn)
+        monkeypatch.setattr(orch, "_run_dirty_tree_fix_turn", commit_turn)
+        fail = AsyncMock()
+        monkeypatch.setattr(orch, "_fail_review_run", fail)
+
+        run = MagicMock()
+        run.id = "review-run"
+        run.issue_id = "iss-1"
+
+        result = await orch._validate_review_fix_advanced(  # noqa: SLF001
+            run=run,
+            fix_run_id="review-fix",
+            binding=_binding(),
+            issue=_issue_in_progress(),
+            workspace_path=tmp_path,
+            branch="symphony/eng-1",
+            start_sha="before-fix-sha",
+        )
+
+        assert result == ""
+        commit_turn.assert_awaited_once()
+        fail.assert_awaited_once()
+        reason = fail.await_args.kwargs["error"]
+        assert "remain uncommitted" in reason
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_red_ci_defers_signature_until_fix_run_succeeds(
     tmp_path: Path,
 ) -> None:
