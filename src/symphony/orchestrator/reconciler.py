@@ -61,6 +61,7 @@ def _is_merge_like_wait(wait: db.operator_waits.OperatorWait | None) -> bool:
         db.operator_waits.KIND_REVIEW_CAP,
     )
 
+
 # Linear state_type for an abandoned/terminal-negative issue. A canceled issue
 # will never re-enter a polled active lane, so its parked operator wait can
 # never be cleared by a slash command — the reconciler clears it instead.
