@@ -3283,6 +3283,18 @@ class _MergeMixin(_OrchestratorBase):
         )
         return True
 
+    async def _run_issue_id(self, run_id: str, fallback: str) -> str:
+        """Storage id for `run_id`'s issue.
+
+        Authoritative over `issue.id`, which for a scoped tracker is the
+        tracker's own id and can differ from the storage id the `runs` row
+        was created under (e.g. a review-cap park's merge re-dispatch looks
+        up the issue via the tracker and passes that `LinearIssue` all the
+        way through merge completion) (SYM-114 review).
+        """
+        row = await db.runs.get_with_issue(self._conn, run_id)
+        return row.issue_id if row is not None else fallback
+
     async def _mark_merge_done(
         self,
         *,
@@ -3291,6 +3303,7 @@ class _MergeMixin(_OrchestratorBase):
         pr_url: str,
         run_id: str,
     ) -> None:
+        storage_issue_id = await self._run_issue_id(run_id, issue.id)
         states = await self._states_for_binding(binding)
         done_id = states.get(binding.linear_states.done)
         if done_id is None:
@@ -3303,7 +3316,7 @@ class _MergeMixin(_OrchestratorBase):
             )
             return
 
-        tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
+        tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
         tracker = self.tracker(binding)
         await tracker.move_issue(issue.id, done_id)
         final_body = stage_done(
@@ -3331,12 +3344,12 @@ class _MergeMixin(_OrchestratorBase):
         ended_at = self._now().isoformat()
         await db.issue_prs.mark_merged(
             self._conn,
-            issue_id=issue.id,
+            issue_id=storage_issue_id,
             github_repo=binding.github_repo,
             merged_at=ended_at,
         )
         await db.runs.update_status(self._conn, run_id, "done", ended_at=ended_at)
-        await self._clear_operator_wait(issue.id, run_id)
+        await self._clear_operator_wait(storage_issue_id, run_id)
         await self._notify_attention(
             event=EVENT_PR_MERGED,
             issue_identifier=issue.identifier,
@@ -3393,6 +3406,9 @@ class _MergeMixin(_OrchestratorBase):
             )
             if not inserted:
                 return
+            storage_issue_id = issue.id
+        else:
+            storage_issue_id = await self._run_issue_id(run_id, issue.id)
 
         try:
             needs_approval_id: str | None = None
@@ -3407,7 +3423,7 @@ class _MergeMixin(_OrchestratorBase):
                     e,
                 )
 
-            tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
+            tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
             body = awaiting_approval(
                 CommentVars(
                     stage="merge",
@@ -3458,13 +3474,13 @@ class _MergeMixin(_OrchestratorBase):
             )
             # Register so $approve/$reject can be received after restart.
             # Done inside finally so it runs even when a non-LinearError above escapes.
-            self._dispatch_run_ids[issue.id] = run_id
+            self._dispatch_run_ids[storage_issue_id] = run_id
             self._operator_wait_run_ids.add(run_id)
             self._merge_needs_approval_bindings[run_id] = binding
             try:
                 await db.operator_waits.upsert(
                     self._conn,
-                    issue_id=issue.id,
+                    issue_id=storage_issue_id,
                     run_id=run_id,
                     kind=db.operator_waits.KIND_MERGE,
                     linear_team_key=binding.linear_team_key,

@@ -413,7 +413,9 @@ class _SlashCommandsMixin(_OrchestratorBase):
         if run_id.startswith(MANUAL_MERGE_PARKED_RUN_PREFIX):
             run_started = await self._manual_merge_parked_started_at(issue_id)
         else:
-            run_started = await self._run_started_at(run_id)
+            run_started = await self._review_cap_wait_started_at(run_id) or (
+                await self._run_started_at(run_id)
+            )
         stored = await db.comment_cursors.get(self._conn, issue_id)
         if stored is None:
             return run_started, set()
@@ -422,6 +424,24 @@ class _SlashCommandsMixin(_OrchestratorBase):
         if stored_dt < run_started:
             return run_started, set()
         return stored_dt, set(stored_ids)
+
+    async def _review_cap_wait_started_at(self, run_id: str) -> datetime | None:
+        """Floor for a review-cap park: the park time, not the reused review run's start.
+
+        A review-cap wait reuses the review run's own id (`run.id`), whose
+        `started_at` is when that review iteration began — long before the
+        park happened. Clamping to it would let comments from that entire
+        review round (potentially the whole cap-hitting cycle) count as
+        "new" on every poll. Clamp to the operator_wait's `created_at` (set
+        at park time) instead (SYM-114 review).
+        """
+        wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
+        if wait is None or wait.kind != db.operator_waits.KIND_REVIEW_CAP:
+            return None
+        try:
+            return _parse_rfc3339(wait.created_at)
+        except ValueError:
+            return None
 
     async def _run_started_at(self, run_id: str) -> datetime:
         cur = await self._conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,))
