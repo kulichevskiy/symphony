@@ -262,6 +262,7 @@ async def update_status(
     kind: str | None = None,
     detail: str | None = None,
     returncode: int | None = None,
+    commit: bool = True,
 ) -> None:
     cur = await conn.execute(
         """
@@ -321,7 +322,8 @@ async def update_status(
     if run is not None and status == "completed":
         completed_at = ended_at or run["ended_at"] or run["started_at"]
         await _clear_stale_wait_for_completed_run(conn, run, completed_at)
-    await conn.commit()
+    if commit:
+        await conn.commit()
 
 
 def _truncate_termination_detail(

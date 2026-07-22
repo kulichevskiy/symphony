@@ -24,6 +24,7 @@ from symphony.orchestrator.reconciler import (
     ACTION_NOTED,
     ACTION_OBSERVED,
     ACTION_WOULD_CLEAR,
+    DRIFT_LINEAR_CANCELED,
     DRIFT_LINEAR_STATE_DONE,
     DRIFT_MERGE_ZOMBIE,
     DRIFT_ORPHAN_PR_OPEN,
@@ -41,10 +42,13 @@ NOW = datetime(2026, 5, 17, 12, 0, tzinfo=UTC)
 @dataclass
 class _FakeLinear:
     state_name: str = "In Progress"
+    state_type: str | None = None
     error: Exception | None = None
     move_error: Exception | None = None
+    comment_error: Exception | None = None
     calls: int = 0
     moves: list[tuple[str, str]] = field(default_factory=list)
+    comments: list[tuple[str, str]] = field(default_factory=list)
     states_map: dict[str, str] = field(
         default_factory=lambda: {
             "In Progress": "state-in-progress",
@@ -67,7 +71,7 @@ class _FakeLinear:
             url="https://linear.app/issue/ENG-1",
             state_id="state",
             state_name=self.state_name,
-            state_type="completed" if self.state_name == "Done" else "started",
+            state_type=self.state_type or ("completed" if self.state_name == "Done" else "started"),
             team_key="ENG",
             labels=["symphony"],
             updated_at="2026-05-17T11:58:00Z",
@@ -80,6 +84,12 @@ class _FakeLinear:
         if self.move_error is not None:
             raise self.move_error
         self.moves.append((issue_id_or_identifier, state_id))
+
+    async def post_comment(self, issue_uuid: str, body: str) -> str:
+        if self.comment_error is not None:
+            raise self.comment_error
+        self.comments.append((issue_uuid, body))
+        return "cmt-1"
 
 
 class _FakeGitHub:
@@ -354,6 +364,24 @@ def test_classifies_all_drift_kinds() -> None:
             done_state_names={"Done"},
         )
         == DRIFT_LINEAR_STATE_DONE
+    )
+    assert (
+        classify_linear_drift(
+            has_operator_wait=True,
+            state_name="Canceled",
+            state_type="canceled",
+            done_state_names={"Done"},
+        )
+        == DRIFT_LINEAR_CANCELED
+    )
+    assert (
+        classify_linear_drift(
+            has_operator_wait=False,
+            state_name="Canceled",
+            state_type="canceled",
+            done_state_names={"Done"},
+        )
+        is None
     )
     assert classify_github_drift(has_merge_wait=True, prs=[merged_pr]) == DRIFT_MERGE_ZOMBIE
     assert classify_github_drift(has_merge_wait=True, prs=[closed_pr]) == DRIFT_PR_CLOSED_NO_MERGE
@@ -731,6 +759,54 @@ async def test_active_pr_closed_no_merge_clears_wait_without_marking_merged(
 
 
 @pytest.mark.asyncio
+async def test_active_linear_canceled_last_budget_slot_still_clears_pr(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canceled issue with a merge wait for a closed-unmerged PR must have
+
+    both the wait AND the stale PR record cleared even when the shared action
+    budget only has one slot left for this tick. The cancel-clear must not
+    consume the only slot and leave the PR cleanup stranded — once the wait is
+    gone, `_github_clearable` can never fire for it again.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_merge_wait(conn)
+        await _seed_pr(conn)
+        reconciler = Reconciler(
+            Config(repos=[_binding()], reconcile_max_actions_per_tick=1),
+            conn,
+            _FakeLinear(state_name="Canceled", state_type="canceled"),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "CLOSED",
+                    "mergeable": None,
+                    "merged": False,
+                    "mergedAt": None,
+                    "url": "https://github.com/org/repo/pull/42",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+        )
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert pr is None
+
+
+@pytest.mark.asyncio
 async def test_active_linear_done_notes_transition_without_clearing_wait(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -764,6 +840,473 @@ async def test_active_linear_done_notes_transition_without_clearing_wait(
         "linear",
         "linear:Done",
     ) in transitions
+
+
+@pytest.mark.asyncio
+async def test_active_linear_canceled_clears_wait_and_supersedes_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake = _FakeLinear(state_name="Canceled", state_type="canceled")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        transitions = await _transition_rows(conn)
+        cur = await conn.execute("SELECT status FROM runs WHERE id = ?", ("run-iss-1",))
+        run_row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert run_row is not None
+    assert str(run_row["status"]) == db.runs.SUPERSEDED_STATUS
+    assert rows[0][1] == DRIFT_LINEAR_CANCELED
+    assert rows[0][2] == ACTION_CLEARED
+    assert ("operator_waits", "__row__", "removed", None) in transitions
+    assert (
+        "external_observations",
+        "external_state_change",
+        "linear",
+        "linear:Canceled",
+    ) in transitions
+    assert fake.comments and fake.comments[0][0] == "iss-1"
+
+
+@pytest.mark.asyncio
+async def test_active_linear_canceled_supersedes_older_failed_run_too(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed -> retried -> failed-again issue that then gets canceled must
+
+    have both the earlier and the current parked run superseded, or the
+    earlier failure keeps the issue in the "Needs attention" lane even
+    though its wait is gone.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-iss-1-attempt-1",
+            issue_id="iss-1",
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-05-16T10:00:00Z",
+        )
+        await _seed_implement_failed_wait(conn)
+        fake = _FakeLinear(state_name="Canceled", state_type="canceled")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        cur = await conn.execute(
+            "SELECT id, status FROM runs WHERE issue_id = ? ORDER BY id",
+            ("iss-1",),
+        )
+        run_rows = {str(row["id"]): str(row["status"]) for row in await cur.fetchall()}
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert run_rows["run-iss-1"] == db.runs.SUPERSEDED_STATUS
+    assert run_rows["run-iss-1-attempt-1"] == db.runs.SUPERSEDED_STATUS
+
+
+@pytest.mark.asyncio
+async def test_active_linear_canceled_with_orphan_pr_only_clears_no_adoption(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        fake = _FakeLinear(state_name="Canceled", state_type="canceled")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        review = await db.review_state.get(conn, "iss-1")
+        transitions = await _transition_rows(conn)
+        cur = await conn.execute("SELECT status FROM runs WHERE id = ?", ("run-iss-1",))
+        run_row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    # The cancel-clear must win outright: no adoption, no review run, no
+    # `@codex review`, and the issue is never moved back into an active lane.
+    assert wait is None
+    assert pr is None
+    assert review.pr_number is None
+    assert fake_gh.comments == []
+    assert fake.moves == []
+    assert run_row is not None
+    assert str(run_row["status"]) == db.runs.SUPERSEDED_STATUS
+    assert rows[0][1] == DRIFT_LINEAR_CANCELED
+    assert rows[0][2] == ACTION_CLEARED
+    assert ("operator_waits", "__row__", "removed", None) in transitions
+    # Canceled wins outright, so the orphan head-branch probe must never fire —
+    # not just have its result discarded.
+    assert fake_gh.head_calls == []
+
+
+@pytest.mark.asyncio
+async def test_active_linear_canceled_clears_despite_github_backoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient GitHub 429/5xx while fetching the linked PR must not block
+    clearing an already-confirmed Linear cancellation.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        await _seed_pr(conn)
+        fake = _FakeLinear(state_name="Canceled", state_type="canceled")
+        fake_gh = _FakeGitHub(error=GitHubError("HTTP 429 too many requests"))
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert fake.comments and fake.comments[0][0] == "iss-1"
+    # PR state was unknown this tick, so the wording must not claim the PR
+    # side is resolved.
+    assert "still open" in fake.comments[0][1]
+
+
+@pytest.mark.asyncio
+async def test_active_linear_canceled_budgeted_out_preserves_github_backoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the shared action budget is already spent before a canceled
+
+    issue's PR is fetched, its cancel-clear is deferred to a later tick — so a
+    transient GitHub 429/5xx here must not be swallowed as if a clear were
+    happening. Swallowing it would let `tick()` keep hammering GitHub instead
+    of entering backoff.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn, "iss-1")
+        await _seed_implement_failed_wait(conn, "iss-1")
+        await _seed_issue(conn, "iss-2")
+        await _seed_merge_wait(conn, "iss-2")
+        await _seed_pr(conn, "iss-2")
+        fake = _FakeLinear(state_name="Canceled", state_type="canceled")
+        fake_gh = _FakeGitHub(error=GitHubError("HTTP 429 too many requests"))
+        reconciler = Reconciler(
+            Config(repos=[_binding()], reconcile_max_actions_per_tick=1),
+            conn,
+            fake,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        await reconciler.tick()
+        wait_1 = await db.operator_waits.get(conn, "iss-1")
+        wait_2 = await db.operator_waits.get(conn, "iss-2")
+    finally:
+        await conn.close()
+
+    assert wait_1 is None
+    assert wait_2 is not None
+    assert reconciler._backoff_active() is True
+
+
+@pytest.mark.asyncio
+async def test_active_linear_canceled_open_pr_later_closed_unmerged_is_cleared_without_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PR still open when the wait was cleared on an earlier tick, later
+
+    closed without merging, must still be cleaned up even though there is no
+    operator wait left for this issue.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(conn)
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(state_name="Canceled", state_type="canceled"),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "CLOSED",
+                    "mergeable": None,
+                    "merged": False,
+                    "mergedAt": None,
+                    "url": "https://github.com/org/repo/pull/42",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        await reconciler.tick()
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        rows = await _observation_rows(conn)
+    finally:
+        await conn.close()
+
+    assert pr is None
+    assert rows[-1][1] == DRIFT_PR_CLOSED_NO_MERGE
+    assert rows[-1][2] == ACTION_CLEARED
+
+
+@pytest.mark.asyncio
+async def test_active_linear_canceled_respects_pr_binding_opt_out_without_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A canceled issue with multiple linked PR rows and no active wait must
+
+    only clear the closed-unmerged PR whose own binding has reconcile
+    enabled — a sibling PR row on a `reconcile_enabled=False` binding must
+    not be swept up just because it shares the issue.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(
+            conn,
+            github_repo="org/repo",
+            binding_key='["ENG","org/repo","symphony"]',
+            pr_number=42,
+        )
+        await _seed_pr(
+            conn,
+            github_repo="org/other",
+            binding_key='["ENG","org/other","frontend"]',
+            pr_number=99,
+        )
+        reconciler = Reconciler(
+            Config(
+                repos=[
+                    _binding(issue_label="symphony", github_repo="org/repo"),
+                    _binding(
+                        issue_label="frontend",
+                        github_repo="org/other",
+                        reconcile_enabled=False,
+                    ),
+                ]
+            ),
+            conn,
+            _FakeLinear(state_name="Canceled", state_type="canceled"),  # type: ignore[arg-type]
+            _FakeGitHub(
+                views_by_repo={
+                    "org/repo": {
+                        "state": "CLOSED",
+                        "mergeable": None,
+                        "merged": False,
+                        "mergedAt": None,
+                        "url": "https://github.com/org/repo/pull/42",
+                    },
+                    "org/other": {
+                        "state": "CLOSED",
+                        "mergeable": None,
+                        "merged": False,
+                        "mergedAt": None,
+                        "url": "https://github.com/org/other/pull/99",
+                    },
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        await reconciler.tick()
+        enabled_pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        disabled_pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/other")
+    finally:
+        await conn.close()
+
+    assert enabled_pr is None
+    assert disabled_pr is not None
+
+
+@pytest.mark.asyncio
+async def test_active_linear_canceled_respects_wait_binding_opt_out(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A wait's own binding opting out of reconcile must not be overridden by
+    an unrelated PR binding that happens to be enabled.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn, issue_label="symphony", github_repo="org/repo")
+        await _seed_pr(
+            conn,
+            github_repo="org/other",
+            binding_key='["ENG","org/other","frontend"]',
+            pr_number=99,
+        )
+        fake = _FakeLinear(state_name="Canceled", state_type="canceled")
+        reconciler = Reconciler(
+            Config(
+                repos=[
+                    _binding(
+                        issue_label="symphony",
+                        github_repo="org/repo",
+                        reconcile_enabled=False,
+                    ),
+                    _binding(
+                        issue_label="frontend",
+                        github_repo="org/other",
+                        reconcile_enabled=True,
+                    ),
+                ]
+            ),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        await reconciler.tick()
+        wait = await db.operator_waits.get(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert wait is not None
+
+
+@pytest.mark.asyncio
+async def test_active_linear_canceled_retires_live_review_monitor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A review monitor left `running` while a deliver_failed wait suppressed
+    its polling must be retired immediately on cancel-clear, not left live.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_deliver_failed_wait(conn)
+        await db.runs.create(
+            conn,
+            id="run-iss-1-review",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-17T09:00:00Z",
+        )
+        fake = _FakeLinear(state_name="Canceled", state_type="canceled")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        await reconciler.tick()
+        cur = await conn.execute(
+            "SELECT status, termination_kind, termination_detail FROM runs WHERE id = ?",
+            ("run-iss-1-review",),
+        )
+        review_row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    assert review_row is not None
+    assert str(review_row["status"]) == db.runs.SUPERSEDED_STATUS
+    assert str(review_row["termination_kind"]) == "tracker_canceled"
+    assert "canceled" in str(review_row["termination_detail"]).lower()
+
+
+@pytest.mark.asyncio
+async def test_active_linear_still_started_retains_wait_and_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake = _FakeLinear(state_name="In Progress")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        cur = await conn.execute("SELECT status FROM runs WHERE id = ?", ("run-iss-1",))
+        run_row = await cur.fetchone()
+    finally:
+        await conn.close()
+
+    assert wait is not None
+    assert run_row is not None
+    assert str(run_row["status"]) == "failed"
+    assert rows[0][1] is None
+    assert rows[0][2] == ACTION_OBSERVED
+    assert fake.comments == []
 
 
 @pytest.mark.asyncio

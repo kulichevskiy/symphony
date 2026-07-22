@@ -448,6 +448,23 @@ class _SlashCommandsMixin(_OrchestratorBase):
         if run_id.startswith(MANUAL_MERGE_PARKED_RUN_PREFIX):
             await self._handle_parked_manual_merge_slash_intent(issue_id, intent)
             return
+        if (
+            run_id in self._operator_wait_run_ids
+            and await db.operator_waits.get_by_run_id(self._conn, run_id) is None
+        ):
+            # The in-memory dicts below are only refreshed by `_restore_operator_waits`
+            # at the top of a poll tick, so a wait cleared out-of-band mid-tick (e.g. by
+            # the background reconciler auto-clearing a canceled issue) can leave a
+            # stale run_id routable here even though its DB row is already gone. Evict
+            # it and reject the command instead of acting on a wait that no longer
+            # exists.
+            await self._clear_operator_wait(issue_id, run_id)
+            await self._post_command_rejected(
+                issue_id,
+                self._slash_text(intent),
+                "operator wait is no longer active",
+            )
+            return
         if run_id in self._implement_failed_run_bindings:
             await self._handle_implement_failed_slash_intent(issue_id, run_id, intent)
             return
