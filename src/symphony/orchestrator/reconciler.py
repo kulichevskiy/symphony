@@ -630,7 +630,11 @@ class Reconciler:
                 )
 
         if post_cancel_comment:
-            pr_remains_open = bool(prs) and github_action != ACTION_CLEARED
+            # `github_action == ACTION_CLEARED` only proves the single drifted PR
+            # the tick handled got cleared — with multiple linked PR rows, another
+            # one can still be open. Re-check the actual remaining rows rather than
+            # inferring "none open" from that one action.
+            pr_remains_open = bool(await self._open_prs(issue_id))
             body = _CANCELED_CLEAR_BODY_PR_OPEN if pr_remains_open else _CANCELED_CLEAR_BODY
             try:
                 await self.tracker(tracker_ctx).post_comment(tracker_issue_id, body)
@@ -1157,6 +1161,8 @@ class Reconciler:
             team_key=wait.linear_team_key,
             github_repo=wait.github_repo,
             issue_label=wait.issue_label,
+            tracker_provider=wait.tracker_provider,
+            tracker_site=wait.tracker_site,
         )
 
     def _bindings_for_pr(
@@ -1188,6 +1194,8 @@ class Reconciler:
         team_key: str,
         github_repo: str,
         issue_label: str | None,
+        tracker_provider: str | None = None,
+        tracker_site: str | None = None,
     ) -> list[RepoBinding]:
         bindings: list[RepoBinding] = []
         for binding in self.config.repos:
@@ -1196,6 +1204,10 @@ class Reconciler:
             if binding.github_repo != github_repo:
                 continue
             if issue_label is not None and (binding.issue_label or "") != issue_label:
+                continue
+            if tracker_provider is not None and binding.tracker_provider != tracker_provider:
+                continue
+            if tracker_site is not None and binding.tracker_site != tracker_site:
                 continue
             bindings.append(binding)
         return bindings
