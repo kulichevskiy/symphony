@@ -209,6 +209,26 @@ async def _seed_merge_wait(
     )
 
 
+async def _seed_review_cap_wait(
+    conn: aiosqlite.Connection,
+    issue_id: str = "iss-1",
+    *,
+    issue_label: str = "symphony",
+    github_repo: str = "org/repo",
+) -> None:
+    await _seed_run(conn, issue_id, f"run-{issue_id}")
+    await db.operator_waits.upsert(
+        conn,
+        issue_id=issue_id,
+        run_id=f"run-{issue_id}",
+        kind=db.operator_waits.KIND_REVIEW_CAP,
+        linear_team_key="ENG",
+        github_repo=github_repo,
+        issue_label=issue_label,
+        created_at="2026-05-17T10:01:00Z",
+    )
+
+
 async def _seed_implement_failed_wait(
     conn: aiosqlite.Connection,
     issue_id: str = "iss-1",
@@ -564,6 +584,101 @@ async def test_active_merge_zombie_clears_wait_and_marks_pr_merged(
     ]
     assert ("operator_waits", "kind", db.operator_waits.KIND_MERGE, None) in transitions
     assert ("issue_prs", "merged_at", None, merged_at) in transitions
+
+
+@pytest.mark.asyncio
+async def test_active_review_cap_zombie_clears_wait_and_marks_pr_merged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A review-cap park (SYM-114) is merge-like: a PR merged out-of-band
+    must clear it the same way a merge zombie clears a `KIND_MERGE` wait."""
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    merged_at = "2026-05-17T11:59:00Z"
+    try:
+        await _seed_issue(conn)
+        await _seed_review_cap_wait(conn)
+        await _seed_pr(conn)
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "MERGED",
+                    "mergeable": "UNKNOWN",
+                    "mergedAt": merged_at,
+                    "url": "https://github.com/org/repo/pull/42",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        stored_merged_at = await _merged_at(conn)
+        transitions = await _transition_rows(conn)
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert stored_merged_at == merged_at
+    assert [(source, drift, action) for source, drift, action, _ in rows] == [
+        ("linear", None, ACTION_OBSERVED),
+        ("github", DRIFT_MERGE_ZOMBIE, ACTION_CLEARED),
+    ]
+    assert ("operator_waits", "kind", db.operator_waits.KIND_REVIEW_CAP, None) in transitions
+    assert ("issue_prs", "merged_at", None, merged_at) in transitions
+
+
+@pytest.mark.asyncio
+async def test_active_review_cap_pr_closed_no_merge_clears_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A review-cap park (SYM-114) must also be cleared when the parked PR
+    is closed unmerged out-of-band, mirroring the `KIND_MERGE` behavior."""
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_review_cap_wait(conn)
+        await _seed_pr(conn)
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "CLOSED",
+                    "mergeable": None,
+                    "merged": False,
+                    "mergedAt": None,
+                    "url": "https://github.com/org/repo/pull/42",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+        )
+        transitions = await _transition_rows(conn)
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert pr is None
+    assert rows[1][1] == DRIFT_PR_CLOSED_NO_MERGE
+    assert rows[1][2] == ACTION_CLEARED
+    assert ("issue_prs", "__row__", "org/repo#42", None) in transitions
 
 
 @pytest.mark.asyncio
