@@ -72,16 +72,29 @@ def claude_builder_settings() -> str:
 
     Registers a PreToolUse deny-hook over all tools that blocks the
     background-task machinery a one-shot dispatch cannot honor (background
-    Bash, ScheduleWakeup, BashOutput, KillShell). We do NOT set
-    `disableAllHooks` here — that would silence the very hook we're adding
-    (the read-only reviewer keeps its own `disableAllHooks` settings).
+    Bash, ScheduleWakeup, BashOutput, KillShell, and the cron/monitor
+    surface). We do NOT set `disableAllHooks` here — that would silence the
+    very hook we're adding (the read-only reviewer keeps its own
+    `disableAllHooks` settings).
+
+    The hook `matcher` is a regex matched against `tool_name`, not a glob:
+    `"*"` is an invalid "match nothing/one-or-more-of-nothing" regex, so the
+    hook would silently never fire. `""` is the documented all-tools matcher.
+
+    Also sets `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`: without it, a
+    foreground Bash call that runs past its timeout is auto-backgrounded by
+    the CLI itself (no `run_in_background` on the call for our hook to
+    catch), and `BashOutput`/`KillShell` to retrieve/stop it are denied —
+    stranding the run. This env var disables that auto-background conversion
+    (and `run_in_background`) outright.
     """
     return json.dumps(
         {
+            "env": {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1"},
             "hooks": {
                 "PreToolUse": [
                     {
-                        "matcher": "*",
+                        "matcher": "",
                         "hooks": [
                             {
                                 "type": "command",

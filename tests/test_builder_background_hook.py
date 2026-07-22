@@ -59,6 +59,12 @@ def test_hook_blocks_bash_output_and_kill_shell() -> None:
         assert result.returncode == 2, tool
 
 
+def test_hook_blocks_cron_and_monitor_tools() -> None:
+    for tool in ("CronCreate", "CronList", "CronDelete", "Monitor", "TaskOutput", "TaskStop"):
+        result = _run_hook({"tool_name": tool, "tool_input": {}})
+        assert result.returncode == 2, tool
+
+
 def test_hook_allows_foreground_bash() -> None:
     result = _run_hook({"tool_name": "Bash", "tool_input": {"command": "git commit -m x"}})
     assert result.returncode == 0
@@ -101,6 +107,17 @@ def test_builder_settings_registers_pretooluse_hook() -> None:
 def test_builder_settings_does_not_disable_all_hooks() -> None:
     settings = json.loads(claude_builder_settings())
     assert settings.get("disableAllHooks") is not True
+
+
+def test_builder_settings_hook_matcher_matches_all_tools() -> None:
+    settings = json.loads(claude_builder_settings())
+    entries = settings["hooks"]["PreToolUse"]
+    assert all(entry["matcher"] == "" for entry in entries)
+
+
+def test_builder_settings_disables_background_tasks_env() -> None:
+    settings = json.loads(claude_builder_settings())
+    assert settings["env"]["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] == "1"
 
 
 # --- wiring into every builder command builder -----------------------------

@@ -14,7 +14,11 @@ one-shot dispatch cannot honor:
   * any `Bash` with `run_in_background == true` — reachable only at the
     parameter level, which tool allowlists can't gate;
   * `ScheduleWakeup`, `BashOutput`, `KillShell` by name — the
-    self-continuation + background-poll surface.
+    self-continuation + background-poll surface;
+  * `CronCreate`, `CronList`, `CronDelete`, `Monitor`, `TaskOutput`,
+    `TaskStop` by name — the same scheduling/monitoring surface reachable
+    through the current cron and background-monitor tools instead of
+    `ScheduleWakeup`/`BashOutput`/`KillShell`.
 
 Stdlib only: shipped in the container image and invoked by the claude CLI,
 not imported by symphony.
@@ -25,7 +29,19 @@ from __future__ import annotations
 import json
 import sys
 
-_BLOCKED_TOOLS = frozenset({"ScheduleWakeup", "BashOutput", "KillShell"})
+_BLOCKED_TOOLS = frozenset(
+    {
+        "ScheduleWakeup",
+        "BashOutput",
+        "KillShell",
+        "CronCreate",
+        "CronList",
+        "CronDelete",
+        "Monitor",
+        "TaskOutput",
+        "TaskStop",
+    }
+)
 
 _STEER = (
     "Run the command in the FOREGROUND (never run_in_background) and make "
