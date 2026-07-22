@@ -71,8 +71,7 @@ class _FakeLinear:
             url="https://linear.app/issue/ENG-1",
             state_id="state",
             state_name=self.state_name,
-            state_type=self.state_type
-            or ("completed" if self.state_name == "Done" else "started"),
+            state_type=self.state_type or ("completed" if self.state_name == "Done" else "started"),
             team_key="ENG",
             labels=["symphony"],
             updated_at="2026-05-17T11:58:00Z",

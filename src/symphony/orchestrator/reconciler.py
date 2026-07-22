@@ -574,13 +574,9 @@ class Reconciler:
 
         if post_cancel_comment:
             try:
-                await self.tracker(tracker_ctx).post_comment(
-                    tracker_issue_id, _CANCELED_CLEAR_BODY
-                )
+                await self.tracker(tracker_ctx).post_comment(tracker_issue_id, _CANCELED_CLEAR_BODY)
             except LinearError as e:
-                log.warning(
-                    "could not post canceled auto-clear comment on %s: %s", issue_id, e
-                )
+                log.warning("could not post canceled auto-clear comment on %s: %s", issue_id, e)
 
         return _ReconcileIssueResult(
             observations=2,
