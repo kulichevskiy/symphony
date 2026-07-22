@@ -448,9 +448,10 @@ class _SlashCommandsMixin(_OrchestratorBase):
         if run_id.startswith(MANUAL_MERGE_PARKED_RUN_PREFIX):
             await self._handle_parked_manual_merge_slash_intent(issue_id, intent)
             return
-        if run_id in self._operator_wait_run_ids and await db.operator_waits.get_by_run_id(
-            self._conn, run_id
-        ) is None:
+        if (
+            run_id in self._operator_wait_run_ids
+            and await db.operator_waits.get_by_run_id(self._conn, run_id) is None
+        ):
             # The in-memory dicts below are only refreshed by `_restore_operator_waits`
             # at the top of a poll tick, so a wait cleared out-of-band mid-tick (e.g. by
             # the background reconciler auto-clearing a canceled issue) can leave a
