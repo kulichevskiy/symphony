@@ -43,7 +43,7 @@ export type Applicability = {
   why: Record<CommandId, string>;
 };
 
-export function applicability(status: string): Applicability {
+export function applicability(status: string, waitingOn?: string | null): Applicability {
   const en = {} as Record<CommandId, boolean>;
   const why = {} as Record<CommandId, string>;
   for (const c of ALL_CMDS) {
@@ -74,7 +74,13 @@ export function applicability(status: string): Applicability {
       on("skip-acceptance");
       on("retry-acceptance");
       on("stop");
-      off("reject", "Already past review");
+      // A review-cap park (Needs Input) still accepts $reject to halt —
+      // only a genuine post-review merge wait has already passed review.
+      if (waitingOn === "review_cap") {
+        on("reject");
+      } else {
+        off("reject", "Already past review");
+      }
       off("skip-review", "Review already complete");
       off("retry", "Nothing has failed");
       break;

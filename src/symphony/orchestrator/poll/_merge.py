@@ -1546,6 +1546,7 @@ class _MergeMixin(_OrchestratorBase):
             if binding is None:
                 return
         tracker = self.tracker(binding)
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
         wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
         if (
             intent.kind is SlashKind.RETRY
@@ -1585,7 +1586,7 @@ class _MergeMixin(_OrchestratorBase):
             states = await self._states_for_binding(binding)
             blocked_id = states.get(binding.linear_states.blocked)
             try:
-                issue = await tracker.lookup_issue(issue_id)
+                issue = await tracker.lookup_issue(tracker_issue_id)
             except LinearError as e:
                 log.warning("could not look up %s for merge reject: %s", issue_id, e)
                 raise SlashHandlerFailure(
@@ -1594,7 +1595,7 @@ class _MergeMixin(_OrchestratorBase):
                 ) from e
             if blocked_id is not None:
                 try:
-                    await tracker.move_issue(issue_id, blocked_id)
+                    await tracker.move_issue(tracker_issue_id, blocked_id)
                 except LinearError as e:
                     log.warning(
                         "could not move %s to blocked after merge reject: %s",
@@ -1613,7 +1614,7 @@ class _MergeMixin(_OrchestratorBase):
 
         # $approve or $retry: re-dispatch the merge.
         try:
-            issue = await tracker.lookup_issue(issue_id)
+            issue = await tracker.lookup_issue(tracker_issue_id)
         except LinearError as e:
             log.warning("could not look up %s for merge re-dispatch: %s", issue_id, e)
             raise SlashHandlerFailure(
@@ -1636,7 +1637,7 @@ class _MergeMixin(_OrchestratorBase):
             await self._clear_operator_wait(issue_id, run_id)
             try:
                 await tracker.post_comment(
-                    issue_id,
+                    tracker_issue_id,
                     truncate_body(
                         resumed(
                             CommentVars(

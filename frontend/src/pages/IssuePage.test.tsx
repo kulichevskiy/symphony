@@ -70,6 +70,16 @@ describe("applicability", () => {
     const { en } = applicability("done");
     expect(Object.values(en).every((v) => v === false)).toBe(true);
   });
+
+  it("disables Reject for a plain awaiting-merge wait", () => {
+    const { en } = applicability("awaiting_merge");
+    expect(en.reject).toBe(false);
+  });
+
+  it("enables Reject for a review-cap park in awaiting-merge", () => {
+    const { en } = applicability("awaiting_merge", "review_cap");
+    expect(en.reject).toBe(true);
+  });
 });
 
 describe("CmdButton", () => {
