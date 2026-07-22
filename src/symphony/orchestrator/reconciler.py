@@ -50,6 +50,17 @@ DRIFT_LINEAR_CANCELED = "linear_state_canceled"
 DRIFT_PR_LOCALLY_MERGED = "pr_locally_merged"
 DRIFT_ORPHAN_PR_OPEN = "orphan_pr_open"
 
+
+def _is_merge_like_wait(wait: db.operator_waits.OperatorWait | None) -> bool:
+    """A review-cap park is awaiting the same `$approve`-to-merge decision as a
+    merge wait, so a PR merged/closed outside Symphony must clear it the same
+    way a merge zombie clears a `KIND_MERGE` wait — otherwise the wait lingers
+    and a later `$approve` targets an already-merged PR."""
+    return wait is not None and wait.kind in (
+        db.operator_waits.KIND_MERGE,
+        db.operator_waits.KIND_REVIEW_CAP,
+    )
+
 # Linear state_type for an abandoned/terminal-negative issue. A canceled issue
 # will never re-enter a polled active lane, so its parked operator wait can
 # never be cleared by a slash command — the reconciler clears it instead.
@@ -496,7 +507,7 @@ class Reconciler:
             observations=drift_prs,
         )
         github_drift = classify_github_drift(
-            has_merge_wait=wait is not None and wait.kind == db.operator_waits.KIND_MERGE,
+            has_merge_wait=_is_merge_like_wait(wait),
             prs=drift_prs,
             linear_canceled=linear_is_canceled,
         )
@@ -1463,15 +1474,11 @@ def _github_clearable(
     github_prs: list[GithubPrObservation],
 ) -> bool:
     if github_drift == DRIFT_PR_CLOSED_NO_MERGE:
-        if wait is not None and wait.kind != db.operator_waits.KIND_MERGE:
+        if wait is not None and not _is_merge_like_wait(wait):
             return False
         return bool(_closed_unmerged_prs(github_prs))
     if github_drift == DRIFT_MERGE_ZOMBIE:
-        return (
-            wait is not None
-            and wait.kind == db.operator_waits.KIND_MERGE
-            and bool(_merged_prs_with_timestamps(github_prs))
-        )
+        return _is_merge_like_wait(wait) and bool(_merged_prs_with_timestamps(github_prs))
     if github_drift == DRIFT_PR_LOCALLY_MERGED:
         return bool(_merged_prs_with_timestamps(github_prs))
     return False
@@ -1482,7 +1489,7 @@ def _github_prs_for_drift(
     wait: db.operator_waits.OperatorWait | None,
     github_prs: list[GithubPrObservation],
 ) -> list[GithubPrObservation]:
-    if wait is None or wait.kind != db.operator_waits.KIND_MERGE:
+    if not _is_merge_like_wait(wait):
         return github_prs
     return [pr for pr in github_prs if pr.github_repo.casefold() == wait.github_repo.casefold()]
 

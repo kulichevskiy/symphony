@@ -1546,6 +1546,23 @@ class _MergeMixin(_OrchestratorBase):
             if binding is None:
                 return
         tracker = self.tracker(binding)
+        wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
+        if (
+            intent.kind is SlashKind.RETRY
+            and wait is not None
+            and wait.kind == db.operator_waits.KIND_REVIEW_CAP
+        ):
+            # The review-cap park only advertises `$approve` (force-advance) and
+            # `$reject` (stop) — `$retry` falling into the shared "re-dispatch the
+            # merge" path below would merge without another review pass, which is
+            # not what an operator retrying a review-cap park intends.
+            await self._post_command_rejected(
+                issue_id,
+                self._slash_text(intent),
+                "$retry is not supported for a review-cap park; reply $approve to "
+                "force-advance or $reject to stop",
+            )
+            return
         if intent.kind is SlashKind.APPROVE:
             parked_pr = await db.issue_prs.get(
                 self._conn,

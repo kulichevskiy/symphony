@@ -158,8 +158,8 @@ def stuck_loop_escape(v: CommentVars) -> str:
         f"- Last trigger: **{v.trigger}**\n"
         f"- {token_block(v)}\n\n"
         f"PR: {v.pr_url}\n\n"
-        f"Reply with `$approve` to force-advance, `$reject` to stop, or "
-        f"free-form steering for one more attempt.\n"
+        f"Reply with `$approve` to force-advance, or `$reject` to stop. "
+        f"(Free-form steering / `$retry` are not supported for this park.)\n"
     )
 
 
