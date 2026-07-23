@@ -233,6 +233,38 @@ def _codex_event_api_error(event: dict[str, Any]) -> StreamApiError | None:
     return StreamApiError(message=msg, status=status)
 
 
+# Pre-stream auth failures print a plain-text (often stderr-only) line the
+# JSONL classifier above never sees: claude's "Not logged in", and codex's
+# auth-session / refresh failure phrasings.
+_PLAINTEXT_AUTH_PHRASES: tuple[str, ...] = (
+    "not logged in",
+    "please run /login",
+    "authentication_error",
+    "invalid api key",
+    "refresh token expired",
+    "refresh_token_expired",
+    "refresh token was already used",
+    "refresh_token_reused",
+    "refresh token was revoked",
+    "refresh_token_invalidated",
+    "401 unauthorized",
+)
+
+
+def classify_plaintext_auth_error(text: str) -> StreamApiError | None:
+    """Recover an auth failure from plain-text output the JSONL classifier
+    can't parse (a pre-stream crash on stdout, or a stderr-only message).
+
+    Callers scope `text` to a single subprocess's own stdout+stderr so the
+    error is attributed to the pass/agent that actually produced it, never a
+    combined multi-agent log.
+    """
+    low = text.lower()
+    if any(phrase in low for phrase in _PLAINTEXT_AUTH_PHRASES):
+        return StreamApiError(message="authentication failure", status=401)
+    return None
+
+
 def classify_stream_api_error(stdout: str) -> StreamApiError | None:
     """Recover a provider API error from an agent's terminal JSONL stream.
 

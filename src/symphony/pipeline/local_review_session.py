@@ -55,6 +55,7 @@ from .local_review import (
     LocalVerdict,
     ReviewerAgent,
     build_local_review_command,
+    classify_plaintext_auth_error,
     classify_stream_api_error,
     extract_last_agent_message,
     is_small_diff,
@@ -351,6 +352,14 @@ async def run_local_review_session(
         # instead of a generic "no verdict marker". `api_error` carries the
         # same as a typed signal (`.transient`) for downstream retry gating.
         api_error = classify_stream_api_error(collected.stdout)
+        if api_error is None:
+            # A pre-stream auth failure (claude "Not logged in", codex
+            # refresh/401) often prints a plain-text, stderr-only line the
+            # JSONL classifier above never sees. Scope the scan to THIS
+            # pass's own stdout+stderr — never a combined multi-agent log —
+            # so a claude finder's failure can never be misattributed to a
+            # codex verifier that hasn't run yet.
+            api_error = classify_plaintext_auth_error(collected.stdout + "\n" + collected.stderr)
         return ReviewerOutput(
             stdout=collected.stdout,
             head_sha=head_sha,
@@ -480,6 +489,20 @@ async def run_local_review_session(
             stdout=verifier_out.stdout,
             last_message_file=verifier_out.last_message_file,
         )
+        # The finder can hit a typed auth failure (401) and still emit usable
+        # findings, so it passes the `agent_error`-with-findings guard above
+        # and reaches a verifier that succeeds cleanly. Carry the finder's
+        # `api_error`/`api_error_agent` forward when the verifier didn't
+        # produce its own, so the loop still surfaces (and expires) the
+        # finder's failing provider instead of silently dropping it.
+        merged_api_error = (
+            verifier_out.api_error if verifier_out.api_error is not None else finder_out.api_error
+        )
+        merged_api_error_agent = (
+            verifier_out.api_error_agent
+            if verifier_out.api_error is not None
+            else finder_out.api_error_agent
+        )
         return replace(
             verifier_out,
             last_message_file=verifier_message,
@@ -488,6 +511,8 @@ async def run_local_review_session(
             output_tokens=(verifier_out.output_tokens + finder_out.output_tokens),
             cache_write_tokens=(verifier_out.cache_write_tokens + finder_out.cache_write_tokens),
             cache_read_tokens=(verifier_out.cache_read_tokens + finder_out.cache_read_tokens),
+            api_error=merged_api_error,
+            api_error_agent=merged_api_error_agent,
         )
 
     async def _fixer(iteration: int, verdict: LocalVerdict) -> FixerOutput:
@@ -588,6 +613,13 @@ async def run_local_review_session(
         head_advanced = bool(head_after) and head_after != head_before
         if not head_advanced:
             api_error = classify_stream_api_error(collected.stdout)
+            if api_error is None:
+                # As in `_run_reviewer_pass`: a pre-stream auth failure can
+                # print only a plain-text stderr line the JSONL classifier
+                # never sees. Scoped to this fix-run's own stdout+stderr.
+                api_error = classify_plaintext_auth_error(
+                    collected.stdout + "\n" + collected.stderr
+                )
             # Preserve ANY provider API error, not only transient statuses: a
             # deterministic 401/unauthorized fix failure must keep its typed
             # `api_error` (tagged with the fixer's agent by the loop) so the

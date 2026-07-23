@@ -1051,6 +1051,71 @@ async def test_two_pass_finder_with_findings_and_stray_error_still_verifies(
 
 
 @pytest.mark.asyncio
+async def test_two_pass_finder_401_survives_merge_when_verifier_stalls(
+    tmp_path: Path,
+) -> None:
+    """A codex finder that hits a typed 401 but still produces usable findings
+    proceeds to the verifier (per the guard above); when that claude verifier
+    then stalls (its own `api_error` stays None), the merged `ReviewerOutput`
+    must still carry the *finder's* `api_error`/`api_error_agent` so the loop
+    surfaces + expires codex — not silently drop it because the verifier
+    doesn't carry one of its own. Regression for the merge's `replace()`
+    folding only cost counters and losing `finder_out.api_error`."""
+    finder_stream = [
+        RunnerEvent(
+            kind="stdout",
+            line=json.dumps(
+                {"type": "turn.failed", "error": {"message": "unauthorized", "status": 401}}
+            ),
+        ),
+        RunnerEvent(
+            kind="stdout",
+            line=json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"id": "i", "type": "agent_message", "text": "## Findings\n- x"},
+                }
+            ),
+        ),
+        RunnerEvent(kind="exit", returncode=0),
+    ]
+    verifier_stall = [RunnerEvent(kind="stall_timeout")]
+    runner = _ScriptedRunner(
+        scripts=[finder_stream, verifier_stall, finder_stream, verifier_stall]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=500, changed_files=10)
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-2pass-merge-401",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.api_error is not None and result.api_error.status == 401
+    # Attributed to the finder's provider (codex), not the stalled verifier's
+    # (claude).
+    assert result.api_error_agent == "codex"
+
+
+@pytest.mark.asyncio
 async def test_finder_uses_sonnet_verifier_stays_on_opus(
     tmp_path: Path,
 ) -> None:
@@ -1657,5 +1722,50 @@ async def test_fixer_deterministic_401_surfaces_as_fix_run_failed(tmp_path: Path
     )
 
     assert result.outcome == LoopOutcome.FIX_RUN_FAILED
+    assert result.api_error is not None and result.api_error.status == 401
+    assert result.api_error_agent == "claude"
+
+
+@pytest.mark.asyncio
+async def test_single_pass_reviewer_plaintext_auth_failure_tags_only_reviewer_agent(
+    tmp_path: Path,
+) -> None:
+    """A single-pass (small-diff) claude reviewer that dies on a pre-stream,
+    plaintext "Not logged in" line (no JSONL, so `classify_stream_api_error`
+    sees nothing) must attribute the failure to claude only — never to the
+    verifier's agent (codex), which never ran this iteration. Regression for
+    the combined-log scrape misattributing a claude pre-stream auth failure to
+    an uninvolved codex verifier."""
+    plaintext_auth_failure = [
+        RunnerEvent(kind="stderr", line="Not logged in. Please run /login."),
+        RunnerEvent(kind="exit", returncode=1),
+    ]
+    runner = _ScriptedRunner(scripts=[plaintext_auth_failure, plaintext_auth_failure])
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=1, changed_files=1)
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-plaintext-401",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="claude"),
+        verifier_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=1,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
     assert result.api_error is not None and result.api_error.status == 401
     assert result.api_error_agent == "claude"

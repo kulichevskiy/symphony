@@ -92,6 +92,7 @@ from ...pipeline.cost_guard import (
 )
 from ...pipeline.local_review import (
     StreamApiError,
+    classify_plaintext_auth_error,
     classify_stream_api_error,
     extract_last_agent_message,
 )
@@ -3416,9 +3417,12 @@ class _OrchestratorBase:
         stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
         if stdout is None:
             return False
-        api_error: object | None = classify_stream_api_error(stdout) or _plaintext_auth_error(
+        # Pre-stream auth failures print a plain-text (often stderr-only) line
+        # the JSONL classifier skips: claude's "Not logged in", and codex's
+        # auth-session / refresh failure phrasings.
+        api_error: object | None = classify_stream_api_error(
             stdout
-        )
+        ) or classify_plaintext_auth_error(stdout)
         if api_error is None:
             return False
         cur = await self._conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,))
@@ -3463,7 +3467,7 @@ class _OrchestratorBase:
             if log_path is None:
                 return False
             stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
-            api_error = _plaintext_auth_error(stdout) if stdout is not None else None
+            api_error = classify_plaintext_auth_error(stdout) if stdout is not None else None
             if api_error is None:
                 return False
         run_started_at = ""
@@ -4738,48 +4742,6 @@ class _OrchestratorBase:
 
 
 log = logging.getLogger(__name__)
-
-
-_PLAINTEXT_AUTH_PHRASES = (
-    "not logged in",
-    "please run /login",
-    "authentication_error",
-    "invalid api key",
-    "refresh token expired",
-    "refresh_token_expired",
-    "refresh token was already used",
-    "refresh_token_reused",
-    "refresh token was revoked",
-    "refresh_token_invalidated",
-    "401 unauthorized",
-)
-
-
-# Post-run bookkeeping keyed by run id (auth verdicts, launched agent) is only
-# needed for the immediate post-run decision, so the maps are bounded instead of
-# growing for the daemon's lifetime (SYM-229 review).
-_MAX_RUN_MEMO_ENTRIES = 512
-
-
-def _remember_bounded(memo: dict[str, Any], key: str, value: Any) -> None:
-    """Record `key`→`value`, evicting the oldest entries past the cap."""
-    memo[key] = value
-    while len(memo) > _MAX_RUN_MEMO_ENTRIES:
-        memo.pop(next(iter(memo)), None)
-
-
-def _plaintext_auth_error(stdout: str) -> StreamApiError | None:
-    """An auth failure recovered from plain log text, or None.
-
-    Pre-stream auth failures print a plain-text (often stderr-only) line the
-    JSONL classifier skips: claude's "Not logged in", and codex's auth-session /
-    refresh failure phrasings. Shared by the runner tail and by the rc=0 fix
-    paths, whose `api_error` comes from the JSONL-only reader and would otherwise
-    miss these entirely (SYM-229 review)."""
-    low = stdout.lower()
-    if any(phrase in low for phrase in _PLAINTEXT_AUTH_PHRASES):
-        return StreamApiError(message="authentication failure", status=401)
-    return None
 
 
 def _looks_like_auth_error(api_error: object) -> bool:
