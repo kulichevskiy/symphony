@@ -5950,3 +5950,155 @@ async def test_required_check_fix_run_carries_fix_role_model(
         assert argv[argv.index("--model") + 1] == "sonnet"
     finally:
         await conn.close()
+
+
+def _scoped_issue() -> LinearIssue:
+    """A tracker `LinearIssue` whose id is the *tracker* id, distinct from the
+    storage id the `runs`/`review_state`/`operator_waits` rows live under.
+
+    Mirrors a scoped tracker (`storage_id != tracker_id`), where merge recovery
+    must persist follow-up state under the storage id, not `issue.id`.
+    """
+    return LinearIssue(
+        id="tracker-iss",
+        identifier="ENG-1",
+        title="Add auth",
+        description="Need OAuth.",
+        url="https://linear.app/team/issue/ENG-1",
+        state_id="state-review",
+        state_name="In Review",
+        state_type="started",
+        team_key="ENG",
+        labels=["feature"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_execute_pr_merge_threads_storage_id_to_conflict_fix(
+    tmp_path: Path,
+) -> None:
+    """SYM-114 follow-up: `_execute_pr_merge` must thread `storage_issue_id`
+    into the merge-conflict rebase fix dispatch.
+
+    For a scoped tracker the conflict fix-run and its review state must land
+    under the storage id, not the tracker `issue.id`.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(auto_merge=False)
+        gh = MagicMock()
+        gh.pr_merge = AsyncMock(side_effect=GitHubError("merge conflict detected"))
+        conflict_view = {
+            "headRefOid": "abc123",
+            "mergeable": "CONFLICTING",
+            "mergeStateStatus": "DIRTY",
+            "baseRefName": "main",
+            "mergedAt": None,
+        }
+        gh.pr_view = AsyncMock(return_value=conflict_view)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg, AsyncMock(), conn, runner=MagicMock(), gh=gh, push_fn=AsyncMock()
+        )
+        orch._gh_client = AsyncMock(return_value=gh)  # type: ignore[method-assign]  # noqa: SLF001
+        dispatch = AsyncMock(return_value=True)
+        orch._dispatch_merge_conflict_rebase_fix_run = dispatch  # type: ignore[method-assign]  # noqa: SLF001
+
+        halted = await orch._execute_pr_merge(  # noqa: SLF001
+            binding=binding,
+            issue=_scoped_issue(),
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            run_id="merge-run",
+            premerge_view=None,
+            storage_issue_id="storage-iss",
+        )
+
+        assert halted is True
+        dispatch.assert_awaited_once()
+        assert dispatch.await_args.kwargs["storage_issue_id"] == "storage-iss"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_required_check_fix_persists_state_under_storage_id(
+    tmp_path: Path,
+) -> None:
+    """SYM-114 follow-up: required-check merge recovery must read + write review
+    state under the storage id for a scoped tracker, not the tracker `issue.id`.
+
+    Otherwise a scoped-tracker `$approve` that hits a required-check failure
+    bumps the iteration / signature under the tracker id, bypassing the cap and
+    dedup state the rest of the machinery keeps under the storage id.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(auto_merge=False)
+        await db.issues.upsert(
+            conn, id="storage-iss", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        await db.review_state.begin_review(
+            conn,
+            "storage-iss",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo="org/repo",
+            issue_label=None,
+        )
+        await db.runs.create(
+            conn,
+            id="merge-run",
+            issue_id="storage-iss",
+            stage="merge",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+        fix_run = AsyncMock(return_value=True)
+        orch._dispatch_merge_required_check_fix_run = fix_run  # type: ignore[method-assign]  # noqa: SLF001
+
+        failing_checks: list[dict[str, object]] = [
+            {"__typename": "CheckRun", "name": "ci/test", "conclusion": "FAILURE"}
+        ]
+        dispatched = await orch._dispatch_merge_required_check_fix_if_allowed(  # noqa: SLF001
+            binding=binding,
+            issue=_scoped_issue(),
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            head_sha="abc123",
+            failing_checks=failing_checks,
+            merge_error="required check failed",
+            merge_run_id="merge-run",
+            storage_issue_id="storage-iss",
+        )
+
+        assert dispatched is True
+        fix_run.assert_awaited_once()
+        assert fix_run.await_args.kwargs["storage_issue_id"] == "storage-iss"
+
+        signature = _required_check_trigger_signature(
+            head_sha="abc123", failing_checks=failing_checks
+        )
+        storage_state = await db.review_state.get(conn, "storage-iss")
+        assert storage_state.iteration == 1
+        assert storage_state.last_trigger_signature == signature
+
+        # Nothing must have leaked onto the tracker id.
+        tracker_state = await db.review_state.get(conn, "tracker-iss")
+        assert tracker_state.iteration == 0
+        assert tracker_state.last_trigger_signature == ""
+    finally:
+        await conn.close()

@@ -485,12 +485,13 @@ class _MergeMixin(_OrchestratorBase):
         binding: RepoBinding,
         issue: LinearIssue,
         state: db.review_state.ReviewState,
+        storage_issue_id: str | None = None,
     ) -> int:
         if state.pr_number is None:
             return 0
         interrupted = await db.runs.interrupt_stale_merge_needs_approval(
             self._conn,
-            issue_id=issue.id,
+            issue_id=storage_issue_id or issue.id,
             github_repo=binding.github_repo,
             pr_number=state.pr_number,
         )
@@ -684,12 +685,14 @@ class _MergeMixin(_OrchestratorBase):
         merge_error: str,
         merge_run_id: str | None = None,
         dispatch_capacity_held: bool = False,
+        storage_issue_id: str | None = None,
     ) -> bool:
+        storage_issue_id = storage_issue_id or issue.id
         signature = _required_check_trigger_signature(
             head_sha=head_sha,
             failing_checks=failing_checks,
         )
-        state = await db.review_state.get(self._conn, issue.id)
+        state = await db.review_state.get(self._conn, storage_issue_id)
         if not should_dispatch_fix_run(
             prev_signature=state.last_trigger_signature,
             new_signature=signature,
@@ -698,7 +701,7 @@ class _MergeMixin(_OrchestratorBase):
         # A prior review-fix run that hit a transient API error stays in the
         # review state (not moved to Ready). Guard here so the merge loop does
         # not immediately re-dispatch before the backoff window elapses.
-        if await self._agent_infra_retry_backoff_active(issue.id):
+        if await self._agent_infra_retry_backoff_active(storage_issue_id):
             if merge_run_id is not None:
                 await self._fail_run(
                     merge_run_id,
@@ -723,7 +726,7 @@ class _MergeMixin(_OrchestratorBase):
         # remote-review gate. No fix run exists yet at this boundary, so fall
         # back to a fresh run id when no live merge run is driving us.
         if await self._maybe_park_for_token_budget(
-            issue.id, merge_run_id or str(uuid.uuid4()), binding
+            storage_issue_id, merge_run_id or str(uuid.uuid4()), binding
         ):
             return False
 
@@ -740,10 +743,11 @@ class _MergeMixin(_OrchestratorBase):
             iteration=iteration,
             merge_run_id=merge_run_id,
             dispatch_capacity_held=dispatch_capacity_held,
+            storage_issue_id=storage_issue_id,
         )
         if dispatched is True:
-            await db.review_state.bump_iteration(self._conn, issue.id)
-            await db.review_state.set_signature(self._conn, issue.id, signature)
+            await db.review_state.bump_iteration(self._conn, storage_issue_id)
+            await db.review_state.set_signature(self._conn, storage_issue_id, signature)
         return dispatched is not False
 
     async def _dispatch_merge_required_check_fix_run(
@@ -760,7 +764,9 @@ class _MergeMixin(_OrchestratorBase):
         iteration: int,
         merge_run_id: str | None = None,
         dispatch_capacity_held: bool = False,
+        storage_issue_id: str | None = None,
     ) -> bool | None:
+        storage_issue_id = storage_issue_id or issue.id
         action_log_tail = await self._merge_required_check_action_log_tail(
             repo=binding.github_repo,
             failing_checks=failing_checks,
@@ -833,7 +839,7 @@ class _MergeMixin(_OrchestratorBase):
             fix_run_id: str,
             drop_dispatch_id: Callable[[], None],
         ) -> bool | None:
-            prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
+            prior_total = await db.runs.cost_for_issue(self._conn, storage_issue_id)
             try:
                 (
                     usage_delta,
@@ -919,7 +925,7 @@ class _MergeMixin(_OrchestratorBase):
                     run_id=fix_run_id,
                     binding=binding,
                     issue=issue,
-                    storage_issue_id=issue.id,
+                    storage_issue_id=storage_issue_id,
                     api_error=api_error,
                     reason=reason,
                     termination_kind=db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
@@ -969,7 +975,7 @@ class _MergeMixin(_OrchestratorBase):
                 local_review_result = await self._run_local_review_phase(
                     binding=binding,
                     issue=issue,
-                    storage_issue_id=issue.id,
+                    storage_issue_id=storage_issue_id,
                     workspace_path=workspace_path,
                     parent_run_id=fix_run_id,
                 )
@@ -983,7 +989,7 @@ class _MergeMixin(_OrchestratorBase):
                         await self._block_local_only_review_infra_failure(
                             binding=binding,
                             issue=issue,
-                            storage_issue_id=issue.id,
+                            storage_issue_id=storage_issue_id,
                             run_id=run.id,
                             result=local_review_result,
                         )
@@ -1037,7 +1043,7 @@ class _MergeMixin(_OrchestratorBase):
                 )
                 return True
 
-            state = await db.review_state.get(self._conn, issue.id)
+            state = await db.review_state.get(self._conn, storage_issue_id)
             if state.pr_number is None:
                 state = replace(
                     state,
@@ -1055,6 +1061,7 @@ class _MergeMixin(_OrchestratorBase):
                 binding=binding,
                 issue=issue,
                 state=state,
+                storage_issue_id=storage_issue_id,
             )
             if merge_run_id is not None:
                 running_interrupted = await db.runs.interrupt_running_merge(
@@ -1077,6 +1084,7 @@ class _MergeMixin(_OrchestratorBase):
             setup=setup,
             on_dedup_loss=on_dedup_loss,
             dispatch_capacity_held=dispatch_capacity_held,
+            storage_issue_id=storage_issue_id,
         )
 
     async def _run_required_check_fix_agent(
@@ -1139,7 +1147,9 @@ class _MergeMixin(_OrchestratorBase):
         merge_run_id: str | None = None,
         dispatch_capacity_held: bool = False,
         on_started: Callable[[str], Awaitable[None]] | None = None,
+        storage_issue_id: str | None = None,
     ) -> bool:
+        storage_issue_id = storage_issue_id or issue.id
         base_ref = await self._resolve_pr_base_ref(
             binding=binding,
             issue=issue,
@@ -1181,7 +1191,7 @@ class _MergeMixin(_OrchestratorBase):
             fix_run_id: str,
             drop_dispatch_id: Callable[[], None],
         ) -> bool:
-            prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
+            prior_total = await db.runs.cost_for_issue(self._conn, storage_issue_id)
             prompt = merge_conflict_rebase_fix_prompt(
                 issue_title=issue.title,
                 issue_body=issue.description,
@@ -1286,7 +1296,7 @@ class _MergeMixin(_OrchestratorBase):
                 )
             marked = await db.issue_prs.mark_merge_conflict_fixed(
                 self._conn,
-                issue_id=issue.id,
+                issue_id=storage_issue_id,
                 github_repo=binding.github_repo,
                 pr_number=pr_number,
                 head_sha=fixed_head_sha,
@@ -1300,7 +1310,7 @@ class _MergeMixin(_OrchestratorBase):
                 )
             interrupted = await db.runs.interrupt_stale_merge_needs_approval(
                 self._conn,
-                issue_id=issue.id,
+                issue_id=storage_issue_id,
                 github_repo=binding.github_repo,
                 pr_number=pr_number,
             )
@@ -1333,6 +1343,7 @@ class _MergeMixin(_OrchestratorBase):
             after_dedup=after_dedup,
             on_dedup_loss=on_dedup_loss,
             dispatch_capacity_held=dispatch_capacity_held,
+            storage_issue_id=storage_issue_id,
         )
         return bool(result)
 
@@ -2856,6 +2867,7 @@ class _MergeMixin(_OrchestratorBase):
                 run_id=run_id,
                 workspace_path=workspace_path,
                 pr_url=pr_url,
+                storage_issue_id=storage_issue_id,
             ):
                 return run_id
 
@@ -2877,6 +2889,7 @@ class _MergeMixin(_OrchestratorBase):
                 pr_url=pr_url,
                 run_id=run_id,
                 approved_head_sha=approved_head_sha,
+                storage_issue_id=storage_issue_id,
             )
             if halted:
                 return run_id
@@ -2888,6 +2901,7 @@ class _MergeMixin(_OrchestratorBase):
                 pr_url=pr_url,
                 run_id=run_id,
                 premerge_view=premerge_view,
+                storage_issue_id=storage_issue_id,
             ):
                 return run_id
 
@@ -2955,11 +2969,14 @@ class _MergeMixin(_OrchestratorBase):
         run_id: str,
         workspace_path: Path,
         pr_url: str,
+        storage_issue_id: str | None = None,
     ) -> bool:
         """Run the merge agent, record its usage, and check the runner verdict.
         Returns True if the run halted (caller returns the run id)."""
         try:
-            prior_total = await db.runs.cost_for_issue(self._conn, issue.id)
+            prior_total = await db.runs.cost_for_issue(
+                self._conn, storage_issue_id or issue.id
+            )
             (
                 cumulative_usage,
                 final_kind,
@@ -3041,6 +3058,7 @@ class _MergeMixin(_OrchestratorBase):
         pr_url: str,
         run_id: str,
         approved_head_sha: str,
+        storage_issue_id: str | None = None,
     ) -> tuple[bool, dict[str, object] | None]:
         """Re-fetch the PR before merging and verify the pushed HEAD is the
         approved one (re-classifying review on drift) and conflict-free.
@@ -3050,6 +3068,7 @@ class _MergeMixin(_OrchestratorBase):
         pre-check could not run), forwarded to the merge step for required-check
         recovery.
         """
+        storage_issue_id = storage_issue_id or issue.id
         try:
             premerge_view = await (await self._gh_client()).pr_view(
                 pr_number,
@@ -3100,7 +3119,7 @@ class _MergeMixin(_OrchestratorBase):
                     run_id=run_id,
                     reason=reason,
                 )
-                state = await db.review_state.get(self._conn, issue.id)
+                state = await db.review_state.get(self._conn, storage_issue_id)
                 await self._retrigger_codex_review_unless_approved(
                     binding=binding,
                     issue=issue,
@@ -3117,6 +3136,7 @@ class _MergeMixin(_OrchestratorBase):
                 view=premerge_view,
                 merge_run_id=run_id,
                 dispatch_capacity_held=True,
+                storage_issue_id=storage_issue_id,
             )
             return True, premerge_view
 
@@ -3131,9 +3151,11 @@ class _MergeMixin(_OrchestratorBase):
         pr_url: str,
         run_id: str,
         premerge_view: dict[str, object] | None,
+        storage_issue_id: str | None = None,
     ) -> bool:
         """Merge the PR, recovering from merge conflicts / required-check
         failures. Returns True if the run halted (caller returns the run id)."""
+        storage_issue_id = storage_issue_id or issue.id
         try:
             await (await self._gh_client()).pr_merge(
                 pr_number,
@@ -3165,6 +3187,7 @@ class _MergeMixin(_OrchestratorBase):
                     view=conflict_view,
                     merge_run_id=run_id,
                     dispatch_capacity_held=True,
+                    storage_issue_id=storage_issue_id,
                 )
                 return True
             required_view: dict[str, object] | None = None
@@ -3206,8 +3229,12 @@ class _MergeMixin(_OrchestratorBase):
                         merge_error=str(e),
                         merge_run_id=run_id,
                         dispatch_capacity_held=True,
+                        storage_issue_id=storage_issue_id,
                     )
-                    if dispatched or await db.operator_waits.get(self._conn, issue.id) is not None:
+                    if (
+                        dispatched
+                        or await db.operator_waits.get(self._conn, storage_issue_id) is not None
+                    ):
                         return True
             await self._mark_merge_needs_approval(
                 binding=binding,
