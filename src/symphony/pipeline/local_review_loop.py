@@ -76,6 +76,13 @@ class ReviewerOutput:
     # deterministic 4xx). `agent_error` carries its message for operators;
     # `api_error` is the gate downstream retry logic reads.
     api_error: StreamApiError | None = None
+    # Which agent produced `api_error` ("claude"/"codex"). A two-pass review
+    # can run the verifier on a different provider than the finder, so the
+    # session tags the pass that actually failed here; the loop threads it into
+    # `LoopResult.api_error_agent` so an expiry hits the failing provider rather
+    # than always the session's `reviewer_agent`. None → the caller falls back
+    # to the reviewer agent (the single-pass / common case).
+    api_error_agent: str | None = None
     cost_usd: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -224,6 +231,10 @@ async def run_local_review_loop(
         # the generic marker message.
         stream_error: str | None = None
         stream_api_error: StreamApiError | None = None
+        # Which provider owns `stream_api_error`. The output attributes it
+        # (verifier pass may differ from the finder); fall back to the session's
+        # reviewer agent when it doesn't (single-pass / common case).
+        stream_api_error_agent: str | None = None
         for attempt in range(REVIEWER_FAILURE_RETRIES + 1):
             out = await reviewer(i)
             _record_usage(out)
@@ -231,6 +242,7 @@ async def run_local_review_loop(
                 stream_error = out.agent_error
             if out.api_error is not None:
                 stream_api_error = out.api_error
+                stream_api_error_agent = out.api_error_agent or str(reviewer_agent)
             if not out.ok:
                 reviewer_error = out.error or "reviewer failed"
                 if attempt < REVIEWER_FAILURE_RETRIES:
@@ -240,7 +252,7 @@ async def run_local_review_loop(
                     iterations=i + 1,
                     error=reviewer_error,
                     api_error=stream_api_error,
-                    api_error_agent=(str(reviewer_agent) if stream_api_error else None),
+                    api_error_agent=(stream_api_error_agent if stream_api_error else None),
                 )
             parsed = parse_local_review_output(
                 agent=reviewer_agent,
@@ -259,7 +271,7 @@ async def run_local_review_loop(
                 iterations=i + 1,
                 error=reviewer_error or stream_error or "reviewer failed",
                 api_error=stream_api_error,
-                api_error_agent=(str(reviewer_agent) if stream_api_error else None),
+                api_error_agent=(stream_api_error_agent if stream_api_error else None),
             )
         verdicts.append(verdict)
 
@@ -287,7 +299,7 @@ async def run_local_review_loop(
                 iterations=i + 1,
                 error=stream_error or "reviewer emitted no verdict marker",
                 api_error=stream_api_error,
-                api_error_agent=(str(reviewer_agent) if stream_api_error else None),
+                api_error_agent=(stream_api_error_agent if stream_api_error else None),
             )
 
         # CHANGES_REQUESTED — gate on the merged-findings digest before paying

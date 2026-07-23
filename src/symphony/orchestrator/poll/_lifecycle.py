@@ -1669,6 +1669,32 @@ class _LifecycleMixin(_OrchestratorBase):
                         provider=lr_failed_agent,
                         run_id=parent_run_id,
                     )
+                elif lr_api_error is None:
+                    # No JSONL api_error reached the LoopResult: a PRE-STREAM auth
+                    # failure (claude "Not logged in", codex refresh/401) prints a
+                    # plain-text — often stderr-only — line the stdout JSONL
+                    # classifier never sees, so it silently left the row
+                    # `connected`. Scrape the run log for it like the stage
+                    # runners do (Config v2 5/9), scoped to the pass that failed so
+                    # a claude reviewer's failure can't expire a codex fixer.
+                    lr_scrape_agents: set[str] = set()
+                    if result is None or result.outcome in (
+                        LoopOutcome.REVIEWER_FAILED,
+                        LoopOutcome.FIX_RUN_FAILED,
+                    ):
+                        if result is None or result.outcome == LoopOutcome.REVIEWER_FAILED:
+                            lr_scrape_agents.add(reviewer_role.agent)
+                            lr_scrape_agents.add(verifier_role.agent)
+                        if result is None or result.outcome == LoopOutcome.FIX_RUN_FAILED:
+                            lr_scrape_agents.add(fixer_role.agent)
+                    for lr_scrape_agent in lr_scrape_agents:
+                        if lr_scrape_agent in _AGENT_CRED_LAYOUT:
+                            await self._flag_auth_failure_from_log(
+                                lr_scrape_agent,
+                                self.config.log_root / f"{local_review_run_id}.log",
+                                1,
+                                local_review_run_id,
+                            )
 
             log.info(
                 "local-review phase for %s ended in %s (iterations=%d, strategy=%s, reviewer=%s)",

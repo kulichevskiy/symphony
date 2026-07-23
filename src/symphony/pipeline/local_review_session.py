@@ -358,6 +358,10 @@ async def run_local_review_session(
             ok=True,
             agent_error=api_error.message if api_error is not None else None,
             api_error=api_error,
+            # Tag with THIS pass's agent so a two-pass verifier failure (which
+            # may run a different provider than the finder) expires the right
+            # provider; the loop reads it into `LoopResult.api_error_agent`.
+            api_error_agent=(str(agent) if api_error is not None else None),
             cost_usd=cost_delta,
             input_tokens=input_delta,
             output_tokens=output_delta,
@@ -584,7 +588,14 @@ async def run_local_review_session(
         head_advanced = bool(head_after) and head_after != head_before
         if not head_advanced:
             api_error = classify_stream_api_error(collected.stdout)
-            if api_error is not None and api_error.transient:
+            # Preserve ANY provider API error, not only transient statuses: a
+            # deterministic 401/unauthorized fix failure must keep its typed
+            # `api_error` (tagged with the fixer's agent by the loop) so the
+            # orchestrator can expire the credential instead of reducing it to a
+            # plain FIX_RUN_FAILED that leaves the row connected. A blocked
+            # fix-run (SYM-101) exits 0 with no api_error, so this can't swallow
+            # the operator-wait path.
+            if api_error is not None:
                 return FixerOutput(
                     ok=False,
                     error=api_error.message,

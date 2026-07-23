@@ -555,3 +555,37 @@ async def test_transient_api_error_propagated_into_loop_result() -> None:
     assert result.api_error == api_err
     assert result.api_error is not None and result.api_error.transient is True
     assert fixer.received == []
+    # No explicit attribution on the output → falls back to the reviewer agent.
+    assert result.api_error_agent == "codex"
+
+
+@pytest.mark.asyncio
+async def test_reviewer_output_api_error_agent_tags_that_provider() -> None:
+    """A two-pass reviewer whose api_error came from the verifier (a different
+    provider than the finder) attributes it via `ReviewerOutput.api_error_agent`;
+    the loop must tag `LoopResult.api_error_agent` with that agent — not the
+    session's `reviewer_agent` — so an expiry hits the failing provider."""
+    api_err = StreamApiError(message="API Error: 401 unauthorized", status=401)
+
+    async def _reviewer(i: int) -> ReviewerOutput:
+        return ReviewerOutput(
+            stdout="(verifier ran on codex and returned 401)",
+            head_sha="s1",
+            ok=True,
+            agent_error=api_err.message,
+            api_error=api_err,
+            api_error_agent="codex",
+        )
+
+    fixer = _FixerScript()
+    result = await run_local_review_loop(
+        reviewer_agent="claude",
+        reviewer=_reviewer,
+        fixer=fixer,
+        cap=5,
+    )
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.api_error == api_err
+    # Tagged with the verifier's provider, not the session's reviewer_agent.
+    assert result.api_error_agent == "codex"
+    assert fixer.received == []

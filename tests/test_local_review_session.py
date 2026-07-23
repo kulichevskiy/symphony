@@ -1572,3 +1572,90 @@ async def test_wall_clock_secs_wired_to_specs_and_distinguishes_error(
     reviewer_spec, fixer_spec = runner.specs
     assert reviewer_spec.wall_clock_secs == 2
     assert fixer_spec.wall_clock_secs == 2
+
+
+@pytest.mark.asyncio
+async def test_two_pass_verifier_401_tags_verifier_agent(tmp_path: Path) -> None:
+    """A two-pass review whose verifier runs a different provider than the
+    finder and returns a 401 must attribute the failure to the *verifier's*
+    agent — a codex finder must not expire a claude verifier's provider (and
+    vice versa). Regression for `api_error_agent` only ever being the finder."""
+    finder_text = "## Findings\n- suspicion at foo.py:1"
+    # Finder (codex) succeeds with findings; verifier (claude) exits 0 with only
+    # a 401 and no verdict. The loop retries the whole two-pass once.
+    runner = _ScriptedRunner(
+        scripts=[
+            _message_stream("codex", finder_text),
+            _claude_api_error_stream(401),
+            _message_stream("codex", finder_text),
+            _claude_api_error_stream(401),
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=500, changed_files=10)
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-verify-401",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.api_error is not None and result.api_error.status == 401
+    # Attributed to the verifier's provider, not the finder's (codex).
+    assert result.api_error_agent == "claude"
+
+
+@pytest.mark.asyncio
+async def test_fixer_deterministic_401_surfaces_as_fix_run_failed(tmp_path: Path) -> None:
+    """A fixer that exits 0 emitting a deterministic 401 (unauthorized) and
+    makes no commit must surface FIX_RUN_FAILED carrying the fixer's api_error
+    tagged with its agent — not a silent ok=True that leaves the row connected.
+    Only transient statuses were preserved before; a 401 was dropped."""
+    runner = _ScriptedRunner(
+        scripts=[
+            _codex_message_stream(f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"),
+            _claude_api_error_stream(401),
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        # HEAD never advances: the fixer made no commit before the 401.
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-fix-401",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.FIX_RUN_FAILED
+    assert result.api_error is not None and result.api_error.status == 401
+    assert result.api_error_agent == "claude"

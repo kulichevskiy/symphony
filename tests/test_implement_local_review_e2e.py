@@ -1755,3 +1755,120 @@ async def test_local_review_deliver_failed_resumes_after_restart(
         assert "Tokens: in 7 · out 11 · cache w 13 / r 17" in stage_done_posts[0]
     finally:
         await conn.close()
+
+
+def _claude_cred_far_future(token: str = "tok") -> str:
+    # Far-future expiry so the daemon's proactive refresh is skipped.
+    return json.dumps({"claudeAiOauth": {"accessToken": token, "expiresAt": 4102444800000}})
+
+
+@pytest.mark.asyncio
+async def test_local_review_plaintext_auth_failure_expires_connection(
+    tmp_path: Path,
+) -> None:
+    """A local-review reviewer that dies on a PRE-STREAM auth failure prints a
+    plain-text (stderr-only) "Not logged in" line the stdout JSONL classifier
+    never sees, so `LoopResult.api_error` is None. The finally must still scrape
+    the run log (like the stage runners) and flip the UI-connected provider to
+    `expired` — otherwise the row stays `connected` and the issue hot-loops."""
+    from symphony.crypto import CredentialCipher
+
+    enc_key = "deployment-secret"
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = RepoBinding(
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            agent="claude",
+            branch_prefix="symphony",
+            review_strategy="local",
+            # Reviewer runs claude too, so the auth failure is attributable to
+            # the claude connection.
+            reviewer_agent="claude",
+            linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+            symphony_encryption_key=enc_key,
+        )
+
+        # Claude is UI-connected before the run.
+        await db.oauth_connections.set_connection(
+            conn,
+            provider="claude",
+            credential=_claude_cred_far_future(),
+            cipher=CredentialCipher(enc_key),
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_clone = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+        push_fn = AsyncMock()
+
+        # Reviewer emits ONLY a stderr auth line and exits non-zero — no JSONL
+        # api_error on stdout. The loop retries the reviewer once, so provide
+        # two identical scripts.
+        auth_fail_script = [
+            RunnerEvent(kind="stderr", line="Not logged in · Please run /login"),
+            RunnerEvent(kind="exit", returncode=1),
+        ]
+        runner = _StagedRunner(
+            {
+                "implement": [
+                    [
+                        RunnerEvent(kind="started", pid=4242),
+                        RunnerEvent(
+                            kind="stdout",
+                            line=json.dumps(
+                                {
+                                    "type": "result",
+                                    "subtype": "success",
+                                    "total_cost_usd": 0.01,
+                                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                                }
+                            ),
+                        ),
+                        RunnerEvent(kind="exit", returncode=0),
+                    ]
+                ],
+                "local_review": [auth_fail_script, list(auth_fail_script)],
+            }
+        )
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, cfg.repos[0])
+
+        # The pre-stream auth failure was scraped from the run log and the
+        # claude connection flipped to `expired`.
+        status = await db.oauth_connections.get_status(conn, "claude")
+        assert status is not None and status.status == "expired"
+        assert status.updated_by == "auth-failure"
+    finally:
+        await conn.close()
