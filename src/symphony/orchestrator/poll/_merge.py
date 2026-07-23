@@ -3293,7 +3293,7 @@ class _MergeMixin(_OrchestratorBase):
         way through merge completion) (SYM-114 review).
         """
         row = await db.runs.get_with_issue(self._conn, run_id)
-        return row.issue_id if row is not None else fallback
+        return row.run.issue_id if row is not None else fallback
 
     async def _mark_merge_done(
         self,
