@@ -259,6 +259,7 @@ class _AcceptanceMixin(_OrchestratorBase):
             approved_head_sha: str = "",
             skip_review: bool = False,
             on_started: Callable[[str], Awaitable[None]] | None = None,
+            storage_issue_id: str | None = None,
         ) -> asyncio.Task[None]: ...
         @staticmethod
         def _slash_text(intent: SlashIntent) -> str: ...

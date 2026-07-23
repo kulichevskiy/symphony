@@ -5048,6 +5048,64 @@ async def test_retry_slash_reruns_hybrid_local_gate_before_remote_review(
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_review_cap_park_registers_watched_operator_wait(
+    tmp_path: Path,
+) -> None:
+    """Parking at the review-iteration cap must register an operator wait so
+    the slash loop watches the parked issue for `$approve`/`$reject` replies.
+
+    Regression: the review-cap park only moved the issue to Needs Input and
+    posted the stuck-loop-escape comment without a wait or a parked PR, so its
+    comments were never polled and every operator reply was silently dropped.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.team_states = AsyncMock(return_value=_states())
+        linear.post_comment = AsyncMock()
+        linear.move_issue = AsyncMock()
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=MagicMock())
+        run = db.runs.Run(
+            id="review-run",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+            ended_at=None,
+            cost_usd=0.0,
+        )
+
+        await orch._park_review_for_approval(  # noqa: SLF001
+            run=run,
+            binding=binding,
+            issue=_issue_in_code_review(),
+            trigger="codex_inline:cap",
+        )
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.run_id == "review-run"
+        assert wait.kind == db.operator_waits.KIND_REVIEW_CAP
+        assert orch._dispatch_run_ids["iss-1"] == "review-run"  # noqa: SLF001
+        assert "review-run" in orch._operator_wait_run_ids  # noqa: SLF001
+        assert orch._merge_needs_approval_bindings["review-run"] is binding  # noqa: SLF001
+        # The parked run is now eligible for the slash-command poll set.
+        assert orch._slash_command_run_eligible("review-run")  # noqa: SLF001
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
+    finally:
+        await conn.close()
+
+
 @pytest.mark.parametrize(
     "kind",
     [SlashKind.APPROVE, SlashKind.REJECT, SlashKind.STOP],

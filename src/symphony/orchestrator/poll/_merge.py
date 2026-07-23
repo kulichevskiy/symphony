@@ -1538,11 +1538,32 @@ class _MergeMixin(_OrchestratorBase):
                 issue_id,
                 run_id,
                 intent,
-                expected_kinds=(db.operator_waits.KIND_MERGE,),
+                expected_kinds=(
+                    db.operator_waits.KIND_MERGE,
+                    db.operator_waits.KIND_REVIEW_CAP,
+                ),
             )
             if binding is None:
                 return
         tracker = self.tracker(binding)
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
+        wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
+        if (
+            intent.kind is SlashKind.RETRY
+            and wait is not None
+            and wait.kind == db.operator_waits.KIND_REVIEW_CAP
+        ):
+            # The review-cap park only advertises `$approve` (force-advance) and
+            # `$reject` (stop) — `$retry` falling into the shared "re-dispatch the
+            # merge" path below would merge without another review pass, which is
+            # not what an operator retrying a review-cap park intends.
+            await self._post_command_rejected(
+                issue_id,
+                self._slash_text(intent),
+                "$retry is not supported for a review-cap park; reply $approve to "
+                "force-advance or $reject to stop",
+            )
+            return
         if intent.kind is SlashKind.APPROVE:
             parked_pr = await db.issue_prs.get(
                 self._conn,
@@ -1565,7 +1586,7 @@ class _MergeMixin(_OrchestratorBase):
             states = await self._states_for_binding(binding)
             blocked_id = states.get(binding.linear_states.blocked)
             try:
-                issue = await tracker.lookup_issue(issue_id)
+                issue = await tracker.lookup_issue(tracker_issue_id)
             except LinearError as e:
                 log.warning("could not look up %s for merge reject: %s", issue_id, e)
                 raise SlashHandlerFailure(
@@ -1574,7 +1595,7 @@ class _MergeMixin(_OrchestratorBase):
                 ) from e
             if blocked_id is not None:
                 try:
-                    await tracker.move_issue(issue_id, blocked_id)
+                    await tracker.move_issue(tracker_issue_id, blocked_id)
                 except LinearError as e:
                     log.warning(
                         "could not move %s to blocked after merge reject: %s",
@@ -1593,7 +1614,7 @@ class _MergeMixin(_OrchestratorBase):
 
         # $approve or $retry: re-dispatch the merge.
         try:
-            issue = await tracker.lookup_issue(issue_id)
+            issue = await tracker.lookup_issue(tracker_issue_id)
         except LinearError as e:
             log.warning("could not look up %s for merge re-dispatch: %s", issue_id, e)
             raise SlashHandlerFailure(
@@ -1616,7 +1637,7 @@ class _MergeMixin(_OrchestratorBase):
             await self._clear_operator_wait(issue_id, run_id)
             try:
                 await tracker.post_comment(
-                    issue_id,
+                    tracker_issue_id,
                     truncate_body(
                         resumed(
                             CommentVars(
@@ -1646,6 +1667,7 @@ class _MergeMixin(_OrchestratorBase):
                 pr_number=pr_number,
                 pr_url=pr_url,
                 on_started=on_merge_started,
+                storage_issue_id=issue_id,
             )
 
     async def _parked_closed_unmerged_pr_for_event(
@@ -2528,9 +2550,17 @@ class _MergeMixin(_OrchestratorBase):
         approved_head_sha: str = "",
         skip_review: bool = False,
         on_started: Callable[[str], Awaitable[None]] | None = None,
+        storage_issue_id: str | None = None,
     ) -> asyncio.Task[None]:
+        # `issue.id` is the tracker's own id, which for a scoped tracker
+        # setup differs from the `issues` table storage id. All persisted
+        # follow-up state (`runs`, `_dispatch_run_ids`, `_scheduled_issue_ids`)
+        # must key off the storage id so other lookups (operator_waits,
+        # `db.runs.has_active`, ...) that already use it can see this
+        # in-flight merge (SYM-114 review).
+        storage_issue_id = storage_issue_id or issue.id
         binding_key = _binding_key(binding)
-        self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
+        self._reserve_scheduled_slot(issue_id=storage_issue_id, binding_key=binding_key)
         task = asyncio.create_task(
             self._merge_with_limits(
                 binding=binding,
@@ -2540,13 +2570,14 @@ class _MergeMixin(_OrchestratorBase):
                 approved_head_sha=approved_head_sha,
                 skip_review=skip_review,
                 on_started=on_started,
+                storage_issue_id=storage_issue_id,
             )
         )
         self._dispatch_tasks.add(task)
         task.add_done_callback(
             partial(
                 self._dispatch_task_done,
-                issue_id=issue.id,
+                issue_id=storage_issue_id,
                 binding_key=binding_key,
             )
         )
@@ -2562,7 +2593,9 @@ class _MergeMixin(_OrchestratorBase):
         approved_head_sha: str = "",
         skip_review: bool = False,
         on_started: Callable[[str], Awaitable[None]] | None = None,
+        storage_issue_id: str | None = None,
     ) -> None:
+        storage_issue_id = storage_issue_id or issue.id
         key = _binding_key(binding)
         binding_sem = self._binding_dispatch_sems.setdefault(
             key,
@@ -2582,9 +2615,10 @@ class _MergeMixin(_OrchestratorBase):
                         approved_head_sha=approved_head_sha,
                         skip_review=skip_review,
                         on_started=on_started,
+                        storage_issue_id=storage_issue_id,
                     )
         except asyncio.CancelledError:
-            run_id = self._dispatch_run_ids.get(issue.id)
+            run_id = self._dispatch_run_ids.get(storage_issue_id)
             if run_id is not None:
                 await self._fail_run(run_id, "merge cancelled")
             raise
@@ -2755,7 +2789,9 @@ class _MergeMixin(_OrchestratorBase):
         approved_head_sha: str = "",
         skip_review: bool = False,
         on_started: Callable[[str], Awaitable[None]] | None = None,
+        storage_issue_id: str | None = None,
     ) -> str | None:
+        storage_issue_id = storage_issue_id or issue.id
         run_id = str(uuid.uuid4())
         now = self._now().isoformat()
         # Launch gate: merge is a follow-up stage (drains in-flight work even
@@ -2769,7 +2805,7 @@ class _MergeMixin(_OrchestratorBase):
             inserted = await db.runs.create_if_no_active(
                 self._conn,
                 id=run_id,
-                issue_id=issue.id,
+                issue_id=storage_issue_id,
                 stage="merge",
                 status="running",
                 pid=None,
@@ -2782,7 +2818,7 @@ class _MergeMixin(_OrchestratorBase):
             return None
 
         await self._complete_review_monitors_for_merge(issue)
-        self._dispatch_run_ids[issue.id] = run_id
+        self._dispatch_run_ids[storage_issue_id] = run_id
         if on_started is not None:
             try:
                 await on_started(run_id)
@@ -2866,7 +2902,7 @@ class _MergeMixin(_OrchestratorBase):
         finally:
             if workspace_path is not None:
                 self._workspace.release(binding, issue)
-            self._dispatch_run_ids.pop(issue.id, None)
+            self._dispatch_run_ids.pop(storage_issue_id, None)
 
     async def _acquire_merge_workspace(
         self,
@@ -3247,6 +3283,18 @@ class _MergeMixin(_OrchestratorBase):
         )
         return True
 
+    async def _run_issue_id(self, run_id: str, fallback: str) -> str:
+        """Storage id for `run_id`'s issue.
+
+        Authoritative over `issue.id`, which for a scoped tracker is the
+        tracker's own id and can differ from the storage id the `runs` row
+        was created under (e.g. a review-cap park's merge re-dispatch looks
+        up the issue via the tracker and passes that `LinearIssue` all the
+        way through merge completion) (SYM-114 review).
+        """
+        row = await db.runs.get_with_issue(self._conn, run_id)
+        return row.run.issue_id if row is not None else fallback
+
     async def _mark_merge_done(
         self,
         *,
@@ -3255,6 +3303,7 @@ class _MergeMixin(_OrchestratorBase):
         pr_url: str,
         run_id: str,
     ) -> None:
+        storage_issue_id = await self._run_issue_id(run_id, issue.id)
         states = await self._states_for_binding(binding)
         done_id = states.get(binding.linear_states.done)
         if done_id is None:
@@ -3267,7 +3316,7 @@ class _MergeMixin(_OrchestratorBase):
             )
             return
 
-        tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
+        tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
         tracker = self.tracker(binding)
         await tracker.move_issue(issue.id, done_id)
         final_body = stage_done(
@@ -3295,12 +3344,12 @@ class _MergeMixin(_OrchestratorBase):
         ended_at = self._now().isoformat()
         await db.issue_prs.mark_merged(
             self._conn,
-            issue_id=issue.id,
+            issue_id=storage_issue_id,
             github_repo=binding.github_repo,
             merged_at=ended_at,
         )
         await db.runs.update_status(self._conn, run_id, "done", ended_at=ended_at)
-        await self._clear_operator_wait(issue.id, run_id)
+        await self._clear_operator_wait(storage_issue_id, run_id)
         await self._notify_attention(
             event=EVENT_PR_MERGED,
             issue_identifier=issue.identifier,
@@ -3357,6 +3406,9 @@ class _MergeMixin(_OrchestratorBase):
             )
             if not inserted:
                 return
+            storage_issue_id = issue.id
+        else:
+            storage_issue_id = await self._run_issue_id(run_id, issue.id)
 
         try:
             needs_approval_id: str | None = None
@@ -3371,7 +3423,7 @@ class _MergeMixin(_OrchestratorBase):
                     e,
                 )
 
-            tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
+            tokens = await db.runs.tokens_for_issue(self._conn, storage_issue_id)
             body = awaiting_approval(
                 CommentVars(
                     stage="merge",
@@ -3422,13 +3474,13 @@ class _MergeMixin(_OrchestratorBase):
             )
             # Register so $approve/$reject can be received after restart.
             # Done inside finally so it runs even when a non-LinearError above escapes.
-            self._dispatch_run_ids[issue.id] = run_id
+            self._dispatch_run_ids[storage_issue_id] = run_id
             self._operator_wait_run_ids.add(run_id)
             self._merge_needs_approval_bindings[run_id] = binding
             try:
                 await db.operator_waits.upsert(
                     self._conn,
-                    issue_id=issue.id,
+                    issue_id=storage_issue_id,
                     run_id=run_id,
                     kind=db.operator_waits.KIND_MERGE,
                     linear_team_key=binding.linear_team_key,

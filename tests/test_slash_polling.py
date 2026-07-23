@@ -613,6 +613,108 @@ async def test_merge_approve_dispatches_when_operator_shares_linear_identity(
 
 
 @pytest.mark.asyncio
+async def test_review_cap_approve_schedules_merge(tmp_path: Path) -> None:
+    """SYM-114: `$approve` on a review-cap park force-advances to merge
+    using the parked PR from `review_state`."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("$approve")])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_operator_wait(
+            conn,
+            run_id="review-run",
+            kind=db.operator_waits.KIND_REVIEW_CAP,
+            stage="review",
+            status="completed",
+        )
+        await _seed_review_state(conn, pr_number=166)
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        _, kwargs = orch._schedule_merge.call_args  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["pr_number"] == 166
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_cap_reject_moves_to_blocked_and_clears_wait(tmp_path: Path) -> None:
+    """SYM-114: `$reject`/`$stop` on a review-cap park moves the issue to
+    blocked and clears the wait instead of leaving it stranded."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("$reject")])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_operator_wait(
+            conn,
+            run_id="review-run",
+            kind=db.operator_waits.KIND_REVIEW_CAP,
+            stage="review",
+            status="completed",
+        )
+        await _seed_review_state(conn, pr_number=166)
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-blocked")
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        assert "review-run" not in orch._operator_wait_run_ids  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_cap_retry_rejected_without_redispatch(tmp_path: Path) -> None:
+    """SYM-114: `$retry` isn't a supported reply on a review-cap park — it
+    must be rejected, not silently re-dispatch a merge."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("$retry")])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_operator_wait(
+            conn,
+            run_id="review-run",
+            kind=db.operator_waits.KIND_REVIEW_CAP,
+            stage="review",
+            status="completed",
+        )
+        await _seed_review_state(conn, pr_number=166)
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+        bodies = [str(c.args[1]) for c in linear.post_comment.await_args_list]
+        assert any("$retry" in body and "not supported" in body for body in bodies)
+        assert await db.operator_waits.get(conn, "iss-1") is not None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_skip_acceptance_after_restart_dispatches_merge(
     tmp_path: Path,
 ) -> None:

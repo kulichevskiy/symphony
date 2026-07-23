@@ -807,6 +807,48 @@ async def test_reconcile_merge_wait_clean_retires_live_review_monitor(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_auto_recoverable_merge_waits_skips_review_cap_wait(
+    tmp_path: Path,
+) -> None:
+    """A review-cap park (SYM-114) must never be auto-merged by the merge
+    wait reconciler — only the operator's `$approve` may advance it."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_merge_operator_wait(conn)
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="merge-run",
+            kind=db.operator_waits.KIND_REVIEW_CAP,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="",
+            created_at="2026-05-10T00:03:00+00:00",
+        )
+        orch = _make_merge_wait_orchestrator(
+            conn,
+            gh_view={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "baseRefName": "main",
+                "mergedAt": None,
+            },
+        )
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        assert await orch._reconcile_auto_recoverable_merge_waits() == 0  # noqa: SLF001
+
+        orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
+        orch.linear.post_comment.assert_not_awaited()
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_REVIEW_CAP
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_reconcile_merge_wait_blocked_leaves_wait_untouched(
     tmp_path: Path,
 ) -> None:

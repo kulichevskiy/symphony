@@ -19,6 +19,7 @@ KIND_DELIVER_FAILED = "deliver_failed"
 KIND_REVIEW_FAILED = "review_failed"
 KIND_REVIEW_STOPPED = "review_stopped"
 KIND_MERGE = "merge"
+KIND_REVIEW_CAP = "review_cap"
 KIND_ACCEPTANCE_BLOCKED = "acceptance_blocked"
 KIND_ACCEPTANCE_REJECTED = "acceptance_rejected"
 # Soft per-issue token budget tripped at a dispatch boundary. The live agent
@@ -307,6 +308,7 @@ __all__ = [
     "KIND_IMPLEMENT_BLOCKED",
     "KIND_IMPLEMENT_FAILED",
     "KIND_MERGE",
+    "KIND_REVIEW_CAP",
     "KIND_REVIEW_FAILED",
     "KIND_REVIEW_STOPPED",
     "OperatorWait",

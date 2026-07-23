@@ -1753,6 +1753,7 @@ class _OrchestratorBase:
                 db.operator_waits.KIND_REVIEW_FAILED,
                 db.operator_waits.KIND_REVIEW_STOPPED,
                 db.operator_waits.KIND_MERGE,
+                db.operator_waits.KIND_REVIEW_CAP,
                 db.operator_waits.KIND_ACCEPTANCE_BLOCKED,
                 db.operator_waits.KIND_ACCEPTANCE_REJECTED,
                 db.operator_waits.KIND_BUDGET_EXCEEDED,
@@ -1817,7 +1818,10 @@ class _OrchestratorBase:
             db.operator_waits.KIND_REVIEW_STOPPED,
         ):
             self._review_failed_run_bindings[wait.run_id] = binding
-        elif wait.kind == db.operator_waits.KIND_MERGE:
+        elif wait.kind in (
+            db.operator_waits.KIND_MERGE,
+            db.operator_waits.KIND_REVIEW_CAP,
+        ):
             self._merge_needs_approval_bindings[wait.run_id] = binding
         elif wait.kind == db.operator_waits.KIND_ACCEPTANCE_REJECTED:
             self._acceptance_rejected_run_bindings[wait.run_id] = binding

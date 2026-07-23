@@ -43,7 +43,7 @@ export type Applicability = {
   why: Record<CommandId, string>;
 };
 
-export function applicability(status: string): Applicability {
+export function applicability(status: string, waitingOn?: string | null): Applicability {
   const en = {} as Record<CommandId, boolean>;
   const why = {} as Record<CommandId, string>;
   for (const c of ALL_CMDS) {
@@ -71,10 +71,19 @@ export function applicability(status: string): Applicability {
       break;
     case "awaiting_merge":
       on("approve");
-      on("skip-acceptance");
-      on("retry-acceptance");
       on("stop");
-      off("reject", "Already past review");
+      // A review-cap park (Needs Input) only honors $approve/$reject — the
+      // backend routes it through the merge-needs-approval handler, which
+      // silently no-ops skip-acceptance/retry-acceptance for this wait kind.
+      if (waitingOn === "review_cap") {
+        on("reject");
+        off("skip-acceptance", "Not supported for a review-cap park");
+        off("retry-acceptance", "Not supported for a review-cap park");
+      } else {
+        off("reject", "Already past review");
+        on("skip-acceptance");
+        on("retry-acceptance");
+      }
       off("skip-review", "Review already complete");
       off("retry", "Nothing has failed");
       break;

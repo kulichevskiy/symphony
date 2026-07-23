@@ -643,17 +643,19 @@ export function ConfirmBar({
 
 function Controls({
   status,
+  waitingOn,
   applied,
   busy,
   onRun,
 }: {
   status: string;
+  waitingOn: string | null;
   applied: CommandId | null;
   busy: boolean;
   onRun: (id: CommandId) => void;
 }) {
   const [confirm, setConfirm] = useState<CommandId | null>(null);
-  const { en, why } = applicability(status);
+  const { en, why } = applicability(status, waitingOn);
 
   function handle(id: CommandId) {
     if (COMMANDS[id].destructive) {
@@ -1141,6 +1143,7 @@ export function IssuePage() {
             >
               <Controls
                 status={cockpit.status}
+                waitingOn={cockpit.waitingOn}
                 applied={applied}
                 busy={mutation.isPending}
                 onRun={(cmd) => mutation.mutate(cmd)}
