@@ -1669,25 +1669,23 @@ class _LifecycleMixin(_OrchestratorBase):
                         provider=lr_failed_agent,
                         run_id=parent_run_id,
                     )
-                elif lr_api_error is None:
-                    # No JSONL api_error reached the LoopResult: a PRE-STREAM auth
-                    # failure (claude "Not logged in", codex refresh/401) prints a
-                    # plain-text — often stderr-only — line the stdout JSONL
-                    # classifier never sees, so it silently left the row
-                    # `connected`. Scrape the run log for it like the stage
-                    # runners do (Config v2 5/9), scoped to the pass that failed so
-                    # a claude reviewer's failure can't expire a codex fixer.
-                    lr_scrape_agents: set[str] = set()
-                    if result is None or result.outcome in (
-                        LoopOutcome.REVIEWER_FAILED,
-                        LoopOutcome.FIX_RUN_FAILED,
-                    ):
-                        if result is None or result.outcome == LoopOutcome.REVIEWER_FAILED:
-                            lr_scrape_agents.add(reviewer_role.agent)
-                            lr_scrape_agents.add(verifier_role.agent)
-                        if result is None or result.outcome == LoopOutcome.FIX_RUN_FAILED:
-                            lr_scrape_agents.add(fixer_role.agent)
-                    for lr_scrape_agent in lr_scrape_agents:
+                elif lr_api_error is None and result is None:
+                    # The session raised before returning a LoopResult at all
+                    # (a stall/spawn exception outside any tracked pass, e.g.
+                    # in `workspace_scrubber`/providers/`on_iteration`) — there
+                    # is no per-pass tag to read, so we can't know which of
+                    # reviewer/verifier/fixer's provider actually failed.
+                    # `_run_reviewer_pass`/`_fixer` now classify auth failures
+                    # from each pass's own stdout+stderr (Config v2 6/9
+                    # follow-up), so every REVIEWER_FAILED/FIX_RUN_FAILED
+                    # outcome already carries the right `api_error_agent`
+                    # above and never reaches here. Only flag from the shared
+                    # run log when every role is the same single provider —
+                    # the one case where scraping it can't hit the wrong,
+                    # uninvolved provider.
+                    lr_roles_agents = {reviewer_role.agent, verifier_role.agent, fixer_role.agent}
+                    if len(lr_roles_agents) == 1:
+                        (lr_scrape_agent,) = lr_roles_agents
                         if lr_scrape_agent in _AGENT_CRED_LAYOUT:
                             await self._flag_auth_failure_from_log(
                                 lr_scrape_agent,

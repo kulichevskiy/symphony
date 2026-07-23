@@ -1769,3 +1769,86 @@ async def test_single_pass_reviewer_plaintext_auth_failure_tags_only_reviewer_ag
     assert result.outcome == LoopOutcome.REVIEWER_FAILED
     assert result.api_error is not None and result.api_error.status == 401
     assert result.api_error_agent == "claude"
+
+
+@pytest.mark.asyncio
+async def test_reviewer_spawn_failure_with_auth_stderr_tags_reviewer_agent(
+    tmp_path: Path,
+) -> None:
+    """A reviewer whose process fails to spawn at all (e.g. a codex refresh
+    failure before the CLI even starts) can still print a plaintext auth line
+    on stderr. `_run_reviewer_pass` must classify it and tag `api_error_agent`
+    with the reviewer's own agent — never the verifier's (claude), which never
+    ran this iteration. Regression for the ambiguous combined-log fallback,
+    which had no per-agent scoping and could misattribute a codex spawn-time
+    401 to an uninvolved claude verifier."""
+    spawn_auth_failure = [
+        RunnerEvent(kind="stderr", line="401 Unauthorized: refresh token expired"),
+        RunnerEvent(kind="spawn_failed", error="codex auth refresh failed"),
+    ]
+    runner = _ScriptedRunner(scripts=[spawn_auth_failure, spawn_auth_failure])
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-spawn-401",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.api_error is not None and result.api_error.status == 401
+    assert result.api_error_agent == "codex"
+
+
+@pytest.mark.asyncio
+async def test_fixer_stall_with_auth_stderr_tags_fixer_agent(tmp_path: Path) -> None:
+    """A fix-run that stalls after printing a plaintext auth line on stderr
+    must surface `FixerOutput.api_error` so `LoopResult.api_error_agent` is
+    the fixer's own agent (codex) — not the claude reviewer/verifier that
+    already succeeded this iteration."""
+    runner = _ScriptedRunner(
+        scripts=[
+            _codex_message_stream(f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"),
+            [
+                RunnerEvent(kind="stderr", line="Not logged in. Please run /login."),
+                RunnerEvent(kind="stall_timeout"),
+            ],
+        ],
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-fix-stall-401",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.FIX_RUN_FAILED
+    assert result.api_error is not None and result.api_error.status == 401
+    assert result.api_error_agent == "claude"

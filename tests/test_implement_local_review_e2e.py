@@ -22,7 +22,7 @@ import pytest
 
 from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
-from symphony.config import Config, LinearStates, RepoBinding
+from symphony.config import Config, LinearStates, RepoBinding, RoleConfig
 from symphony.github.client import GitHubError
 from symphony.linear.client import LinearIssue
 from symphony.linear.slash import SlashIntent, SlashKind
@@ -1768,9 +1768,13 @@ async def test_local_review_plaintext_auth_failure_expires_connection(
 ) -> None:
     """A local-review reviewer that dies on a PRE-STREAM auth failure prints a
     plain-text (stderr-only) "Not logged in" line the stdout JSONL classifier
-    never sees, so `LoopResult.api_error` is None. The finally must still scrape
-    the run log (like the stage runners) and flip the UI-connected provider to
-    `expired` — otherwise the row stays `connected` and the issue hot-loops."""
+    never sees. `_run_reviewer_pass` classifies its own stdout+stderr and tags
+    `ReviewerOutput.api_error`/`api_error_agent`, so `LoopResult.api_error` is
+    already populated by the session's primary path (not the shared-log
+    fallback, which only fires when the session raises with no `LoopResult` at
+    all). The finally must still flip the UI-connected provider to `expired`
+    from that tagged error — otherwise the row stays `connected` and the issue
+    hot-loops."""
     from symphony.crypto import CredentialCipher
 
     enc_key = "deployment-secret"
@@ -1870,5 +1874,164 @@ async def test_local_review_plaintext_auth_failure_expires_connection(
         status = await db.oauth_connections.get_status(conn, "claude")
         assert status is not None and status.status == "expired"
         assert status.updated_by == "auth-failure"
+    finally:
+        await conn.close()
+
+
+async def _run_local_review_session_ambiguous_fault(
+    tmp_path: Path, monkeypatch, *, binding_agent: str = "claude", roles
+):
+    """Shared setup: `run_local_review_session` raises before returning any
+    `LoopResult` (an exception outside every tracked pass — a stall/spawn
+    fault in `workspace_scrubber`/providers/`on_iteration`), after writing an
+    auth phrase to the shared run log. This is the one case the `_lifecycle`
+    fallback still scrapes the log for, since there is no per-pass tag to
+    read at all."""
+    from symphony.crypto import CredentialCipher
+    from symphony.orchestrator.poll import _lifecycle as lifecycle_mod
+
+    def _write_log(log_path: Path) -> None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("401 Unauthorized: refresh token expired\n")
+
+    async def _exploding_session_with_log(*, log_path: Path, **_: object) -> None:
+        await asyncio.to_thread(_write_log, log_path)
+        raise RuntimeError("local-review session blew up")
+
+    monkeypatch.setattr(lifecycle_mod, "run_local_review_session", _exploding_session_with_log)
+
+    enc_key = "deployment-secret"
+    conn = await db.connect(tmp_path / "s.sqlite")
+    binding = RepoBinding(
+        linear_team_key="ENG",
+        github_repo="org/repo",
+        agent=binding_agent,
+        branch_prefix="symphony",
+        review_strategy="local",
+        reviewer_agent="codex",
+        linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
+    )
+    cfg = Config(
+        repos=[binding],
+        roles=roles,
+        log_root=tmp_path / "logs",
+        workspace_root=tmp_path / "ws",
+        db_path=tmp_path / "s.sqlite",
+        symphony_encryption_key=enc_key,
+    )
+    await db.oauth_connections.set_connection(
+        conn,
+        provider="claude",
+        credential=_claude_cred_far_future(),
+        cipher=CredentialCipher(enc_key),
+    )
+    # auth.json shape: tokens.access_token, no `exp` claim so the proactive
+    # refresh treats it as not-expiring-soon and skips a network call.
+    await db.oauth_connections.set_connection(
+        conn,
+        provider="codex",
+        credential=json.dumps({"OPENAI_API_KEY": None, "tokens": {"access_token": "tok"}}),
+        cipher=CredentialCipher(enc_key),
+    )
+
+    linear = AsyncMock()
+    linear.issues_in_state = AsyncMock(return_value=[_issue()])
+    linear.lookup_issue = AsyncMock(return_value=_issue())
+    linear.post_comment = AsyncMock(return_value="cmt-1")
+    linear.move_issue = AsyncMock()
+
+    workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+    workspace_path.mkdir(parents=True)
+    workspace = MagicMock()
+    workspace.acquire = AsyncMock(return_value=workspace_path)
+    workspace.release = MagicMock()
+
+    gh = MagicMock()
+    gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+    gh.pr_comment = AsyncMock()
+    gh.repo_clone = AsyncMock()
+    gh.repo_default_branch = AsyncMock(return_value="trunk")
+    push_fn = AsyncMock()
+
+    runner = _StagedRunner(
+        {
+            "implement": [
+                [
+                    RunnerEvent(kind="started", pid=4242),
+                    RunnerEvent(
+                        kind="stdout",
+                        line=json.dumps(
+                            {
+                                "type": "result",
+                                "subtype": "success",
+                                "total_cost_usd": 0.01,
+                                "usage": {"input_tokens": 1, "output_tokens": 1},
+                            }
+                        ),
+                    ),
+                    RunnerEvent(kind="exit", returncode=0),
+                ]
+            ],
+        }
+    )
+
+    orch = Orchestrator(
+        cfg,
+        linear,
+        conn,
+        runner=runner,
+        gh=gh,
+        workspace=workspace,
+        push_fn=push_fn,
+    )
+    orch._states = {"ENG": _states()}  # noqa: SLF001
+
+    await _scan_and_wait(orch, cfg.repos[0])
+    return conn
+
+
+@pytest.mark.asyncio
+async def test_local_review_session_fault_with_mixed_providers_flags_neither(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """When `run_local_review_session` raises with no `LoopResult` at all,
+    there is no per-pass tag telling us which of a codex reviewer / claude
+    verifier / claude fixer actually failed. The shared run log has no
+    pass-boundary markers, so scraping it for the lone auth phrase and
+    guessing a provider would risk expiring an uninvolved connection (the
+    bug this fix targets). With mismatched providers across the roles, the
+    fallback must flag neither connection."""
+    conn = await _run_local_review_session_ambiguous_fault(tmp_path, monkeypatch, roles={})
+    try:
+        for provider in ("claude", "codex"):
+            status = await db.oauth_connections.get_status(conn, provider)
+            assert status is not None and status.status == "connected"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_local_review_session_fault_with_single_shared_provider_flags_it(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    """Same ambiguous-fault scenario as above, but reviewer/verifier/fixer all
+    share one provider (codex) — the one case where the shared-log scrape is
+    unambiguous, so the fallback must still flag it."""
+    conn = await _run_local_review_session_ambiguous_fault(
+        tmp_path,
+        monkeypatch,
+        # `agent="codex"` covers implement/fix/accept (the legacy field's
+        # mapped roles); `review_find` is codex via `reviewer_agent` below.
+        # Only `review_verify` (no legacy field) needs an explicit override —
+        # it otherwise defaults to the family opposite `review_find`.
+        binding_agent="codex",
+        roles={"review_verify": RoleConfig(agent="codex")},
+    )
+    try:
+        status = await db.oauth_connections.get_status(conn, "codex")
+        assert status is not None and status.status == "expired"
+        assert status.updated_by == "auth-failure"
+        claude_status = await db.oauth_connections.get_status(conn, "claude")
+        assert claude_status is not None and claude_status.status == "connected"
     finally:
         await conn.close()

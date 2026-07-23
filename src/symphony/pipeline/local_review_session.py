@@ -319,12 +319,22 @@ async def run_local_review_session(
                 last_message_text = None
 
         if collected.terminal_kind == "spawn_failed":
+            # A spawn failure can itself be an auth failure (e.g. codex
+            # refusing to start with no valid session). Classify THIS pass's
+            # own stdout+stderr here so a REVIEWER_FAILED outcome carries the
+            # right provider tag instead of leaving the shared-log fallback
+            # (which can't tell passes apart) to guess.
+            spawn_api_error = classify_plaintext_auth_error(
+                collected.stdout + "\n" + collected.stderr
+            )
             return ReviewerOutput(
                 stdout=collected.stdout,
                 head_sha=head_sha,
                 last_message_file=last_message_text,
                 ok=False,
                 error=f"spawn_failed: {collected.spawn_error or 'unknown'}",
+                api_error=spawn_api_error,
+                api_error_agent=(str(agent) if spawn_api_error is not None else None),
                 cost_usd=cost_delta,
                 input_tokens=input_delta,
                 output_tokens=output_delta,
@@ -332,12 +342,20 @@ async def run_local_review_session(
                 cache_read_tokens=cache_read_delta,
             )
         if collected.stall_timeout:
+            # As above: a stall can follow a pre-stream auth failure the
+            # process never recovered from, so classify this pass's own
+            # output rather than relying on the ambiguous shared-log scrape.
+            stall_api_error = classify_plaintext_auth_error(
+                collected.stdout + "\n" + collected.stderr
+            )
             return ReviewerOutput(
                 stdout=collected.stdout,
                 head_sha=head_sha,
                 last_message_file=last_message_text,
                 ok=False,
                 error="reviewer stalled",
+                api_error=stall_api_error,
+                api_error_agent=(str(agent) if stall_api_error is not None else None),
                 cost_usd=cost_delta,
                 input_tokens=input_delta,
                 output_tokens=output_delta,
@@ -568,9 +586,17 @@ async def run_local_review_session(
         cache_write_delta = fixer_estimator.total_cache_write_tokens - cache_write_before
         cache_read_delta = fixer_estimator.total_cache_read_tokens - cache_read_before
         if collected.terminal_kind == "spawn_failed":
+            # Classify this fix-run's own stdout+stderr so a FIX_RUN_FAILED
+            # outcome carries the fixer's provider tag when the spawn itself
+            # failed on auth, instead of leaving the ambiguous shared-log
+            # fallback to guess which pass actually failed.
+            spawn_api_error = classify_plaintext_auth_error(
+                collected.stdout + "\n" + collected.stderr
+            )
             return FixerOutput(
                 ok=False,
                 error=f"spawn_failed: {collected.spawn_error or 'unknown'}",
+                api_error=spawn_api_error,
                 cost_usd=cost_delta,
                 input_tokens=input_delta,
                 output_tokens=output_delta,
@@ -583,9 +609,13 @@ async def run_local_review_session(
                 if collected.terminal_kind == "wall_clock_timeout"
                 else "fix-run stalled"
             )
+            stall_api_error = classify_plaintext_auth_error(
+                collected.stdout + "\n" + collected.stderr
+            )
             return FixerOutput(
                 ok=False,
                 error=stall_error,
+                api_error=stall_api_error,
                 cost_usd=cost_delta,
                 input_tokens=input_delta,
                 output_tokens=output_delta,
