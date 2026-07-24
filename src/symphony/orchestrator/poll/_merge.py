@@ -881,6 +881,21 @@ class _MergeMixin(_OrchestratorBase):
                 returncode=final_returncode,
             )
             if transition.next_run_status != "completed":
+                # A Claude auth failure the daemon re-validated is a stale
+                # per-run token, not a dead account: requeue this fix-run with
+                # backoff instead of escalating to needs-approval (SYM-229).
+                if await self._requeue_auth_failed_fix_run(
+                    run_id=fix_run_id,
+                    binding=binding,
+                    issue=issue,
+                    storage_issue_id=issue.id,
+                    workspace_path=workspace_path,
+                    final_kind=final_kind,
+                    returncode=final_returncode,
+                ):
+                    if merge_run_id is not None:
+                        await db.runs.interrupt_running_merge(self._conn, merge_run_id)
+                    return None
                 await db.runs.update_status(
                     self._conn,
                     fix_run_id,
@@ -925,7 +940,9 @@ class _MergeMixin(_OrchestratorBase):
                     termination_kind=db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
                     workspace_path=workspace_path,
                     force_requeue=await self._claude_auth_requeue_signal(
-                        binding.resolved_role("fix", self.config.roles).agent,
+                        self._launched_agent(
+                            fix_run_id, binding.resolved_role("fix", self.config.roles).agent
+                        ),
                         api_error,
                         run_id=fix_run_id,
                         log_path=log_path,

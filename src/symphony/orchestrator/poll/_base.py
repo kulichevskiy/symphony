@@ -369,6 +369,10 @@ class _OrchestratorBase:
     # daemon refresh no matter how many detection points see it, and so the
     # requeue sites can honor a verdict the runner tail already computed.
     _claude_auth_revalidated: dict[str, bool]
+    # The agent a run was actually launched with, keyed by run id. A hot config
+    # reload can swap `roles.fix.agent` mid-run, so the auth paths must key off
+    # what produced the log, not off whatever the role resolves to now.
+    _run_launched_agents: dict[str, str]
     _implement_failed_run_bindings: dict[str, RepoBinding]
     _implement_blocked_run_bindings: dict[str, RepoBinding]
     _deliver_failed_run_bindings: dict[str, RepoBinding]
@@ -569,6 +573,7 @@ class _OrchestratorBase:
         self._dispatch_run_ids: dict[str, str] = {}
         self._operator_wait_run_ids: set[str] = set()
         self._claude_auth_revalidated: dict[str, bool] = {}
+        self._run_launched_agents: dict[str, str] = {}
         self._implement_failed_run_bindings: dict[str, RepoBinding] = {}
         self._implement_blocked_run_bindings: dict[str, RepoBinding] = {}
         self._deliver_failed_run_bindings: dict[str, RepoBinding] = {}
@@ -3334,6 +3339,18 @@ class _OrchestratorBase:
                     )
                     return "transient"
                 return "dead"
+            # Re-check right before writing: the token exchange above took a
+            # network round-trip, and `write_back` happily accepts an `expired`
+            # row (it re-persists it as `connected`). A liveness Test or another
+            # UI path that expired the row mid-exchange must not be silently
+            # undone by this stale run (SYM-229 review).
+            still_live = await db.oauth_connections.get_status(self._conn, "claude")
+            if still_live is None or still_live.status != "connected":
+                log.info(
+                    "claude re-validate finished but the row is no longer connected; "
+                    "respecting the gate"
+                )
+                return "gated"
             wrote = await self._credential_write_back.write_back(
                 "claude",
                 refreshed,
@@ -3446,6 +3463,49 @@ class _OrchestratorBase:
             run_started_at = str(row["started_at"]) if row is not None else ""
         return await self._flag_claude_auth_failure(
             "claude", api_error, run_started_at=run_started_at, run_id=run_id
+        )
+
+    def _launched_agent(self, run_id: str, fallback: str = "") -> str:
+        """The agent a run was launched with (recorded by the runner tail), or
+        `fallback`. Resolving the role again at decision time can read a
+        hot-reloaded value that never ran (SYM-229 review)."""
+        return self._run_launched_agents.get(run_id) or fallback
+
+    async def _requeue_auth_failed_fix_run(
+        self,
+        *,
+        run_id: str,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        storage_issue_id: str,
+        workspace_path: Path | None,
+        final_kind: str,
+        returncode: int | None,
+        agent: str = "",
+        termination_kind: str = db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
+    ) -> bool:
+        """Requeue a fix-run that died on a Claude auth failure the daemon
+        re-validated, instead of parking the issue (SYM-229). True when the run
+        was requeued and the caller must NOT escalate. Non-auth failures and a
+        dead/gated connection return False, so the normal park path runs."""
+        if not await self._claude_auth_requeue_signal(
+            self._launched_agent(run_id, agent),
+            None,
+            run_id=run_id,
+            log_path=self.config.log_root / f"{run_id}.log",
+        ):
+            return False
+        return await self._maybe_requeue_transient_agent_failure(
+            run_id=run_id,
+            binding=binding,
+            issue=issue,
+            storage_issue_id=storage_issue_id,
+            api_error=None,
+            reason=f"claude auth failure, connection re-validated: {final_kind}",
+            returncode=returncode,
+            termination_kind=termination_kind,
+            workspace_path=workspace_path,
+            force_requeue=True,
         )
 
     async def _materialize_claude_env(self, agent: str) -> dict[str, str]:
@@ -3656,6 +3716,10 @@ class _OrchestratorBase:
             # the refreshed credential from the per-run dir back to the DB and
             # remove the dir (Config v2 3/9).
             await self._finalize_claude_env(claude_env)
+        # Remember what this run actually ran with: a hot config reload can
+        # swap the role's agent afterwards, and the auth paths must key off
+        # the agent that produced this log (SYM-229 review).
+        self._run_launched_agents[run_id] = role.agent
         await self._flag_auth_failure_from_log(role.agent, log_path, final_returncode, run_id)
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
@@ -3978,6 +4042,10 @@ class _OrchestratorBase:
             # See `_run_stage_command`: a Claude fix/review run can also refresh
             # its token in place — write back from the per-run dir + tear down.
             await self._finalize_claude_env(claude_env)
+        # Remember what this run actually ran with: a hot config reload can
+        # swap the role's agent afterwards, and the auth paths must key off
+        # the agent that produced this log (SYM-229 review).
+        self._run_launched_agents[run_id] = role.agent
         await self._flag_auth_failure_from_log(role.agent, log_path, final_returncode, run_id)
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
