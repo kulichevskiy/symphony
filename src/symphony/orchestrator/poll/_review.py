@@ -479,6 +479,7 @@ class _ReviewMixin(_OrchestratorBase):
             returncode: int | None = None,
             termination_kind: str = db.runs.TRANSIENT_API_RETRY_KIND,
             workspace_path: Path | None = None,
+            force_requeue: bool = False,
         ) -> bool: ...
 
         async def _move_issue_to_review_state(
@@ -1762,6 +1763,22 @@ class _ReviewMixin(_OrchestratorBase):
                 returncode=final_returncode,
             )
             if transition.next_run_status != "completed":
+                # A Claude auth failure the daemon re-validated is a stale
+                # per-run token, not a dead account: requeue this fix-run with
+                # backoff instead of parking the issue (SYM-229).
+                if await self._requeue_auth_failed_fix_run(
+                    run_id=fix_run_id,
+                    binding=binding,
+                    issue=issue,
+                    # The backoff gate counts retries against the run's stored
+                    # issue id, which can differ from the tracker id for a
+                    # scoped tracker (SYM-229 review).
+                    storage_issue_id=run.issue_id,
+                    workspace_path=workspace_path,
+                    final_kind=final_kind,
+                    returncode=final_returncode,
+                ):
+                    return False
                 await db.runs.update_status(
                     self._conn,
                     fix_run_id,
@@ -2215,6 +2232,22 @@ class _ReviewMixin(_OrchestratorBase):
                 returncode=final_returncode,
             )
             if transition.next_run_status != "completed":
+                # A Claude auth failure the daemon re-validated is a stale
+                # per-run token, not a dead account: requeue this fix-run with
+                # backoff instead of parking the issue (SYM-229).
+                if await self._requeue_auth_failed_fix_run(
+                    run_id=fix_run_id,
+                    binding=binding,
+                    issue=issue,
+                    # The backoff gate counts retries against the run's stored
+                    # issue id, which can differ from the tracker id for a
+                    # scoped tracker (SYM-229 review).
+                    storage_issue_id=run.issue_id,
+                    workspace_path=workspace_path,
+                    final_kind=final_kind,
+                    returncode=final_returncode,
+                ):
+                    return False
                 await db.runs.update_status(
                     self._conn,
                     fix_run_id,
@@ -2764,6 +2797,14 @@ class _ReviewMixin(_OrchestratorBase):
             reason=reason,
             termination_kind=db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
             workspace_path=workspace_path,
+            force_requeue=await self._claude_auth_requeue_signal(
+                self._launched_agent(
+                    fix_run_id, binding.resolved_role("fix", self.config.roles).agent
+                ),
+                api_error,
+                run_id=fix_run_id,
+                log_path=log_path,
+            ),
         ):
             # _maybe_requeue_transient_agent_failure already stamped fix_run_id
             # via _fail_run; just clear review rearm state and return.

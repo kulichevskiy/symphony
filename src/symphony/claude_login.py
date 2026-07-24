@@ -31,6 +31,7 @@ import re
 import secrets
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
@@ -305,20 +306,37 @@ CLAUDE_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
 _REFRESH_TIMEOUT_SECS = 30.0
 
 
-async def refresh_claude_credential(
+@dataclass(frozen=True)
+class ClaudeRefreshOutcome:
+    """Outcome of a refresh-token exchange.
+
+    `credential` is the rebuilt blob on success. On failure it is `None` and
+    `transient` says whether the exchange failed for a *retryable* reason — an
+    unreachable/5xx/429 token endpoint or a network timeout — as opposed to a
+    genuinely dead credential (no refresh token, a 4xx `invalid_grant`, a
+    malformed response). Callers must not declare a connection dead on a
+    transient failure (SYM-229 review): the account may be perfectly valid and
+    expiring the shared row would block every other run until a reconnect."""
+
+    credential: str | None
+    transient: bool = False
+
+
+async def refresh_claude_credential_outcome(
     raw: str, *, client: httpx.AsyncClient | None = None
-) -> str | None:
-    """Exchange the credential blob's refresh token for a fresh access token
-    and return the rebuilt blob (all unrelated fields preserved verbatim), or
-    `None` when the blob has no refresh token or the exchange fails. Never
-    raises — the caller treats `None` as "connection is dead, park it"."""
+) -> ClaudeRefreshOutcome:
+    """Exchange the credential blob's refresh token for a fresh access token.
+
+    Returns the rebuilt blob (all unrelated fields preserved verbatim), or a
+    failure tagged transient/permanent — see `ClaudeRefreshOutcome`. Never
+    raises."""
     parsed = _parse_claude_oauth(raw)
     if parsed is None:
-        return None
+        return ClaudeRefreshOutcome(None)
     payload, oauth = parsed
     refresh_token = oauth.get("refreshToken")
     if not isinstance(refresh_token, str) or not refresh_token:
-        return None
+        return ClaudeRefreshOutcome(None)
     data = {
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -329,18 +347,29 @@ async def refresh_claude_credential(
     try:
         response = await http.post(CLAUDE_OAUTH_TOKEN_URL, json=data)
         if response.status_code != 200:
-            log.warning("claude token refresh failed with HTTP %d", response.status_code)
-            return None
+            # 5xx/429 is the endpoint being unhappy, not the credential being
+            # dead; 4xx (invalid_grant, revoked/consumed refresh token) is.
+            transient = response.status_code >= 500 or response.status_code == 429
+            log.warning(
+                "claude token refresh failed with HTTP %d (transient=%s)",
+                response.status_code,
+                transient,
+            )
+            return ClaudeRefreshOutcome(None, transient=transient)
         token = response.json()
-    except (httpx.HTTPError, ValueError):
-        log.warning("claude token refresh failed", exc_info=True)
-        return None
+    except httpx.HTTPError:
+        # Network/timeout: retryable, says nothing about the credential.
+        log.warning("claude token refresh failed to reach the endpoint", exc_info=True)
+        return ClaudeRefreshOutcome(None, transient=True)
+    except ValueError:
+        log.warning("claude token refresh returned an unparseable body", exc_info=True)
+        return ClaudeRefreshOutcome(None)
     finally:
         if owns_client:
             await http.aclose()
     access_token = token.get("access_token")
     if not isinstance(access_token, str) or not access_token:
-        return None
+        return ClaudeRefreshOutcome(None)
     oauth = dict(oauth)
     oauth["accessToken"] = access_token
     # Some providers omit refresh_token on refresh (the old one stays valid);
@@ -353,7 +382,16 @@ async def refresh_claude_credential(
         oauth["expiresAt"] = int((datetime.now(UTC).timestamp() + expires_in) * 1000)
     payload = dict(payload)
     payload["claudeAiOauth"] = oauth
-    return json.dumps(payload)
+    return ClaudeRefreshOutcome(json.dumps(payload))
+
+
+async def refresh_claude_credential(
+    raw: str, *, client: httpx.AsyncClient | None = None
+) -> str | None:
+    """The rebuilt blob from a refresh-token exchange, or `None` on any failure.
+    Callers that must tell a flaky token endpoint from a dead credential use
+    `refresh_claude_credential_outcome` instead."""
+    return (await refresh_claude_credential_outcome(raw, client=client)).credential
 
 
 class SubprocessClaudeLogin:

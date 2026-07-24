@@ -172,6 +172,7 @@ class _LifecycleMixin(_OrchestratorBase):
             returncode: int | None = None,
             termination_kind: str = db.runs.TRANSIENT_API_RETRY_KIND,
             workspace_path: Path | None = None,
+            force_requeue: bool = False,
         ) -> bool: ...
 
         async def _move_issue_to_local_code_review_state(
@@ -777,6 +778,27 @@ class _LifecycleMixin(_OrchestratorBase):
         )
 
         if transition.next_run_status != "completed":
+            # A nonzero exit on a Claude auth failure the daemon re-validated
+            # (SYM-229) means a stale per-run token, not a dead account: requeue
+            # this run instead of parking the issue. The runner tail already
+            # recorded the verdict, so this reuses it (no second refresh).
+            if await self._claude_auth_requeue_signal(
+                implement_role.agent,
+                None,
+                run_id=run_id,
+                log_path=self.config.log_root / f"{run_id}.log",
+            ) and await self._maybe_requeue_transient_agent_failure(
+                run_id=run_id,
+                binding=binding,
+                issue=issue,
+                storage_issue_id=issue_id,
+                api_error=None,
+                reason=f"claude auth failure, connection re-validated: {final_kind}",
+                returncode=final_returncode,
+                workspace_path=workspace_path,
+                force_requeue=True,
+            ):
+                return None
             log.info(
                 "implement run %s ended in %s (rc=%s) -> failed",
                 run_id,
@@ -881,10 +903,15 @@ class _LifecycleMixin(_OrchestratorBase):
                 api_error = _read_run_stream_api_error_obj(log_path)
                 if api_error is not None:
                     reason = api_error.message
-                    # An authentication failure flips the Claude card to
-                    # `expired` and arms the dispatch gate (Config v2 5/9) —
-                    # never a retry loop.
-                    await self._flag_claude_auth_failure(implement_role.agent, api_error)
+                    # An authentication failure re-validates the shared Claude
+                    # connection with a daemon refresh (SYM-229): a refreshable
+                    # connection stays connected and the run is requeued (a
+                    # stale per-run token, not a fleet-wide outage); only the
+                    # daemon's own refresh failing expires the card and arms the
+                    # dispatch gate (Config v2 5/9).
+                    auth_requeue = await self._flag_claude_auth_failure(
+                        implement_role.agent, api_error
+                    )
                     if await self._maybe_requeue_transient_agent_failure(
                         run_id=run_id,
                         binding=binding,
@@ -894,6 +921,7 @@ class _LifecycleMixin(_OrchestratorBase):
                         reason=reason,
                         returncode=final_returncode,
                         workspace_path=workspace_path,
+                        force_requeue=auth_requeue,
                     ):
                         return None
             log.info("implement run %s -> failed (completion gate): %s", run_id, reason)
@@ -990,6 +1018,15 @@ class _LifecycleMixin(_OrchestratorBase):
                     reason=_local_review_termination_reason(local_review_result),
                     termination_kind=db.runs.LOCAL_REVIEW_TRANSIENT_RETRY_KIND,
                     workspace_path=workspace_path,
+                    force_requeue=await self._claude_auth_requeue_signal(
+                        local_review_result.api_error_agent if local_review_result else "",
+                        _lr_api_error,
+                        # Keyed by the implement run: the local-review phase's own
+                        # finally block already flagged (and re-validated) this
+                        # auth failure under the same id, so this reuses that
+                        # verdict instead of forcing a second refresh.
+                        run_id=run_id,
+                    ),
                 ):
                     return False, local_review_result
                 # Budget exhausted or non-transient error. When the api_error was
@@ -1034,13 +1071,26 @@ class _LifecycleMixin(_OrchestratorBase):
                 # closed). Both are treated as non-transient, fail-closed operator
                 # waits. Wiring transient retry here would require plumbing api_error
                 # through run_verify_session / _run_dirty_tree_fix_turn — out of scope.
-                await self._block_verify_failure(
+                # A verify-fix that died on a Claude auth failure the daemon
+                # re-validated is a stale per-run token: requeue with backoff
+                # instead of parking the issue (SYM-229 review).
+                if not await self._requeue_auth_failed_fix_run(
+                    run_id=run_id,
                     binding=binding,
                     issue=issue,
                     storage_issue_id=issue_id,
-                    run_id=run_id,
-                    result=verify_result,
-                )
+                    workspace_path=workspace_path,
+                    final_kind="verify fix auth failure",
+                    returncode=None,
+                    termination_kind=db.runs.LOCAL_REVIEW_TRANSIENT_RETRY_KIND,
+                ):
+                    await self._block_verify_failure(
+                        binding=binding,
+                        issue=issue,
+                        storage_issue_id=issue_id,
+                        run_id=run_id,
+                        result=verify_result,
+                    )
                 return False, local_review_result
             # SYM-108: record the green gate against the exact head it
             # verified so the merge gate can treat a no-CI repo as mergeable
@@ -1609,11 +1659,15 @@ class _LifecycleMixin(_OrchestratorBase):
                 lr_api_error = result.api_error if result is not None else None
                 lr_failed_agent = result.api_error_agent if result is not None else None
                 if lr_api_error is not None and lr_failed_agent in _AGENT_CRED_LAYOUT:
+                    # Recorded under the parent run id so the caller's requeue
+                    # decision reuses THIS verdict rather than re-validating (a
+                    # second refresh could fail transiently and undo it).
                     await self._flag_claude_auth_failure(
                         lr_failed_agent,
                         lr_api_error,
                         run_started_at=local_review_started_at,
                         provider=lr_failed_agent,
+                        run_id=parent_run_id,
                     )
 
             log.info(
@@ -2061,9 +2115,13 @@ class _LifecycleMixin(_OrchestratorBase):
             if result is None or not result.ok:
                 # A Claude verify-fix that died on auth must flip the card and
                 # arm the dispatch gate like the stage runners (Config v2 5/9).
-                await self._flag_auth_failure_from_log(
+                # Recorded under the parent run id as well, so the caller's
+                # park-vs-requeue decision can honor it (SYM-229 review): a
+                # re-validated stale token should retry the run, not park.
+                if await self._flag_auth_failure_from_log(
                     fixer_role.agent, verify_log_path, 1, verify_run_id
-                )
+                ):
+                    self._record_claude_auth_verdict(parent_run_id, True)
             await self._finalize_verify_run(
                 run_id=verify_run_id,
                 ok=result.ok if result is not None else False,

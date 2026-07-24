@@ -53,6 +53,7 @@ from ...claude_login import (
     claude_expires_at,
     read_claude_credential,
     refresh_claude_credential,
+    refresh_claude_credential_outcome,
     strip_claude_refresh_token,
 )
 from ...codex_login import (
@@ -362,6 +363,16 @@ class _OrchestratorBase:
     _active_run_ids: set[str]
     _dispatch_run_ids: dict[str, str]
     _operator_wait_run_ids: set[str]
+    # Per-run verdict of the SYM-229 Claude auth re-validate, keyed by run id:
+    # True when the shared connection was proven usable (requeue THIS run),
+    # False when it was expired/gated. Cached so one auth failure triggers ONE
+    # daemon refresh no matter how many detection points see it, and so the
+    # requeue sites can honor a verdict the runner tail already computed.
+    _claude_auth_revalidated: dict[str, bool]
+    # The agent a run was actually launched with, keyed by run id. A hot config
+    # reload can swap `roles.fix.agent` mid-run, so the auth paths must key off
+    # what produced the log, not off whatever the role resolves to now.
+    _run_launched_agents: dict[str, str]
     _implement_failed_run_bindings: dict[str, RepoBinding]
     _implement_blocked_run_bindings: dict[str, RepoBinding]
     _deliver_failed_run_bindings: dict[str, RepoBinding]
@@ -561,6 +572,8 @@ class _OrchestratorBase:
         self._active_run_ids: set[str] = set()
         self._dispatch_run_ids: dict[str, str] = {}
         self._operator_wait_run_ids: set[str] = set()
+        self._claude_auth_revalidated: dict[str, bool] = {}
+        self._run_launched_agents: dict[str, str] = {}
         self._implement_failed_run_bindings: dict[str, RepoBinding] = {}
         self._implement_blocked_run_bindings: dict[str, RepoBinding] = {}
         self._deliver_failed_run_bindings: dict[str, RepoBinding] = {}
@@ -2154,6 +2167,7 @@ class _OrchestratorBase:
         returncode: int | None = None,
         termination_kind: str = db.runs.TRANSIENT_API_RETRY_KIND,
         workspace_path: Path | None = None,
+        force_requeue: bool = False,
     ) -> bool:
         """Requeue an implement run that died on a *transient* provider API
         error instead of escalating, until the retry budget is spent.
@@ -2176,8 +2190,14 @@ class _OrchestratorBase:
 
         For `REVIEW_FIX_TRANSIENT_RETRY_KIND` the issue is NOT moved to Ready —
         the existing PR is intact and the retry is driven by the merge/acceptance
-        loop once the backoff elapses."""
-        if api_error is None or not api_error.transient:
+        loop once the backoff elapses.
+
+        `force_requeue` requeues regardless of `api_error.transient` — used for a
+        Claude auth failure whose shared connection the daemon just re-validated
+        (SYM-229): the failure was a stale per-run token, not a retryable 5xx,
+        but re-invoking is safe and must not escalate. The retry budget still
+        caps it, so a genuinely broken account can't loop forever."""
+        if not force_requeue and (api_error is None or not api_error.transient):
             return False
         # The current run is still `running` (its marker is stamped below), so
         # `_agent_infra_retry_count` skips it and counts only the *prior*
@@ -3158,30 +3178,41 @@ class _OrchestratorBase:
         )
 
     async def _flag_claude_auth_failure(
-        self, agent: str, api_error: object, *, run_started_at: str = "", provider: str = ""
-    ) -> None:
-        """After a Claude run died on an authentication error, flip the UI
-        connection to `expired` so the Connections card surfaces the fix and
-        the dispatch gate above stops further runs (Config v2 5/9). A no-op
-        for non-auth errors, when Claude was never UI-connected, or when the
-        stored row changed after the run started (`run_started_at`) — a fresh
-        reconnect/refresh must not be flagged for a stale run's failure."""
+        self,
+        agent: str,
+        api_error: object,
+        *,
+        run_started_at: str = "",
+        provider: str = "",
+        run_id: str = "",
+    ) -> bool:
+        """After a Claude run died on an authentication error, re-validate the
+        shared UI connection with a daemon-owned refresh instead of expiring it
+        outright (SYM-229 blast-radius hardening).
+
+        A single run's 401 / "Not logged in" is usually a stale per-run token,
+        not a dead account — flipping the *shared* `oauth_connections` row to
+        `expired` on it hard-blocks every other run at the pre-spawn gate (the
+        SYM-226 flap, a one-run hiccup turned fleet-wide outage). So a run's
+        auth failure triggers a daemon re-validate: if the connection can still
+        be refreshed, the failure is transient — the row stays `connected` and
+        this returns True so the caller requeues *that* run while other
+        dispatch continues. Only the daemon's OWN refresh genuinely failing
+        flips the row to `expired` (returns False), arming the reconnect
+        dispatch gate (Config v2 5/9).
+
+        Returns False (a no-op) for non-auth errors, when Claude was never
+        UI-connected, or when the stored row changed under an operator
+        RECONNECT after the run started (`run_started_at`) — a fresh reconnect
+        must not be flagged for a stale run's failure."""
         provider = provider or agent
         if provider not in _AGENT_CRED_LAYOUT or api_error is None:
-            return
-        message = str(getattr(api_error, "message", "") or "")
-        status_code = getattr(api_error, "status", None)
-        looks_auth = (
-            "not logged in" in message.lower()
-            or "unauthorized" in message.lower()
-            or "authentication" in message.lower()
-            or status_code == 401
-        )
-        if not looks_auth:
-            return
+            return False
+        if not _looks_like_auth_error(api_error):
+            return False
         status = await db.oauth_connections.get_status(self._conn, provider)
         if status is None or status.status not in ("connected", "expired"):
-            return
+            return False
         # The stale-run guard suppresses flagging only when the row changed
         # under an operator RECONNECT after the run started — a daemon token
         # refresh (auto-refresh/write-back) bumps updated_at but keeps the same
@@ -3207,8 +3238,32 @@ class _OrchestratorBase:
                 log.info(
                     "claude auth failure from a run older than the stored credential; not flagging"
                 )
-                return
-        log.warning("%s run failed on authentication; marking the connection expired", provider)
+                return self._record_claude_auth_verdict(run_id, False)
+        # Re-validate before expiring: a daemon refresh that still succeeds
+        # means the shared connection is fine and the run's failure was
+        # transient. Only claude has a clean central refresh here — codex keeps
+        # the immediate-expire path (out of scope for SYM-229). Re-validate ONLY
+        # a currently-connected row: an already-`expired` row has armed the
+        # reconnect gate, so a later stale run must not silently refresh it back
+        # to connected and unblock the fleet without the operator reconnect.
+        if provider == "claude" and status.status == "connected":
+            verdict = await self._revalidate_claude_after_auth_failure()
+            if verdict in ("usable", "transient"):
+                log.info(
+                    "claude run auth failure cleared by a daemon re-validate (%s); "
+                    "requeueing the run",
+                    verdict,
+                )
+                return self._record_claude_auth_verdict(run_id, True)
+            if verdict == "gated":
+                # Already expired, or disconnected mid-flight: respect it —
+                # neither re-expire nor requeue.
+                return self._record_claude_auth_verdict(run_id, False)
+        log.warning(
+            "%s run failed on authentication and the connection could not be refreshed; "
+            "marking it expired",
+            provider,
+        )
         await db.oauth_connections.update_status(
             self._conn,
             provider=provider,
@@ -3216,6 +3271,120 @@ class _OrchestratorBase:
             updated_at=self._now().strftime("%Y-%m-%dT%H:%M:%SZ"),
             updated_by="auth-failure",
         )
+        return self._record_claude_auth_verdict(run_id, False)
+
+    def _record_claude_auth_verdict(self, run_id: str, requeue: bool) -> bool:
+        """Remember this run's auth re-validate verdict so every other detection
+        point (runner tail, completion gate, the review/merge/local-review
+        requeue sites) reuses it instead of forcing a second daemon refresh —
+        a second refresh could fail transiently and undo a verdict that was
+        already proven safe (SYM-229 review)."""
+        if run_id:
+            _remember_bounded(self._claude_auth_revalidated, run_id, requeue)
+        return requeue
+
+    async def _revalidate_claude_after_auth_failure(self) -> str:
+        """Daemon-owned re-validate of the shared Claude connection after a run
+        reported an auth failure (SYM-229). Forces a central token refresh —
+        ignoring the keep-fresh horizon, since the run's failure (not the clock)
+        is the trigger — under the same serialization + CAS write-back as the
+        proactive refresh.
+
+        Verdict:
+          * `usable` — the refresh succeeded and was persisted, or a concurrent
+            reconnect/refresh already replaced the credential the failed run
+            started from. Requeue the run.
+          * `transient` — the token endpoint was unreachable/5xx/429. Says
+            nothing about the credential, so the connection must NOT be expired;
+            requeue with backoff (the retry budget bounds it).
+          * `dead` — the refresh genuinely failed (revoked/consumed refresh
+            token, no refresh token). Expire the row and arm the gate.
+          * `gated` — the row is already expired, or was disconnected
+            mid-flight: neither expire nor requeue, just respect it."""
+        async with self._claude_refresh_lock:
+            # Re-check under the lock: while we waited on it, a concurrent auth
+            # failure may have expired the connection. `_resolve_claude_credential`
+            # still returns credentials for `expired` rows and `write_back`
+            # accepts them (flipping back to `connected`), so without this a
+            # stale run could resurrect a gated connection without an operator
+            # reconnect. Respect the gate — the outer caller only checked before
+            # the wait.
+            gated = await db.oauth_connections.get_status(self._conn, "claude")
+            if gated is None or gated.status != "connected":
+                return "gated"
+            current = await self._resolve_claude_credential()
+            if current is None:
+                return "gated"
+            outcome = await refresh_claude_credential_outcome(current)
+            refreshed = outcome.credential
+            if refreshed is None:
+                # A reconnect/refresh that landed while our (doomed) token
+                # exchange was in flight must win: the connection is usable if
+                # the stored credential is no longer the one the failed run
+                # started from.
+                latest = await self._resolve_claude_credential()
+                if latest is not None and latest != current:
+                    log.info(
+                        "claude re-validate refresh failed but the row was already replaced; "
+                        "treating the connection as usable"
+                    )
+                    return "usable"
+                if outcome.transient:
+                    # A flaky/unreachable token endpoint says nothing about the
+                    # account — expiring here would block every other run until
+                    # an operator reconnect for no reason. But the row may have
+                    # been expired/disconnected while the exchange was in
+                    # flight; that gate wins over a retry (SYM-229 review).
+                    live = await db.oauth_connections.get_status(self._conn, "claude")
+                    if live is None or live.status != "connected":
+                        log.info(
+                            "claude re-validate hit a transient refresh failure but the row "
+                            "is no longer connected; respecting the gate"
+                        )
+                        return "gated"
+                    log.warning(
+                        "claude re-validate could not reach the token endpoint; "
+                        "leaving the connection connected and retrying the run"
+                    )
+                    return "transient"
+                return "dead"
+            # Re-check right before writing: the token exchange above took a
+            # network round-trip, and `write_back` happily accepts an `expired`
+            # row (it re-persists it as `connected`). A liveness Test or another
+            # UI path that expired the row mid-exchange must not be silently
+            # undone by this stale run (SYM-229 review).
+            still_live = await db.oauth_connections.get_status(self._conn, "claude")
+            if still_live is None or still_live.status != "connected":
+                log.info(
+                    "claude re-validate finished but the row is no longer connected; "
+                    "respecting the gate"
+                )
+                return "gated"
+            wrote = await self._credential_write_back.write_back(
+                "claude",
+                refreshed,
+                expires_at=claude_expires_at(refreshed),
+                expected_prior=current,
+            )
+            if not wrote:
+                # write_back returns False for BOTH a CAS race (a concurrent
+                # reconnect/refresh already replaced the row — still usable) and
+                # a missing/non-live row (the operator disconnected mid-flight —
+                # must NOT be treated as usable). Distinguish: only a currently
+                # connected replacement keeps the connection usable; a
+                # deleted/expired row means respect the disconnect.
+                replacement = await db.oauth_connections.get_status(self._conn, "claude")
+                if replacement is not None and replacement.status == "connected":
+                    log.info(
+                        "claude re-validate raced a reconnect/refresh; using the stored credential"
+                    )
+                    return "usable"
+                log.info(
+                    "claude re-validate write-back found no live connected row "
+                    "(disconnected mid-flight); not requeueing"
+                )
+                return "gated"
+            return "usable"
 
     async def _post_materialize_block_reason(
         self, agent: str, claude_env: dict[str, str]
@@ -3233,45 +3402,119 @@ class _OrchestratorBase:
 
     async def _flag_auth_failure_from_log(
         self, agent: str, log_path: Path, returncode: int | None, run_id: str
-    ) -> None:
+    ) -> bool:
         """After a failed agent run, recover the provider API error from the
         run log and flip the connection on an authentication failure — every
         runner path, not just the rc=0 implement completion gate (Config v2
         5/9 review fix). Best-effort: an unreadable log is a no-op. The run's
-        own started_at (from the runs row) anchors the stale-run guard."""
+        own started_at (from the runs row) anchors the stale-run guard. Returns
+        the SYM-229 requeue signal (see `_flag_claude_auth_failure`): True when
+        the connection was re-validated and this run should be requeued."""
         if agent not in _AGENT_CRED_LAYOUT or returncode in (0, None):
-            return
+            return False
         stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
         if stdout is None:
-            return
-        api_error: object | None = classify_stream_api_error(stdout)
+            return False
+        api_error: object | None = classify_stream_api_error(stdout) or _plaintext_auth_error(
+            stdout
+        )
         if api_error is None:
-            # Pre-stream auth failures print a plain-text (often stderr-only)
-            # line the JSONL classifier skips: claude's "Not logged in", and
-            # codex's auth-session / refresh failure phrasings.
-            low = stdout.lower()
-            _auth_phrases = (
-                "not logged in",
-                "please run /login",
-                "authentication_error",
-                "invalid api key",
-                "refresh token expired",
-                "refresh_token_expired",
-                "refresh token was already used",
-                "refresh_token_reused",
-                "refresh token was revoked",
-                "refresh_token_invalidated",
-                "401 unauthorized",
-            )
-            if any(phrase in low for phrase in _auth_phrases):
-                api_error = StreamApiError(message="authentication failure", status=401)
-        if api_error is None:
-            return
+            return False
         cur = await self._conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,))
         row = await cur.fetchone()
         run_started_at = str(row["started_at"]) if row is not None else ""
-        await self._flag_claude_auth_failure(
-            agent, api_error, run_started_at=run_started_at, provider=agent
+        return await self._flag_claude_auth_failure(
+            agent, api_error, run_started_at=run_started_at, provider=agent, run_id=run_id
+        )
+
+    async def _claude_auth_requeue_signal(
+        self,
+        agent: str | None,
+        api_error: object | None,
+        *,
+        run_id: str = "",
+        log_path: Path | None = None,
+    ) -> bool:
+        """Whether a requeue site should requeue a run that failed on a Claude
+        auth error (SYM-229).
+
+        Order matters:
+          1. A verdict this run's auth failure already produced elsewhere (the
+             runner tail, or the completion gate) wins — one auth failure must
+             cause exactly ONE daemon refresh, otherwise a second, transiently
+             failing refresh could undo a verdict already proven safe.
+          2. Otherwise re-validate now. The rc=0 fix paths never reach the runner
+             tail (it early-returns on `returncode == 0`), so no refresh has run
+             yet and a dead-but-still-`connected` row would be force-requeued
+             forever without ever being gated. `api_error` there comes from the
+             JSONL-only reader, so fall back to scanning the log for a plaintext
+             auth line before concluding there is nothing to do.
+        The re-validate goes through `_flag_claude_auth_failure` with this run's
+        `started_at`, so its stale-run guard still suppresses a failure from a
+        run that predates an operator reconnect."""
+        if agent != "claude":
+            return False
+        if run_id:
+            cached = self._claude_auth_revalidated.get(run_id)
+            if cached is not None:
+                return cached
+        if api_error is None or not _looks_like_auth_error(api_error):
+            if log_path is None:
+                return False
+            stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
+            api_error = _plaintext_auth_error(stdout) if stdout is not None else None
+            if api_error is None:
+                return False
+        run_started_at = ""
+        if run_id:
+            cur = await self._conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,))
+            row = await cur.fetchone()
+            run_started_at = str(row["started_at"]) if row is not None else ""
+        return await self._flag_claude_auth_failure(
+            "claude", api_error, run_started_at=run_started_at, run_id=run_id
+        )
+
+    def _launched_agent(self, run_id: str, fallback: str = "") -> str:
+        """The agent a run was launched with (recorded by the runner tail), or
+        `fallback`. Resolving the role again at decision time can read a
+        hot-reloaded value that never ran (SYM-229 review)."""
+        return self._run_launched_agents.get(run_id) or fallback
+
+    async def _requeue_auth_failed_fix_run(
+        self,
+        *,
+        run_id: str,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        storage_issue_id: str,
+        workspace_path: Path | None,
+        final_kind: str,
+        returncode: int | None,
+        agent: str = "",
+        termination_kind: str = db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
+    ) -> bool:
+        """Requeue a fix-run that died on a Claude auth failure the daemon
+        re-validated, instead of parking the issue (SYM-229). True when the run
+        was requeued and the caller must NOT escalate. Non-auth failures and a
+        dead/gated connection return False, so the normal park path runs."""
+        if not await self._claude_auth_requeue_signal(
+            self._launched_agent(run_id, agent),
+            None,
+            run_id=run_id,
+            log_path=self.config.log_root / f"{run_id}.log",
+        ):
+            return False
+        return await self._maybe_requeue_transient_agent_failure(
+            run_id=run_id,
+            binding=binding,
+            issue=issue,
+            storage_issue_id=storage_issue_id,
+            api_error=None,
+            reason=f"claude auth failure, connection re-validated: {final_kind}",
+            returncode=returncode,
+            termination_kind=termination_kind,
+            workspace_path=workspace_path,
+            force_requeue=True,
         )
 
     async def _materialize_claude_env(self, agent: str) -> dict[str, str]:
@@ -3482,6 +3725,10 @@ class _OrchestratorBase:
             # the refreshed credential from the per-run dir back to the DB and
             # remove the dir (Config v2 3/9).
             await self._finalize_claude_env(claude_env)
+        # Remember what this run actually ran with: a hot config reload can
+        # swap the role's agent afterwards, and the auth paths must key off
+        # the agent that produced this log (SYM-229 review).
+        _remember_bounded(self._run_launched_agents, run_id, role.agent)
         await self._flag_auth_failure_from_log(role.agent, log_path, final_returncode, run_id)
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
@@ -3804,6 +4051,10 @@ class _OrchestratorBase:
             # See `_run_stage_command`: a Claude fix/review run can also refresh
             # its token in place — write back from the per-run dir + tear down.
             await self._finalize_claude_env(claude_env)
+        # Remember what this run actually ran with: a hot config reload can
+        # swap the role's agent afterwards, and the auth paths must key off
+        # the agent that produced this log (SYM-229 review).
+        _remember_bounded(self._run_launched_agents, run_id, role.agent)
         await self._flag_auth_failure_from_log(role.agent, log_path, final_returncode, run_id)
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
@@ -4477,6 +4728,61 @@ class _OrchestratorBase:
 
 
 log = logging.getLogger(__name__)
+
+
+_PLAINTEXT_AUTH_PHRASES = (
+    "not logged in",
+    "please run /login",
+    "authentication_error",
+    "invalid api key",
+    "refresh token expired",
+    "refresh_token_expired",
+    "refresh token was already used",
+    "refresh_token_reused",
+    "refresh token was revoked",
+    "refresh_token_invalidated",
+    "401 unauthorized",
+)
+
+
+# Post-run bookkeeping keyed by run id (auth verdicts, launched agent) is only
+# needed for the immediate post-run decision, so the maps are bounded instead of
+# growing for the daemon's lifetime (SYM-229 review).
+_MAX_RUN_MEMO_ENTRIES = 512
+
+
+def _remember_bounded(memo: dict[str, Any], key: str, value: Any) -> None:
+    """Record `key`→`value`, evicting the oldest entries past the cap."""
+    memo[key] = value
+    while len(memo) > _MAX_RUN_MEMO_ENTRIES:
+        memo.pop(next(iter(memo)), None)
+
+
+def _plaintext_auth_error(stdout: str) -> StreamApiError | None:
+    """An auth failure recovered from plain log text, or None.
+
+    Pre-stream auth failures print a plain-text (often stderr-only) line the
+    JSONL classifier skips: claude's "Not logged in", and codex's auth-session /
+    refresh failure phrasings. Shared by the runner tail and by the rc=0 fix
+    paths, whose `api_error` comes from the JSONL-only reader and would otherwise
+    miss these entirely (SYM-229 review)."""
+    low = stdout.lower()
+    if any(phrase in low for phrase in _PLAINTEXT_AUTH_PHRASES):
+        return StreamApiError(message="authentication failure", status=401)
+    return None
+
+
+def _looks_like_auth_error(api_error: object) -> bool:
+    """Whether a run's provider error is an authentication failure (401 / 'not
+    logged in' / 'unauthorized' / 'authentication') — the shape both the expire
+    path and the SYM-229 single-run requeue signal key on."""
+    message = str(getattr(api_error, "message", "") or "").lower()
+    return (
+        "not logged in" in message
+        or "unauthorized" in message
+        or "authentication" in message
+        or getattr(api_error, "status", None) == 401
+    )
 
 
 def _read_log_best_effort(log_path: Path) -> str | None:
