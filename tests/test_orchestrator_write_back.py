@@ -371,44 +371,89 @@ async def test_disconnect_mid_run_is_not_resurrected(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@respx.mock
 async def test_auth_failure_flags_expired_and_gates_dispatch(tmp_path: Path) -> None:
-    """Config v2 5/9: an auth-failed Claude run flips the row to `expired`;
-    the dispatch gate then blocks further Claude runs until reconnect —
-    the SYM-200/201 hot loop is structurally impossible."""
+    """SYM-229 blast-radius hardening: a single run's auth failure re-validates
+    the shared Claude connection with a daemon refresh instead of expiring it
+    outright. When the connection is still refreshable the row stays
+    `connected` and the run is requeued (return True) — other dispatch keeps
+    running. Only the daemon's OWN refresh genuinely failing flips the row to
+    `expired` and arms the reconnect dispatch gate (the SYM-200/201 hot loop
+    is still structurally impossible)."""
 
     class _AuthError:
         message = "Not logged in · Please run /login"
         status = None
 
+    # The re-validate refresh succeeds once (200), then the account is dead
+    # (400) — driving the refreshable then not-refreshable paths in order.
+    route = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json={
+                    "access_token": "tok-revalidated",
+                    "refresh_token": "rt-2",
+                    "expires_in": 28800,
+                },
+            ),
+            httpx.Response(400, json={}),
+        ]
+    )
     harness = await Harness.create(tmp_path, config=_config(tmp_path))
     try:
         cipher = CredentialCipher(ENC_KEY)
+        # Refreshable connection (carries a refresh token).
         await db.oauth_connections.set_connection(
-            harness.conn, provider="claude", credential=_cred("tok"), cipher=cipher
+            harness.conn, provider="claude", credential=_cred_soon("tok"), cipher=cipher
         )
         # Live connection: no block.
         assert await harness.orch._claude_expired_block_reason("claude") is None  # noqa: SLF001
 
-        await harness.orch._flag_claude_auth_failure("claude", _AuthError())  # noqa: SLF001
+        # A single run's auth failure while the connection can still be
+        # refreshed: the daemon re-mints the token, the row stays connected,
+        # and the run is requeued (return True) — no fleet-wide expire.
+        requeued = await harness.orch._flag_claude_auth_failure(  # noqa: SLF001
+            "claude", _AuthError()
+        )
+        assert requeued is True
+        assert route.call_count == 1
+        status = await db.oauth_connections.get_status(harness.conn, "claude")
+        assert status is not None and status.status == "connected"
+        # Other dispatch continues — the gate is not armed.
+        assert await harness.orch._claude_expired_block_reason("claude") is None  # noqa: SLF001
+        # The re-minted token is persisted.
+        stored = await db.oauth_connections.get_credential(harness.conn, "claude", cipher)
+        assert json.loads(stored)["claudeAiOauth"]["accessToken"] == "tok-revalidated"
+
+        # Non-auth errors never touch the connection (and never refresh).
+        class _Http500:
+            message = "API Error: 500 upstream"
+            status = 500
+
+        assert (
+            await harness.orch._flag_claude_auth_failure("claude", _Http500())  # noqa: SLF001
+            is False
+        )
+        assert route.call_count == 1
+        status = await db.oauth_connections.get_status(harness.conn, "claude")
+        assert status is not None and status.status == "connected"
+
+        # Only the daemon's OWN refresh genuinely failing expires the row and
+        # arms the reconnect gate.
+        expired = await harness.orch._flag_claude_auth_failure(  # noqa: SLF001
+            "claude", _AuthError()
+        )
+        assert expired is False
+        assert route.call_count == 2
         status = await db.oauth_connections.get_status(harness.conn, "claude")
         assert status is not None and status.status == "expired"
         assert status.updated_by == "auth-failure"
 
         blocked = await harness.orch._claude_expired_block_reason("claude")  # noqa: SLF001
         assert blocked is not None and "reconnect it" in blocked
-        # Non-Claude agents and non-auth errors never flip/block.
+        # Non-Claude agents never flip/block.
         assert await harness.orch._claude_expired_block_reason("codex") is None  # noqa: SLF001
-
-        class _Http500:
-            message = "API Error: 500 upstream"
-            status = 500
-
-        await db.oauth_connections.update_status(
-            harness.conn, provider="claude", status="connected"
-        )
-        await harness.orch._flag_claude_auth_failure("claude", _Http500())  # noqa: SLF001
-        status = await db.oauth_connections.get_status(harness.conn, "claude")
-        assert status is not None and status.status == "connected"
     finally:
         await harness.close()
 

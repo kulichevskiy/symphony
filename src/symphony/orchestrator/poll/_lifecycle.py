@@ -172,6 +172,7 @@ class _LifecycleMixin(_OrchestratorBase):
             returncode: int | None = None,
             termination_kind: str = db.runs.TRANSIENT_API_RETRY_KIND,
             workspace_path: Path | None = None,
+            force_requeue: bool = False,
         ) -> bool: ...
 
         async def _move_issue_to_local_code_review_state(
@@ -881,10 +882,15 @@ class _LifecycleMixin(_OrchestratorBase):
                 api_error = _read_run_stream_api_error_obj(log_path)
                 if api_error is not None:
                     reason = api_error.message
-                    # An authentication failure flips the Claude card to
-                    # `expired` and arms the dispatch gate (Config v2 5/9) —
-                    # never a retry loop.
-                    await self._flag_claude_auth_failure(implement_role.agent, api_error)
+                    # An authentication failure re-validates the shared Claude
+                    # connection with a daemon refresh (SYM-229): a refreshable
+                    # connection stays connected and the run is requeued (a
+                    # stale per-run token, not a fleet-wide outage); only the
+                    # daemon's own refresh failing expires the card and arms the
+                    # dispatch gate (Config v2 5/9).
+                    auth_requeue = await self._flag_claude_auth_failure(
+                        implement_role.agent, api_error
+                    )
                     if await self._maybe_requeue_transient_agent_failure(
                         run_id=run_id,
                         binding=binding,
@@ -894,6 +900,7 @@ class _LifecycleMixin(_OrchestratorBase):
                         reason=reason,
                         returncode=final_returncode,
                         workspace_path=workspace_path,
+                        force_requeue=auth_requeue,
                     ):
                         return None
             log.info("implement run %s -> failed (completion gate): %s", run_id, reason)
