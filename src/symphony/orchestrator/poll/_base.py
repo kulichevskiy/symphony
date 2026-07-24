@@ -3030,36 +3030,59 @@ class _OrchestratorBase:
         return await self._resolve_agent_credential("claude")
 
     async def _maybe_refresh_claude_credential(self, credential: str) -> str | None:
-        """Proactive central token refresh (Config v2 4/9).
+        """Proactive central token refresh (Config v2 4/9; SYM-227).
 
-        When the stored access token would expire within the run's maximum
-        wall clock, the daemon refreshes it here — serialized, before dispatch
-        — so the CLI inside a run never rotates the one-shot refresh token
-        itself (which is what raced concurrent runs to death). Far-from-expiry
-        credentials pass through untouched. A failed refresh flips the row to
-        `expired` and returns `None`: dispatch must not proceed on a token
-        that dies mid-run."""
-        horizon = self.config.wall_clock_timeout_secs or _DEFAULT_REFRESH_HORIZON_SECS
-        if not claude_credential_expires_within(credential, horizon):
+        The daemon keeps the stored access token fresh with a margin far larger
+        than a run's wall clock (`_CLAUDE_KEEP_FRESH_HORIZON_SECS`), refreshing
+        here — serialized, before dispatch — so a run always starts from a
+        near-freshly-minted token and the CLI inside a run never has to rotate
+        the one-shot refresh token itself (which is what raced concurrent runs,
+        and a single issue's own claude processes, to death). A token already
+        far from expiry passes through untouched.
+
+        Two distinct triggers, so a proactive refresh miss cannot strand a
+        still-usable connection: the keep-fresh horizon decides whether to
+        refresh, but a refresh failure only expires the row (and blocks
+        dispatch) when the token is actually within a run's wall clock — i.e.
+        would die mid-run. A keep-fresh miss on a token that still outlives the
+        run fails open on the current token."""
+        keep_fresh_horizon = max(
+            _CLAUDE_KEEP_FRESH_HORIZON_SECS, self.config.wall_clock_timeout_secs
+        )
+        if not claude_credential_expires_within(credential, keep_fresh_horizon):
             return credential
         async with self._claude_refresh_lock:
             # A concurrent dispatch may have refreshed while we waited.
             current = await self._resolve_claude_credential()
             if current is None:
                 return None
-            if not claude_credential_expires_within(current, horizon):
+            if not claude_credential_expires_within(current, keep_fresh_horizon):
                 return current
             refreshed = await refresh_claude_credential(current)
             now = self._now().strftime("%Y-%m-%dT%H:%M:%SZ")
             if refreshed is None:
                 # A reconnect that landed while the (doomed) token exchange was
-                # in flight must win: only expire the row if it still holds the
+                # in flight must win: only touch the row if it still holds the
                 # credential the failed refresh started from.
                 latest = await self._resolve_claude_credential()
                 if latest is not None and latest != current:
                     log.info("claude refresh failed but the row was reconnected; using it")
                     return latest
-                log.warning("claude token refresh failed; marking the connection expired")
+                # Keep-fresh miss vs. dies-mid-run: the wide keep-fresh horizon
+                # sends tokens with hours of runway through here, so a transient
+                # refresh failure must not expire a still-usable connection.
+                # Only expire (and block dispatch) when the token is actually
+                # within a run's wall clock; otherwise fail open on the current
+                # token, which still outlives the run.
+                dies_mid_run_horizon = (
+                    self.config.wall_clock_timeout_secs or _DEFAULT_REFRESH_HORIZON_SECS
+                )
+                if not claude_credential_expires_within(current, dies_mid_run_horizon):
+                    log.warning("claude keep-fresh refresh failed; using the still-valid token")
+                    return current
+                log.warning(
+                    "claude token refresh failed near expiry; marking the connection expired"
+                )
                 await db.oauth_connections.update_status(
                     self._conn,
                     provider="claude",
@@ -4464,6 +4487,21 @@ _AGENT_CRED_LAYOUT: dict[str, tuple[str, str]] = {
 # Refresh horizon when no wall-clock cap is configured (Config v2 4/9): a
 # token must outlive the longest plausible run so the CLI never refreshes.
 _DEFAULT_REFRESH_HORIZON_SECS = 2 * 60 * 60
+
+# Keep the Claude access token proactively fresh with headroom far larger than
+# any run's wall clock (SYM-227). The Claude access-token TTL is ~8h; gating the
+# central refresh on the ~1h wall clock meant it effectively never ran — every
+# dispatch handed out the raw stored token, which concurrent runs (and a single
+# issue's implement + local-review claude processes) then raced to rotate,
+# poisoning the shared one-shot refresh token ("Not logged in" mid-run). Keeping
+# a wide margin makes the daemon re-mint well before expiry so runs always start
+# from a near-freshly-minted token and the daemon — not a run's CLI — owns
+# rotation. The margin (6h) sits below a freshly-minted token's ~8h TTL, so a
+# just-refreshed token is not immediately re-refreshed (no per-dispatch refresh
+# storm), while the trigger is floored at the wall clock so a token that would
+# die mid-run is always refreshed. Only claude uses this; codex keeps the
+# wall-clock-based horizon.
+_CLAUDE_KEEP_FRESH_HORIZON_SECS = 6 * 60 * 60
 
 
 MERGE_WAIT_RECONCILE_INTERVAL_SECS = 600
