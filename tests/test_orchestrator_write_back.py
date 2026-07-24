@@ -246,6 +246,63 @@ async def test_keeps_token_fresh_far_beyond_wall_clock(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_keep_fresh_refresh_failure_fails_open(tmp_path: Path) -> None:
+    """SYM-227: a keep-fresh refresh miss on a token that still outlives the run
+    must not strand the connection. A ~3h-out token (past the wall clock, so not
+    dying mid-run) whose refresh hits a transient failure falls open on the
+    still-valid token — dispatch proceeds and the row stays connected."""
+    respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(return_value=httpx.Response(500, json={}))
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn,
+            provider="claude",
+            credential=_cred_in("tok-live", 3 * 60 * 60),
+            cipher=cipher,
+        )
+        env = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
+        try:
+            assert env.get("CLAUDE_CONFIG_DIR")  # dispatch proceeds on the live token
+            blob = json.loads((Path(env["CLAUDE_CONFIG_DIR"]) / ".credentials.json").read_text())
+            assert blob["claudeAiOauth"]["accessToken"] == "tok-live"
+        finally:
+            await harness.orch._finalize_claude_env(env)  # noqa: SLF001
+        status = await db.oauth_connections.get_status(harness.conn, "claude")
+        assert status is not None and status.status == "connected"
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_freshly_minted_token_not_re_refreshed(tmp_path: Path) -> None:
+    """SYM-227: the keep-fresh margin sits below a fresh token's ~8h TTL, so a
+    just-minted token (well beyond the margin) is not re-refreshed — no
+    per-dispatch rotation storm that would poison siblings' refresh tokens."""
+    route = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(
+        return_value=httpx.Response(200, json={"access_token": "x"})
+    )
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn,
+            provider="claude",
+            credential=_cred_in("tok-fresh", 7 * 60 * 60 + 1800),
+            cipher=cipher,
+        )
+        env = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
+        try:
+            assert route.call_count == 0
+        finally:
+            await harness.orch._finalize_claude_env(env)  # noqa: SLF001
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_refresh_failure_marks_expired_and_blocks_materialization(tmp_path: Path) -> None:
     respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(return_value=httpx.Response(400, json={}))
     harness = await Harness.create(tmp_path, config=_config(tmp_path))
