@@ -3233,9 +3233,7 @@ class _OrchestratorBase:
         # transient. Only claude has a clean central refresh here — codex keeps
         # the immediate-expire path (out of scope for SYM-229).
         if provider == "claude" and await self._revalidate_claude_after_auth_failure():
-            log.info(
-                "claude run auth failure cleared by a daemon re-validate; requeueing the run"
-            )
+            log.info("claude run auth failure cleared by a daemon re-validate; requeueing the run")
             return True
         log.warning(
             "%s run failed on authentication and the connection could not be refreshed; "
