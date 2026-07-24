@@ -1770,7 +1770,10 @@ class _ReviewMixin(_OrchestratorBase):
                     run_id=fix_run_id,
                     binding=binding,
                     issue=issue,
-                    storage_issue_id=issue.id,
+                    # The backoff gate counts retries against the run's stored
+                    # issue id, which can differ from the tracker id for a
+                    # scoped tracker (SYM-229 review).
+                    storage_issue_id=run.issue_id,
                     workspace_path=workspace_path,
                     final_kind=final_kind,
                     returncode=final_returncode,
@@ -2236,7 +2239,10 @@ class _ReviewMixin(_OrchestratorBase):
                     run_id=fix_run_id,
                     binding=binding,
                     issue=issue,
-                    storage_issue_id=issue.id,
+                    # The backoff gate counts retries against the run's stored
+                    # issue id, which can differ from the tracker id for a
+                    # scoped tracker (SYM-229 review).
+                    storage_issue_id=run.issue_id,
                     workspace_path=workspace_path,
                     final_kind=final_kind,
                     returncode=final_returncode,

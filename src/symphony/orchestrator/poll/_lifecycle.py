@@ -1071,13 +1071,26 @@ class _LifecycleMixin(_OrchestratorBase):
                 # closed). Both are treated as non-transient, fail-closed operator
                 # waits. Wiring transient retry here would require plumbing api_error
                 # through run_verify_session / _run_dirty_tree_fix_turn — out of scope.
-                await self._block_verify_failure(
+                # A verify-fix that died on a Claude auth failure the daemon
+                # re-validated is a stale per-run token: requeue with backoff
+                # instead of parking the issue (SYM-229 review).
+                if not await self._requeue_auth_failed_fix_run(
+                    run_id=run_id,
                     binding=binding,
                     issue=issue,
                     storage_issue_id=issue_id,
-                    run_id=run_id,
-                    result=verify_result,
-                )
+                    workspace_path=workspace_path,
+                    final_kind="verify fix auth failure",
+                    returncode=None,
+                    termination_kind=db.runs.LOCAL_REVIEW_TRANSIENT_RETRY_KIND,
+                ):
+                    await self._block_verify_failure(
+                        binding=binding,
+                        issue=issue,
+                        storage_issue_id=issue_id,
+                        run_id=run_id,
+                        result=verify_result,
+                    )
                 return False, local_review_result
             # SYM-108: record the green gate against the exact head it
             # verified so the merge gate can treat a no-CI repo as mergeable
@@ -2102,9 +2115,13 @@ class _LifecycleMixin(_OrchestratorBase):
             if result is None or not result.ok:
                 # A Claude verify-fix that died on auth must flip the card and
                 # arm the dispatch gate like the stage runners (Config v2 5/9).
-                await self._flag_auth_failure_from_log(
+                # Recorded under the parent run id as well, so the caller's
+                # park-vs-requeue decision can honor it (SYM-229 review): a
+                # re-validated stale token should retry the run, not park.
+                if await self._flag_auth_failure_from_log(
                     fixer_role.agent, verify_log_path, 1, verify_run_id
-                )
+                ):
+                    self._record_claude_auth_verdict(parent_run_id, True)
             await self._finalize_verify_run(
                 run_id=verify_run_id,
                 ok=result.ok if result is not None else False,

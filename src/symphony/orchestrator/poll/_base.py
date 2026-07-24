@@ -3280,7 +3280,7 @@ class _OrchestratorBase:
         a second refresh could fail transiently and undo a verdict that was
         already proven safe (SYM-229 review)."""
         if run_id:
-            self._claude_auth_revalidated[run_id] = requeue
+            _remember_bounded(self._claude_auth_revalidated, run_id, requeue)
         return requeue
 
     async def _revalidate_claude_after_auth_failure(self) -> str:
@@ -3332,7 +3332,16 @@ class _OrchestratorBase:
                 if outcome.transient:
                     # A flaky/unreachable token endpoint says nothing about the
                     # account — expiring here would block every other run until
-                    # an operator reconnect for no reason.
+                    # an operator reconnect for no reason. But the row may have
+                    # been expired/disconnected while the exchange was in
+                    # flight; that gate wins over a retry (SYM-229 review).
+                    live = await db.oauth_connections.get_status(self._conn, "claude")
+                    if live is None or live.status != "connected":
+                        log.info(
+                            "claude re-validate hit a transient refresh failure but the row "
+                            "is no longer connected; respecting the gate"
+                        )
+                        return "gated"
                     log.warning(
                         "claude re-validate could not reach the token endpoint; "
                         "leaving the connection connected and retrying the run"
@@ -3719,7 +3728,7 @@ class _OrchestratorBase:
         # Remember what this run actually ran with: a hot config reload can
         # swap the role's agent afterwards, and the auth paths must key off
         # the agent that produced this log (SYM-229 review).
-        self._run_launched_agents[run_id] = role.agent
+        _remember_bounded(self._run_launched_agents, run_id, role.agent)
         await self._flag_auth_failure_from_log(role.agent, log_path, final_returncode, run_id)
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
@@ -4045,7 +4054,7 @@ class _OrchestratorBase:
         # Remember what this run actually ran with: a hot config reload can
         # swap the role's agent afterwards, and the auth paths must key off
         # the agent that produced this log (SYM-229 review).
-        self._run_launched_agents[run_id] = role.agent
+        _remember_bounded(self._run_launched_agents, run_id, role.agent)
         await self._flag_auth_failure_from_log(role.agent, log_path, final_returncode, run_id)
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
@@ -4734,6 +4743,19 @@ _PLAINTEXT_AUTH_PHRASES = (
     "refresh_token_invalidated",
     "401 unauthorized",
 )
+
+
+# Post-run bookkeeping keyed by run id (auth verdicts, launched agent) is only
+# needed for the immediate post-run decision, so the maps are bounded instead of
+# growing for the daemon's lifetime (SYM-229 review).
+_MAX_RUN_MEMO_ENTRIES = 512
+
+
+def _remember_bounded(memo: dict[str, Any], key: str, value: Any) -> None:
+    """Record `key`→`value`, evicting the oldest entries past the cap."""
+    memo[key] = value
+    while len(memo) > _MAX_RUN_MEMO_ENTRIES:
+        memo.pop(next(iter(memo)), None)
 
 
 def _plaintext_auth_error(stdout: str) -> StreamApiError | None:
