@@ -227,11 +227,10 @@ def read_claude_credential(path: Path) -> str | None:
         return None
 
 
-def claude_expires_at(raw: str) -> str | None:
-    """The stored credential's access-token expiry as an absolute ISO timestamp
-    (`%Y-%m-%dT%H:%M:%SZ`), or `None` if the blob has no parseable `expiresAt`.
-
-    Claude stores it under `claudeAiOauth.expiresAt` as epoch milliseconds."""
+def _parse_claude_oauth(raw: str) -> tuple[dict[str, object], dict[str, object]] | None:
+    """Parse a stored Claude credential blob into `(payload, claudeAiOauth)`, or
+    `None` when it isn't the expected JSON object shape. The shared front half of
+    every credential reader/rewriter below."""
     try:
         payload = json.loads(raw)
     except (ValueError, TypeError):
@@ -241,6 +240,18 @@ def claude_expires_at(raw: str) -> str | None:
     oauth = payload.get("claudeAiOauth")
     if not isinstance(oauth, dict):
         return None
+    return payload, oauth
+
+
+def claude_expires_at(raw: str) -> str | None:
+    """The stored credential's access-token expiry as an absolute ISO timestamp
+    (`%Y-%m-%dT%H:%M:%SZ`), or `None` if the blob has no parseable `expiresAt`.
+
+    Claude stores it under `claudeAiOauth.expiresAt` as epoch milliseconds."""
+    parsed = _parse_claude_oauth(raw)
+    if parsed is None:
+        return None
+    _, oauth = parsed
     expires_ms = oauth.get("expiresAt")
     if not isinstance(expires_ms, (int, float)) or isinstance(expires_ms, bool):
         return None
@@ -263,14 +274,11 @@ def strip_claude_refresh_token(raw: str) -> str:
     full credential, refresh token included, in the DB and owns rotation
     centrally (SYM-227). Input that isn't the expected blob is returned
     unchanged."""
-    try:
-        payload = json.loads(raw)
-    except (ValueError, TypeError):
+    parsed = _parse_claude_oauth(raw)
+    if parsed is None:
         return raw
-    if not isinstance(payload, dict):
-        return raw
-    oauth = payload.get("claudeAiOauth")
-    if not isinstance(oauth, dict) or "refreshToken" not in oauth:
+    payload, oauth = parsed
+    if "refreshToken" not in oauth:
         return raw
     payload["claudeAiOauth"] = {k: v for k, v in oauth.items() if k != "refreshToken"}
     return json.dumps(payload)
@@ -304,15 +312,10 @@ async def refresh_claude_credential(
     and return the rebuilt blob (all unrelated fields preserved verbatim), or
     `None` when the blob has no refresh token or the exchange fails. Never
     raises — the caller treats `None` as "connection is dead, park it"."""
-    try:
-        payload = json.loads(raw)
-    except (ValueError, TypeError):
+    parsed = _parse_claude_oauth(raw)
+    if parsed is None:
         return None
-    if not isinstance(payload, dict):
-        return None
-    oauth = payload.get("claudeAiOauth")
-    if not isinstance(oauth, dict):
-        return None
+    payload, oauth = parsed
     refresh_token = oauth.get("refreshToken")
     if not isinstance(refresh_token, str) or not refresh_token:
         return None
