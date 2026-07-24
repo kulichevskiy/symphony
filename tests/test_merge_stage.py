@@ -6002,9 +6002,7 @@ async def test_execute_pr_merge_threads_storage_id_to_conflict_fix(
             workspace_root=tmp_path / "ws",
             db_path=tmp_path / "s.sqlite",
         )
-        orch = Orchestrator(
-            cfg, AsyncMock(), conn, runner=MagicMock(), gh=gh, push_fn=AsyncMock()
-        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=gh, push_fn=AsyncMock())
         orch._gh_client = AsyncMock(return_value=gh)  # type: ignore[method-assign]  # noqa: SLF001
         dispatch = AsyncMock(return_value=True)
         orch._dispatch_merge_conflict_rebase_fix_run = dispatch  # type: ignore[method-assign]  # noqa: SLF001

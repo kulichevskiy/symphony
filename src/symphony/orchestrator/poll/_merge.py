@@ -2974,9 +2974,7 @@ class _MergeMixin(_OrchestratorBase):
         """Run the merge agent, record its usage, and check the runner verdict.
         Returns True if the run halted (caller returns the run id)."""
         try:
-            prior_total = await db.runs.cost_for_issue(
-                self._conn, storage_issue_id or issue.id
-            )
+            prior_total = await db.runs.cost_for_issue(self._conn, storage_issue_id or issue.id)
             (
                 cumulative_usage,
                 final_kind,

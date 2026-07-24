@@ -5151,9 +5151,7 @@ async def test_review_cap_wait_floor_precedes_stuck_loop_invite(
             comment_post_time.append(clock())
 
         linear.post_comment = AsyncMock(side_effect=_record_comment)
-        orch = Orchestrator(
-            cfg, linear, conn, runner=MagicMock(), gh=MagicMock(), clock=clock
-        )
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=MagicMock(), clock=clock)
         run = db.runs.Run(
             id="review-run",
             issue_id="iss-1",
