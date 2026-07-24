@@ -526,11 +526,19 @@ async def test_revalidate_respects_disconnect_mid_flight(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+@respx.mock
 async def test_claude_auth_requeue_signal(tmp_path: Path) -> None:
     """SYM-229 review: the signal the review/merge/local-review requeue sites
-    read — True only for a Claude auth error on a still-`connected` row (the
-    daemon re-validated it); False for non-auth errors, non-claude agents, and
-    an already-expired row."""
+    read drives the daemon re-validate itself (it must not trust a stale
+    `connected` row, since the rc=0 fix paths skip the runner-tail flag). True
+    for a Claude auth error on a re-validatable row; False for non-auth errors,
+    non-claude agents, no error, and an already-expired (gated) row — and those
+    paths never touch the refresh endpoint."""
+    route = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(
+        return_value=httpx.Response(
+            200, json={"access_token": "tok-new", "refresh_token": "rt-2", "expires_in": 28800}
+        )
+    )
 
     class _Auth:
         message = "Not logged in"
@@ -544,15 +552,21 @@ async def test_claude_auth_requeue_signal(tmp_path: Path) -> None:
     try:
         cipher = CredentialCipher(ENC_KEY)
         await db.oauth_connections.set_connection(
-            harness.conn, provider="claude", credential=_cred("tok"), cipher=cipher
+            harness.conn, provider="claude", credential=_cred_soon("tok"), cipher=cipher
         )
         sig = harness.orch._claude_auth_requeue_signal  # noqa: SLF001
+        # Claude auth error on a re-validatable row → one daemon refresh → True.
         assert await sig("claude", _Auth()) is True
+        assert route.call_count == 1
+        # Non-auth error, non-claude agent, and no error short-circuit: no refresh.
         assert await sig("claude", _NonAuth()) is False
         assert await sig("codex", _Auth()) is False
         assert await sig("claude", None) is False
+        assert route.call_count == 1
+        # An already-expired (gated) row is never re-validated back to connected.
         await db.oauth_connections.update_status(harness.conn, provider="claude", status="expired")
-        assert await sig("claude", _Auth()) is False  # gated, not a requeue
+        assert await sig("claude", _Auth()) is False
+        assert route.call_count == 1
     finally:
         await harness.close()
 

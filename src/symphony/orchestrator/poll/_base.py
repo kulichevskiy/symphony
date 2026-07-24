@@ -3258,6 +3258,16 @@ class _OrchestratorBase:
         reconnect/refresh already replaced the credential the failed run started
         from), False when the daemon's own refresh genuinely failed."""
         async with self._claude_refresh_lock:
+            # Re-check under the lock: while we waited on it, a concurrent auth
+            # failure may have expired the connection. `_resolve_claude_credential`
+            # still returns credentials for `expired` rows and `write_back`
+            # accepts them (flipping back to `connected`), so without this a
+            # stale run could resurrect a gated connection without an operator
+            # reconnect. Respect the gate — the outer caller only checked before
+            # the wait.
+            gated = await db.oauth_connections.get_status(self._conn, "claude")
+            if gated is None or gated.status != "connected":
+                return False
             current = await self._resolve_claude_credential()
             if current is None:
                 return False
@@ -3363,17 +3373,18 @@ class _OrchestratorBase:
     async def _claude_auth_requeue_signal(
         self, agent: str | None, api_error: object | None
     ) -> bool:
-        """True when a failed run's error is a Claude auth failure that the
-        daemon already re-validated away (SYM-229): the shared connection is
-        still `connected`, so THIS run should be requeued rather than parked.
-        The runner tail runs `_flag_auth_failure_from_log` before the review /
-        merge / local-review requeue sites read the log, so the row state here
-        already reflects that re-validate — letting those paths honor the same
-        single-run retry the implement completion gate wires directly."""
+        """Whether the review / merge / local-review requeue sites should
+        requeue a run that failed on a Claude auth error (SYM-229). Drives the
+        daemon re-validate itself rather than trusting the pre-existing row
+        state: on a clean rc=0 fix exit (no HEAD advance) the runner tail skips
+        `_flag_auth_failure_from_log` (returncode == 0), so no refresh has run
+        and a dead-but-still-`connected` row would otherwise be force-requeued
+        forever without being gated. Delegating to `_flag_claude_auth_failure`
+        re-validates a connected row (→ True, requeue this run) or expires a
+        dead one (→ False, park and arm the reconnect gate)."""
         if agent != "claude" or api_error is None or not _looks_like_auth_error(api_error):
             return False
-        status = await db.oauth_connections.get_status(self._conn, "claude")
-        return status is not None and status.status == "connected"
+        return await self._flag_claude_auth_failure("claude", api_error)
 
     async def _materialize_claude_env(self, agent: str) -> dict[str, str]:
         """Per-run Claude credential materialization (Config v2 3/9).
