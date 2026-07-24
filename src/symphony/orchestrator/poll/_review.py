@@ -479,6 +479,7 @@ class _ReviewMixin(_OrchestratorBase):
             returncode: int | None = None,
             termination_kind: str = db.runs.TRANSIENT_API_RETRY_KIND,
             workspace_path: Path | None = None,
+            force_requeue: bool = False,
         ) -> bool: ...
 
         async def _move_issue_to_review_state(
