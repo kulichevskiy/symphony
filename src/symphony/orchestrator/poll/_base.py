@@ -294,6 +294,7 @@ class _OrchestratorBase:
             issue: LinearIssue,
             *,
             dispatch_capacity_held: bool = False,
+            storage_issue_id: str | None = None,
         ) -> AsyncIterator[None]:
             yield
 
@@ -3536,6 +3537,7 @@ class _OrchestratorBase:
             binding,
             issue,
             dispatch_capacity_held=dispatch_capacity_held,
+            storage_issue_id=storage_issue_id,
         ):
             try:
                 workspace_path = await self._workspace.acquire(binding, issue)

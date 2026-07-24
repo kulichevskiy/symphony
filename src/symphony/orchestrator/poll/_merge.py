@@ -382,6 +382,7 @@ class _MergeMixin(_OrchestratorBase):
                     pr_url=pr.pr_url,
                     view=view,
                     wait_run_id=wait.run_id,
+                    storage_issue_id=wait.issue_id,
                 )
             else:
 
@@ -444,6 +445,7 @@ class _MergeMixin(_OrchestratorBase):
         pr_url: str,
         view: dict[str, object],
         wait_run_id: str,
+        storage_issue_id: str | None = None,
     ) -> asyncio.Task[None]:
         self._merge_wait_reconcile_issue_ids.add(issue.id)
 
@@ -455,9 +457,10 @@ class _MergeMixin(_OrchestratorBase):
                 pr_url=pr_url,
                 view=view,
                 merge_run_id=wait_run_id,
+                storage_issue_id=storage_issue_id,
             )
             if recovered:
-                await self._clear_operator_wait(issue.id, wait_run_id)
+                await self._clear_operator_wait(storage_issue_id or issue.id, wait_run_id)
 
         task = asyncio.create_task(dispatch_conflict_fix())
         self._dispatch_tasks.add(task)
@@ -636,6 +639,7 @@ class _MergeMixin(_OrchestratorBase):
         pr_url: str,
         reason: str,
         merge_run_id: str | None,
+        storage_issue_id: str | None = None,
     ) -> None:
         await self._mark_merge_needs_approval(
             binding=binding,
@@ -644,6 +648,7 @@ class _MergeMixin(_OrchestratorBase):
             run_id=merge_run_id or str(uuid.uuid4()),
             reason=reason,
             create_run=merge_run_id is None,
+            storage_issue_id=storage_issue_id,
         )
 
     async def _merge_required_check_terminal_run(
@@ -724,6 +729,7 @@ class _MergeMixin(_OrchestratorBase):
                 pr_url=pr_url,
                 reason=f"required-check iteration cap reached: {signature}",
                 merge_run_id=merge_run_id,
+                storage_issue_id=storage_issue_id,
             )
             return False
 
@@ -799,6 +805,7 @@ class _MergeMixin(_OrchestratorBase):
                 pr_url=pr_url,
                 reason=f"required-check fix-run failed: workspace acquire failed: {e}",
                 merge_run_id=merge_run_id,
+                storage_issue_id=storage_issue_id,
             )
 
         async def on_dedup_loss() -> bool | None:
@@ -823,6 +830,7 @@ class _MergeMixin(_OrchestratorBase):
                         f"remote HEAD for {branch}: {e}"
                     ),
                     merge_run_id=merge_run_id,
+                    storage_issue_id=storage_issue_id,
                 )
                 return False
 
@@ -836,6 +844,7 @@ class _MergeMixin(_OrchestratorBase):
                         f"required-check fix-run failed: could not read remote HEAD for {branch}"
                     ),
                     merge_run_id=merge_run_id,
+                    storage_issue_id=storage_issue_id,
                 )
                 return False
             return True
@@ -881,6 +890,7 @@ class _MergeMixin(_OrchestratorBase):
                     pr_url=pr_url,
                     reason=f"required-check fix-run failed: {e}",
                     merge_run_id=merge_run_id,
+                    storage_issue_id=storage_issue_id,
                 )
                 return False
 
@@ -911,6 +921,7 @@ class _MergeMixin(_OrchestratorBase):
                     pr_url=pr_url,
                     reason=f"required-check fix-run ended with {final_kind}",
                     merge_run_id=merge_run_id,
+                    storage_issue_id=storage_issue_id,
                 )
                 return False
 
@@ -965,6 +976,7 @@ class _MergeMixin(_OrchestratorBase):
                     pr_url=pr_url,
                     reason=reason,
                     merge_run_id=merge_run_id,
+                    storage_issue_id=storage_issue_id,
                 )
                 return False
 
@@ -1015,6 +1027,7 @@ class _MergeMixin(_OrchestratorBase):
                                 f"{_local_review_termination_reason(local_review_result)}"
                             ),
                             merge_run_id=merge_run_id,
+                            storage_issue_id=storage_issue_id,
                         )
                         return False
 
@@ -1032,6 +1045,7 @@ class _MergeMixin(_OrchestratorBase):
                     pr_url=pr_url,
                     reason=f"required-check fix-run push failed: {e}",
                     merge_run_id=merge_run_id,
+                    storage_issue_id=storage_issue_id,
                 )
                 return False
 
@@ -1134,6 +1148,7 @@ class _MergeMixin(_OrchestratorBase):
         pr_url: str,
         reason: str,
         merge_run_id: str | None,
+        storage_issue_id: str | None = None,
     ) -> None:
         await self._mark_merge_needs_approval(
             binding=binding,
@@ -1142,6 +1157,7 @@ class _MergeMixin(_OrchestratorBase):
             run_id=merge_run_id or str(uuid.uuid4()),
             reason=reason,
             create_run=merge_run_id is None,
+            storage_issue_id=storage_issue_id,
         )
 
     async def _dispatch_merge_conflict_rebase_fix_run(
@@ -1171,6 +1187,7 @@ class _MergeMixin(_OrchestratorBase):
                 pr_url=pr_url,
                 reason=f"merge-conflict fix-run failed: workspace acquire failed: {e}",
                 merge_run_id=merge_run_id,
+                storage_issue_id=storage_issue_id,
             )
 
         async def on_dedup_loss() -> bool:
@@ -1250,6 +1267,7 @@ class _MergeMixin(_OrchestratorBase):
                     pr_url=pr_url,
                     reason=f"merge-conflict fix-run failed: {e}",
                     merge_run_id=merge_run_id,
+                    storage_issue_id=storage_issue_id,
                 )
                 return False
 
@@ -1280,6 +1298,7 @@ class _MergeMixin(_OrchestratorBase):
                     pr_url=pr_url,
                     reason=(f"merge-conflict fix-run failed: runner ended with {final_kind}"),
                     merge_run_id=merge_run_id,
+                    storage_issue_id=storage_issue_id,
                 )
                 return False
 
@@ -1449,6 +1468,7 @@ class _MergeMixin(_OrchestratorBase):
             run_id=str(uuid.uuid4()),
             create_run=True,
             view=view,
+            storage_issue_id=candidate.issue_id,
         ):
             return None
 
@@ -1467,6 +1487,7 @@ class _MergeMixin(_OrchestratorBase):
             pr_url=candidate.pr_url,
             view=view,
             on_started=clear_parked_marker,
+            storage_issue_id=candidate.issue_id,
         )
 
     async def _parked_manual_merge_transition_matches(
@@ -1509,6 +1530,7 @@ class _MergeMixin(_OrchestratorBase):
         pr_url: str,
         view: dict[str, object],
         on_started: Callable[[str], Awaitable[None]] | None = None,
+        storage_issue_id: str | None = None,
     ) -> asyncio.Task[None]:
         self._parked_manual_merge_revival_issue_ids.add(issue.id)
 
@@ -1520,6 +1542,7 @@ class _MergeMixin(_OrchestratorBase):
                 pr_url=pr_url,
                 view=view,
                 on_started=on_started,
+                storage_issue_id=storage_issue_id,
             )
 
         task = asyncio.create_task(dispatch_conflict_fix())
@@ -1783,7 +1806,7 @@ class _MergeMixin(_OrchestratorBase):
         async with self._parked_closed_unmerged_lock:
             current = await db.issue_prs.get(
                 self._conn,
-                issue_id=issue.id,
+                issue_id=pr.issue_id,
                 github_repo=binding.github_repo,
             )
             if current is None or current.pr_number != pr.pr_number or current.parked_at is None:
@@ -1839,7 +1862,7 @@ class _MergeMixin(_OrchestratorBase):
 
             deleted = await db.issue_prs.delete(
                 self._conn,
-                issue_id=issue.id,
+                issue_id=pr.issue_id,
                 github_repo=binding.github_repo,
                 pr_number=pr.pr_number,
             )
@@ -2206,6 +2229,7 @@ class _MergeMixin(_OrchestratorBase):
                 run_id=str(uuid.uuid4()),
                 create_run=True,
                 view=view,
+                storage_issue_id=candidate.issue_id,
             ):
                 return _MergePreDispatch(handled=tasks, view=None, required_check_failures=[])
             if candidate.parked_at is not None:
@@ -2365,6 +2389,7 @@ class _MergeMixin(_OrchestratorBase):
                         "approval"
                     ),
                     create_run=True,
+                    storage_issue_id=candidate.issue_id,
                 )
                 return []
         elif check_state == "pending":
@@ -2391,6 +2416,7 @@ class _MergeMixin(_OrchestratorBase):
                         "merge needs operator approval"
                     ),
                     create_run=True,
+                    storage_issue_id=candidate.issue_id,
                 )
             return []
         return None
@@ -2746,13 +2772,15 @@ class _MergeMixin(_OrchestratorBase):
         run_id: str,
         create_run: bool,
         view: dict[str, object],
+        storage_issue_id: str | None = None,
     ) -> bool:
+        storage_issue_id = storage_issue_id or issue.id
         if _pr_view_is_merged(view):
             if create_run:
                 inserted = await db.runs.create_if_no_active(
                     self._conn,
                     id=run_id,
-                    issue_id=issue.id,
+                    issue_id=storage_issue_id,
                     stage="merge",
                     status="running",
                     pid=None,
@@ -2802,6 +2830,7 @@ class _MergeMixin(_OrchestratorBase):
                 run_id=run_id,
                 reason="pull request closed before merge",
                 create_run=create_run,
+                storage_issue_id=storage_issue_id,
             )
             return True
         return False
@@ -3432,12 +3461,14 @@ class _MergeMixin(_OrchestratorBase):
         final_kind: str | None = None,
         returncode: int | None = None,
         exc: BaseException | str | None = None,
+        storage_issue_id: str | None = None,
     ) -> None:
         if create_run:
+            storage_issue_id = storage_issue_id or issue.id
             inserted = await db.runs.create_if_no_active(
                 self._conn,
                 id=run_id,
-                issue_id=issue.id,
+                issue_id=storage_issue_id,
                 stage="merge",
                 status="running",
                 pid=None,
@@ -3447,7 +3478,6 @@ class _MergeMixin(_OrchestratorBase):
             )
             if not inserted:
                 return
-            storage_issue_id = issue.id
         else:
             storage_issue_id = await self._run_issue_id(run_id, issue.id)
 

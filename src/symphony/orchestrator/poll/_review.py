@@ -517,6 +517,7 @@ class _ReviewMixin(_OrchestratorBase):
             issue: LinearIssue,
             *,
             dispatch_capacity_held: bool = False,
+            storage_issue_id: str | None = None,
         ) -> AsyncIterator[None]:
             yield
 

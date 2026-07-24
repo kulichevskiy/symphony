@@ -6224,3 +6224,313 @@ async def test_pre_dispatch_scan_threads_storage_id_to_required_check_fix(
         assert tracker_state.last_trigger_signature == ""
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_scan_finalizes_merged_candidate_under_storage_id(
+    tmp_path: Path,
+) -> None:
+    """Codex P2 on SYM-225: `_handle_merge_candidate_pre_dispatch` finalizing an
+    externally-merged PR (`_finalize_pr_if_closed(create_run=True)`) must create
+    the merge run and mark `issue_prs` merged under the candidate's storage id,
+    not the tracker id `issue.id` - else the candidate is never marked merged
+    and gets re-finalized every tick.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(auto_merge=False)
+        await db.issues.upsert(
+            conn, id="storage-iss", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        await db.issues.upsert(
+            conn, id="tracker-iss", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="storage-iss",
+            github_repo=binding.github_repo,
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        candidate = await db.issue_prs.get(
+            conn, issue_id="storage-iss", github_repo=binding.github_repo
+        )
+        assert candidate is not None
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        workspace = MagicMock()
+        workspace.cleanup = AsyncMock(return_value=[])
+        orch._workspace = workspace  # noqa: SLF001
+        view = {
+            "headRefOid": "abc123",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "baseRefName": "main",
+            "state": "MERGED",
+            "mergedAt": "2026-05-10T00:03:00+00:00",
+        }
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(return_value=view)
+        orch._gh_client = AsyncMock(return_value=gh)  # type: ignore[method-assign]  # noqa: SLF001
+
+        pre = await orch._handle_merge_candidate_pre_dispatch(  # noqa: SLF001
+            candidate=candidate,
+            binding=binding,
+            issue=_scoped_issue(),
+            required_context_cache={},
+        )
+
+        assert pre.handled is not None
+
+        storage_runs = await db.runs.history_for_issue(conn, "storage-iss")
+        tracker_runs = await db.runs.history_for_issue(conn, "tracker-iss")
+        assert [r.stage for r in storage_runs] == ["merge"]
+        assert storage_runs[0].status == "done"
+        assert tracker_runs == []
+
+        pr = await db.issue_prs.get(conn, issue_id="storage-iss", github_repo=binding.github_repo)
+        assert pr is not None
+        assert pr.merged_at is not None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_scan_parks_closed_candidate_wait_under_storage_id(
+    tmp_path: Path,
+) -> None:
+    """Codex P2 on SYM-225: the closed-PR branch of `_finalize_pr_if_closed`
+    (`_mark_merge_needs_approval(create_run=True)`) must register the
+    `operator_waits` row under the candidate's storage id - else the
+    `$approve`/`$reject` reply loop watches the wrong issue (SYM-114).
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(auto_merge=False)
+        await db.issues.upsert(
+            conn, id="storage-iss", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        await db.issues.upsert(
+            conn, id="tracker-iss", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="storage-iss",
+            github_repo=binding.github_repo,
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        candidate = await db.issue_prs.get(
+            conn, issue_id="storage-iss", github_repo=binding.github_repo
+        )
+        assert candidate is not None
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        view = {
+            "headRefOid": "abc123",
+            "mergeable": "UNKNOWN",
+            "mergeStateStatus": "UNKNOWN",
+            "baseRefName": "main",
+            "state": "CLOSED",
+            "mergedAt": None,
+        }
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(return_value=view)
+        orch._gh_client = AsyncMock(return_value=gh)  # type: ignore[method-assign]  # noqa: SLF001
+
+        pre = await orch._handle_merge_candidate_pre_dispatch(  # noqa: SLF001
+            candidate=candidate,
+            binding=binding,
+            issue=_scoped_issue(),
+            required_context_cache={},
+        )
+
+        assert pre.handled is not None
+
+        storage_wait = await db.operator_waits.get(conn, "storage-iss")
+        tracker_wait = await db.operator_waits.get(conn, "tracker-iss")
+        assert storage_wait is not None
+        assert tracker_wait is None
+
+        storage_runs = await db.runs.history_for_issue(conn, "storage-iss")
+        tracker_runs = await db.runs.history_for_issue(conn, "tracker-iss")
+        assert [r.status for r in storage_runs] == ["needs_approval"]
+        assert tracker_runs == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_required_check_fix_iteration_cap_parks_under_storage_id(
+    tmp_path: Path,
+) -> None:
+    """Codex P2 on SYM-225: the required-check fix-run iteration-cap parking
+    path (`_mark_merge_required_check_fix_needs_approval`) must persist the
+    `runs` row under the storage id, not the tracker `issue.id` - else a
+    scoped-tracker cap/early-failure park bypasses the cap/dedup state the
+    rest of the merge-gate machinery keeps under the storage id.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(auto_merge=False)
+        await db.issues.upsert(
+            conn, id="storage-iss", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        await db.issues.upsert(
+            conn, id="tracker-iss", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        await db.review_state.begin_review(
+            conn,
+            "storage-iss",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo=binding.github_repo,
+            issue_label=None,
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        for _ in range(cfg.review_iteration_cap):
+            await db.review_state.bump_iteration(conn, "storage-iss")
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        failing_checks: list[dict[str, object]] = [
+            {"__typename": "CheckRun", "name": "ci/test", "conclusion": "FAILURE"}
+        ]
+        dispatched = await orch._dispatch_merge_required_check_fix_if_allowed(  # noqa: SLF001
+            binding=binding,
+            issue=_scoped_issue(),
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            head_sha="abc123",
+            failing_checks=failing_checks,
+            merge_error="required checks failed",
+            merge_run_id=None,
+            storage_issue_id="storage-iss",
+        )
+
+        assert dispatched is False
+        storage_runs = await db.runs.history_for_issue(conn, "storage-iss")
+        tracker_runs = await db.runs.history_for_issue(conn, "tracker-iss")
+        assert [r.status for r in storage_runs] == ["needs_approval"]
+        assert tracker_runs == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_run_fix_dispatch_reserves_scheduled_slot_under_storage_id(
+    tmp_path: Path,
+) -> None:
+    """Codex P2 on SYM-225: `_run_fix_dispatch` must reserve the scheduled slot
+    (`_review_fix_dispatch_slot`) under the storage id, not the tracker
+    `issue.id` - else a scoped tracker's drain-guard check
+    (`_scheduled_issue_ids`, keyed by storage id everywhere else) never sees
+    a live review-fix reservation for that issue.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(auto_merge=False)
+        await db.issues.upsert(
+            conn, id="storage-iss", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+        seen: dict[str, set[str]] = {}
+
+        async def body(workspace_path: Path, fix_run_id: str, drop_dispatch_id: object) -> bool:
+            seen["scheduled_issue_ids"] = set(orch._scheduled_issue_ids)  # noqa: SLF001
+            return True
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=tmp_path / "ws")
+        orch._workspace = workspace  # noqa: SLF001
+
+        result = await orch._run_fix_dispatch(  # noqa: SLF001
+            binding=binding,
+            issue=_scoped_issue(),
+            ignored_stages=("review", "merge"),
+            on_acquire_failure=AsyncMock(),
+            body=body,
+            storage_issue_id="storage-iss",
+        )
+
+        assert result is True
+        assert seen["scheduled_issue_ids"] == {"storage-iss"}
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_schedule_reconciled_merge_conflict_rebase_fix_threads_storage_id(
+    tmp_path: Path,
+) -> None:
+    """Codex P2 on SYM-225: the stale merge-wait reconcile path
+    (`_schedule_reconciled_merge_conflict_rebase_fix`) must thread the
+    operator wait's storage id into the conflict rebase fix-run dispatch and
+    the follow-up operator-wait clear, not fall back to the tracker
+    `issue.id` - else a scoped-tracker auto-recovery writes its fix-run under
+    the wrong id and never clears the wait it was reconciling.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+        orch._dispatch_merge_conflict_rebase_fix_run = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=True
+        )
+        orch._clear_operator_wait = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        view = {
+            "headRefOid": "abc123",
+            "mergeable": "CONFLICTING",
+            "mergeStateStatus": "DIRTY",
+        }
+        orch._schedule_reconciled_merge_conflict_rebase_fix(  # noqa: SLF001
+            binding=binding,
+            issue=_scoped_issue(),
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            view=view,
+            wait_run_id="merge-run",
+            storage_issue_id="storage-iss",
+        )
+        await orch.drain_dispatch_tasks()
+
+        orch._dispatch_merge_conflict_rebase_fix_run.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._dispatch_merge_conflict_rebase_fix_run.await_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["storage_issue_id"] == "storage-iss"
+        orch._clear_operator_wait.assert_awaited_once_with(  # type: ignore[attr-defined]  # noqa: SLF001
+            "storage-iss", "merge-run"
+        )
+    finally:
+        await conn.close()
