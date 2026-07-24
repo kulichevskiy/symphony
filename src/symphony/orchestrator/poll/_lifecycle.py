@@ -778,6 +778,27 @@ class _LifecycleMixin(_OrchestratorBase):
         )
 
         if transition.next_run_status != "completed":
+            # A nonzero exit on a Claude auth failure the daemon re-validated
+            # (SYM-229) means a stale per-run token, not a dead account: requeue
+            # this run instead of parking the issue. The runner tail already
+            # recorded the verdict, so this reuses it (no second refresh).
+            if await self._claude_auth_requeue_signal(
+                implement_role.agent,
+                None,
+                run_id=run_id,
+                log_path=self.config.log_root / f"{run_id}.log",
+            ) and await self._maybe_requeue_transient_agent_failure(
+                run_id=run_id,
+                binding=binding,
+                issue=issue,
+                storage_issue_id=issue_id,
+                api_error=None,
+                reason=f"claude auth failure, connection re-validated: {final_kind}",
+                returncode=final_returncode,
+                workspace_path=workspace_path,
+                force_requeue=True,
+            ):
+                return None
             log.info(
                 "implement run %s ended in %s (rc=%s) -> failed",
                 run_id,
@@ -1000,6 +1021,11 @@ class _LifecycleMixin(_OrchestratorBase):
                     force_requeue=await self._claude_auth_requeue_signal(
                         local_review_result.api_error_agent if local_review_result else "",
                         _lr_api_error,
+                        # Keyed by the implement run: the local-review phase's own
+                        # finally block already flagged (and re-validated) this
+                        # auth failure under the same id, so this reuses that
+                        # verdict instead of forcing a second refresh.
+                        run_id=run_id,
                     ),
                 ):
                     return False, local_review_result
@@ -1620,11 +1646,15 @@ class _LifecycleMixin(_OrchestratorBase):
                 lr_api_error = result.api_error if result is not None else None
                 lr_failed_agent = result.api_error_agent if result is not None else None
                 if lr_api_error is not None and lr_failed_agent in _AGENT_CRED_LAYOUT:
+                    # Recorded under the parent run id so the caller's requeue
+                    # decision reuses THIS verdict rather than re-validating (a
+                    # second refresh could fail transiently and undo it).
                     await self._flag_claude_auth_failure(
                         lr_failed_agent,
                         lr_api_error,
                         run_started_at=local_review_started_at,
                         provider=lr_failed_agent,
+                        run_id=parent_run_id,
                     )
 
             log.info(

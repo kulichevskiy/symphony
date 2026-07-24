@@ -53,6 +53,7 @@ from ...claude_login import (
     claude_expires_at,
     read_claude_credential,
     refresh_claude_credential,
+    refresh_claude_credential_outcome,
     strip_claude_refresh_token,
 )
 from ...codex_login import (
@@ -362,6 +363,12 @@ class _OrchestratorBase:
     _active_run_ids: set[str]
     _dispatch_run_ids: dict[str, str]
     _operator_wait_run_ids: set[str]
+    # Per-run verdict of the SYM-229 Claude auth re-validate, keyed by run id:
+    # True when the shared connection was proven usable (requeue THIS run),
+    # False when it was expired/gated. Cached so one auth failure triggers ONE
+    # daemon refresh no matter how many detection points see it, and so the
+    # requeue sites can honor a verdict the runner tail already computed.
+    _claude_auth_revalidated: dict[str, bool]
     _implement_failed_run_bindings: dict[str, RepoBinding]
     _implement_blocked_run_bindings: dict[str, RepoBinding]
     _deliver_failed_run_bindings: dict[str, RepoBinding]
@@ -561,6 +568,7 @@ class _OrchestratorBase:
         self._active_run_ids: set[str] = set()
         self._dispatch_run_ids: dict[str, str] = {}
         self._operator_wait_run_ids: set[str] = set()
+        self._claude_auth_revalidated: dict[str, bool] = {}
         self._implement_failed_run_bindings: dict[str, RepoBinding] = {}
         self._implement_blocked_run_bindings: dict[str, RepoBinding] = {}
         self._deliver_failed_run_bindings: dict[str, RepoBinding] = {}
@@ -3165,7 +3173,13 @@ class _OrchestratorBase:
         )
 
     async def _flag_claude_auth_failure(
-        self, agent: str, api_error: object, *, run_started_at: str = "", provider: str = ""
+        self,
+        agent: str,
+        api_error: object,
+        *,
+        run_started_at: str = "",
+        provider: str = "",
+        run_id: str = "",
     ) -> bool:
         """After a Claude run died on an authentication error, re-validate the
         shared UI connection with a daemon-owned refresh instead of expiring it
@@ -3219,7 +3233,7 @@ class _OrchestratorBase:
                 log.info(
                     "claude auth failure from a run older than the stored credential; not flagging"
                 )
-                return False
+                return self._record_claude_auth_verdict(run_id, False)
         # Re-validate before expiring: a daemon refresh that still succeeds
         # means the shared connection is fine and the run's failure was
         # transient. Only claude has a clean central refresh here — codex keeps
@@ -3227,13 +3241,19 @@ class _OrchestratorBase:
         # a currently-connected row: an already-`expired` row has armed the
         # reconnect gate, so a later stale run must not silently refresh it back
         # to connected and unblock the fleet without the operator reconnect.
-        if (
-            provider == "claude"
-            and status.status == "connected"
-            and await self._revalidate_claude_after_auth_failure()
-        ):
-            log.info("claude run auth failure cleared by a daemon re-validate; requeueing the run")
-            return True
+        if provider == "claude" and status.status == "connected":
+            verdict = await self._revalidate_claude_after_auth_failure()
+            if verdict in ("usable", "transient"):
+                log.info(
+                    "claude run auth failure cleared by a daemon re-validate (%s); "
+                    "requeueing the run",
+                    verdict,
+                )
+                return self._record_claude_auth_verdict(run_id, True)
+            if verdict == "gated":
+                # Already expired, or disconnected mid-flight: respect it —
+                # neither re-expire nor requeue.
+                return self._record_claude_auth_verdict(run_id, False)
         log.warning(
             "%s run failed on authentication and the connection could not be refreshed; "
             "marking it expired",
@@ -3246,17 +3266,36 @@ class _OrchestratorBase:
             updated_at=self._now().strftime("%Y-%m-%dT%H:%M:%SZ"),
             updated_by="auth-failure",
         )
-        return False
+        return self._record_claude_auth_verdict(run_id, False)
 
-    async def _revalidate_claude_after_auth_failure(self) -> bool:
+    def _record_claude_auth_verdict(self, run_id: str, requeue: bool) -> bool:
+        """Remember this run's auth re-validate verdict so every other detection
+        point (runner tail, completion gate, the review/merge/local-review
+        requeue sites) reuses it instead of forcing a second daemon refresh —
+        a second refresh could fail transiently and undo a verdict that was
+        already proven safe (SYM-229 review)."""
+        if run_id:
+            self._claude_auth_revalidated[run_id] = requeue
+        return requeue
+
+    async def _revalidate_claude_after_auth_failure(self) -> str:
         """Daemon-owned re-validate of the shared Claude connection after a run
         reported an auth failure (SYM-229). Forces a central token refresh —
         ignoring the keep-fresh horizon, since the run's failure (not the clock)
         is the trigger — under the same serialization + CAS write-back as the
-        proactive refresh. Returns True when the connection is still usable
-        (the refresh succeeded and was persisted, or a concurrent
-        reconnect/refresh already replaced the credential the failed run started
-        from), False when the daemon's own refresh genuinely failed."""
+        proactive refresh.
+
+        Verdict:
+          * `usable` — the refresh succeeded and was persisted, or a concurrent
+            reconnect/refresh already replaced the credential the failed run
+            started from. Requeue the run.
+          * `transient` — the token endpoint was unreachable/5xx/429. Says
+            nothing about the credential, so the connection must NOT be expired;
+            requeue with backoff (the retry budget bounds it).
+          * `dead` — the refresh genuinely failed (revoked/consumed refresh
+            token, no refresh token). Expire the row and arm the gate.
+          * `gated` — the row is already expired, or was disconnected
+            mid-flight: neither expire nor requeue, just respect it."""
         async with self._claude_refresh_lock:
             # Re-check under the lock: while we waited on it, a concurrent auth
             # failure may have expired the connection. `_resolve_claude_credential`
@@ -3267,11 +3306,12 @@ class _OrchestratorBase:
             # the wait.
             gated = await db.oauth_connections.get_status(self._conn, "claude")
             if gated is None or gated.status != "connected":
-                return False
+                return "gated"
             current = await self._resolve_claude_credential()
             if current is None:
-                return False
-            refreshed = await refresh_claude_credential(current)
+                return "gated"
+            outcome = await refresh_claude_credential_outcome(current)
+            refreshed = outcome.credential
             if refreshed is None:
                 # A reconnect/refresh that landed while our (doomed) token
                 # exchange was in flight must win: the connection is usable if
@@ -3283,8 +3323,17 @@ class _OrchestratorBase:
                         "claude re-validate refresh failed but the row was already replaced; "
                         "treating the connection as usable"
                     )
-                    return True
-                return False
+                    return "usable"
+                if outcome.transient:
+                    # A flaky/unreachable token endpoint says nothing about the
+                    # account — expiring here would block every other run until
+                    # an operator reconnect for no reason.
+                    log.warning(
+                        "claude re-validate could not reach the token endpoint; "
+                        "leaving the connection connected and retrying the run"
+                    )
+                    return "transient"
+                return "dead"
             wrote = await self._credential_write_back.write_back(
                 "claude",
                 refreshed,
@@ -3303,13 +3352,13 @@ class _OrchestratorBase:
                     log.info(
                         "claude re-validate raced a reconnect/refresh; using the stored credential"
                     )
-                    return True
+                    return "usable"
                 log.info(
                     "claude re-validate write-back found no live connected row "
                     "(disconnected mid-flight); not requeueing"
                 )
-                return False
-            return True
+                return "gated"
+            return "usable"
 
     async def _post_materialize_block_reason(
         self, agent: str, claude_env: dict[str, str]
@@ -3340,51 +3389,64 @@ class _OrchestratorBase:
         stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
         if stdout is None:
             return False
-        api_error: object | None = classify_stream_api_error(stdout)
-        if api_error is None:
-            # Pre-stream auth failures print a plain-text (often stderr-only)
-            # line the JSONL classifier skips: claude's "Not logged in", and
-            # codex's auth-session / refresh failure phrasings.
-            low = stdout.lower()
-            _auth_phrases = (
-                "not logged in",
-                "please run /login",
-                "authentication_error",
-                "invalid api key",
-                "refresh token expired",
-                "refresh_token_expired",
-                "refresh token was already used",
-                "refresh_token_reused",
-                "refresh token was revoked",
-                "refresh_token_invalidated",
-                "401 unauthorized",
-            )
-            if any(phrase in low for phrase in _auth_phrases):
-                api_error = StreamApiError(message="authentication failure", status=401)
+        api_error: object | None = classify_stream_api_error(stdout) or _plaintext_auth_error(
+            stdout
+        )
         if api_error is None:
             return False
         cur = await self._conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,))
         row = await cur.fetchone()
         run_started_at = str(row["started_at"]) if row is not None else ""
         return await self._flag_claude_auth_failure(
-            agent, api_error, run_started_at=run_started_at, provider=agent
+            agent, api_error, run_started_at=run_started_at, provider=agent, run_id=run_id
         )
 
     async def _claude_auth_requeue_signal(
-        self, agent: str | None, api_error: object | None
+        self,
+        agent: str | None,
+        api_error: object | None,
+        *,
+        run_id: str = "",
+        log_path: Path | None = None,
     ) -> bool:
-        """Whether the review / merge / local-review requeue sites should
-        requeue a run that failed on a Claude auth error (SYM-229). Drives the
-        daemon re-validate itself rather than trusting the pre-existing row
-        state: on a clean rc=0 fix exit (no HEAD advance) the runner tail skips
-        `_flag_auth_failure_from_log` (returncode == 0), so no refresh has run
-        and a dead-but-still-`connected` row would otherwise be force-requeued
-        forever without being gated. Delegating to `_flag_claude_auth_failure`
-        re-validates a connected row (→ True, requeue this run) or expires a
-        dead one (→ False, park and arm the reconnect gate)."""
-        if agent != "claude" or api_error is None or not _looks_like_auth_error(api_error):
+        """Whether a requeue site should requeue a run that failed on a Claude
+        auth error (SYM-229).
+
+        Order matters:
+          1. A verdict this run's auth failure already produced elsewhere (the
+             runner tail, or the completion gate) wins — one auth failure must
+             cause exactly ONE daemon refresh, otherwise a second, transiently
+             failing refresh could undo a verdict already proven safe.
+          2. Otherwise re-validate now. The rc=0 fix paths never reach the runner
+             tail (it early-returns on `returncode == 0`), so no refresh has run
+             yet and a dead-but-still-`connected` row would be force-requeued
+             forever without ever being gated. `api_error` there comes from the
+             JSONL-only reader, so fall back to scanning the log for a plaintext
+             auth line before concluding there is nothing to do.
+        The re-validate goes through `_flag_claude_auth_failure` with this run's
+        `started_at`, so its stale-run guard still suppresses a failure from a
+        run that predates an operator reconnect."""
+        if agent != "claude":
             return False
-        return await self._flag_claude_auth_failure("claude", api_error)
+        if run_id:
+            cached = self._claude_auth_revalidated.get(run_id)
+            if cached is not None:
+                return cached
+        if api_error is None or not _looks_like_auth_error(api_error):
+            if log_path is None:
+                return False
+            stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
+            api_error = _plaintext_auth_error(stdout) if stdout is not None else None
+            if api_error is None:
+                return False
+        run_started_at = ""
+        if run_id:
+            cur = await self._conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,))
+            row = await cur.fetchone()
+            run_started_at = str(row["started_at"]) if row is not None else ""
+        return await self._flag_claude_auth_failure(
+            "claude", api_error, run_started_at=run_started_at, run_id=run_id
+        )
 
     async def _materialize_claude_env(self, agent: str) -> dict[str, str]:
         """Per-run Claude credential materialization (Config v2 3/9).
@@ -4589,6 +4651,35 @@ class _OrchestratorBase:
 
 
 log = logging.getLogger(__name__)
+
+
+_PLAINTEXT_AUTH_PHRASES = (
+    "not logged in",
+    "please run /login",
+    "authentication_error",
+    "invalid api key",
+    "refresh token expired",
+    "refresh_token_expired",
+    "refresh token was already used",
+    "refresh_token_reused",
+    "refresh token was revoked",
+    "refresh_token_invalidated",
+    "401 unauthorized",
+)
+
+
+def _plaintext_auth_error(stdout: str) -> StreamApiError | None:
+    """An auth failure recovered from plain log text, or None.
+
+    Pre-stream auth failures print a plain-text (often stderr-only) line the
+    JSONL classifier skips: claude's "Not logged in", and codex's auth-session /
+    refresh failure phrasings. Shared by the runner tail and by the rc=0 fix
+    paths, whose `api_error` comes from the JSONL-only reader and would otherwise
+    miss these entirely (SYM-229 review)."""
+    low = stdout.lower()
+    if any(phrase in low for phrase in _PLAINTEXT_AUTH_PHRASES):
+        return StreamApiError(message="authentication failure", status=401)
+    return None
 
 
 def _looks_like_auth_error(api_error: object) -> bool:

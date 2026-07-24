@@ -2766,7 +2766,10 @@ class _ReviewMixin(_OrchestratorBase):
             termination_kind=db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
             workspace_path=workspace_path,
             force_requeue=await self._claude_auth_requeue_signal(
-                binding.resolved_role("fix", self.config.roles).agent, api_error
+                binding.resolved_role("fix", self.config.roles).agent,
+                api_error,
+                run_id=fix_run_id,
+                log_path=log_path,
             ),
         ):
             # _maybe_requeue_transient_agent_failure already stamped fix_run_id

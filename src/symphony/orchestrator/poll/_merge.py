@@ -925,7 +925,10 @@ class _MergeMixin(_OrchestratorBase):
                     termination_kind=db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
                     workspace_path=workspace_path,
                     force_requeue=await self._claude_auth_requeue_signal(
-                        binding.resolved_role("fix", self.config.roles).agent, api_error
+                        binding.resolved_role("fix", self.config.roles).agent,
+                        api_error,
+                        run_id=fix_run_id,
+                        log_path=log_path,
                     ),
                 ):
                     if merge_run_id is not None:

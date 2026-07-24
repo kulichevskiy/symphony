@@ -518,9 +518,125 @@ async def test_revalidate_respects_disconnect_mid_flight(tmp_path: Path) -> None
             return await orig_write_back(*args, **kwargs)
 
         harness.orch._credential_write_back.write_back = _disconnecting_write_back  # type: ignore[assignment]  # noqa: SLF001
-        usable = await harness.orch._revalidate_claude_after_auth_failure()  # noqa: SLF001
-        assert usable is False
+        verdict = await harness.orch._revalidate_claude_after_auth_failure()  # noqa: SLF001
+        assert verdict == "gated"  # neither usable nor "dead" → no expire, no requeue
         assert await db.oauth_connections.get_status(harness.conn, "claude") is None
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_transient_token_endpoint_does_not_expire_connection(tmp_path: Path) -> None:
+    """SYM-229 review: a 5xx/unreachable token endpoint says nothing about the
+    account, so a run's auth failure during an endpoint flake must NOT expire the
+    shared connection (that would block every other run until a reconnect). The
+    row stays `connected` and the run is requeued."""
+    respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(return_value=httpx.Response(500, json={}))
+
+    class _Auth:
+        message = "Not logged in"
+        status = 401
+
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="claude", credential=_cred_soon("tok"), cipher=cipher
+        )
+        assert await harness.orch._flag_claude_auth_failure("claude", _Auth()) is True  # noqa: SLF001
+        status = await db.oauth_connections.get_status(harness.conn, "claude")
+        assert status is not None and status.status == "connected"
+        # A genuinely dead credential (4xx) still expires it.
+        respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(return_value=httpx.Response(400, json={}))
+        assert await harness.orch._flag_claude_auth_failure("claude", _Auth()) is False  # noqa: SLF001
+        status = await db.oauth_connections.get_status(harness.conn, "claude")
+        assert status is not None and status.status == "expired"
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_auth_verdict_is_cached_per_run(tmp_path: Path) -> None:
+    """SYM-229 review: one auth failure must cause exactly ONE daemon refresh.
+    A verdict recorded for a run (by the runner tail / completion gate) is reused
+    by the requeue sites instead of triggering a second refresh that could fail
+    transiently and undo an already-proven-safe verdict."""
+    route = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(
+        return_value=httpx.Response(
+            200, json={"access_token": "tok-new", "refresh_token": "rt-2", "expires_in": 28800}
+        )
+    )
+
+    class _Auth:
+        message = "Not logged in"
+        status = 401
+
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="claude", credential=_cred_soon("tok"), cipher=cipher
+        )
+        # First detection point records the verdict for this run.
+        assert (
+            await harness.orch._flag_claude_auth_failure(  # noqa: SLF001
+                "claude", _Auth(), run_id="run-1"
+            )
+            is True
+        )
+        assert route.call_count == 1
+        # The requeue site reuses it — no second refresh.
+        assert (
+            await harness.orch._claude_auth_requeue_signal(  # noqa: SLF001
+                "claude", _Auth(), run_id="run-1"
+            )
+            is True
+        )
+        assert route.call_count == 1
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_requeue_signal_reads_plaintext_auth_log(tmp_path: Path) -> None:
+    """SYM-229 review: the rc=0 fix paths get `api_error` from the JSONL-only
+    reader, which skips plaintext/stderr auth lines. The requeue signal falls
+    back to scanning the run log so a rc=0 "Not logged in" is re-validated
+    (and requeued) instead of parked as a silent no-op."""
+    route = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(
+        return_value=httpx.Response(
+            200, json={"access_token": "tok-new", "refresh_token": "rt-2", "expires_in": 28800}
+        )
+    )
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="claude", credential=_cred_soon("tok"), cipher=cipher
+        )
+        log_path = tmp_path / "rc0.log"
+        log_path.write_text("Not logged in · Please run /login\n", encoding="utf-8")
+        # api_error is None (JSONL reader saw nothing) but the log says otherwise.
+        assert (
+            await harness.orch._claude_auth_requeue_signal(  # noqa: SLF001
+                "claude", None, run_id="run-rc0", log_path=log_path
+            )
+            is True
+        )
+        assert route.call_count == 1
+        # A log with no auth line stays a no-op (and never refreshes).
+        clean = tmp_path / "clean.log"
+        clean.write_text("all good\n", encoding="utf-8")
+        assert (
+            await harness.orch._claude_auth_requeue_signal(  # noqa: SLF001
+                "claude", None, run_id="run-clean", log_path=clean
+            )
+            is False
+        )
+        assert route.call_count == 1
     finally:
         await harness.close()
 
