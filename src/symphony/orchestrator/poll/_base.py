@@ -3189,15 +3189,7 @@ class _OrchestratorBase:
         provider = provider or agent
         if provider not in _AGENT_CRED_LAYOUT or api_error is None:
             return False
-        message = str(getattr(api_error, "message", "") or "")
-        status_code = getattr(api_error, "status", None)
-        looks_auth = (
-            "not logged in" in message.lower()
-            or "unauthorized" in message.lower()
-            or "authentication" in message.lower()
-            or status_code == 401
-        )
-        if not looks_auth:
+        if not _looks_like_auth_error(api_error):
             return False
         status = await db.oauth_connections.get_status(self._conn, provider)
         if status is None or status.status not in ("connected", "expired"):
@@ -3231,8 +3223,15 @@ class _OrchestratorBase:
         # Re-validate before expiring: a daemon refresh that still succeeds
         # means the shared connection is fine and the run's failure was
         # transient. Only claude has a clean central refresh here — codex keeps
-        # the immediate-expire path (out of scope for SYM-229).
-        if provider == "claude" and await self._revalidate_claude_after_auth_failure():
+        # the immediate-expire path (out of scope for SYM-229). Re-validate ONLY
+        # a currently-connected row: an already-`expired` row has armed the
+        # reconnect gate, so a later stale run must not silently refresh it back
+        # to connected and unblock the fleet without the operator reconnect.
+        if (
+            provider == "claude"
+            and status.status == "connected"
+            and await self._revalidate_claude_after_auth_failure()
+        ):
             log.info("claude run auth failure cleared by a daemon re-validate; requeueing the run")
             return True
         log.warning(
@@ -3283,12 +3282,23 @@ class _OrchestratorBase:
                 expected_prior=current,
             )
             if not wrote:
-                # CAS no-op: a concurrent refresh/reconnect already updated the
-                # row — the connection is still usable.
+                # write_back returns False for BOTH a CAS race (a concurrent
+                # reconnect/refresh already replaced the row — still usable) and
+                # a missing/non-live row (the operator disconnected mid-flight —
+                # must NOT be treated as usable). Distinguish: only a currently
+                # connected replacement keeps the connection usable; a
+                # deleted/expired row means respect the disconnect.
+                replacement = await db.oauth_connections.get_status(self._conn, "claude")
+                if replacement is not None and replacement.status == "connected":
+                    log.info(
+                        "claude re-validate raced a reconnect/refresh; using the stored credential"
+                    )
+                    return True
                 log.info(
-                    "claude re-validate raced a reconnect/refresh; using the stored credential"
+                    "claude re-validate write-back found no live connected row "
+                    "(disconnected mid-flight); not requeueing"
                 )
-                return True
+                return False
             return True
 
     async def _post_materialize_block_reason(
@@ -3307,17 +3317,19 @@ class _OrchestratorBase:
 
     async def _flag_auth_failure_from_log(
         self, agent: str, log_path: Path, returncode: int | None, run_id: str
-    ) -> None:
+    ) -> bool:
         """After a failed agent run, recover the provider API error from the
         run log and flip the connection on an authentication failure — every
         runner path, not just the rc=0 implement completion gate (Config v2
         5/9 review fix). Best-effort: an unreadable log is a no-op. The run's
-        own started_at (from the runs row) anchors the stale-run guard."""
+        own started_at (from the runs row) anchors the stale-run guard. Returns
+        the SYM-229 requeue signal (see `_flag_claude_auth_failure`): True when
+        the connection was re-validated and this run should be requeued."""
         if agent not in _AGENT_CRED_LAYOUT or returncode in (0, None):
-            return
+            return False
         stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
         if stdout is None:
-            return
+            return False
         api_error: object | None = classify_stream_api_error(stdout)
         if api_error is None:
             # Pre-stream auth failures print a plain-text (often stderr-only)
@@ -3340,13 +3352,28 @@ class _OrchestratorBase:
             if any(phrase in low for phrase in _auth_phrases):
                 api_error = StreamApiError(message="authentication failure", status=401)
         if api_error is None:
-            return
+            return False
         cur = await self._conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,))
         row = await cur.fetchone()
         run_started_at = str(row["started_at"]) if row is not None else ""
-        await self._flag_claude_auth_failure(
+        return await self._flag_claude_auth_failure(
             agent, api_error, run_started_at=run_started_at, provider=agent
         )
+
+    async def _claude_auth_requeue_signal(
+        self, agent: str | None, api_error: object | None
+    ) -> bool:
+        """True when a failed run's error is a Claude auth failure that the
+        daemon already re-validated away (SYM-229): the shared connection is
+        still `connected`, so THIS run should be requeued rather than parked.
+        The runner tail runs `_flag_auth_failure_from_log` before the review /
+        merge / local-review requeue sites read the log, so the row state here
+        already reflects that re-validate — letting those paths honor the same
+        single-run retry the implement completion gate wires directly."""
+        if agent != "claude" or api_error is None or not _looks_like_auth_error(api_error):
+            return False
+        status = await db.oauth_connections.get_status(self._conn, "claude")
+        return status is not None and status.status == "connected"
 
     async def _materialize_claude_env(self, agent: str) -> dict[str, str]:
         """Per-run Claude credential materialization (Config v2 3/9).
@@ -4551,6 +4578,19 @@ class _OrchestratorBase:
 
 
 log = logging.getLogger(__name__)
+
+
+def _looks_like_auth_error(api_error: object) -> bool:
+    """Whether a run's provider error is an authentication failure (401 / 'not
+    logged in' / 'unauthorized' / 'authentication') — the shape both the expire
+    path and the SYM-229 single-run requeue signal key on."""
+    message = str(getattr(api_error, "message", "") or "").lower()
+    return (
+        "not logged in" in message
+        or "unauthorized" in message
+        or "authentication" in message
+        or getattr(api_error, "status", None) == 401
+    )
 
 
 def _read_log_best_effort(log_path: Path) -> str | None:

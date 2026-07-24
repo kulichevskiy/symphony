@@ -2765,6 +2765,9 @@ class _ReviewMixin(_OrchestratorBase):
             reason=reason,
             termination_kind=db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
             workspace_path=workspace_path,
+            force_requeue=await self._claude_auth_requeue_signal(
+                binding.resolved_role("fix", self.config.roles).agent, api_error
+            ),
         ):
             # _maybe_requeue_transient_agent_failure already stamped fix_run_id
             # via _fail_run; just clear review rearm state and return.

@@ -459,6 +459,105 @@ async def test_auth_failure_flags_expired_and_gates_dispatch(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+@respx.mock
+async def test_expired_connection_not_revalidated_back_to_connected(tmp_path: Path) -> None:
+    """SYM-229 review: once the Claude row is `expired` (the reconnect gate is
+    armed), a later stale run's auth failure must NOT silently refresh it back
+    to `connected` and unblock the fleet without the operator reconnect. No
+    re-validate refresh is attempted; the row stays gated."""
+    route = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(
+        return_value=httpx.Response(
+            200, json={"access_token": "x", "refresh_token": "y", "expires_in": 28800}
+        )
+    )
+
+    class _AuthError:
+        message = "Not logged in"
+        status = 401
+
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="claude", credential=_cred_soon("tok"), cipher=cipher
+        )
+        await db.oauth_connections.update_status(harness.conn, provider="claude", status="expired")
+        result = await harness.orch._flag_claude_auth_failure("claude", _AuthError())  # noqa: SLF001
+        assert result is False
+        assert route.call_count == 0  # an expired row is never re-validated
+        status = await db.oauth_connections.get_status(harness.conn, "claude")
+        assert status is not None and status.status == "expired"
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_revalidate_respects_disconnect_mid_flight(tmp_path: Path) -> None:
+    """SYM-229 review: if the operator disconnects Claude while the re-validate
+    refresh is in flight, the write-back finds no live row. That miss must NOT
+    be treated as a harmless CAS race — the run is not requeued (returns False)
+    so the intentional disconnect is respected."""
+    respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(
+        return_value=httpx.Response(
+            200, json={"access_token": "tok-new", "refresh_token": "rt-2", "expires_in": 28800}
+        )
+    )
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="claude", credential=_cred_soon("tok"), cipher=cipher
+        )
+        # Simulate the operator disconnecting mid-flight: the row is gone by the
+        # time the re-validate write-back runs.
+        orig_write_back = harness.orch._credential_write_back.write_back  # noqa: SLF001
+
+        async def _disconnecting_write_back(*args: object, **kwargs: object) -> bool:
+            await db.oauth_connections.delete(harness.conn, "claude")
+            return await orig_write_back(*args, **kwargs)
+
+        harness.orch._credential_write_back.write_back = _disconnecting_write_back  # type: ignore[assignment]  # noqa: SLF001
+        usable = await harness.orch._revalidate_claude_after_auth_failure()  # noqa: SLF001
+        assert usable is False
+        assert await db.oauth_connections.get_status(harness.conn, "claude") is None
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_claude_auth_requeue_signal(tmp_path: Path) -> None:
+    """SYM-229 review: the signal the review/merge/local-review requeue sites
+    read — True only for a Claude auth error on a still-`connected` row (the
+    daemon re-validated it); False for non-auth errors, non-claude agents, and
+    an already-expired row."""
+
+    class _Auth:
+        message = "Not logged in"
+        status = 401
+
+    class _NonAuth:
+        message = "API Error: 500 upstream"
+        status = 500
+
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="claude", credential=_cred("tok"), cipher=cipher
+        )
+        sig = harness.orch._claude_auth_requeue_signal  # noqa: SLF001
+        assert await sig("claude", _Auth()) is True
+        assert await sig("claude", _NonAuth()) is False
+        assert await sig("codex", _Auth()) is False
+        assert await sig("claude", None) is False
+        await db.oauth_connections.update_status(harness.conn, provider="claude", status="expired")
+        assert await sig("claude", _Auth()) is False  # gated, not a requeue
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
 async def test_auth_failure_without_ui_connection_is_noop(tmp_path: Path) -> None:
     class _AuthError:
         message = "Not logged in"

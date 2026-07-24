@@ -997,6 +997,10 @@ class _LifecycleMixin(_OrchestratorBase):
                     reason=_local_review_termination_reason(local_review_result),
                     termination_kind=db.runs.LOCAL_REVIEW_TRANSIENT_RETRY_KIND,
                     workspace_path=workspace_path,
+                    force_requeue=await self._claude_auth_requeue_signal(
+                        local_review_result.api_error_agent if local_review_result else "",
+                        _lr_api_error,
+                    ),
                 ):
                     return False, local_review_result
                 # Budget exhausted or non-transient error. When the api_error was

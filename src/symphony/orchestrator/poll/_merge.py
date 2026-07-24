@@ -924,6 +924,9 @@ class _MergeMixin(_OrchestratorBase):
                     reason=reason,
                     termination_kind=db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
                     workspace_path=workspace_path,
+                    force_requeue=await self._claude_auth_requeue_signal(
+                        binding.resolved_role("fix", self.config.roles).agent, api_error
+                    ),
                 ):
                     if merge_run_id is not None:
                         running_interrupted = await db.runs.interrupt_running_merge(
