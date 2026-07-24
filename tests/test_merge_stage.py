@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -6098,5 +6098,55 @@ async def test_required_check_fix_persists_state_under_storage_id(
         tracker_state = await db.review_state.get(conn, "tracker-iss")
         assert tracker_state.iteration == 0
         assert tracker_state.last_trigger_signature == ""
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_merge_required_check_terminal_run_threads_storage_id(
+    tmp_path: Path,
+) -> None:
+    """SYM-114 follow-up: `_merge_required_check_terminal_run` must persist and
+    return the `runs` row under the storage id for a scoped tracker.
+
+    Otherwise the "awaiting approval" comment posted by
+    `_park_local_only_review_needs_approval` (which reads `run.issue_id`)
+    sums token totals under the tracker id instead of the storage id.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(auto_merge=False)
+        await db.issues.upsert(
+            conn, id="storage-iss", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+
+        run = await orch._merge_required_check_terminal_run(  # noqa: SLF001
+            binding=binding,
+            issue=_scoped_issue(),
+            merge_run_id=None,
+            storage_issue_id="storage-iss",
+        )
+
+        assert run.issue_id == "storage-iss"
+        persisted = await db.runs.history_for_issue(conn, "storage-iss")
+        assert any(r.id == run.id for r in persisted)
+
+        tokens_for_issue = AsyncMock(wraps=db.runs.tokens_for_issue)
+        with patch.object(db.runs, "tokens_for_issue", tokens_for_issue):
+            await orch._park_local_only_review_needs_approval(  # noqa: SLF001
+                run=run,
+                binding=binding,
+                issue=_scoped_issue(),
+                pr_url="https://github.com/org/repo/pull/42",
+                result=None,
+            )
+        tokens_for_issue.assert_awaited_once_with(conn, "storage-iss")
     finally:
         await conn.close()

@@ -647,15 +647,21 @@ class _MergeMixin(_OrchestratorBase):
         )
 
     async def _merge_required_check_terminal_run(
-        self, *, binding: RepoBinding, issue: LinearIssue, merge_run_id: str | None
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        merge_run_id: str | None,
+        storage_issue_id: str | None = None,
     ) -> db.runs.Run:
+        storage_issue_id = storage_issue_id or issue.id
         run_id = merge_run_id or str(uuid.uuid4())
         started_at = self._now().isoformat()
         if merge_run_id is None:
             await db.runs.create(
                 self._conn,
                 id=run_id,
-                issue_id=issue.id,
+                issue_id=storage_issue_id,
                 stage="merge",
                 status="running",
                 pid=None,
@@ -664,7 +670,7 @@ class _MergeMixin(_OrchestratorBase):
             )
         return db.runs.Run(
             id=run_id,
-            issue_id=issue.id,
+            issue_id=storage_issue_id,
             stage="merge",
             status="running",
             pid=None,
@@ -985,6 +991,7 @@ class _MergeMixin(_OrchestratorBase):
                             binding=binding,
                             issue=issue,
                             merge_run_id=merge_run_id,
+                            storage_issue_id=storage_issue_id,
                         )
                         await self._block_local_only_review_infra_failure(
                             binding=binding,
@@ -1033,6 +1040,7 @@ class _MergeMixin(_OrchestratorBase):
                     binding=binding,
                     issue=issue,
                     merge_run_id=merge_run_id,
+                    storage_issue_id=storage_issue_id,
                 )
                 await self._park_local_only_review_needs_approval(
                     run=run,
