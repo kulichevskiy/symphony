@@ -6150,3 +6150,77 @@ async def test_merge_required_check_terminal_run_threads_storage_id(
         tokens_for_issue.assert_awaited_once_with(conn, "storage-iss")
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_pre_dispatch_scan_threads_storage_id_to_required_check_fix(
+    tmp_path: Path,
+) -> None:
+    """SYM-225 review: the periodic merge-candidate scan (`_handle_merge_candidate_pre_dispatch`)
+    must dedupe and dispatch the required-check fix under the candidate's storage id, not the
+    tracker id `issue.id` - otherwise a scoped tracker's scan path and the reactive
+    `_merge_approved_pr` path consult/write different `review_state` rows.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(auto_merge=False)
+        await db.issues.upsert(
+            conn, id="storage-iss", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="storage-iss",
+            github_repo=binding.github_repo,
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        candidate = await db.issue_prs.get(
+            conn, issue_id="storage-iss", github_repo=binding.github_repo
+        )
+        assert candidate is not None
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+        view = {
+            "headRefOid": "abc123",
+            "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
+            "baseRefName": "main",
+            "mergedAt": None,
+        }
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(return_value=view)
+        orch._gh_client = AsyncMock(return_value=gh)  # type: ignore[method-assign]  # noqa: SLF001
+        orch._finalize_pr_if_closed = AsyncMock(return_value=False)  # type: ignore[method-assign]  # noqa: SLF001
+        failing_checks: list[dict[str, object]] = [
+            {"__typename": "CheckRun", "name": "ci/test", "conclusion": "FAILURE"}
+        ]
+        orch._required_check_failures_for_view = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=failing_checks
+        )
+        schedule = MagicMock(return_value=asyncio.get_running_loop().create_future())
+        orch._schedule_merge_required_check_fix = schedule  # type: ignore[method-assign]  # noqa: SLF001
+
+        pre = await orch._handle_merge_candidate_pre_dispatch(  # noqa: SLF001
+            candidate=candidate,
+            binding=binding,
+            issue=_scoped_issue(),
+            required_context_cache={},
+        )
+
+        assert pre.handled is not None
+        schedule.assert_called_once()
+        assert schedule.call_args.kwargs["storage_issue_id"] == "storage-iss"
+
+        # The dedup check that gates dispatch must also key off the storage id.
+        storage_state = await db.review_state.get(conn, "storage-iss")
+        assert storage_state.iteration == 0  # scheduler mocked out, only signature check ran
+        tracker_state = await db.review_state.get(conn, "tracker-iss")
+        assert tracker_state.last_trigger_signature == ""
+    finally:
+        await conn.close()

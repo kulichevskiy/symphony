@@ -2233,6 +2233,7 @@ class _MergeMixin(_OrchestratorBase):
                         pr_number=candidate.pr_number,
                         pr_url=candidate.pr_url,
                         view=view,
+                        storage_issue_id=candidate.issue_id,
                     )
                 )
                 return _MergePreDispatch(handled=tasks, view=None, required_check_failures=[])
@@ -2243,7 +2244,7 @@ class _MergeMixin(_OrchestratorBase):
                 required_context_cache=required_context_cache,
             )
             if required_check_failures and await self._merge_required_check_fix_should_dispatch(
-                issue_id=issue.id,
+                issue_id=candidate.issue_id,
                 head_sha=str(view.get("headRefOid") or ""),
                 failing_checks=required_check_failures,
             ):
@@ -2256,6 +2257,7 @@ class _MergeMixin(_OrchestratorBase):
                         head_sha=str(view.get("headRefOid") or ""),
                         failing_checks=required_check_failures,
                         merge_error="required status check failed before merge",
+                        storage_issue_id=candidate.issue_id,
                     )
                 )
                 return _MergePreDispatch(handled=tasks, view=None, required_check_failures=[])
@@ -2480,6 +2482,7 @@ class _MergeMixin(_OrchestratorBase):
                         approved_head_sha=head_sha,
                         skip_review=verdict.kind is not VerdictKind.APPROVED,
                         on_started=on_started,
+                        storage_issue_id=candidate.issue_id,
                     )
                 ]
         elif verdict.merge_conflict:
@@ -2497,6 +2500,7 @@ class _MergeMixin(_OrchestratorBase):
                     pr_number=candidate.pr_number,
                     pr_url=candidate.pr_url,
                     view=view,
+                    storage_issue_id=candidate.issue_id,
                 )
             ]
         elif verdict.kind is VerdictKind.CHANGES_REQUESTED:
@@ -2517,6 +2521,7 @@ class _MergeMixin(_OrchestratorBase):
         pr_number: int,
         pr_url: str,
         view: dict[str, object],
+        storage_issue_id: str | None = None,
     ) -> asyncio.Task[None]:
         async def dispatch_conflict_fix() -> None:
             await self._dispatch_merge_conflict_rebase_fix_run(
@@ -2525,6 +2530,7 @@ class _MergeMixin(_OrchestratorBase):
                 pr_number=pr_number,
                 pr_url=pr_url,
                 view=view,
+                storage_issue_id=storage_issue_id,
             )
 
         task = asyncio.create_task(dispatch_conflict_fix())
@@ -2542,6 +2548,7 @@ class _MergeMixin(_OrchestratorBase):
         head_sha: str,
         failing_checks: list[dict[str, object]],
         merge_error: str,
+        storage_issue_id: str | None = None,
     ) -> asyncio.Task[None]:
         async def dispatch_required_check_fix() -> None:
             await self._dispatch_merge_required_check_fix_if_allowed(
@@ -2552,6 +2559,7 @@ class _MergeMixin(_OrchestratorBase):
                 head_sha=head_sha,
                 failing_checks=failing_checks,
                 merge_error=merge_error,
+                storage_issue_id=storage_issue_id,
             )
 
         task = asyncio.create_task(dispatch_required_check_fix())
