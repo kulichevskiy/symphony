@@ -255,6 +255,27 @@ def claude_credential_expired(raw: str) -> bool:
     return claude_credential_expires_within(raw, 0.0)
 
 
+def strip_claude_refresh_token(raw: str) -> str:
+    """Return the credential blob with the one-shot refresh token removed
+    (SYM-228). A run's CLI then holds a bearer access token it cannot rotate, so
+    concurrent runs — and a single issue's own claude processes — can't consume
+    each other's refresh token ("Not logged in" mid-run). The daemon keeps the
+    full credential, refresh token included, in the DB and owns rotation
+    centrally (SYM-227). Input that isn't the expected blob is returned
+    unchanged."""
+    try:
+        payload = json.loads(raw)
+    except (ValueError, TypeError):
+        return raw
+    if not isinstance(payload, dict):
+        return raw
+    oauth = payload.get("claudeAiOauth")
+    if not isinstance(oauth, dict) or "refreshToken" not in oauth:
+        return raw
+    payload["claudeAiOauth"] = {k: v for k, v in oauth.items() if k != "refreshToken"}
+    return json.dumps(payload)
+
+
 def claude_credential_expires_within(raw: str, horizon_secs: float) -> bool:
     """Whether the credential's access token expires within `horizon_secs`
     from now (Config v2 4/9: the daemon refreshes proactively when the expiry

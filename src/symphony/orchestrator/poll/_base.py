@@ -53,6 +53,7 @@ from ...claude_login import (
     claude_expires_at,
     read_claude_credential,
     refresh_claude_credential,
+    strip_claude_refresh_token,
 )
 from ...codex_login import (
     codex_credential_expires_within,
@@ -3279,7 +3280,9 @@ class _OrchestratorBase:
         For a Claude run with a UI-stored credential, writes it into a private,
         single-run config dir and returns `{"CLAUDE_CONFIG_DIR": ...}` so the
         CLI authenticates off the DB copy — concurrent runs each get their own
-        dir, so they can never race one shared credentials file. Returns `{}`
+        dir, so they can never race one shared credentials file. The claude copy
+        is access-token-only (the refresh token is stripped, SYM-228) so a run
+        cannot rotate the one-shot refresh token. Returns `{}`
         (and materializes nothing) for non-Claude runs or when Claude isn't
         UI-connected. The caller MUST pass the returned env to
         `_finalize_claude_env` when the run ends — that reads the (possibly
@@ -3302,16 +3305,23 @@ class _OrchestratorBase:
             credential = await self._maybe_refresh_codex_credential(credential)
             if credential is None:
                 return {}
+        # SYM-228: a claude run gets an access-token-only copy — the one-shot
+        # refresh token is stripped so the CLI cannot rotate it (the daemon owns
+        # rotation centrally, SYM-227). The DB row keeps the full credential.
+        # codex is unchanged.
+        run_credential = strip_claude_refresh_token(credential) if agent == "claude" else credential
         config_dir = Path(tempfile.mkdtemp(prefix=f"symphony-{agent}-"))
         try:
             os.chmod(config_dir, 0o700)
             credentials_path = config_dir / filename
-            credentials_path.write_text(credential, encoding="utf-8")
+            credentials_path.write_text(run_credential, encoding="utf-8")
             credentials_path.chmod(0o600)
             # Pristine copy of what this run started from — the CAS guard the
-            # finalize write-back compares the DB row against (Config v2 5/9).
+            # finalize write-back compares against (Config v2 5/9). For claude
+            # this is the stripped copy; the run can't rotate it, so the claude
+            # write-back is a no-op and the daemon-owned DB credential stands.
             prior_path = config_dir / f"{filename}.orig"
-            prior_path.write_text(credential, encoding="utf-8")
+            prior_path.write_text(run_credential, encoding="utf-8")
             prior_path.chmod(0o600)
             if agent == "codex":
                 # CODEX_HOME replaces the CLI's whole config dir, not just its
