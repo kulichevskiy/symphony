@@ -169,7 +169,8 @@ async def test_near_expiry_refreshes_exactly_once_under_concurrency(tmp_path: Pa
                     (Path(env["CLAUDE_CONFIG_DIR"]) / ".credentials.json").read_text()
                 )
                 assert blob["claudeAiOauth"]["accessToken"] == "tok-new"
-                assert blob["claudeAiOauth"]["refreshToken"] == "rt-2"
+                # SYM-228: the run's copy is access-token-only.
+                assert "refreshToken" not in blob["claudeAiOauth"]
                 assert blob["claudeAiOauth"]["scopes"] == ["user:inference"]
         finally:
             await harness.orch._finalize_claude_env(env_a)  # noqa: SLF001
@@ -423,6 +424,40 @@ async def test_auth_failure_without_ui_connection_is_noop(tmp_path: Path) -> Non
         await harness.orch._flag_claude_auth_failure("claude", _AuthError())  # noqa: SLF001
         assert await db.oauth_connections.get_status(harness.conn, "claude") is None
         assert await harness.orch._claude_expired_block_reason("claude") is None  # noqa: SLF001
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_materialized_claude_creds_have_no_refresh_token(tmp_path: Path) -> None:
+    """SYM-228: a run's materialized credential carries the access token but not
+    the one-shot refresh token, so the CLI cannot rotate the shared token and
+    concurrent runs (or one issue's own claude processes) can't poison it. The
+    daemon keeps the full credential — refresh token included — in the DB and
+    owns rotation centrally (SYM-227)."""
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        # Far-future expiry (30h) so materialize doesn't trip the keep-fresh
+        # refresh; a refresh token is present in the stored blob.
+        await db.oauth_connections.set_connection(
+            harness.conn,
+            provider="claude",
+            credential=_cred_in("tok", 30 * 60 * 60, refresh="rt-secret"),
+            cipher=cipher,
+        )
+        env = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
+        try:
+            blob = json.loads((Path(env["CLAUDE_CONFIG_DIR"]) / ".credentials.json").read_text())
+            assert blob["claudeAiOauth"]["accessToken"] == "tok"
+            assert "refreshToken" not in blob["claudeAiOauth"]
+        finally:
+            await harness.orch._finalize_claude_env(env)  # noqa: SLF001
+        # The DB retains the full credential (incl. the refresh token).
+        stored = json.loads(
+            await db.oauth_connections.get_credential(harness.conn, "claude", cipher)
+        )
+        assert stored["claudeAiOauth"]["refreshToken"] == "rt-secret"
     finally:
         await harness.close()
 
