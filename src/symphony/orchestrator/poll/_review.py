@@ -461,6 +461,7 @@ class _ReviewMixin(_OrchestratorBase):
             binding: RepoBinding,
             issue: LinearIssue,
             state: db.review_state.ReviewState,
+            storage_issue_id: str | None = None,
         ) -> int: ...
 
         async def _maybe_park_for_token_budget(
