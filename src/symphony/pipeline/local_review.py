@@ -258,8 +258,15 @@ def classify_plaintext_auth_error(text: str) -> StreamApiError | None:
     Callers scope `text` to a single subprocess's own stdout+stderr so the
     error is attributed to the pass/agent that actually produced it, never a
     combined multi-agent log.
+
+    JSONL lines are skipped: an agent's stream events are
+    `classify_stream_api_error`'s domain, and a *reviewer* streams prose about
+    the diff it is reviewing — a review of auth code legitimately quotes "401
+    Unauthorized" / "refresh token expired" without the credential having
+    failed. Scanning those lines expired a healthy provider (and parked the
+    issue) purely for what the reviewer wrote.
     """
-    low = text.lower()
+    low = "\n".join(line for line in text.splitlines() if not line.strip().startswith("{")).lower()
     if any(phrase in low for phrase in _PLAINTEXT_AUTH_PHRASES):
         return StreamApiError(message="authentication failure", status=401)
     return None

@@ -1080,9 +1080,7 @@ async def test_two_pass_finder_401_survives_merge_when_verifier_stalls(
         RunnerEvent(kind="exit", returncode=0),
     ]
     verifier_stall = [RunnerEvent(kind="stall_timeout")]
-    runner = _ScriptedRunner(
-        scripts=[finder_stream, verifier_stall, finder_stream, verifier_stall]
-    )
+    runner = _ScriptedRunner(scripts=[finder_stream, verifier_stall, finder_stream, verifier_stall])
 
     async def head_sha(_: Path) -> str:
         return "sha-1"
@@ -1852,3 +1850,60 @@ async def test_fixer_stall_with_auth_stderr_tags_fixer_agent(tmp_path: Path) -> 
     assert result.outcome == LoopOutcome.FIX_RUN_FAILED
     assert result.api_error is not None and result.api_error.status == 401
     assert result.api_error_agent == "claude"
+
+
+@pytest.mark.asyncio
+async def test_reviewer_stall_after_auth_prose_does_not_flag_auth_failure(
+    tmp_path: Path,
+) -> None:
+    """A reviewer reviewing an auth-related diff streams findings that quote
+    auth wording ("401 Unauthorized", "refresh token expired") on stdout, then
+    stalls with no verdict. That prose is the reviewer's own review text — the
+    credential is fine — so `LoopResult.api_error` must stay None and the
+    caller must not expire the provider. Regression for the per-pass plaintext
+    scan reading the pass's whole stdout, where a review *about* auth code
+    looked identical to a real pre-stream auth failure."""
+    auth_prose_then_stall = [
+        RunnerEvent(
+            kind="stdout",
+            line=json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "i",
+                        "type": "agent_message",
+                        "text": (
+                            "## Findings\n- The refresh path returns 200 where it should "
+                            "return 401 Unauthorized once the refresh token expired."
+                        ),
+                    },
+                }
+            ),
+        ),
+        RunnerEvent(kind="stall_timeout"),
+    ]
+    runner = _ScriptedRunner(scripts=[auth_prose_then_stall, auth_prose_then_stall])
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-auth-prose",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.api_error is None
+    assert result.api_error_agent is None

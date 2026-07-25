@@ -17,6 +17,7 @@ import pytest
 from symphony.pipeline.local_review import (
     TRANSIENT_API_STATUSES,
     StreamApiError,
+    classify_plaintext_auth_error,
     classify_stream_api_error,
 )
 
@@ -149,3 +150,44 @@ def test_codex_raw_error_event_api_error_text_status_parsed() -> None:
     assert err is not None
     assert err.status == 503
     assert err.transient is True
+
+
+def test_plaintext_auth_scan_ignores_auth_phrases_inside_jsonl() -> None:
+    """A reviewer whose job is to review auth code streams that prose on stdout
+    as JSONL — quoting "401 Unauthorized" / "refresh token expired" is normal
+    review output, not a failed credential. The plaintext scan must skip JSON
+    lines (they belong to `classify_stream_api_error`), or a healthy provider
+    gets expired for what the reviewer wrote about the diff."""
+    stream = "\n".join(
+        [
+            json.dumps({"type": "turn.started"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": (
+                            "The handler returns 200 where it should return 401 Unauthorized "
+                            "once the refresh token expired."
+                        ),
+                    },
+                }
+            ),
+        ]
+    )
+    assert classify_plaintext_auth_error(stream) is None
+
+
+def test_plaintext_auth_scan_reads_non_json_lines_alongside_jsonl() -> None:
+    """The genuine case still classifies: a pre-stream plaintext auth line is
+    caught even when JSONL follows it on the same stream, and even when the
+    stream's own JSON prose is auth-flavoured."""
+    stream = "\n".join(
+        [
+            "Not logged in. Please run /login.",
+            json.dumps({"type": "turn.failed", "error": {"message": "stream aborted"}}),
+        ]
+    )
+    err = classify_plaintext_auth_error(stream)
+    assert err is not None
+    assert err.status == 401
