@@ -3476,7 +3476,20 @@ class _OrchestratorBase:
             if log_path is None:
                 return False
             stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
-            api_error = classify_plaintext_auth_error(stdout) if stdout is not None else None
+            # Same three tiers the runner tail uses: claude's canonical auth
+            # shape is a terminal `result` with `is_error: true` and no status,
+            # which the JSONL and plaintext scans both skip — and these rc=0
+            # paths never reach the runner tail, so missing it here means the
+            # connection is neither re-validated nor gated (SYM-218 review).
+            api_error = (
+                (
+                    classify_stream_api_error(stdout)
+                    or classify_plaintext_auth_error(stdout)
+                    or classify_json_field_auth_error(stdout)
+                )
+                if stdout is not None
+                else None
+            )
             if api_error is None:
                 return False
         run_started_at = ""

@@ -83,6 +83,12 @@ class ReviewerOutput:
     # than always the session's `reviewer_agent`. None → the caller falls back
     # to the reviewer agent (the single-pass / common case).
     api_error_agent: str | None = None
+    # Additional (error, agent) pairs when MORE THAN ONE provider failed in the
+    # same output — a two-pass review where the finder and the verifier each hit
+    # their own auth failure. The single `api_error` slot can only name one, but
+    # every failing connection needs its own re-validate/expire, so the rest ride
+    # here (SYM-218 review).
+    extra_api_errors: tuple[tuple[StreamApiError, str], ...] = ()
     cost_usd: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -121,6 +127,9 @@ class LoopResult:
     # Which agent produced `api_error` ("claude"/"codex"), so a caller flags
     # only the failing provider in a mixed reviewer/fixer config (Config v2 6/9).
     api_error_agent: str | None = None
+    # Further (error, agent) pairs when more than one provider failed — the
+    # caller must act on each, not just `api_error_agent` (SYM-218 review).
+    extra_api_errors: tuple[tuple[StreamApiError, str], ...] = ()
     # Sum of reviewer+fixer subprocess costs across every iteration.
     # Recorded on the issue's `runs.cost_usd` for the audit trail; it no
     # longer gates the loop.
@@ -215,6 +224,9 @@ async def run_local_review_loop(
             error=error,
             api_error=api_error,
             api_error_agent=api_error_agent,
+            # Only meaningful alongside a primary error; a result with no
+            # api_error has nothing extra to act on either.
+            extra_api_errors=(stream_extra_api_errors if api_error is not None else ()),
             total_cost_usd=total_cost,
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
@@ -235,6 +247,9 @@ async def run_local_review_loop(
         # (verifier pass may differ from the finder); fall back to the session's
         # reviewer agent when it doesn't (single-pass / common case).
         stream_api_error_agent: str | None = None
+        # Secondary (error, agent) pairs from the same output — see
+        # ReviewerOutput.extra_api_errors.
+        stream_extra_api_errors: tuple[tuple[StreamApiError, str], ...] = ()
         for attempt in range(REVIEWER_FAILURE_RETRIES + 1):
             out = await reviewer(i)
             _record_usage(out)
@@ -243,6 +258,7 @@ async def run_local_review_loop(
             if out.api_error is not None:
                 stream_api_error = out.api_error
                 stream_api_error_agent = out.api_error_agent or str(reviewer_agent)
+                stream_extra_api_errors = out.extra_api_errors
             if not out.ok:
                 reviewer_error = out.error or "reviewer failed"
                 if attempt < REVIEWER_FAILURE_RETRIES:
@@ -263,6 +279,7 @@ async def run_local_review_loop(
             stream_api_error_agent = (
                 (out.api_error_agent or str(reviewer_agent)) if out.api_error is not None else None
             )
+            stream_extra_api_errors = out.extra_api_errors if out.api_error is not None else ()
             parsed = parse_local_review_output(
                 agent=reviewer_agent,
                 stdout=out.stdout,
@@ -350,6 +367,13 @@ async def run_local_review_loop(
                 api_error=fix.api_error,
                 api_error_agent=fixer_agent if fix.api_error else None,
             )
+        if fix.api_error is not None:
+            # A fixer that committed and *then* failed on auth is still an auth
+            # failure the daemon must act on: carry it so the eventual result
+            # (APPROVED, EXHAUSTED, ...) surfaces the provider (SYM-218 review).
+            stream_api_error = fix.api_error
+            stream_api_error_agent = fixer_agent
+            stream_extra_api_errors = ()
 
     return _result(
         outcome=LoopOutcome.EXHAUSTED,

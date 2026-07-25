@@ -190,6 +190,24 @@ def _prefer_actionable_api_error(
     return secondary_error, secondary_agent
 
 
+def _spare_auth_errors(
+    *,
+    chosen: StreamApiError | None,
+    candidates: tuple[tuple[StreamApiError | None, str | None], ...],
+) -> tuple[tuple[StreamApiError, str], ...]:
+    """The auth failures that did NOT win the single `api_error` slot.
+
+    When both passes hit auth failures, each names a different connection and
+    each needs its own re-validate/expire — so the losers ride along instead of
+    being dropped (SYM-218 review).
+    """
+    return tuple(
+        (error, str(agent))
+        for error, agent in candidates
+        if error is not None and error is not chosen and agent and is_auth_api_error(error)
+    )
+
+
 def _classify_pass_auth_error(stdout: str, stderr: str = "") -> StreamApiError | None:
     """Three-tier provider-error classification scoped to ONE pass's own output.
 
@@ -561,6 +579,13 @@ async def run_local_review_session(
             primary=(verifier_out.api_error, verifier_out.api_error_agent),
             secondary=(finder_out.api_error, finder_out.api_error_agent),
         )
+        merged_extra_api_errors = _spare_auth_errors(
+            chosen=merged_api_error,
+            candidates=(
+                (verifier_out.api_error, verifier_out.api_error_agent),
+                (finder_out.api_error, finder_out.api_error_agent),
+            ),
+        )
         return replace(
             verifier_out,
             last_message_file=verifier_message,
@@ -571,6 +596,7 @@ async def run_local_review_session(
             cache_read_tokens=(verifier_out.cache_read_tokens + finder_out.cache_read_tokens),
             api_error=merged_api_error,
             api_error_agent=merged_api_error_agent,
+            extra_api_errors=merged_extra_api_errors,
         )
 
     async def _fixer(iteration: int, verdict: LocalVerdict) -> FixerOutput:
@@ -681,6 +707,13 @@ async def run_local_review_session(
         final_message = extract_last_agent_message(agent=fixer_role.agent, stdout=collected.stdout)
         head_after = await head_sha_provider(workspace_path)
         head_advanced = bool(head_after) and head_after != head_before
+        # Classify regardless of whether the fixer committed: a fixer that
+        # advances HEAD and *then* has its final provider call fail on auth is
+        # still an auth failure the daemon must act on. Keeping the commit does
+        # not make the credential valid again (SYM-218 review).
+        committed_api_error = (
+            _classify_pass_auth_error(collected.stdout, collected.stderr) if head_advanced else None
+        )
         if not head_advanced:
             api_error = _classify_pass_auth_error(collected.stdout, collected.stderr)
             # Preserve ANY provider API error, not only transient statuses: a
@@ -720,6 +753,9 @@ async def run_local_review_session(
             )
         return FixerOutput(
             ok=True,
+            # The commit stands, but a post-commit auth failure still has to
+            # reach the daemon (SYM-218 review).
+            api_error=committed_api_error,
             cost_usd=cost_delta,
             input_tokens=input_delta,
             output_tokens=output_delta,
