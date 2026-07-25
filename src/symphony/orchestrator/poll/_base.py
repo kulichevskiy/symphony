@@ -4753,6 +4753,19 @@ class _OrchestratorBase:
 log = logging.getLogger(__name__)
 
 
+# Post-run bookkeeping keyed by run id (auth verdicts, launched agent) is only
+# needed for the immediate post-run decision, so the maps are bounded instead of
+# growing for the daemon's lifetime (SYM-229 review).
+_MAX_RUN_MEMO_ENTRIES = 512
+
+
+def _remember_bounded(memo: dict[str, Any], key: str, value: Any) -> None:
+    """Record `key`→`value`, evicting the oldest entries past the cap."""
+    memo[key] = value
+    while len(memo) > _MAX_RUN_MEMO_ENTRIES:
+        memo.pop(next(iter(memo)), None)
+
+
 def _looks_like_auth_error(api_error: object) -> bool:
     """Whether a run's provider error is an authentication failure (401 / 'not
     logged in' / 'unauthorized' / 'authentication') — the shape both the expire
