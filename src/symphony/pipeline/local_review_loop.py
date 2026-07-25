@@ -190,6 +190,12 @@ async def run_local_review_loop(
         )
 
     verdicts: list[LocalVerdict] = []
+    # An auth failure that must outlive the iteration that saw it: a fixer that
+    # commits and *then* fails on auth is not an iteration-local event — the
+    # next reviewer may well approve, and the result would otherwise carry no
+    # error at all, leaving that credential un-revalidated (SYM-218 review).
+    pending_api_error: StreamApiError | None = None
+    pending_api_error_agent: str | None = None
     prev_findings_signature = ""
     total_cost = 0.0
     total_input_tokens = 0
@@ -217,6 +223,11 @@ async def run_local_review_loop(
         api_error: StreamApiError | None = None,
         api_error_agent: str | None = None,
     ) -> LoopResult:
+        # Anything carried from an earlier iteration still needs acting on, so
+        # it fills the slot when this outcome has no error of its own.
+        if api_error is None and pending_api_error is not None:
+            api_error = pending_api_error
+            api_error_agent = pending_api_error_agent
         return LoopResult(
             outcome=outcome,
             iterations=iterations,
@@ -364,16 +375,23 @@ async def run_local_review_loop(
                 outcome=LoopOutcome.FIX_RUN_FAILED,
                 iterations=i + 1,
                 error=fix.error or "fix-run failed",
-                api_error=fix.api_error,
-                api_error_agent=fixer_agent if fix.api_error else None,
+                # A fixer that failed without its own provider error must not
+                # erase the reviewer's surviving auth failure — a LoopResult
+                # exists, so the lifecycle's shared-log fallback won't run and
+                # that connection would stay connected (SYM-218 review).
+                api_error=fix.api_error or stream_api_error,
+                api_error_agent=(
+                    fixer_agent
+                    if fix.api_error
+                    else (stream_api_error_agent if stream_api_error else None)
+                ),
             )
         if fix.api_error is not None:
             # A fixer that committed and *then* failed on auth is still an auth
             # failure the daemon must act on: carry it so the eventual result
             # (APPROVED, EXHAUSTED, ...) surfaces the provider (SYM-218 review).
-            stream_api_error = fix.api_error
-            stream_api_error_agent = fixer_agent
-            stream_extra_api_errors = ()
+            pending_api_error = fix.api_error
+            pending_api_error_agent = fixer_agent
 
     return _result(
         outcome=LoopOutcome.EXHAUSTED,
