@@ -589,3 +589,59 @@ async def test_reviewer_output_api_error_agent_tags_that_provider() -> None:
     # Tagged with the verifier's provider, not the session's reviewer_agent.
     assert result.api_error_agent == "codex"
     assert fixer.received == []
+
+
+@pytest.mark.asyncio
+async def test_approved_verdict_still_surfaces_a_surviving_api_error() -> None:
+    """A two-pass finder can hit a typed 401 and still emit usable findings
+    that a clean verifier then APPROVEs — the loop must not drop the
+    finder's `api_error`/`api_error_agent` just because the outcome is
+    APPROVED, or the failing provider's row stays `connected`."""
+    api_err = StreamApiError(message="authentication failure", status=401)
+
+    async def _reviewer(i: int) -> ReviewerOutput:
+        return ReviewerOutput(
+            stdout=_codex_jsonl(f"clean\n{VERDICT_APPROVED_MARKER}"),
+            head_sha="s1",
+            ok=True,
+            api_error=api_err,
+            api_error_agent="claude",
+        )
+
+    fixer = _FixerScript()
+    result = await run_local_review_loop(
+        reviewer_agent="codex",
+        reviewer=_reviewer,
+        fixer=fixer,
+        cap=5,
+    )
+    assert result.outcome == LoopOutcome.APPROVED
+    assert result.api_error == api_err
+    assert result.api_error_agent == "claude"
+
+
+@pytest.mark.asyncio
+async def test_stuck_loop_verdict_still_surfaces_a_surviving_api_error() -> None:
+    """Same as above but for the STUCK_LOOP outcome (identical findings
+    twice in a row) — the auth signal must not be dropped there either."""
+    api_err = StreamApiError(message="authentication failure", status=401)
+
+    async def _reviewer(i: int) -> ReviewerOutput:
+        return ReviewerOutput(
+            stdout=_codex_jsonl(f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"),
+            head_sha="s1",
+            ok=True,
+            api_error=api_err,
+            api_error_agent="claude",
+        )
+
+    fixer = _FixerScript()
+    result = await run_local_review_loop(
+        reviewer_agent="codex",
+        reviewer=_reviewer,
+        fixer=fixer,
+        cap=5,
+    )
+    assert result.outcome == LoopOutcome.STUCK_LOOP
+    assert result.api_error == api_err
+    assert result.api_error_agent == "claude"

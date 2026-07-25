@@ -289,9 +289,15 @@ async def run_local_review_loop(
                 pass
 
         if verdict.kind == LocalVerdictKind.APPROVED:
+            # A verifier that approves cleanly can still follow a finder
+            # that hit a typed auth failure (401) but still emitted usable
+            # findings — surface (and expire) that provider rather than
+            # dropping it just because the loop is otherwise happy.
             return _result(
                 outcome=LoopOutcome.APPROVED,
                 iterations=i + 1,
+                api_error=stream_api_error,
+                api_error_agent=(stream_api_error_agent if stream_api_error else None),
             )
         if verdict.kind == LocalVerdictKind.UNPARSEABLE:
             return _result(
@@ -311,6 +317,8 @@ async def run_local_review_loop(
                 outcome=LoopOutcome.STUCK_LOOP,
                 iterations=i + 1,
                 error="reviewer produced the same findings twice in a row",
+                api_error=stream_api_error,
+                api_error_agent=(stream_api_error_agent if stream_api_error else None),
             )
         prev_findings_signature = findings_signature
 
@@ -337,6 +345,12 @@ async def run_local_review_loop(
     return _result(
         outcome=LoopOutcome.EXHAUSTED,
         iterations=cap,
+        # `stream_api_error`/`stream_api_error_agent` from the final
+        # iteration's reviewer call are still bound here (for-loop bodies
+        # don't scope in Python) — surface a lingering auth failure even
+        # when the cap was hit rather than the reviewer failing outright.
+        api_error=stream_api_error,
+        api_error_agent=(stream_api_error_agent if stream_api_error else None),
     )
 
 

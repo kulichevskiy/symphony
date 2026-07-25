@@ -55,6 +55,7 @@ from .local_review import (
     LocalVerdict,
     ReviewerAgent,
     build_local_review_command,
+    classify_json_field_auth_error,
     classify_plaintext_auth_error,
     classify_stream_api_error,
     extract_last_agent_message,
@@ -378,6 +379,14 @@ async def run_local_review_session(
             # so a claude finder's failure can never be misattributed to a
             # codex verifier that hasn't run yet.
             api_error = classify_plaintext_auth_error(collected.stdout + "\n" + collected.stderr)
+        if api_error is None:
+            # Neither classifier matched: claude's canonical auth shape is a
+            # terminal `result` event with `is_error: true` and no
+            # `api_error_status` field, so it carries no signal the two
+            # tiers above scan for. Check the auth-bearing JSON fields
+            # (mirrors `_base.py`'s three-tier order) scoped to this pass's
+            # own stdout.
+            api_error = classify_json_field_auth_error(collected.stdout)
         return ReviewerOutput(
             stdout=collected.stdout,
             head_sha=head_sha,
@@ -628,6 +637,8 @@ async def run_local_review_session(
                 nonzero_api_error = classify_plaintext_auth_error(
                     collected.stdout + "\n" + collected.stderr
                 )
+            if nonzero_api_error is None:
+                nonzero_api_error = classify_json_field_auth_error(collected.stdout)
             return FixerOutput(
                 ok=False,
                 error=f"fix-run exited rc={collected.returncode}",
@@ -656,6 +667,11 @@ async def run_local_review_session(
                 api_error = classify_plaintext_auth_error(
                     collected.stdout + "\n" + collected.stderr
                 )
+            if api_error is None:
+                # Neither classifier matched: fall back to the JSON-field
+                # scan (mirrors `_base.py`'s three-tier order) so claude's
+                # `result`/`is_error` shape isn't missed here either.
+                api_error = classify_json_field_auth_error(collected.stdout)
             # Preserve ANY provider API error, not only transient statuses: a
             # deterministic 401/unauthorized fix failure must keep its typed
             # `api_error` (tagged with the fixer's agent by the loop) so the

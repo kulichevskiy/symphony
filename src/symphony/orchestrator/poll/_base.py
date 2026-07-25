@@ -91,6 +91,7 @@ from ...pipeline.cost_guard import (
     UsageDelta,
 )
 from ...pipeline.local_review import (
+    PLAINTEXT_AUTH_PHRASES,
     StreamApiError,
     classify_json_field_auth_error,
     classify_plaintext_auth_error,
@@ -4755,13 +4756,20 @@ log = logging.getLogger(__name__)
 def _looks_like_auth_error(api_error: object) -> bool:
     """Whether a run's provider error is an authentication failure (401 / 'not
     logged in' / 'unauthorized' / 'authentication') — the shape both the expire
-    path and the SYM-229 single-run requeue signal key on."""
+    path and the SYM-229 single-run requeue signal key on.
+
+    Also matches the shared plaintext phrase list: an already-classified
+    `api_error` can carry an auth-shaped message none of the checks above see —
+    a codex `turn.failed` "refresh token expired" has no 401 status and none of
+    those words — so this gate must recognize the same shapes the classifiers
+    do (SYM-218)."""
     message = str(getattr(api_error, "message", "") or "").lower()
     return (
         "not logged in" in message
         or "unauthorized" in message
         or "authentication" in message
         or getattr(api_error, "status", None) == 401
+        or any(phrase in message for phrase in PLAINTEXT_AUTH_PHRASES)
     )
 
 

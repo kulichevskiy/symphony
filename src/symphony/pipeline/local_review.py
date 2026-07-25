@@ -236,7 +236,7 @@ def _codex_event_api_error(event: dict[str, Any]) -> StreamApiError | None:
 # Pre-stream auth failures print a plain-text (often stderr-only) line the
 # JSONL classifier above never sees: claude's "Not logged in", and codex's
 # auth-session / refresh failure phrasings.
-_PLAINTEXT_AUTH_PHRASES: tuple[str, ...] = (
+PLAINTEXT_AUTH_PHRASES: tuple[str, ...] = (
     "not logged in",
     "please run /login",
     "authentication_error",
@@ -267,7 +267,7 @@ def classify_plaintext_auth_error(text: str) -> StreamApiError | None:
     issue) purely for what the reviewer wrote.
     """
     low = "\n".join(line for line in text.splitlines() if not line.strip().startswith("{")).lower()
-    if any(phrase in low for phrase in _PLAINTEXT_AUTH_PHRASES):
+    if any(phrase in low for phrase in PLAINTEXT_AUTH_PHRASES):
         return StreamApiError(message="authentication failure", status=401)
     return None
 
@@ -311,7 +311,7 @@ def classify_json_field_auth_error(stdout: str) -> StreamApiError | None:
                 text = err
         if text is None:
             continue
-        if any(phrase in text.lower() for phrase in _PLAINTEXT_AUTH_PHRASES):
+        if any(phrase in text.lower() for phrase in PLAINTEXT_AUTH_PHRASES):
             found = StreamApiError(message="authentication failure", status=401)
     return found
 
@@ -956,6 +956,7 @@ __all__ = [
     "LocalVerdictKind",
     "ReviewerAgent",
     "StreamApiError",
+    "PLAINTEXT_AUTH_PHRASES",
     "VERDICT_APPROVED_MARKER",
     "VERDICT_CHANGES_REQUESTED_MARKER",
     "build_local_review_command",

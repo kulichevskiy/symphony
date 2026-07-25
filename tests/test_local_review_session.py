@@ -587,6 +587,67 @@ def _claude_api_error_stream(status: int) -> list[RunnerEvent]:
     ]
 
 
+def _claude_json_field_auth_error_stream() -> list[RunnerEvent]:
+    """A claude reviewer stream that exits 0 carrying claude's canonical auth
+    shape: a terminal `result` event with `is_error: true` and no
+    `api_error_status` — neither `classify_stream_api_error` (no status/no
+    `API Error:` text) nor `classify_plaintext_auth_error` (the line is JSON,
+    which that classifier skips) can see it; only the JSON-field tier can."""
+    return [
+        RunnerEvent(
+            kind="stdout",
+            line=json.dumps(
+                {
+                    "type": "result",
+                    "is_error": True,
+                    "result": "Invalid API key · Please run /login",
+                }
+            ),
+        ),
+        RunnerEvent(kind="exit", returncode=0),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reviewer_json_field_auth_error_surfaces_as_reviewer_failed(
+    tmp_path: Path,
+) -> None:
+    """Regression: claude's canonical auth-failure shape — a terminal
+    `result` event with `is_error: true` and no `api_error_status` — must
+    be caught by the third (JSON-field) classification tier in
+    `_run_reviewer_pass`, not left unclassified so the row stays
+    `connected`."""
+    runner = _ScriptedRunner(
+        scripts=[
+            _claude_json_field_auth_error_stream(),
+            _claude_json_field_auth_error_stream(),
+        ],
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-json-field-401",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="claude"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.api_error is not None and result.api_error.status == 401
+    assert result.api_error_agent == "claude"
+
+
 @pytest.mark.asyncio
 async def test_claude_transient_api_error_surfaces_as_reviewer_failed(
     tmp_path: Path,
