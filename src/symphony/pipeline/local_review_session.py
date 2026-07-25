@@ -222,11 +222,18 @@ def _classify_pass_auth_error(stdout: str, stderr: str = "") -> StreamApiError |
     multi-agent log — so a claude finder's failure can never be misattributed to
     a codex verifier that hasn't run yet. Mirrors `_base.py`'s tier order.
     """
-    return (
-        classify_stream_api_error(stdout)
-        or classify_plaintext_auth_error(stdout + ("\n" + stderr if stderr else ""))
-        or classify_json_field_auth_error(stdout)
-    )
+    stream_error = classify_stream_api_error(stdout)
+    if stream_error is not None and is_auth_api_error(stream_error):
+        return stream_error
+    # Don't let an earlier non-auth event (a synthetic 500) short-circuit the
+    # auth tiers: a pass can emit that and *then* terminate with an auth-only
+    # shape, and only the auth failure identifies a connection the daemon must
+    # act on (SYM-218 review). A non-auth stream error is still returned when
+    # no auth evidence exists.
+    auth_error = classify_plaintext_auth_error(
+        stdout + ("\n" + stderr if stderr else "")
+    ) or classify_json_field_auth_error(stdout)
+    return auth_error or stream_error
 
 
 async def run_local_review_session(

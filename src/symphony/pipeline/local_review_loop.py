@@ -222,12 +222,26 @@ async def run_local_review_loop(
         error: str | None = None,
         api_error: StreamApiError | None = None,
         api_error_agent: str | None = None,
+        extra_api_errors: tuple[tuple[StreamApiError, str], ...] = (),
     ) -> LoopResult:
         # Anything carried from an earlier iteration still needs acting on, so
         # it fills the slot when this outcome has no error of its own.
+        # Falls back to the current iteration's reviewer extras (function-scoped,
+        # assigned at the top of each iteration) when the caller passes none.
+        extras = extra_api_errors or stream_extra_api_errors
         if api_error is None and pending_api_error is not None:
             api_error = pending_api_error
             api_error_agent = pending_api_error_agent
+        elif (
+            pending_api_error is not None
+            and pending_api_error is not api_error
+            and pending_api_error_agent
+            and pending_api_error_agent != api_error_agent
+        ):
+            # A later error took the slot, but the earlier one names a DIFFERENT
+            # connection that still needs its own re-validate/expire — carry it
+            # as an extra rather than dropping it (SYM-218 review).
+            extras = (*extras, (pending_api_error, pending_api_error_agent))
         return LoopResult(
             outcome=outcome,
             iterations=iterations,
@@ -237,7 +251,7 @@ async def run_local_review_loop(
             api_error_agent=api_error_agent,
             # Only meaningful alongside a primary error; a result with no
             # api_error has nothing extra to act on either.
-            extra_api_errors=(stream_extra_api_errors if api_error is not None else ()),
+            extra_api_errors=(extras if api_error is not None else ()),
             total_cost_usd=total_cost,
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
@@ -286,11 +300,6 @@ async def run_local_review_loop(
             # or the lifecycle expires a connection that just proved healthy.
             # (An error the same output carries — e.g. a finder 401 merged with
             # a clean verifier — is preserved, since it comes from `out`.)
-            stream_api_error = out.api_error
-            stream_api_error_agent = (
-                (out.api_error_agent or str(reviewer_agent)) if out.api_error is not None else None
-            )
-            stream_extra_api_errors = out.extra_api_errors if out.api_error is not None else ()
             parsed = parse_local_review_output(
                 agent=reviewer_agent,
                 stdout=out.stdout,
@@ -299,6 +308,15 @@ async def run_local_review_loop(
             )
             if parsed.kind == LocalVerdictKind.UNPARSEABLE and attempt < REVIEWER_FAILURE_RETRIES:
                 continue
+            # Only a parseable verdict means this attempt truly recovered, so
+            # only then do earlier attempts' errors stop being live. Clearing
+            # before the parse would drop a first attempt's typed transient/auth
+            # signal when the retry is *also* unparseable (SYM-218 review).
+            stream_api_error = out.api_error
+            stream_api_error_agent = (
+                (out.api_error_agent or str(reviewer_agent)) if out.api_error is not None else None
+            )
+            stream_extra_api_errors = out.extra_api_errors if out.api_error is not None else ()
             verdict = parsed
             break
 
