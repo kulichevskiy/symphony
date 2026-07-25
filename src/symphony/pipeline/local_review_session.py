@@ -54,11 +54,13 @@ from .local_review import (
     DiffSize,
     LocalVerdict,
     ReviewerAgent,
+    StreamApiError,
     build_local_review_command,
     classify_json_field_auth_error,
     classify_plaintext_auth_error,
     classify_stream_api_error,
     extract_last_agent_message,
+    is_auth_api_error,
     is_small_diff,
     local_review_finder_prompt,
     local_review_prompt,
@@ -161,6 +163,52 @@ def _build_fix_command(
             effort=effort,
         )
     raise ValueError(f"unknown implementer agent {agent!r}")
+
+
+def _prefer_actionable_api_error(
+    *,
+    primary: tuple[StreamApiError | None, str | None],
+    secondary: tuple[StreamApiError | None, str | None],
+) -> tuple[StreamApiError | None, str | None]:
+    """Pick which of two passes' errors survives into the single `api_error`
+    slot: an auth failure wins over any other error, otherwise `primary`.
+
+    A non-auth error (say a verifier 500) is handled by the normal transient
+    retry path, but an auth failure identifies a *connection* the daemon must
+    re-validate or expire — dropping it strands that provider (SYM-218 review).
+    """
+    primary_error, primary_agent = primary
+    secondary_error, secondary_agent = secondary
+    if (
+        secondary_error is not None
+        and is_auth_api_error(secondary_error)
+        and (primary_error is None or not is_auth_api_error(primary_error))
+    ):
+        return secondary_error, secondary_agent
+    if primary_error is not None:
+        return primary_error, primary_agent
+    return secondary_error, secondary_agent
+
+
+def _classify_pass_auth_error(stdout: str, stderr: str = "") -> StreamApiError | None:
+    """Three-tier provider-error classification scoped to ONE pass's own output.
+
+    1. the terminal JSONL stream error (a typed 500/401 with `.transient`);
+    2. a pre-stream auth failure printed as a plain-text, often stderr-only
+       line the JSONL classifier never sees;
+    3. the auth-bearing JSON fields — claude's canonical auth shape is a
+       terminal `result` with `is_error: true` and no `api_error_status`, so it
+       carries no signal the first two tiers scan for.
+
+    Always scoped to this pass's own stdout+stderr — never a combined
+    multi-agent log — so a claude finder's failure can never be misattributed to
+    a codex verifier that hasn't run yet. Mirrors `_base.py`'s tier order.
+    """
+    return (
+        classify_stream_api_error(stdout)
+        or classify_plaintext_auth_error(stdout + ("\n" + stderr if stderr else ""))
+        or classify_json_field_auth_error(stdout)
+    )
 
 
 async def run_local_review_session(
@@ -346,9 +394,7 @@ async def run_local_review_session(
             # As above: a stall can follow a pre-stream auth failure the
             # process never recovered from, so classify this pass's own
             # output rather than relying on the ambiguous shared-log scrape.
-            stall_api_error = classify_plaintext_auth_error(
-                collected.stdout + "\n" + collected.stderr
-            )
+            stall_api_error = _classify_pass_auth_error(collected.stdout, collected.stderr)
             return ReviewerOutput(
                 stdout=collected.stdout,
                 head_sha=head_sha,
@@ -370,23 +416,7 @@ async def run_local_review_session(
         # provider API error from the stream, e.g. a 500) as the reason
         # instead of a generic "no verdict marker". `api_error` carries the
         # same as a typed signal (`.transient`) for downstream retry gating.
-        api_error = classify_stream_api_error(collected.stdout)
-        if api_error is None:
-            # A pre-stream auth failure (claude "Not logged in", codex
-            # refresh/401) often prints a plain-text, stderr-only line the
-            # JSONL classifier above never sees. Scope the scan to THIS
-            # pass's own stdout+stderr — never a combined multi-agent log —
-            # so a claude finder's failure can never be misattributed to a
-            # codex verifier that hasn't run yet.
-            api_error = classify_plaintext_auth_error(collected.stdout + "\n" + collected.stderr)
-        if api_error is None:
-            # Neither classifier matched: claude's canonical auth shape is a
-            # terminal `result` event with `is_error: true` and no
-            # `api_error_status` field, so it carries no signal the two
-            # tiers above scan for. Check the auth-bearing JSON fields
-            # (mirrors `_base.py`'s three-tier order) scoped to this pass's
-            # own stdout.
-            api_error = classify_json_field_auth_error(collected.stdout)
+        api_error = _classify_pass_auth_error(collected.stdout, collected.stderr)
         return ReviewerOutput(
             stdout=collected.stdout,
             head_sha=head_sha,
@@ -522,13 +552,14 @@ async def run_local_review_session(
         # `api_error`/`api_error_agent` forward when the verifier didn't
         # produce its own, so the loop still surfaces (and expires) the
         # finder's failing provider instead of silently dropping it.
-        merged_api_error = (
-            verifier_out.api_error if verifier_out.api_error is not None else finder_out.api_error
-        )
-        merged_api_error_agent = (
-            verifier_out.api_error_agent
-            if verifier_out.api_error is not None
-            else finder_out.api_error_agent
+        # Both passes can fail independently, and `ReviewerOutput` has one
+        # `api_error` slot — so it must carry the failure that needs action.
+        # An auth failure outranks any other provider error: a verifier 500 is
+        # retried by the normal transient path, but a finder 401 whose provider
+        # never gets re-validated silently strands that connection.
+        merged_api_error, merged_api_error_agent = _prefer_actionable_api_error(
+            primary=(verifier_out.api_error, verifier_out.api_error_agent),
+            secondary=(finder_out.api_error, finder_out.api_error_agent),
         )
         return replace(
             verifier_out,
@@ -618,9 +649,7 @@ async def run_local_review_session(
                 if collected.terminal_kind == "wall_clock_timeout"
                 else "fix-run stalled"
             )
-            stall_api_error = classify_plaintext_auth_error(
-                collected.stdout + "\n" + collected.stderr
-            )
+            stall_api_error = _classify_pass_auth_error(collected.stdout, collected.stderr)
             return FixerOutput(
                 ok=False,
                 error=stall_error,
@@ -632,13 +661,7 @@ async def run_local_review_session(
                 cache_read_tokens=cache_read_delta,
             )
         if not collected.ok_exit:
-            nonzero_api_error = classify_stream_api_error(collected.stdout)
-            if nonzero_api_error is None:
-                nonzero_api_error = classify_plaintext_auth_error(
-                    collected.stdout + "\n" + collected.stderr
-                )
-            if nonzero_api_error is None:
-                nonzero_api_error = classify_json_field_auth_error(collected.stdout)
+            nonzero_api_error = _classify_pass_auth_error(collected.stdout, collected.stderr)
             return FixerOutput(
                 ok=False,
                 error=f"fix-run exited rc={collected.returncode}",
@@ -659,19 +682,7 @@ async def run_local_review_session(
         head_after = await head_sha_provider(workspace_path)
         head_advanced = bool(head_after) and head_after != head_before
         if not head_advanced:
-            api_error = classify_stream_api_error(collected.stdout)
-            if api_error is None:
-                # As in `_run_reviewer_pass`: a pre-stream auth failure can
-                # print only a plain-text stderr line the JSONL classifier
-                # never sees. Scoped to this fix-run's own stdout+stderr.
-                api_error = classify_plaintext_auth_error(
-                    collected.stdout + "\n" + collected.stderr
-                )
-            if api_error is None:
-                # Neither classifier matched: fall back to the JSON-field
-                # scan (mirrors `_base.py`'s three-tier order) so claude's
-                # `result`/`is_error` shape isn't missed here either.
-                api_error = classify_json_field_auth_error(collected.stdout)
+            api_error = _classify_pass_auth_error(collected.stdout, collected.stderr)
             # Preserve ANY provider API error, not only transient statuses: a
             # deterministic 401/unauthorized fix failure must keep its typed
             # `api_error` (tagged with the fixer's agent by the loop) so the

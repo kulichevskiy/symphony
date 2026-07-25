@@ -254,6 +254,15 @@ async def run_local_review_loop(
                     api_error=stream_api_error,
                     api_error_agent=(stream_api_error_agent if stream_api_error else None),
                 )
+            # This attempt recovered, so only ITS errors are still live: a
+            # previous attempt's 401 must not ride along on a successful retry,
+            # or the lifecycle expires a connection that just proved healthy.
+            # (An error the same output carries — e.g. a finder 401 merged with
+            # a clean verifier — is preserved, since it comes from `out`.)
+            stream_api_error = out.api_error
+            stream_api_error_agent = (
+                (out.api_error_agent or str(reviewer_agent)) if out.api_error is not None else None
+            )
             parsed = parse_local_review_output(
                 agent=reviewer_agent,
                 stdout=out.stdout,

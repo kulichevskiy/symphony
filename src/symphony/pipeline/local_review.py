@@ -251,6 +251,24 @@ PLAINTEXT_AUTH_PHRASES: tuple[str, ...] = (
 )
 
 
+def is_auth_api_error(api_error: object) -> bool:
+    """Whether a classified provider error is an *authentication* failure.
+
+    Keyed on the same shapes the classifiers recognize: an explicit 401, the
+    usual wording, or any of the shared plaintext phrases (a codex
+    `turn.failed` "refresh token expired" carries neither a 401 nor those
+    words). Single definition — the orchestrator's auth gates delegate here.
+    """
+    message = str(getattr(api_error, "message", "") or "").lower()
+    return (
+        getattr(api_error, "status", None) == 401
+        or "not logged in" in message
+        or "unauthorized" in message
+        or "authentication" in message
+        or any(phrase in message for phrase in PLAINTEXT_AUTH_PHRASES)
+    )
+
+
 def classify_plaintext_auth_error(text: str) -> StreamApiError | None:
     """Recover an auth failure from plain-text output the JSONL classifier
     can't parse (a pre-stream crash on stdout, or a stderr-only message).
