@@ -623,9 +623,15 @@ async def run_local_review_session(
                 cache_read_tokens=cache_read_delta,
             )
         if not collected.ok_exit:
+            nonzero_api_error = classify_stream_api_error(collected.stdout)
+            if nonzero_api_error is None:
+                nonzero_api_error = classify_plaintext_auth_error(
+                    collected.stdout + "\n" + collected.stderr
+                )
             return FixerOutput(
                 ok=False,
                 error=f"fix-run exited rc={collected.returncode}",
+                api_error=nonzero_api_error,
                 cost_usd=cost_delta,
                 input_tokens=input_delta,
                 output_tokens=output_delta,

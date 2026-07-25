@@ -92,6 +92,7 @@ from ...pipeline.cost_guard import (
 )
 from ...pipeline.local_review import (
     StreamApiError,
+    classify_json_field_auth_error,
     classify_plaintext_auth_error,
     classify_stream_api_error,
     extract_last_agent_message,
@@ -3423,6 +3424,13 @@ class _OrchestratorBase:
         api_error: object | None = classify_stream_api_error(
             stdout
         ) or classify_plaintext_auth_error(stdout)
+        if api_error is None:
+            # Neither classifier matched a recognized shape: check the
+            # auth-bearing JSON fields (a claude `result.result`, or a codex
+            # `error`/`turn.failed` error message) for the plaintext phrases,
+            # rather than reverting to a full-text scan of all agent prose
+            # (which flags a reviewer merely discussing auth code).
+            api_error = classify_json_field_auth_error(stdout)
         if api_error is None:
             return False
         cur = await self._conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,))

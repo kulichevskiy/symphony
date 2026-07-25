@@ -1853,6 +1853,49 @@ async def test_fixer_stall_with_auth_stderr_tags_fixer_agent(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
+async def test_fixer_nonzero_exit_with_auth_stderr_tags_fixer_agent(tmp_path: Path) -> None:
+    """A fix-run that prints a plaintext auth line on stderr and exits
+    non-zero (the normal shape: claude prints "Not logged in" and exits 1)
+    must surface `FixerOutput.api_error` so `LoopResult.api_error_agent` is
+    the fixer's own agent, not left `None`. Regression: the rc!=0 branch
+    returned a plain FIX_RUN_FAILED with no api_error, so the connection
+    never expired."""
+    runner = _ScriptedRunner(
+        scripts=[
+            _codex_message_stream(f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"),
+            [
+                RunnerEvent(kind="stderr", line="Not logged in. Please run /login."),
+                RunnerEvent(kind="exit", returncode=1),
+            ],
+        ],
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-fix-nonzero-401",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.FIX_RUN_FAILED
+    assert result.api_error is not None and result.api_error.status == 401
+    assert result.api_error_agent == "claude"
+
+
+@pytest.mark.asyncio
 async def test_reviewer_stall_after_auth_prose_does_not_flag_auth_failure(
     tmp_path: Path,
 ) -> None:

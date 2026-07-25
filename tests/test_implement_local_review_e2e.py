@@ -1869,8 +1869,8 @@ async def test_local_review_plaintext_auth_failure_expires_connection(
 
         await _scan_and_wait(orch, cfg.repos[0])
 
-        # The pre-stream auth failure was scraped from the run log and the
-        # claude connection flipped to `expired`.
+        # The pre-stream auth failure was attributed to the reviewer pass and
+        # the claude connection flipped to `expired`.
         status = await db.oauth_connections.get_status(conn, "claude")
         assert status is not None and status.status == "expired"
         assert status.updated_by == "auth-failure"

@@ -272,6 +272,50 @@ def classify_plaintext_auth_error(text: str) -> StreamApiError | None:
     return None
 
 
+def classify_json_field_auth_error(stdout: str) -> StreamApiError | None:
+    """Recover an auth failure from the auth-bearing JSON fields of a terminal
+    event when neither `classify_stream_api_error` nor
+    `classify_plaintext_auth_error` matched: the `result` text of a claude
+    `result` event with `is_error: true`, or the `error`/`error.message` of a
+    codex `error`/`turn.failed` event.
+
+    Scoped to those specific fields (not all agent prose) so a reviewer's
+    prose about auth code — which legitimately quotes phrases like "401
+    Unauthorized" — is never mistaken for the connection's own credential
+    failing.
+    """
+    found: StreamApiError | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        etype = event.get("type")
+        text: str | None = None
+        if etype == "result" and event.get("is_error") is True:
+            result = event.get("result")
+            if isinstance(result, str) and result.strip():
+                text = result
+        elif etype in ("error", "turn.failed"):
+            err = event.get("error")
+            if isinstance(err, dict):
+                msg = err.get("message")
+                if isinstance(msg, str) and msg.strip():
+                    text = msg
+            elif isinstance(err, str) and err.strip():
+                text = err
+        if text is None:
+            continue
+        if any(phrase in text.lower() for phrase in _PLAINTEXT_AUTH_PHRASES):
+            found = StreamApiError(message="authentication failure", status=401)
+    return found
+
+
 def classify_stream_api_error(stdout: str) -> StreamApiError | None:
     """Recover a provider API error from an agent's terminal JSONL stream.
 
@@ -915,6 +959,8 @@ __all__ = [
     "VERDICT_APPROVED_MARKER",
     "VERDICT_CHANGES_REQUESTED_MARKER",
     "build_local_review_command",
+    "classify_json_field_auth_error",
+    "classify_plaintext_auth_error",
     "classify_stream_api_error",
     "default_reviewer_agent",
     "extract_last_agent_message",
