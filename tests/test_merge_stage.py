@@ -6641,3 +6641,55 @@ async def test_schedule_reconciled_merge_conflict_rebase_fix_threads_storage_id(
         )
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_schedule_reconciled_merge_conflict_rebase_fix_keys_inflight_marker_by_storage_id(
+    tmp_path: Path,
+) -> None:
+    """Codex P2 on SYM-225: the reconcile in-flight marker
+    (`_merge_wait_reconcile_issue_ids`) must be keyed by the operator wait's
+    storage id, matching the `wait.issue_id` membership check in
+    `_reconcile_auto_recoverable_merge_waits`, not the tracker `issue.id` -
+    else a scoped-tracker reconcile never registers as in-flight under the
+    key that's actually checked, and the done-callback never clears it.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+        orch._dispatch_merge_conflict_rebase_fix_run = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=False
+        )
+        orch._clear_operator_wait = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        view = {
+            "headRefOid": "abc123",
+            "mergeable": "CONFLICTING",
+            "mergeStateStatus": "DIRTY",
+        }
+        issue = _scoped_issue()
+        task = orch._schedule_reconciled_merge_conflict_rebase_fix(  # noqa: SLF001
+            binding=binding,
+            issue=issue,
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            view=view,
+            wait_run_id="merge-run",
+            storage_issue_id="storage-iss",
+        )
+        assert "storage-iss" in orch._merge_wait_reconcile_issue_ids
+        assert issue.id not in orch._merge_wait_reconcile_issue_ids
+
+        await task
+        await orch.drain_dispatch_tasks()
+
+        assert "storage-iss" not in orch._merge_wait_reconcile_issue_ids
+    finally:
+        await conn.close()

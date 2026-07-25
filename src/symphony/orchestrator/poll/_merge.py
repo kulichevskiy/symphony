@@ -448,7 +448,8 @@ class _MergeMixin(_OrchestratorBase):
         wait_run_id: str,
         storage_issue_id: str | None = None,
     ) -> asyncio.Task[None]:
-        self._merge_wait_reconcile_issue_ids.add(issue.id)
+        reconcile_issue_id = storage_issue_id or issue.id
+        self._merge_wait_reconcile_issue_ids.add(reconcile_issue_id)
 
         async def dispatch_conflict_fix() -> None:
             recovered = await self._dispatch_merge_conflict_rebase_fix_run(
@@ -461,14 +462,14 @@ class _MergeMixin(_OrchestratorBase):
                 storage_issue_id=storage_issue_id,
             )
             if recovered:
-                await self._clear_operator_wait(storage_issue_id or issue.id, wait_run_id)
+                await self._clear_operator_wait(reconcile_issue_id, wait_run_id)
 
         task = asyncio.create_task(dispatch_conflict_fix())
         self._dispatch_tasks.add(task)
         task.add_done_callback(
             partial(
                 self._merge_wait_reconcile_task_done,
-                issue_id=issue.id,
+                issue_id=reconcile_issue_id,
             )
         )
         return task

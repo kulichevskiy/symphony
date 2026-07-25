@@ -3576,14 +3576,6 @@ class _ReviewMixin(_OrchestratorBase):
         issue: LinearIssue,
         trigger: str,
     ) -> None:
-        # Capture the wait floor BEFORE inviting operator replies. The
-        # review-cap operator_wait's `created_at` clamps comment polling
-        # (`_review_cap_wait_started_at`), so it must be a floor that predates
-        # the stuck-loop invite comment. Capturing it at the upsert instead
-        # would leave a sub-second window in which a `$approve`/`$reject`
-        # posted right after the invite gets `created_at < wait.created_at`
-        # and is never fetched — the exact silent-drop race SYM-114 killed.
-        wait_created_at = self._now().isoformat()
         state = await db.review_state.get(self._conn, issue.id)
         tokens = await db.runs.tokens_for_issue(self._conn, issue.id)
         body = stuck_loop_escape(
@@ -3606,6 +3598,14 @@ class _ReviewMixin(_OrchestratorBase):
             )
         )
         tracker = self.tracker(binding)
+        # Capture the wait floor BEFORE inviting operator replies. The
+        # review-cap operator_wait's `created_at` clamps comment polling
+        # (`_review_cap_wait_started_at`), so it must be a floor that predates
+        # the stuck-loop invite comment. Capturing it at the upsert instead
+        # would leave a sub-second window in which a `$approve`/`$reject`
+        # posted right after the invite gets `created_at < wait.created_at`
+        # and is never fetched — the exact silent-drop race SYM-114 killed.
+        wait_created_at = self._now().isoformat()
         try:
             await tracker.post_comment(issue.id, truncate_body(body))
         except LinearError as e:
