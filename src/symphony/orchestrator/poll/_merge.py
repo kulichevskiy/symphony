@@ -401,6 +401,7 @@ class _MergeMixin(_OrchestratorBase):
                         pr_url=pr.pr_url,
                         approved_head_sha=approved_head_sha,
                         on_started=clear_reconciled_merge_wait,
+                        storage_issue_id=wait.issue_id,
                     )
             log.info(
                 "reconciled merge wait for %s via %s (reason=%s)",

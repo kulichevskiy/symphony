@@ -733,6 +733,113 @@ async def test_reconcile_merge_wait_clean_dispatches_fresh_merge(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_merge_wait_clean_retry_uses_scoped_storage_id(
+    tmp_path: Path,
+) -> None:
+    """SYM-114 follow-up: the "clean merge retry" branch of the auto-recoverable
+    merge wait reconciler must thread the wait's storage id into
+    `_schedule_merge`, not just the conflict-recovery branch above it.
+
+    For a scoped tracker (storage id != tracker issue id), omitting
+    `storage_issue_id` here makes the re-dispatched merge write its follow-up
+    state (`runs`, `_dispatch_run_ids`, ...) under the tracker id instead of
+    the storage id already tracked by the operator wait/cap/dedup state.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding().model_copy(
+            update={"tracker_provider": "linear-alt", "tracker_site": "secondary"}
+        )
+        issue = _issue()
+        # Force a storage-id collision so the secondary-tracker upsert falls
+        # back to a scoped storage id distinct from the tracker issue id.
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier="ENG-0",
+            title="Default issue",
+            team_key=issue.team_key,
+        )
+        scoped_issue_id = await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+            provider=binding.tracker_provider,
+            site=binding.tracker_site,
+        )
+        assert scoped_issue_id != issue.id
+
+        await db.runs.create(
+            conn,
+            id="merge-run",
+            issue_id=scoped_issue_id,
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T00:02:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id=scoped_issue_id,
+            run_id="merge-run",
+            kind=db.operator_waits.KIND_MERGE,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="",
+            created_at="2026-05-10T00:03:00+00:00",
+            tracker_provider=binding.tracker_provider,
+            tracker_site=binding.tracker_site,
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=scoped_issue_id,
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:01:00+00:00",
+        )
+
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=issue)
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "abc123",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "baseRefName": "main",
+                "mergedAt": None,
+            }
+        )
+        orch = Orchestrator(
+            Config(repos=[binding]),
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._review_verdict_for_pr = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            return_value=Verdict(kind=VerdictKind.APPROVED, rule="test_approved")
+        )
+        scheduled = asyncio.create_task(asyncio.sleep(0))
+        orch._schedule_merge = MagicMock(return_value=scheduled)  # type: ignore[method-assign]  # noqa: SLF001
+
+        assert await orch._reconcile_auto_recoverable_merge_waits() == 1  # noqa: SLF001
+        await scheduled
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._schedule_merge.call_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["storage_issue_id"] == scoped_issue_id
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_reconcile_merge_wait_clean_no_signal_does_not_schedule_merge(
     tmp_path: Path,
 ) -> None:
