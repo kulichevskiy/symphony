@@ -461,6 +461,7 @@ class _ReviewMixin(_OrchestratorBase):
             binding: RepoBinding,
             issue: LinearIssue,
             state: db.review_state.ReviewState,
+            storage_issue_id: str | None = None,
         ) -> int: ...
 
         async def _maybe_park_for_token_budget(
@@ -517,6 +518,7 @@ class _ReviewMixin(_OrchestratorBase):
             issue: LinearIssue,
             *,
             dispatch_capacity_held: bool = False,
+            storage_issue_id: str | None = None,
         ) -> AsyncIterator[None]:
             yield
 
@@ -3637,6 +3639,14 @@ class _ReviewMixin(_OrchestratorBase):
             )
         )
         tracker = self.tracker(binding)
+        # Capture the wait floor BEFORE inviting operator replies. The
+        # review-cap operator_wait's `created_at` clamps comment polling
+        # (`_review_cap_wait_started_at`), so it must be a floor that predates
+        # the stuck-loop invite comment. Capturing it at the upsert instead
+        # would leave a sub-second window in which a `$approve`/`$reject`
+        # posted right after the invite gets `created_at < wait.created_at`
+        # and is never fetched — the exact silent-drop race SYM-114 killed.
+        wait_created_at = self._now().isoformat()
         try:
             await tracker.post_comment(issue.id, truncate_body(body))
         except LinearError as e:
@@ -3679,7 +3689,7 @@ class _ReviewMixin(_OrchestratorBase):
                 linear_team_key=binding.linear_team_key,
                 github_repo=binding.github_repo,
                 issue_label=binding.issue_label or "",
-                created_at=self._now().isoformat(),
+                created_at=wait_created_at,
                 provider=binding.provider,
                 tracker_provider=binding.tracker_provider,
                 tracker_site=binding.tracker_site,

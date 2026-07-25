@@ -325,13 +325,20 @@ class _DispatchMixin(_OrchestratorBase):
         issue: LinearIssue,
         *,
         dispatch_capacity_held: bool = False,
+        storage_issue_id: str | None = None,
     ) -> AsyncIterator[None]:
         """Reserve priority capacity for a review-fix job.
 
         Review monitors may run without consuming dispatch slots, but once a
         monitor finds work that changes code, that work should sit ahead of new
         implementation jobs in both the global and per-binding queues.
+
+        ``storage_issue_id`` reserves the scheduled slot under the storage
+        issue id (defaults to ``issue.id``) so a scoped tracker's drain-guard
+        check (``_scheduled_issue_ids``, keyed by storage id elsewhere) sees
+        this reservation (SYM-114 follow-up).
         """
+        storage_issue_id = storage_issue_id or issue.id
         binding_key = _binding_key(binding)
         binding_sem = self._binding_dispatch_sems.setdefault(
             binding_key,
@@ -354,13 +361,13 @@ class _DispatchMixin(_OrchestratorBase):
         # same lock across its whole check-then-write) without blocking this
         # slot's semaphore wait on unrelated config writes (SYM-193 review).
         async with self._config_write_lock:
-            self._reserve_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
+            self._reserve_scheduled_slot(issue_id=storage_issue_id, binding_key=binding_key)
         try:
             async with self._review_fix_sem, review_binding_sem:
                 async with self._global_dispatch_sem, binding_sem:
                     yield
         finally:
-            self._release_scheduled_slot(issue_id=issue.id, binding_key=binding_key)
+            self._release_scheduled_slot(issue_id=storage_issue_id, binding_key=binding_key)
 
     def is_dispatch_paused(self) -> bool:
         """Whether the daemon-level dispatch kill-switch is engaged."""

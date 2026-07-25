@@ -296,6 +296,7 @@ class _OrchestratorBase:
             issue: LinearIssue,
             *,
             dispatch_capacity_held: bool = False,
+            storage_issue_id: str | None = None,
         ) -> AsyncIterator[None]:
             yield
 
@@ -3779,6 +3780,7 @@ class _OrchestratorBase:
         after_dedup: Callable[[str], Awaitable[None]] | None = None,
         on_dedup_loss: Callable[[], Awaitable[bool | None]] | None = None,
         dispatch_capacity_held: bool = False,
+        storage_issue_id: str | None = None,
     ) -> bool | None:
         """Shared scaffolding for the `_dispatch_*_fix_run` family (SYM-157).
 
@@ -3803,11 +3805,19 @@ class _OrchestratorBase:
           ``finally`` block calls it again as a safety net (idempotent).
         * ``on_dedup_loss`` — value to return when another live ``review_fix``
           already exists (defaults to ``False``).
+
+        ``storage_issue_id`` keys the ``review_fix`` run row and the in-memory
+        dispatch id under the storage issue id (defaults to ``issue.id``). For a
+        scoped tracker (``storage_id != tracker_id``) the caller threads the
+        storage id so the fix-run and its dedup state land under the same id the
+        rest of the run/state machinery uses (SYM-114 follow-up).
         """
+        storage_issue_id = storage_issue_id or issue.id
         async with self._review_fix_dispatch_slot(
             binding,
             issue,
             dispatch_capacity_held=dispatch_capacity_held,
+            storage_issue_id=storage_issue_id,
         ):
             try:
                 workspace_path = await self._workspace.acquire(binding, issue)
@@ -3839,7 +3849,7 @@ class _OrchestratorBase:
                     inserted = await db.runs.create_if_no_active(
                         self._conn,
                         id=fix_run_id,
-                        issue_id=issue.id,
+                        issue_id=storage_issue_id,
                         stage="review_fix",
                         status="running",
                         pid=None,
@@ -3852,7 +3862,7 @@ class _OrchestratorBase:
                     if on_dedup_loss is not None:
                         return await on_dedup_loss()
                     return False
-                self._dispatch_run_ids[issue.id] = fix_run_id
+                self._dispatch_run_ids[storage_issue_id] = fix_run_id
 
                 if after_dedup is not None:
                     await after_dedup(fix_run_id)
@@ -3864,8 +3874,8 @@ class _OrchestratorBase:
                     if _id_dropped:
                         return
                     _id_dropped = True
-                    if self._dispatch_run_ids.get(issue.id) == fix_run_id:
-                        self._dispatch_run_ids.pop(issue.id, None)
+                    if self._dispatch_run_ids.get(storage_issue_id) == fix_run_id:
+                        self._dispatch_run_ids.pop(storage_issue_id, None)
 
                 try:
                     return await body(workspace_path, fix_run_id, _drop_dispatch_id)

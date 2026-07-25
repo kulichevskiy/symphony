@@ -5106,6 +5106,80 @@ async def test_review_cap_park_registers_watched_operator_wait(
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_review_cap_wait_floor_precedes_stuck_loop_invite(
+    tmp_path: Path,
+) -> None:
+    """SYM-114 follow-up: the review-cap wait floor must be captured BEFORE the
+    stuck-loop invite comment is posted.
+
+    `_review_cap_wait_started_at` clamps comment polling to the wait's
+    `created_at`. If that timestamp is captured after posting the invite (and
+    moving the issue), a `$approve`/`$reject` landing in the sub-second window
+    right after the invite gets `created_at < wait.created_at` and is never
+    fetched — recreating the exact silent-drop race SYM-114 killed.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding()
+        await _seed_active_review(conn)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        # A monotonic clock that advances one second on every read, so any
+        # ordering error between "capture floor" and "post invite" is visible.
+        from datetime import timedelta
+
+        base = datetime(2026, 5, 10, 12, 0, 0, tzinfo=UTC)
+        ticks = iter(range(1000))
+
+        def clock() -> datetime:
+            return base + timedelta(seconds=next(ticks))
+
+        comment_post_time: list[datetime] = []
+
+        linear = AsyncMock()
+        linear.team_states = AsyncMock(return_value=_states())
+        linear.move_issue = AsyncMock()
+
+        async def _record_comment(*_args: object, **_kwargs: object) -> None:
+            # Wall clock passes during the (real) network round-trip: sample it.
+            comment_post_time.append(clock())
+
+        linear.post_comment = AsyncMock(side_effect=_record_comment)
+        orch = Orchestrator(cfg, linear, conn, runner=MagicMock(), gh=MagicMock(), clock=clock)
+        run = db.runs.Run(
+            id="review-run",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:00:00+00:00",
+            ended_at=None,
+            cost_usd=0.0,
+        )
+
+        await orch._park_review_for_approval(  # noqa: SLF001
+            run=run,
+            binding=binding,
+            issue=_issue_in_code_review(),
+            trigger="codex_inline:cap",
+        )
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert comment_post_time, "invite comment was never posted"
+        # The wait floor must not be *after* the moment the invite was posted;
+        # otherwise a reply landing right after the invite would be clamped out.
+        assert datetime.fromisoformat(wait.created_at) <= comment_post_time[0]
+    finally:
+        await conn.close()
+
+
 @pytest.mark.parametrize(
     "kind",
     [SlashKind.APPROVE, SlashKind.REJECT, SlashKind.STOP],
