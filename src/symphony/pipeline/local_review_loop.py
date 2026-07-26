@@ -46,6 +46,7 @@ from .local_review import (
     LocalVerdictKind,
     ReviewerAgent,
     StreamApiError,
+    is_auth_api_error,
     parse_local_review_output,
 )
 
@@ -166,17 +167,48 @@ def _dedupe_api_errors(
 ) -> tuple[tuple[StreamApiError, str], ...]:
     """Drop repeats and anything the primary slot already names, so a provider
     is never flagged twice for the same failure."""
-    seen: set[tuple[int, str]] = set()
+    seen: set[str] = set()
     out: list[tuple[StreamApiError, str]] = []
     for error, agent in errors:
+        # Keyed by PROVIDER: each provider has one connection needing one
+        # re-validate. Flagging it twice would trigger a second refresh, which
+        # is exactly the rotation the daemon serializes to avoid (SYM-218 review).
         if primary is not None and (error is primary or agent == primary_agent):
             continue
-        key = (id(error), agent)
-        if key in seen:
+        if agent in seen:
             continue
-        seen.add(key)
+        seen.add(agent)
         out.append((error, agent))
     return tuple(out)
+
+
+def _providers_named(
+    primary_agent: str | None, extras: tuple[tuple[StreamApiError, str], ...]
+) -> set[str]:
+    """Every provider an output speaks for — those it did NOT name were not
+    exercised by it, so its silence says nothing about them."""
+    named = {agent for _, agent in extras}
+    if primary_agent:
+        named.add(primary_agent)
+    return named
+
+
+def _prefer_auth_error(
+    first: tuple[StreamApiError | None, str | None],
+    second: tuple[StreamApiError | None, str | None],
+) -> tuple[StreamApiError | None, str | None]:
+    """`first` wins unless only `second` is an auth failure: a credential that
+    needs re-validating outranks a plain API error even when both belong to the
+    same provider (SYM-218 review)."""
+    first_error, _ = first
+    second_error, _ = second
+    if (
+        second_error is not None
+        and is_auth_api_error(second_error)
+        and (first_error is None or not is_auth_api_error(first_error))
+    ):
+        return second
+    return first if first_error is not None else second
 
 
 async def run_local_review_loop(
@@ -346,7 +378,28 @@ async def run_local_review_loop(
                     if out.api_error is not None
                     else None
                 )
-                stream_extra_api_errors = out.extra_api_errors if out.api_error is not None else ()
+                # Providers this attempt never spoke for keep their earlier
+                # failures: a retry that fails in the finder says nothing about
+                # a verifier that never ran (SYM-218 review).
+                touched = _providers_named(
+                    out.api_error_agent or str(reviewer_agent) if out.api_error else None,
+                    out.extra_api_errors,
+                )
+                untouched = tuple(
+                    (error, agent)
+                    for error, agent in (
+                        *stream_extra_api_errors,
+                        *(
+                            ((stream_api_error, stream_api_error_agent),)
+                            if stream_api_error is not None and stream_api_error_agent
+                            else ()
+                        ),
+                    )
+                    if agent not in touched
+                )
+                stream_extra_api_errors = (
+                    (*out.extra_api_errors, *untouched) if out.api_error is not None else untouched
+                )
             elif out.api_error is not None:
                 # An unparseable final attempt with its own error still reports
                 # that error rather than the earlier attempt's.
@@ -433,6 +486,10 @@ async def run_local_review_loop(
                 error=fix.blocked_reason or "fix-run blocked on a human action",
             )
         if not fix.ok:
+            _fix_failure_error, _fix_failure_agent = _prefer_auth_error(
+                (fix.api_error, fixer_agent if fix.api_error else None),
+                (stream_api_error, stream_api_error_agent if stream_api_error else None),
+            )
             return _result(
                 outcome=LoopOutcome.FIX_RUN_FAILED,
                 iterations=i + 1,
@@ -441,12 +498,8 @@ async def run_local_review_loop(
                 # erase the reviewer's surviving auth failure — a LoopResult
                 # exists, so the lifecycle's shared-log fallback won't run and
                 # that connection would stay connected (SYM-218 review).
-                api_error=fix.api_error or stream_api_error,
-                api_error_agent=(
-                    fixer_agent
-                    if fix.api_error
-                    else (stream_api_error_agent if stream_api_error else None)
-                ),
+                api_error=_fix_failure_error,
+                api_error_agent=_fix_failure_agent,
             )
         if fix.api_error is not None:
             # A fixer that committed and *then* failed on auth is still an auth
