@@ -1662,13 +1662,66 @@ class _LifecycleMixin(_OrchestratorBase):
                     # Recorded under the parent run id so the caller's requeue
                     # decision reuses THIS verdict rather than re-validating (a
                     # second refresh could fail transiently and undo it).
-                    await self._flag_claude_auth_failure(
+                    lr_all_usable = await self._flag_claude_auth_failure(
                         lr_failed_agent,
                         lr_api_error,
                         run_started_at=local_review_started_at,
                         provider=lr_failed_agent,
                         run_id=parent_run_id,
                     )
+                    # A two-pass review can have BOTH providers fail on auth.
+                    # The single `api_error` slot names one; each of the others
+                    # is its own connection needing its own re-validate/expire,
+                    # so flag them too (SYM-218 review). Not cached under the
+                    # parent run: the primary verdict owns the requeue decision.
+                    for extra_error, extra_agent in (
+                        result.extra_api_errors if result is not None else ()
+                    ):
+                        if extra_agent in _AGENT_CRED_LAYOUT and extra_agent != lr_failed_agent:
+                            extra_usable = await self._flag_claude_auth_failure(
+                                extra_agent,
+                                extra_error,
+                                run_started_at=local_review_started_at,
+                                provider=extra_agent,
+                            )
+                            lr_all_usable = lr_all_usable and extra_usable
+                    if not lr_all_usable:
+                        # A requeue is only safe when EVERY implicated provider
+                        # came back usable: re-dispatching a run whose other
+                        # role sits behind an expired-connection gate would just
+                        # burn the retry budget (SYM-218 review).
+                        self._record_claude_auth_verdict(parent_run_id, False)
+                elif lr_api_error is None and result is None:
+                    # The session raised before returning a LoopResult at all
+                    # (a stall/spawn exception outside any tracked pass, e.g.
+                    # in `workspace_scrubber`/providers/`on_iteration`) — there
+                    # is no per-pass tag to read, so we can't know which of
+                    # reviewer/verifier/fixer's provider actually failed.
+                    # `_run_reviewer_pass`/`_fixer` now classify auth failures
+                    # from each pass's own stdout+stderr (Config v2 6/9
+                    # follow-up), so every REVIEWER_FAILED/FIX_RUN_FAILED
+                    # outcome already carries the right `api_error_agent`
+                    # above and never reaches here. Only flag from the shared
+                    # run log when every role is the same single provider —
+                    # the one case where scraping it can't hit the wrong,
+                    # uninvolved provider.
+                    lr_roles_agents = {reviewer_role.agent, verifier_role.agent, fixer_role.agent}
+                    if len(lr_roles_agents) == 1:
+                        (lr_scrape_agent,) = lr_roles_agents
+                        if lr_scrape_agent in _AGENT_CRED_LAYOUT:
+                            scraped_requeue = await self._flag_auth_failure_from_log(
+                                lr_scrape_agent,
+                                self.config.log_root / f"{local_review_run_id}.log",
+                                1,
+                                local_review_run_id,
+                            )
+                            # This raising path returns None, so the caller has
+                            # neither an agent nor a verdict to key off. Record
+                            # under the PARENT run id as well, so its requeue
+                            # decision sees that the connection was re-validated
+                            # and retries instead of parking (SYM-218 review).
+                            if scraped_requeue:
+                                self._record_claude_auth_verdict(parent_run_id, True)
 
             log.info(
                 "local-review phase for %s ended in %s (iterations=%d, strategy=%s, reviewer=%s)",

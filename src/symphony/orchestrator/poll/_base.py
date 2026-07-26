@@ -92,8 +92,10 @@ from ...pipeline.cost_guard import (
 )
 from ...pipeline.local_review import (
     StreamApiError,
-    classify_stream_api_error,
+    classify_json_field_auth_error,
+    classify_pass_api_error,
     extract_last_agent_message,
+    is_auth_api_error,
 )
 from ...pipeline.local_review_loop import LoopOutcome, LoopResult
 from ...pipeline.state_machine import on_runner_event
@@ -3416,9 +3418,17 @@ class _OrchestratorBase:
         stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
         if stdout is None:
             return False
-        api_error: object | None = classify_stream_api_error(stdout) or _plaintext_auth_error(
-            stdout
-        )
+        # Pre-stream auth failures print a plain-text (often stderr-only) line
+        # the JSONL classifier skips: claude's "Not logged in", and codex's
+        # auth-session / refresh failure phrasings.
+        api_error: object | None = classify_pass_api_error(stdout)
+        if api_error is None:
+            # Neither classifier matched a recognized shape: check the
+            # auth-bearing JSON fields (a claude `result.result`, or a codex
+            # `error`/`turn.failed` error message) for the plaintext phrases,
+            # rather than reverting to a full-text scan of all agent prose
+            # (which flags a reviewer merely discussing auth code).
+            api_error = classify_json_field_auth_error(stdout)
         if api_error is None:
             return False
         cur = await self._conn.execute("SELECT started_at FROM runs WHERE id = ?", (run_id,))
@@ -3453,17 +3463,26 @@ class _OrchestratorBase:
         The re-validate goes through `_flag_claude_auth_failure` with this run's
         `started_at`, so its stale-run guard still suppresses a failure from a
         run that predates an operator reconnect."""
-        if agent != "claude":
-            return False
+        # Cache first: the local-review raising path records a verdict under the
+        # parent run id but leaves the caller without an agent to key off, so an
+        # agent gate here would discard a re-validation already performed
+        # (SYM-218 review).
         if run_id:
             cached = self._claude_auth_revalidated.get(run_id)
             if cached is not None:
                 return cached
+        if agent != "claude":
+            return False
         if api_error is None or not _looks_like_auth_error(api_error):
             if log_path is None:
                 return False
             stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
-            api_error = _plaintext_auth_error(stdout) if stdout is not None else None
+            # Same three tiers the runner tail uses: claude's canonical auth
+            # shape is a terminal `result` with `is_error: true` and no status,
+            # which the JSONL and plaintext scans both skip — and these rc=0
+            # paths never reach the runner tail, so missing it here means the
+            # connection is neither re-validated nor gated (SYM-218 review).
+            api_error = classify_pass_api_error(stdout) if stdout is not None else None
             if api_error is None:
                 return False
         run_started_at = ""
@@ -4740,21 +4759,6 @@ class _OrchestratorBase:
 log = logging.getLogger(__name__)
 
 
-_PLAINTEXT_AUTH_PHRASES = (
-    "not logged in",
-    "please run /login",
-    "authentication_error",
-    "invalid api key",
-    "refresh token expired",
-    "refresh_token_expired",
-    "refresh token was already used",
-    "refresh_token_reused",
-    "refresh token was revoked",
-    "refresh_token_invalidated",
-    "401 unauthorized",
-)
-
-
 # Post-run bookkeeping keyed by run id (auth verdicts, launched agent) is only
 # needed for the immediate post-run decision, so the maps are bounded instead of
 # growing for the daemon's lifetime (SYM-229 review).
@@ -4768,31 +4772,14 @@ def _remember_bounded(memo: dict[str, Any], key: str, value: Any) -> None:
         memo.pop(next(iter(memo)), None)
 
 
-def _plaintext_auth_error(stdout: str) -> StreamApiError | None:
-    """An auth failure recovered from plain log text, or None.
-
-    Pre-stream auth failures print a plain-text (often stderr-only) line the
-    JSONL classifier skips: claude's "Not logged in", and codex's auth-session /
-    refresh failure phrasings. Shared by the runner tail and by the rc=0 fix
-    paths, whose `api_error` comes from the JSONL-only reader and would otherwise
-    miss these entirely (SYM-229 review)."""
-    low = stdout.lower()
-    if any(phrase in low for phrase in _PLAINTEXT_AUTH_PHRASES):
-        return StreamApiError(message="authentication failure", status=401)
-    return None
-
-
 def _looks_like_auth_error(api_error: object) -> bool:
-    """Whether a run's provider error is an authentication failure (401 / 'not
-    logged in' / 'unauthorized' / 'authentication') — the shape both the expire
-    path and the SYM-229 single-run requeue signal key on."""
-    message = str(getattr(api_error, "message", "") or "").lower()
-    return (
-        "not logged in" in message
-        or "unauthorized" in message
-        or "authentication" in message
-        or getattr(api_error, "status", None) == 401
-    )
+    """Whether a run's provider error is an authentication failure — the shape
+    both the expire path and the SYM-229 single-run requeue signal key on.
+
+    Delegates to the pipeline's `is_auth_api_error` so the classifiers and these
+    gates can never drift apart on what counts as auth (SYM-218).
+    """
+    return is_auth_api_error(api_error)
 
 
 def _read_log_best_effort(log_path: Path) -> str | None:

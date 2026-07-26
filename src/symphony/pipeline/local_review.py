@@ -233,6 +233,135 @@ def _codex_event_api_error(event: dict[str, Any]) -> StreamApiError | None:
     return StreamApiError(message=msg, status=status)
 
 
+# Pre-stream auth failures print a plain-text (often stderr-only) line the
+# JSONL classifier above never sees: claude's "Not logged in", and codex's
+# auth-session / refresh failure phrasings.
+PLAINTEXT_AUTH_PHRASES: tuple[str, ...] = (
+    "not logged in",
+    "please run /login",
+    "authentication_error",
+    "invalid api key",
+    "refresh token expired",
+    "refresh_token_expired",
+    "refresh token was already used",
+    "refresh_token_reused",
+    "refresh token was revoked",
+    "refresh_token_invalidated",
+    "401 unauthorized",
+)
+
+
+def classify_pass_api_error(stdout: str, stderr: str = "") -> StreamApiError | None:
+    """Three-tier provider-error classification scoped to ONE pass's own output.
+
+    1. the terminal JSONL stream error (a typed 500/401 with `.transient`);
+    2. a pre-stream auth failure printed as a plain-text, often stderr-only
+       line the JSONL classifier never sees;
+    3. the auth-bearing JSON fields — claude's canonical auth shape is a
+       terminal `result` with `is_error: true` and no `api_error_status`, so it
+       carries no signal the first two tiers scan for.
+
+    Always scoped to this pass's own stdout+stderr — never a combined
+    multi-agent log — so a claude finder's failure can never be misattributed to
+    a codex verifier that hasn't run yet. Mirrors `_base.py`'s tier order.
+    """
+    stream_error = classify_stream_api_error(stdout)
+    if stream_error is not None and is_auth_api_error(stream_error):
+        return stream_error
+    # Don't let an earlier non-auth event (a synthetic 500) short-circuit the
+    # auth tiers: a pass can emit that and *then* terminate with an auth-only
+    # shape, and only the auth failure identifies a connection the daemon must
+    # act on (SYM-218 review). A non-auth stream error is still returned when
+    # no auth evidence exists.
+    auth_error = classify_plaintext_auth_error(
+        stdout + ("\n" + stderr if stderr else "")
+    ) or classify_json_field_auth_error(stdout)
+    return auth_error or stream_error
+
+
+def is_auth_api_error(api_error: object) -> bool:
+    """Whether a classified provider error is an *authentication* failure.
+
+    Keyed on the same shapes the classifiers recognize: an explicit 401, the
+    usual wording, or any of the shared plaintext phrases (a codex
+    `turn.failed` "refresh token expired" carries neither a 401 nor those
+    words). Single definition — the orchestrator's auth gates delegate here.
+    """
+    message = str(getattr(api_error, "message", "") or "").lower()
+    return (
+        getattr(api_error, "status", None) == 401
+        or "not logged in" in message
+        or "unauthorized" in message
+        or "authentication" in message
+        or any(phrase in message for phrase in PLAINTEXT_AUTH_PHRASES)
+    )
+
+
+def classify_plaintext_auth_error(text: str) -> StreamApiError | None:
+    """Recover an auth failure from plain-text output the JSONL classifier
+    can't parse (a pre-stream crash on stdout, or a stderr-only message).
+
+    Callers scope `text` to a single subprocess's own stdout+stderr so the
+    error is attributed to the pass/agent that actually produced it, never a
+    combined multi-agent log.
+
+    JSONL lines are skipped: an agent's stream events are
+    `classify_stream_api_error`'s domain, and a *reviewer* streams prose about
+    the diff it is reviewing — a review of auth code legitimately quotes "401
+    Unauthorized" / "refresh token expired" without the credential having
+    failed. Scanning those lines expired a healthy provider (and parked the
+    issue) purely for what the reviewer wrote.
+    """
+    low = "\n".join(line for line in text.splitlines() if not line.strip().startswith("{")).lower()
+    if any(phrase in low for phrase in PLAINTEXT_AUTH_PHRASES):
+        return StreamApiError(message="authentication failure", status=401)
+    return None
+
+
+def classify_json_field_auth_error(stdout: str) -> StreamApiError | None:
+    """Recover an auth failure from the auth-bearing JSON fields of a terminal
+    event when neither `classify_stream_api_error` nor
+    `classify_plaintext_auth_error` matched: the `result` text of a claude
+    `result` event with `is_error: true`, or the `error`/`error.message` of a
+    codex `error`/`turn.failed` event.
+
+    Scoped to those specific fields (not all agent prose) so a reviewer's
+    prose about auth code — which legitimately quotes phrases like "401
+    Unauthorized" — is never mistaken for the connection's own credential
+    failing.
+    """
+    found: StreamApiError | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(event, dict):
+            continue
+        etype = event.get("type")
+        text: str | None = None
+        if etype == "result" and event.get("is_error") is True:
+            result = event.get("result")
+            if isinstance(result, str) and result.strip():
+                text = result
+        elif etype in ("error", "turn.failed"):
+            err = event.get("error")
+            if isinstance(err, dict):
+                msg = err.get("message")
+                if isinstance(msg, str) and msg.strip():
+                    text = msg
+            elif isinstance(err, str) and err.strip():
+                text = err
+        if text is None:
+            continue
+        if any(phrase in text.lower() for phrase in PLAINTEXT_AUTH_PHRASES):
+            found = StreamApiError(message="authentication failure", status=401)
+    return found
+
+
 def classify_stream_api_error(stdout: str) -> StreamApiError | None:
     """Recover a provider API error from an agent's terminal JSONL stream.
 
@@ -873,9 +1002,12 @@ __all__ = [
     "LocalVerdictKind",
     "ReviewerAgent",
     "StreamApiError",
+    "PLAINTEXT_AUTH_PHRASES",
     "VERDICT_APPROVED_MARKER",
     "VERDICT_CHANGES_REQUESTED_MARKER",
     "build_local_review_command",
+    "classify_json_field_auth_error",
+    "classify_plaintext_auth_error",
     "classify_stream_api_error",
     "default_reviewer_agent",
     "extract_last_agent_message",

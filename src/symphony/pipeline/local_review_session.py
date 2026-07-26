@@ -53,14 +53,19 @@ from .cost_guard import UsageCostEstimator
 from .local_review import (
     DiffSize,
     LocalVerdict,
+    LocalVerdictKind,
     ReviewerAgent,
+    StreamApiError,
     build_local_review_command,
-    classify_stream_api_error,
+    classify_pass_api_error,
+    classify_plaintext_auth_error,
     extract_last_agent_message,
+    is_auth_api_error,
     is_small_diff,
     local_review_finder_prompt,
     local_review_prompt,
     local_review_verifier_prompt,
+    parse_local_review_output,
 )
 from .local_review_io import CollectedRunnerOutput, collect_runner_output
 from .local_review_loop import (
@@ -159,6 +164,49 @@ def _build_fix_command(
             effort=effort,
         )
     raise ValueError(f"unknown implementer agent {agent!r}")
+
+
+def _prefer_actionable_api_error(
+    *,
+    primary: tuple[StreamApiError | None, str | None],
+    secondary: tuple[StreamApiError | None, str | None],
+) -> tuple[StreamApiError | None, str | None]:
+    """Pick which of two passes' errors survives into the single `api_error`
+    slot: an auth failure wins over any other error, otherwise `primary`.
+
+    A non-auth error (say a verifier 500) is handled by the normal transient
+    retry path, but an auth failure identifies a *connection* the daemon must
+    re-validate or expire — dropping it strands that provider (SYM-218 review).
+    """
+    primary_error, primary_agent = primary
+    secondary_error, secondary_agent = secondary
+    if (
+        secondary_error is not None
+        and is_auth_api_error(secondary_error)
+        and (primary_error is None or not is_auth_api_error(primary_error))
+    ):
+        return secondary_error, secondary_agent
+    if primary_error is not None:
+        return primary_error, primary_agent
+    return secondary_error, secondary_agent
+
+
+def _spare_auth_errors(
+    *,
+    chosen: StreamApiError | None,
+    candidates: tuple[tuple[StreamApiError | None, str | None], ...],
+) -> tuple[tuple[StreamApiError, str], ...]:
+    """The auth failures that did NOT win the single `api_error` slot.
+
+    When both passes hit auth failures, each names a different connection and
+    each needs its own re-validate/expire — so the losers ride along instead of
+    being dropped (SYM-218 review).
+    """
+    return tuple(
+        (error, str(agent))
+        for error, agent in candidates
+        if error is not None and error is not chosen and agent and is_auth_api_error(error)
+    )
 
 
 async def run_local_review_session(
@@ -318,12 +366,22 @@ async def run_local_review_session(
                 last_message_text = None
 
         if collected.terminal_kind == "spawn_failed":
+            # A spawn failure can itself be an auth failure (e.g. codex
+            # refusing to start with no valid session). Classify THIS pass's
+            # own stdout+stderr here so a REVIEWER_FAILED outcome carries the
+            # right provider tag instead of leaving the shared-log fallback
+            # (which can't tell passes apart) to guess.
+            spawn_api_error = classify_plaintext_auth_error(
+                collected.stdout + "\n" + collected.stderr
+            )
             return ReviewerOutput(
                 stdout=collected.stdout,
                 head_sha=head_sha,
                 last_message_file=last_message_text,
                 ok=False,
                 error=f"spawn_failed: {collected.spawn_error or 'unknown'}",
+                api_error=spawn_api_error,
+                api_error_agent=(str(agent) if spawn_api_error is not None else None),
                 cost_usd=cost_delta,
                 input_tokens=input_delta,
                 output_tokens=output_delta,
@@ -331,12 +389,18 @@ async def run_local_review_session(
                 cache_read_tokens=cache_read_delta,
             )
         if collected.stall_timeout:
+            # As above: a stall can follow a pre-stream auth failure the
+            # process never recovered from, so classify this pass's own
+            # output rather than relying on the ambiguous shared-log scrape.
+            stall_api_error = classify_pass_api_error(collected.stdout, collected.stderr)
             return ReviewerOutput(
                 stdout=collected.stdout,
                 head_sha=head_sha,
                 last_message_file=last_message_text,
                 ok=False,
                 error="reviewer stalled",
+                api_error=stall_api_error,
+                api_error_agent=(str(agent) if stall_api_error is not None else None),
                 cost_usd=cost_delta,
                 input_tokens=input_delta,
                 output_tokens=output_delta,
@@ -350,7 +414,7 @@ async def run_local_review_session(
         # provider API error from the stream, e.g. a 500) as the reason
         # instead of a generic "no verdict marker". `api_error` carries the
         # same as a typed signal (`.transient`) for downstream retry gating.
-        api_error = classify_stream_api_error(collected.stdout)
+        api_error = classify_pass_api_error(collected.stdout, collected.stderr)
         return ReviewerOutput(
             stdout=collected.stdout,
             head_sha=head_sha,
@@ -358,6 +422,14 @@ async def run_local_review_session(
             ok=True,
             agent_error=api_error.message if api_error is not None else None,
             api_error=api_error,
+            # Tag with THIS pass's agent so a two-pass verifier failure (which
+            # may run a different provider than the finder) expires the right
+            # provider; the loop reads it into `LoopResult.api_error_agent`.
+            api_error_agent=(str(agent) if api_error is not None else None),
+            # A pass that ran to completion with no provider error proves that
+            # credential works; the loop uses this to retire stale failures
+            # held against the same provider (SYM-218 review).
+            healthy_agents=((str(agent),) if api_error is None else ()),
             cost_usd=cost_delta,
             input_tokens=input_delta,
             output_tokens=output_delta,
@@ -476,6 +548,56 @@ async def run_local_review_session(
             stdout=verifier_out.stdout,
             last_message_file=verifier_out.last_message_file,
         )
+        # The finder can hit a typed auth failure (401) and still emit usable
+        # findings, so it passes the `agent_error`-with-findings guard above
+        # and reaches a verifier that succeeds cleanly. Carry the finder's
+        # `api_error`/`api_error_agent` forward when the verifier didn't
+        # produce its own, so the loop still surfaces (and expires) the
+        # finder's failing provider instead of silently dropping it.
+        # Both passes can fail independently, and `ReviewerOutput` has one
+        # `api_error` slot — so it must carry the failure that needs action.
+        # An auth failure outranks any other provider error: a verifier 500 is
+        # retried by the normal transient path, but a finder 401 whose provider
+        # never gets re-validated silently strands that connection.
+        # Which providers this two-pass output proves healthy. `ok` alone is not
+        # enough: `_run_reviewer_pass` leaves verdict validation to the loop, so
+        # an ordinary nonzero exit with no classified error also reports ok —
+        # require a PARSEABLE verdict before calling the verifier's credential
+        # good (SYM-218 review). The loop then retires stale errors held against
+        # those providers, including a same-provider finder 401.
+        verifier_parsed = parse_local_review_output(
+            agent=verifier_role.agent,
+            stdout=verifier_out.stdout,
+            head_sha=verifier_out.head_sha,
+            last_message_file=verifier_message,
+        )
+        merged_healthy_agents = tuple(
+            {
+                *(
+                    (str(verifier_role.agent),)
+                    if (
+                        verifier_out.ok
+                        and verifier_out.api_error is None
+                        and verifier_parsed.kind != LocalVerdictKind.UNPARSEABLE
+                    )
+                    else ()
+                ),
+                *((str(reviewer_role.agent),) if finder_out.api_error is None else ()),
+            }
+        )
+        finder_api_error = finder_out.api_error
+        finder_api_error_agent = finder_out.api_error_agent
+        merged_api_error, merged_api_error_agent = _prefer_actionable_api_error(
+            primary=(verifier_out.api_error, verifier_out.api_error_agent),
+            secondary=(finder_api_error, finder_api_error_agent),
+        )
+        merged_extra_api_errors = _spare_auth_errors(
+            chosen=merged_api_error,
+            candidates=(
+                (verifier_out.api_error, verifier_out.api_error_agent),
+                (finder_api_error, finder_api_error_agent),
+            ),
+        )
         return replace(
             verifier_out,
             last_message_file=verifier_message,
@@ -484,6 +606,18 @@ async def run_local_review_session(
             output_tokens=(verifier_out.output_tokens + finder_out.output_tokens),
             cache_write_tokens=(verifier_out.cache_write_tokens + finder_out.cache_write_tokens),
             cache_read_tokens=(verifier_out.cache_read_tokens + finder_out.cache_read_tokens),
+            api_error=merged_api_error,
+            api_error_agent=merged_api_error_agent,
+            extra_api_errors=merged_extra_api_errors,
+            healthy_agents=merged_healthy_agents,
+            # Keep the operator-facing message on the SAME failure the
+            # lifecycle acts on: otherwise a verifier 500 is reported while the
+            # finder's provider is the one expired (SYM-218 review).
+            agent_error=(
+                merged_api_error.message
+                if merged_api_error is not None
+                else verifier_out.agent_error
+            ),
         )
 
     async def _fixer(iteration: int, verdict: LocalVerdict) -> FixerOutput:
@@ -539,9 +673,17 @@ async def run_local_review_session(
         cache_write_delta = fixer_estimator.total_cache_write_tokens - cache_write_before
         cache_read_delta = fixer_estimator.total_cache_read_tokens - cache_read_before
         if collected.terminal_kind == "spawn_failed":
+            # Classify this fix-run's own stdout+stderr so a FIX_RUN_FAILED
+            # outcome carries the fixer's provider tag when the spawn itself
+            # failed on auth, instead of leaving the ambiguous shared-log
+            # fallback to guess which pass actually failed.
+            spawn_api_error = classify_plaintext_auth_error(
+                collected.stdout + "\n" + collected.stderr
+            )
             return FixerOutput(
                 ok=False,
                 error=f"spawn_failed: {collected.spawn_error or 'unknown'}",
+                api_error=spawn_api_error,
                 cost_usd=cost_delta,
                 input_tokens=input_delta,
                 output_tokens=output_delta,
@@ -554,9 +696,11 @@ async def run_local_review_session(
                 if collected.terminal_kind == "wall_clock_timeout"
                 else "fix-run stalled"
             )
+            stall_api_error = classify_pass_api_error(collected.stdout, collected.stderr)
             return FixerOutput(
                 ok=False,
                 error=stall_error,
+                api_error=stall_api_error,
                 cost_usd=cost_delta,
                 input_tokens=input_delta,
                 output_tokens=output_delta,
@@ -564,9 +708,11 @@ async def run_local_review_session(
                 cache_read_tokens=cache_read_delta,
             )
         if not collected.ok_exit:
+            nonzero_api_error = classify_pass_api_error(collected.stdout, collected.stderr)
             return FixerOutput(
                 ok=False,
                 error=f"fix-run exited rc={collected.returncode}",
+                api_error=nonzero_api_error,
                 cost_usd=cost_delta,
                 input_tokens=input_delta,
                 output_tokens=output_delta,
@@ -582,9 +728,23 @@ async def run_local_review_session(
         final_message = extract_last_agent_message(agent=fixer_role.agent, stdout=collected.stdout)
         head_after = await head_sha_provider(workspace_path)
         head_advanced = bool(head_after) and head_after != head_before
+        # Classify regardless of whether the fixer committed: a fixer that
+        # advances HEAD and *then* has its final provider call fail on auth is
+        # still an auth failure the daemon must act on. Keeping the commit does
+        # not make the credential valid again (SYM-218 review).
+        committed_api_error = (
+            classify_pass_api_error(collected.stdout, collected.stderr) if head_advanced else None
+        )
         if not head_advanced:
-            api_error = classify_stream_api_error(collected.stdout)
-            if api_error is not None and api_error.transient:
+            api_error = classify_pass_api_error(collected.stdout, collected.stderr)
+            # Preserve ANY provider API error, not only transient statuses: a
+            # deterministic 401/unauthorized fix failure must keep its typed
+            # `api_error` (tagged with the fixer's agent by the loop) so the
+            # orchestrator can expire the credential instead of reducing it to a
+            # plain FIX_RUN_FAILED that leaves the row connected. A blocked
+            # fix-run (SYM-101) exits 0 with no api_error, so this can't swallow
+            # the operator-wait path.
+            if api_error is not None:
                 return FixerOutput(
                     ok=False,
                     error=api_error.message,
@@ -602,6 +762,9 @@ async def run_local_review_session(
             return FixerOutput(
                 ok=True,
                 blocked=True,
+                # Blocked on a human action AND out of credentials: the park
+                # still has to expire/re-validate that provider (SYM-218 review).
+                api_error=committed_api_error,
                 blocked_reason=(
                     completion.blocked_reason
                     or "fix-run blocked on a human action but gave no reason"
@@ -614,6 +777,9 @@ async def run_local_review_session(
             )
         return FixerOutput(
             ok=True,
+            # The commit stands, but a post-commit auth failure still has to
+            # reach the daemon (SYM-218 review).
+            api_error=committed_api_error,
             cost_usd=cost_delta,
             input_tokens=input_delta,
             output_tokens=output_delta,

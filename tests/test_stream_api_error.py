@@ -17,6 +17,8 @@ import pytest
 from symphony.pipeline.local_review import (
     TRANSIENT_API_STATUSES,
     StreamApiError,
+    classify_json_field_auth_error,
+    classify_plaintext_auth_error,
     classify_stream_api_error,
 )
 
@@ -149,3 +151,90 @@ def test_codex_raw_error_event_api_error_text_status_parsed() -> None:
     assert err is not None
     assert err.status == 503
     assert err.transient is True
+
+
+def test_plaintext_auth_scan_ignores_auth_phrases_inside_jsonl() -> None:
+    """A reviewer whose job is to review auth code streams that prose on stdout
+    as JSONL — quoting "401 Unauthorized" / "refresh token expired" is normal
+    review output, not a failed credential. The plaintext scan must skip JSON
+    lines (they belong to `classify_stream_api_error`), or a healthy provider
+    gets expired for what the reviewer wrote about the diff."""
+    stream = "\n".join(
+        [
+            json.dumps({"type": "turn.started"}),
+            json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "type": "agent_message",
+                        "text": (
+                            "The handler returns 200 where it should return 401 Unauthorized "
+                            "once the refresh token expired."
+                        ),
+                    },
+                }
+            ),
+        ]
+    )
+    assert classify_plaintext_auth_error(stream) is None
+
+
+def test_plaintext_auth_scan_reads_non_json_lines_alongside_jsonl() -> None:
+    """The genuine case still classifies: a pre-stream plaintext auth line is
+    caught even when JSONL follows it on the same stream, and even when the
+    stream's own JSON prose is auth-flavoured."""
+    stream = "\n".join(
+        [
+            "Not logged in. Please run /login.",
+            json.dumps({"type": "turn.failed", "error": {"message": "stream aborted"}}),
+        ]
+    )
+    err = classify_plaintext_auth_error(stream)
+    assert err is not None
+    assert err.status == 401
+
+
+def test_json_field_auth_scan_reads_claude_result_text() -> None:
+    """A claude terminal `result` event with `is_error: true` whose `result`
+    text is "Invalid API key · Please run /login" carries no
+    `api_error_status` and doesn't match the `API Error: <status>` shape, so
+    `classify_stream_api_error` returns None for it. The auth-bearing-field
+    scan must still catch it from the `result` text."""
+    stream = json.dumps(
+        {
+            "type": "result",
+            "is_error": True,
+            "result": "Invalid API key · Please run /login",
+        }
+    )
+    assert classify_stream_api_error(stream) is None
+    err = classify_json_field_auth_error(stream)
+    assert err is not None
+    assert err.status == 401
+
+
+def test_json_field_auth_scan_reads_codex_error_event_message() -> None:
+    """A codex `error` event whose `error.message` names a plain-text auth
+    phrase is caught from that field, mirroring what the stage-runner path's
+    combined-log fallback used to catch before it was scoped down to
+    `classify_stream_api_error` + `classify_plaintext_auth_error`."""
+    stream = json.dumps({"type": "error", "error": {"message": "refresh token expired"}})
+    err = classify_json_field_auth_error(stream)
+    assert err is not None
+    assert err.status == 401
+
+
+def test_json_field_auth_scan_ignores_non_auth_fields() -> None:
+    """Reviewer prose that quotes auth phrasing lives in fields the scan does
+    not read (e.g. an `item.completed` agent message) — it must not be
+    mistaken for the connection's own credential failing."""
+    stream = json.dumps(
+        {
+            "type": "item.completed",
+            "item": {
+                "type": "agent_message",
+                "text": "401 Unauthorized once the refresh token expired.",
+            },
+        }
+    )
+    assert classify_json_field_auth_error(stream) is None

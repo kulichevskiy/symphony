@@ -587,6 +587,67 @@ def _claude_api_error_stream(status: int) -> list[RunnerEvent]:
     ]
 
 
+def _claude_json_field_auth_error_stream() -> list[RunnerEvent]:
+    """A claude reviewer stream that exits 0 carrying claude's canonical auth
+    shape: a terminal `result` event with `is_error: true` and no
+    `api_error_status` — neither `classify_stream_api_error` (no status/no
+    `API Error:` text) nor `classify_plaintext_auth_error` (the line is JSON,
+    which that classifier skips) can see it; only the JSON-field tier can."""
+    return [
+        RunnerEvent(
+            kind="stdout",
+            line=json.dumps(
+                {
+                    "type": "result",
+                    "is_error": True,
+                    "result": "Invalid API key · Please run /login",
+                }
+            ),
+        ),
+        RunnerEvent(kind="exit", returncode=0),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_reviewer_json_field_auth_error_surfaces_as_reviewer_failed(
+    tmp_path: Path,
+) -> None:
+    """Regression: claude's canonical auth-failure shape — a terminal
+    `result` event with `is_error: true` and no `api_error_status` — must
+    be caught by the third (JSON-field) classification tier in
+    `_run_reviewer_pass`, not left unclassified so the row stays
+    `connected`."""
+    runner = _ScriptedRunner(
+        scripts=[
+            _claude_json_field_auth_error_stream(),
+            _claude_json_field_auth_error_stream(),
+        ],
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-json-field-401",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="claude"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.api_error is not None and result.api_error.status == 401
+    assert result.api_error_agent == "claude"
+
+
 @pytest.mark.asyncio
 async def test_claude_transient_api_error_surfaces_as_reviewer_failed(
     tmp_path: Path,
@@ -1048,6 +1109,69 @@ async def test_two_pass_finder_with_findings_and_stray_error_still_verifies(
     assert len(runner.specs) == 2
     # The findings reached the verifier prompt despite the stray error event.
     assert "suspicion at foo.py:1" in runner.specs[1].command[-1]
+
+
+@pytest.mark.asyncio
+async def test_two_pass_finder_401_survives_merge_when_verifier_stalls(
+    tmp_path: Path,
+) -> None:
+    """A codex finder that hits a typed 401 but still produces usable findings
+    proceeds to the verifier (per the guard above); when that claude verifier
+    then stalls (its own `api_error` stays None), the merged `ReviewerOutput`
+    must still carry the *finder's* `api_error`/`api_error_agent` so the loop
+    surfaces + expires codex — not silently drop it because the verifier
+    doesn't carry one of its own. Regression for the merge's `replace()`
+    folding only cost counters and losing `finder_out.api_error`."""
+    finder_stream = [
+        RunnerEvent(
+            kind="stdout",
+            line=json.dumps(
+                {"type": "turn.failed", "error": {"message": "unauthorized", "status": 401}}
+            ),
+        ),
+        RunnerEvent(
+            kind="stdout",
+            line=json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {"id": "i", "type": "agent_message", "text": "## Findings\n- x"},
+                }
+            ),
+        ),
+        RunnerEvent(kind="exit", returncode=0),
+    ]
+    verifier_stall = [RunnerEvent(kind="stall_timeout")]
+    runner = _ScriptedRunner(scripts=[finder_stream, verifier_stall, finder_stream, verifier_stall])
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=500, changed_files=10)
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-2pass-merge-401",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.api_error is not None and result.api_error.status == 401
+    # Attributed to the finder's provider (codex), not the stalled verifier's
+    # (claude).
+    assert result.api_error_agent == "codex"
 
 
 @pytest.mark.asyncio
@@ -1572,3 +1696,318 @@ async def test_wall_clock_secs_wired_to_specs_and_distinguishes_error(
     reviewer_spec, fixer_spec = runner.specs
     assert reviewer_spec.wall_clock_secs == 2
     assert fixer_spec.wall_clock_secs == 2
+
+
+@pytest.mark.asyncio
+async def test_two_pass_verifier_401_tags_verifier_agent(tmp_path: Path) -> None:
+    """A two-pass review whose verifier runs a different provider than the
+    finder and returns a 401 must attribute the failure to the *verifier's*
+    agent — a codex finder must not expire a claude verifier's provider (and
+    vice versa). Regression for `api_error_agent` only ever being the finder."""
+    finder_text = "## Findings\n- suspicion at foo.py:1"
+    # Finder (codex) succeeds with findings; verifier (claude) exits 0 with only
+    # a 401 and no verdict. The loop retries the whole two-pass once.
+    runner = _ScriptedRunner(
+        scripts=[
+            _message_stream("codex", finder_text),
+            _claude_api_error_stream(401),
+            _message_stream("codex", finder_text),
+            _claude_api_error_stream(401),
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=500, changed_files=10)
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-verify-401",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.api_error is not None and result.api_error.status == 401
+    # Attributed to the verifier's provider, not the finder's (codex).
+    assert result.api_error_agent == "claude"
+
+
+@pytest.mark.asyncio
+async def test_fixer_deterministic_401_surfaces_as_fix_run_failed(tmp_path: Path) -> None:
+    """A fixer that exits 0 emitting a deterministic 401 (unauthorized) and
+    makes no commit must surface FIX_RUN_FAILED carrying the fixer's api_error
+    tagged with its agent — not a silent ok=True that leaves the row connected.
+    Only transient statuses were preserved before; a 401 was dropped."""
+    runner = _ScriptedRunner(
+        scripts=[
+            _codex_message_stream(f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"),
+            _claude_api_error_stream(401),
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        # HEAD never advances: the fixer made no commit before the 401.
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-fix-401",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.FIX_RUN_FAILED
+    assert result.api_error is not None and result.api_error.status == 401
+    assert result.api_error_agent == "claude"
+
+
+@pytest.mark.asyncio
+async def test_single_pass_reviewer_plaintext_auth_failure_tags_only_reviewer_agent(
+    tmp_path: Path,
+) -> None:
+    """A single-pass (small-diff) claude reviewer that dies on a pre-stream,
+    plaintext "Not logged in" line (no JSONL, so `classify_stream_api_error`
+    sees nothing) must attribute the failure to claude only — never to the
+    verifier's agent (codex), which never ran this iteration. Regression for
+    the combined-log scrape misattributing a claude pre-stream auth failure to
+    an uninvolved codex verifier."""
+    plaintext_auth_failure = [
+        RunnerEvent(kind="stderr", line="Not logged in. Please run /login."),
+        RunnerEvent(kind="exit", returncode=1),
+    ]
+    runner = _ScriptedRunner(scripts=[plaintext_auth_failure, plaintext_auth_failure])
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=1, changed_files=1)
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-plaintext-401",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="claude"),
+        verifier_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=1,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.api_error is not None and result.api_error.status == 401
+    assert result.api_error_agent == "claude"
+
+
+@pytest.mark.asyncio
+async def test_reviewer_spawn_failure_with_auth_stderr_tags_reviewer_agent(
+    tmp_path: Path,
+) -> None:
+    """A reviewer whose process fails to spawn at all (e.g. a codex refresh
+    failure before the CLI even starts) can still print a plaintext auth line
+    on stderr. `_run_reviewer_pass` must classify it and tag `api_error_agent`
+    with the reviewer's own agent — never the verifier's (claude), which never
+    ran this iteration. Regression for the ambiguous combined-log fallback,
+    which had no per-agent scoping and could misattribute a codex spawn-time
+    401 to an uninvolved claude verifier."""
+    spawn_auth_failure = [
+        RunnerEvent(kind="stderr", line="401 Unauthorized: refresh token expired"),
+        RunnerEvent(kind="spawn_failed", error="codex auth refresh failed"),
+    ]
+    runner = _ScriptedRunner(scripts=[spawn_auth_failure, spawn_auth_failure])
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-spawn-401",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.api_error is not None and result.api_error.status == 401
+    assert result.api_error_agent == "codex"
+
+
+@pytest.mark.asyncio
+async def test_fixer_stall_with_auth_stderr_tags_fixer_agent(tmp_path: Path) -> None:
+    """A fix-run that stalls after printing a plaintext auth line on stderr
+    must surface `FixerOutput.api_error` so `LoopResult.api_error_agent` is
+    the fixer's own agent (codex) — not the claude reviewer/verifier that
+    already succeeded this iteration."""
+    runner = _ScriptedRunner(
+        scripts=[
+            _codex_message_stream(f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"),
+            [
+                RunnerEvent(kind="stderr", line="Not logged in. Please run /login."),
+                RunnerEvent(kind="stall_timeout"),
+            ],
+        ],
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-fix-stall-401",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.FIX_RUN_FAILED
+    assert result.api_error is not None and result.api_error.status == 401
+    assert result.api_error_agent == "claude"
+
+
+@pytest.mark.asyncio
+async def test_fixer_nonzero_exit_with_auth_stderr_tags_fixer_agent(tmp_path: Path) -> None:
+    """A fix-run that prints a plaintext auth line on stderr and exits
+    non-zero (the normal shape: claude prints "Not logged in" and exits 1)
+    must surface `FixerOutput.api_error` so `LoopResult.api_error_agent` is
+    the fixer's own agent, not left `None`. Regression: the rc!=0 branch
+    returned a plain FIX_RUN_FAILED with no api_error, so the connection
+    never expired."""
+    runner = _ScriptedRunner(
+        scripts=[
+            _codex_message_stream(f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"),
+            [
+                RunnerEvent(kind="stderr", line="Not logged in. Please run /login."),
+                RunnerEvent(kind="exit", returncode=1),
+            ],
+        ],
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-fix-nonzero-401",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.FIX_RUN_FAILED
+    assert result.api_error is not None and result.api_error.status == 401
+    assert result.api_error_agent == "claude"
+
+
+@pytest.mark.asyncio
+async def test_reviewer_stall_after_auth_prose_does_not_flag_auth_failure(
+    tmp_path: Path,
+) -> None:
+    """A reviewer reviewing an auth-related diff streams findings that quote
+    auth wording ("401 Unauthorized", "refresh token expired") on stdout, then
+    stalls with no verdict. That prose is the reviewer's own review text — the
+    credential is fine — so `LoopResult.api_error` must stay None and the
+    caller must not expire the provider. Regression for the per-pass plaintext
+    scan reading the pass's whole stdout, where a review *about* auth code
+    looked identical to a real pre-stream auth failure."""
+    auth_prose_then_stall = [
+        RunnerEvent(
+            kind="stdout",
+            line=json.dumps(
+                {
+                    "type": "item.completed",
+                    "item": {
+                        "id": "i",
+                        "type": "agent_message",
+                        "text": (
+                            "## Findings\n- The refresh path returns 200 where it should "
+                            "return 401 Unauthorized once the refresh token expired."
+                        ),
+                    },
+                }
+            ),
+        ),
+        RunnerEvent(kind="stall_timeout"),
+    ]
+    runner = _ScriptedRunner(scripts=[auth_prose_then_stall, auth_prose_then_stall])
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-auth-prose",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.REVIEWER_FAILED
+    assert result.api_error is None
+    assert result.api_error_agent is None

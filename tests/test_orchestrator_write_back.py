@@ -688,6 +688,37 @@ async def test_claude_auth_requeue_signal(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_auth_failure_recognizes_codex_refresh_token_phrase(tmp_path: Path) -> None:
+    """Regression: a codex `{"type":"turn.failed","error":{"message":"refresh
+    token expired"}}` classifies via `classify_stream_api_error` to a
+    `StreamApiError(message='refresh token expired', status=None)` — no 401
+    status, and none of "not logged in"/"unauthorized"/"authentication" in
+    the message. Before this fix `looks_auth` rejected it outright and the
+    already-matched classifier tier meant the plaintext/JSON-field fallbacks
+    never ran either, so the row stayed `connected` forever on an expired
+    codex credential."""
+
+    class _CodexRefreshExpired:
+        message = "refresh token expired"
+        status = None
+
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="codex", credential=_codex_cred("tok"), cipher=cipher
+        )
+        await harness.orch._flag_claude_auth_failure(  # noqa: SLF001
+            "codex", _CodexRefreshExpired()
+        )
+        status = await db.oauth_connections.get_status(harness.conn, "codex")
+        assert status is not None and status.status == "expired"
+        assert status.updated_by == "auth-failure"
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
 async def test_auth_failure_without_ui_connection_is_noop(tmp_path: Path) -> None:
     class _AuthError:
         message = "Not logged in"
