@@ -371,7 +371,15 @@ class SubprocessCodexLogin:
                 match = _URL_RE.search(line)
                 if match is not None:
                     url = match.group(0)
-            if code is None:
+            # Only look for the code once the URL line has been seen: codex
+            # prints a `WARNING: ... Refusing to create helper binaries under
+            # temporary dir ...` line before the login prompt whenever
+            # CODEX_HOME lives under a system temp dir (which is exactly what
+            # `SubprocessCodexLogin` uses) — a bare `WARNING` token satisfies
+            # `_CODE_RE` and was getting captured as the user code instead of
+            # the real one two lines later. The URL always precedes the code
+            # in the CLI's own output, so gating on it skips that warning line.
+            if code is None and url is not None:
                 match = _CODE_RE.search(line)
                 if match is not None:
                     code = match.group(1)
