@@ -553,7 +553,9 @@ async def run_local_review_session(
         # An auth failure outranks any other provider error: a verifier 500 is
         # retried by the normal transient path, but a finder 401 whose provider
         # never gets re-validated silently strands that connection.
-        # A later CLEAN pass on the same provider proves that credential works,
+        # A later SUCCESSFUL pass on the same provider proves that credential
+        # works (a stall or spawn failure proves nothing and also reports no
+        # api_error, so `ok` is the gate, not just the absence of an error),
         # so an earlier pass's auth error against it is stale — expiring on it
         # would kill a healthy connection. Only applies when the verifier ran on
         # the finder's provider and produced no error of its own (a supported
@@ -561,7 +563,8 @@ async def run_local_review_session(
         finder_api_error = finder_out.api_error
         finder_api_error_agent = finder_out.api_error_agent
         if (
-            verifier_out.api_error is None
+            verifier_out.ok
+            and verifier_out.api_error is None
             and finder_api_error is not None
             and is_auth_api_error(finder_api_error)
             and str(verifier_role.agent) == str(finder_api_error_agent or reviewer_role.agent)

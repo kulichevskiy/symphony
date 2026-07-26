@@ -158,6 +158,27 @@ REVIEWER_FAILURE_RETRIES = 1
 IterationCallback = Callable[[int, LocalVerdict, float], Awaitable[None]]
 
 
+def _dedupe_api_errors(
+    errors: tuple[tuple[StreamApiError, str], ...],
+    *,
+    primary: StreamApiError | None,
+    primary_agent: str | None,
+) -> tuple[tuple[StreamApiError, str], ...]:
+    """Drop repeats and anything the primary slot already names, so a provider
+    is never flagged twice for the same failure."""
+    seen: set[tuple[int, str]] = set()
+    out: list[tuple[StreamApiError, str]] = []
+    for error, agent in errors:
+        if primary is not None and (error is primary or agent == primary_agent):
+            continue
+        key = (id(error), agent)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append((error, agent))
+    return tuple(out)
+
+
 async def run_local_review_loop(
     *,
     reviewer_agent: ReviewerAgent,
@@ -234,20 +255,19 @@ async def run_local_review_loop(
             api_error = pending_api_error
             api_error_agent = pending_api_error_agent
             extras = (*extras, *pending_extra_api_errors)
-        elif (
-            pending_api_error is not None
-            and pending_api_error is not api_error
-            and pending_api_error_agent
-            and pending_api_error_agent != api_error_agent
-        ):
-            # A later error took the slot, but the earlier one names a DIFFERENT
-            # connection that still needs its own re-validate/expire — carry it
-            # as an extra rather than dropping it (SYM-218 review).
-            extras = (
-                *extras,
-                (pending_api_error, pending_api_error_agent),
-                *pending_extra_api_errors,
-            )
+        elif pending_api_error is not None:
+            # A later error took the slot. The earlier primary rides along when
+            # it names a DIFFERENT connection; its extras ride along regardless,
+            # since they name providers of their own and the repeated-primary
+            # case must not swallow them (SYM-218 review).
+            if (
+                pending_api_error is not api_error
+                and pending_api_error_agent
+                and pending_api_error_agent != api_error_agent
+            ):
+                extras = (*extras, (pending_api_error, pending_api_error_agent))
+            extras = (*extras, *pending_extra_api_errors)
+        extras = _dedupe_api_errors(extras, primary=api_error, primary_agent=api_error_agent)
         return LoopResult(
             outcome=outcome,
             iterations=iterations,
@@ -432,9 +452,19 @@ async def run_local_review_loop(
             # A fixer that committed and *then* failed on auth is still an auth
             # failure the daemon must act on: carry it so the eventual result
             # (APPROVED, EXHAUSTED, ...) surfaces the provider (SYM-218 review).
+            # A pending error from another provider is demoted to an extra
+            # rather than overwritten — both connections need action.
+            if (
+                pending_api_error is not None
+                and pending_api_error_agent
+                and pending_api_error_agent != fixer_agent
+            ):
+                pending_extra_api_errors = (
+                    *pending_extra_api_errors,
+                    (pending_api_error, pending_api_error_agent),
+                )
             pending_api_error = fix.api_error
             pending_api_error_agent = fixer_agent
-            pending_extra_api_errors = ()
 
     return _result(
         outcome=LoopOutcome.EXHAUSTED,
