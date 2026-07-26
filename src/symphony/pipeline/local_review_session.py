@@ -53,6 +53,7 @@ from .cost_guard import UsageCostEstimator
 from .local_review import (
     DiffSize,
     LocalVerdict,
+    LocalVerdictKind,
     ReviewerAgent,
     StreamApiError,
     build_local_review_command,
@@ -64,6 +65,7 @@ from .local_review import (
     local_review_finder_prompt,
     local_review_prompt,
     local_review_verifier_prompt,
+    parse_local_review_output,
 )
 from .local_review_io import CollectedRunnerOutput, collect_runner_output
 from .local_review_loop import (
@@ -424,6 +426,10 @@ async def run_local_review_session(
             # may run a different provider than the finder) expires the right
             # provider; the loop reads it into `LoopResult.api_error_agent`.
             api_error_agent=(str(agent) if api_error is not None else None),
+            # A pass that ran to completion with no provider error proves that
+            # credential works; the loop uses this to retire stale failures
+            # held against the same provider (SYM-218 review).
+            healthy_agents=((str(agent),) if api_error is None else ()),
             cost_usd=cost_delta,
             input_tokens=input_delta,
             output_tokens=output_delta,
@@ -553,24 +559,34 @@ async def run_local_review_session(
         # An auth failure outranks any other provider error: a verifier 500 is
         # retried by the normal transient path, but a finder 401 whose provider
         # never gets re-validated silently strands that connection.
-        # A later SUCCESSFUL pass on the same provider proves that credential
-        # works (a stall or spawn failure proves nothing and also reports no
-        # api_error, so `ok` is the gate, not just the absence of an error),
-        # so an earlier pass's auth error against it is stale — expiring on it
-        # would kill a healthy connection. Only applies when the verifier ran on
-        # the finder's provider and produced no error of its own (a supported
-        # same-agent config, SYM-218 review).
+        # Which providers this two-pass output proves healthy. `ok` alone is not
+        # enough: `_run_reviewer_pass` leaves verdict validation to the loop, so
+        # an ordinary nonzero exit with no classified error also reports ok —
+        # require a PARSEABLE verdict before calling the verifier's credential
+        # good (SYM-218 review). The loop then retires stale errors held against
+        # those providers, including a same-provider finder 401.
+        verifier_parsed = parse_local_review_output(
+            agent=verifier_role.agent,
+            stdout=verifier_out.stdout,
+            head_sha=verifier_out.head_sha,
+            last_message_file=verifier_message,
+        )
+        merged_healthy_agents = tuple(
+            {
+                *(
+                    (str(verifier_role.agent),)
+                    if (
+                        verifier_out.ok
+                        and verifier_out.api_error is None
+                        and verifier_parsed.kind != LocalVerdictKind.UNPARSEABLE
+                    )
+                    else ()
+                ),
+                *((str(reviewer_role.agent),) if finder_out.api_error is None else ()),
+            }
+        )
         finder_api_error = finder_out.api_error
         finder_api_error_agent = finder_out.api_error_agent
-        if (
-            verifier_out.ok
-            and verifier_out.api_error is None
-            and finder_api_error is not None
-            and is_auth_api_error(finder_api_error)
-            and str(verifier_role.agent) == str(finder_api_error_agent or reviewer_role.agent)
-        ):
-            finder_api_error = None
-            finder_api_error_agent = None
         merged_api_error, merged_api_error_agent = _prefer_actionable_api_error(
             primary=(verifier_out.api_error, verifier_out.api_error_agent),
             secondary=(finder_api_error, finder_api_error_agent),
@@ -593,6 +609,7 @@ async def run_local_review_session(
             api_error=merged_api_error,
             api_error_agent=merged_api_error_agent,
             extra_api_errors=merged_extra_api_errors,
+            healthy_agents=merged_healthy_agents,
             # Keep the operator-facing message on the SAME failure the
             # lifecycle acts on: otherwise a verifier 500 is reported while the
             # finder's provider is the one expired (SYM-218 review).

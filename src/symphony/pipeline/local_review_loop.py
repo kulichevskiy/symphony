@@ -90,6 +90,11 @@ class ReviewerOutput:
     # every failing connection needs its own re-validate/expire, so the rest ride
     # here (SYM-218 review).
     extra_api_errors: tuple[tuple[StreamApiError, str], ...] = ()
+    # Providers that completed a pass in THIS output with no error of their own
+    # — a later clean pass proves that credential works, so any earlier failure
+    # held against it is stale and must not expire a healthy connection
+    # (SYM-218 review).
+    healthy_agents: tuple[str, ...] = ()
     cost_usd: float = 0.0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -406,6 +411,20 @@ async def run_local_review_loop(
                 stream_api_error = out.api_error
                 stream_api_error_agent = out.api_error_agent or str(reviewer_agent)
                 stream_extra_api_errors = out.extra_api_errors
+            if out.healthy_agents:
+                healthy = set(out.healthy_agents)
+                if stream_api_error_agent in healthy:
+                    stream_api_error = None
+                    stream_api_error_agent = None
+                stream_extra_api_errors = tuple(
+                    (e, a) for e, a in stream_extra_api_errors if a not in healthy
+                )
+                if pending_api_error_agent in healthy:
+                    pending_api_error = None
+                    pending_api_error_agent = None
+                pending_extra_api_errors = tuple(
+                    (e, a) for e, a in pending_extra_api_errors if a not in healthy
+                )
             verdict = parsed
             break
 

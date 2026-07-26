@@ -1662,7 +1662,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     # Recorded under the parent run id so the caller's requeue
                     # decision reuses THIS verdict rather than re-validating (a
                     # second refresh could fail transiently and undo it).
-                    await self._flag_claude_auth_failure(
+                    lr_all_usable = await self._flag_claude_auth_failure(
                         lr_failed_agent,
                         lr_api_error,
                         run_started_at=local_review_started_at,
@@ -1678,12 +1678,19 @@ class _LifecycleMixin(_OrchestratorBase):
                         result.extra_api_errors if result is not None else ()
                     ):
                         if extra_agent in _AGENT_CRED_LAYOUT and extra_agent != lr_failed_agent:
-                            await self._flag_claude_auth_failure(
+                            extra_usable = await self._flag_claude_auth_failure(
                                 extra_agent,
                                 extra_error,
                                 run_started_at=local_review_started_at,
                                 provider=extra_agent,
                             )
+                            lr_all_usable = lr_all_usable and extra_usable
+                    if not lr_all_usable:
+                        # A requeue is only safe when EVERY implicated provider
+                        # came back usable: re-dispatching a run whose other
+                        # role sits behind an expired-connection gate would just
+                        # burn the retry budget (SYM-218 review).
+                        self._record_claude_auth_verdict(parent_run_id, False)
                 elif lr_api_error is None and result is None:
                     # The session raised before returning a LoopResult at all
                     # (a stall/spawn exception outside any tracked pass, e.g.
