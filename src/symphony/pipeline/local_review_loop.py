@@ -196,6 +196,7 @@ async def run_local_review_loop(
     # error at all, leaving that credential un-revalidated (SYM-218 review).
     pending_api_error: StreamApiError | None = None
     pending_api_error_agent: str | None = None
+    pending_extra_api_errors: tuple[tuple[StreamApiError, str], ...] = ()
     prev_findings_signature = ""
     total_cost = 0.0
     total_input_tokens = 0
@@ -232,6 +233,7 @@ async def run_local_review_loop(
         if api_error is None and pending_api_error is not None:
             api_error = pending_api_error
             api_error_agent = pending_api_error_agent
+            extras = (*extras, *pending_extra_api_errors)
         elif (
             pending_api_error is not None
             and pending_api_error is not api_error
@@ -241,7 +243,11 @@ async def run_local_review_loop(
             # A later error took the slot, but the earlier one names a DIFFERENT
             # connection that still needs its own re-validate/expire — carry it
             # as an extra rather than dropping it (SYM-218 review).
-            extras = (*extras, (pending_api_error, pending_api_error_agent))
+            extras = (
+                *extras,
+                (pending_api_error, pending_api_error_agent),
+                *pending_extra_api_errors,
+            )
         return LoopResult(
             outcome=outcome,
             iterations=iterations,
@@ -309,14 +315,24 @@ async def run_local_review_loop(
             if parsed.kind == LocalVerdictKind.UNPARSEABLE and attempt < REVIEWER_FAILURE_RETRIES:
                 continue
             # Only a parseable verdict means this attempt truly recovered, so
-            # only then do earlier attempts' errors stop being live. Clearing
-            # before the parse would drop a first attempt's typed transient/auth
-            # signal when the retry is *also* unparseable (SYM-218 review).
-            stream_api_error = out.api_error
-            stream_api_error_agent = (
-                (out.api_error_agent or str(reviewer_agent)) if out.api_error is not None else None
-            )
-            stream_extra_api_errors = out.extra_api_errors if out.api_error is not None else ()
+            # only then do earlier attempts' errors stop being live. The FINAL
+            # attempt can also be unparseable (no `continue` left to take), and
+            # clearing there would drop the first attempt's typed transient/auth
+            # signal from the REVIEWER_FAILED result (SYM-218 review).
+            if parsed.kind != LocalVerdictKind.UNPARSEABLE:
+                stream_api_error = out.api_error
+                stream_api_error_agent = (
+                    (out.api_error_agent or str(reviewer_agent))
+                    if out.api_error is not None
+                    else None
+                )
+                stream_extra_api_errors = out.extra_api_errors if out.api_error is not None else ()
+            elif out.api_error is not None:
+                # An unparseable final attempt with its own error still reports
+                # that error rather than the earlier attempt's.
+                stream_api_error = out.api_error
+                stream_api_error_agent = out.api_error_agent or str(reviewer_agent)
+                stream_extra_api_errors = out.extra_api_errors
             verdict = parsed
             break
 
@@ -383,6 +399,7 @@ async def run_local_review_loop(
         if stream_api_error is not None:
             pending_api_error = stream_api_error
             pending_api_error_agent = stream_api_error_agent
+            pending_extra_api_errors = stream_extra_api_errors
 
         fix = await fixer(i, verdict)
         _record_usage(fix)
@@ -417,6 +434,7 @@ async def run_local_review_loop(
             # (APPROVED, EXHAUSTED, ...) surfaces the provider (SYM-218 review).
             pending_api_error = fix.api_error
             pending_api_error_agent = fixer_agent
+            pending_extra_api_errors = ()
 
     return _result(
         outcome=LoopOutcome.EXHAUSTED,
