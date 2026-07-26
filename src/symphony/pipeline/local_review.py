@@ -251,6 +251,34 @@ PLAINTEXT_AUTH_PHRASES: tuple[str, ...] = (
 )
 
 
+def classify_pass_api_error(stdout: str, stderr: str = "") -> StreamApiError | None:
+    """Three-tier provider-error classification scoped to ONE pass's own output.
+
+    1. the terminal JSONL stream error (a typed 500/401 with `.transient`);
+    2. a pre-stream auth failure printed as a plain-text, often stderr-only
+       line the JSONL classifier never sees;
+    3. the auth-bearing JSON fields — claude's canonical auth shape is a
+       terminal `result` with `is_error: true` and no `api_error_status`, so it
+       carries no signal the first two tiers scan for.
+
+    Always scoped to this pass's own stdout+stderr — never a combined
+    multi-agent log — so a claude finder's failure can never be misattributed to
+    a codex verifier that hasn't run yet. Mirrors `_base.py`'s tier order.
+    """
+    stream_error = classify_stream_api_error(stdout)
+    if stream_error is not None and is_auth_api_error(stream_error):
+        return stream_error
+    # Don't let an earlier non-auth event (a synthetic 500) short-circuit the
+    # auth tiers: a pass can emit that and *then* terminate with an auth-only
+    # shape, and only the auth failure identifies a connection the daemon must
+    # act on (SYM-218 review). A non-auth stream error is still returned when
+    # no auth evidence exists.
+    auth_error = classify_plaintext_auth_error(
+        stdout + ("\n" + stderr if stderr else "")
+    ) or classify_json_field_auth_error(stdout)
+    return auth_error or stream_error
+
+
 def is_auth_api_error(api_error: object) -> bool:
     """Whether a classified provider error is an *authentication* failure.
 

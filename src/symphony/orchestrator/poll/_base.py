@@ -93,8 +93,7 @@ from ...pipeline.cost_guard import (
 from ...pipeline.local_review import (
     StreamApiError,
     classify_json_field_auth_error,
-    classify_plaintext_auth_error,
-    classify_stream_api_error,
+    classify_pass_api_error,
     extract_last_agent_message,
     is_auth_api_error,
 )
@@ -3422,9 +3421,7 @@ class _OrchestratorBase:
         # Pre-stream auth failures print a plain-text (often stderr-only) line
         # the JSONL classifier skips: claude's "Not logged in", and codex's
         # auth-session / refresh failure phrasings.
-        api_error: object | None = classify_stream_api_error(
-            stdout
-        ) or classify_plaintext_auth_error(stdout)
+        api_error: object | None = classify_pass_api_error(stdout)
         if api_error is None:
             # Neither classifier matched a recognized shape: check the
             # auth-bearing JSON fields (a claude `result.result`, or a codex
@@ -3466,12 +3463,16 @@ class _OrchestratorBase:
         The re-validate goes through `_flag_claude_auth_failure` with this run's
         `started_at`, so its stale-run guard still suppresses a failure from a
         run that predates an operator reconnect."""
-        if agent != "claude":
-            return False
+        # Cache first: the local-review raising path records a verdict under the
+        # parent run id but leaves the caller without an agent to key off, so an
+        # agent gate here would discard a re-validation already performed
+        # (SYM-218 review).
         if run_id:
             cached = self._claude_auth_revalidated.get(run_id)
             if cached is not None:
                 return cached
+        if agent != "claude":
+            return False
         if api_error is None or not _looks_like_auth_error(api_error):
             if log_path is None:
                 return False
@@ -3481,15 +3482,7 @@ class _OrchestratorBase:
             # which the JSONL and plaintext scans both skip — and these rc=0
             # paths never reach the runner tail, so missing it here means the
             # connection is neither re-validated nor gated (SYM-218 review).
-            api_error = (
-                (
-                    classify_stream_api_error(stdout)
-                    or classify_plaintext_auth_error(stdout)
-                    or classify_json_field_auth_error(stdout)
-                )
-                if stdout is not None
-                else None
-            )
+            api_error = classify_pass_api_error(stdout) if stdout is not None else None
             if api_error is None:
                 return False
         run_started_at = ""

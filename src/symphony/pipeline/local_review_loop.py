@@ -377,6 +377,13 @@ async def run_local_review_loop(
             )
         prev_findings_signature = findings_signature
 
+        # The reviewer's auth failure must outlive this iteration: a successful
+        # fixer followed by a clean approval next round would otherwise drop it,
+        # and so would a blocked fixer returning immediately (SYM-218 review).
+        if stream_api_error is not None:
+            pending_api_error = stream_api_error
+            pending_api_error_agent = stream_api_error_agent
+
         fix = await fixer(i, verdict)
         _record_usage(fix)
         # A blocked fix-run halts the loop before the next review pass: the
