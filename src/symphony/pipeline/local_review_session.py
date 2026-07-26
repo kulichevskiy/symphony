@@ -762,6 +762,9 @@ async def run_local_review_session(
             return FixerOutput(
                 ok=True,
                 blocked=True,
+                # Blocked on a human action AND out of credentials: the park
+                # still has to expire/re-validate that provider (SYM-218 review).
+                api_error=committed_api_error,
                 blocked_reason=(
                     completion.blocked_reason
                     or "fix-run blocked on a human action but gave no reason"

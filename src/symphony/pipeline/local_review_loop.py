@@ -164,56 +164,46 @@ REVIEWER_FAILURE_RETRIES = 1
 IterationCallback = Callable[[int, LocalVerdict, float], Awaitable[None]]
 
 
-def _dedupe_api_errors(
-    errors: tuple[tuple[StreamApiError, str], ...],
-    *,
-    primary: StreamApiError | None,
-    primary_agent: str | None,
-) -> tuple[tuple[StreamApiError, str], ...]:
-    """Drop repeats and anything the primary slot already names, so a provider
-    is never flagged twice for the same failure."""
-    seen: set[str] = set()
-    out: list[tuple[StreamApiError, str]] = []
-    for error, agent in errors:
-        # Keyed by PROVIDER: each provider has one connection needing one
-        # re-validate. Flagging it twice would trigger a second refresh, which
-        # is exactly the rotation the daemon serializes to avoid (SYM-218 review).
-        if primary is not None and (error is primary or agent == primary_agent):
-            continue
-        if agent in seen:
-            continue
-        seen.add(agent)
-        out.append((error, agent))
-    return tuple(out)
+class _AuthErrorLedger:
+    """The unresolved provider error per provider — at most one each.
 
+    A provider has exactly one connection, so it has at most one outstanding
+    failure. Recording is keyed by provider (a later failure for the same
+    provider replaces its earlier one; a different provider's never overwrites
+    it), and a pass that proves a provider healthy removes its entry. Those two
+    operations are the only way the set changes, which makes "an error was
+    silently dropped, duplicated, or outlived its own fix" unrepresentable
+    rather than something every assignment site has to remember (SYM-218).
+    """
 
-def _providers_named(
-    primary_agent: str | None, extras: tuple[tuple[StreamApiError, str], ...]
-) -> set[str]:
-    """Every provider an output speaks for — those it did NOT name were not
-    exercised by it, so its silence says nothing about them."""
-    named = {agent for _, agent in extras}
-    if primary_agent:
-        named.add(primary_agent)
-    return named
+    def __init__(self) -> None:
+        self._errors: dict[str, StreamApiError] = {}
 
+    def record(self, error: StreamApiError | None, agent: str | None) -> None:
+        if error is not None and agent:
+            self._errors[str(agent)] = error
 
-def _prefer_auth_error(
-    first: tuple[StreamApiError | None, str | None],
-    second: tuple[StreamApiError | None, str | None],
-) -> tuple[StreamApiError | None, str | None]:
-    """`first` wins unless only `second` is an auth failure: a credential that
-    needs re-validating outranks a plain API error even when both belong to the
-    same provider (SYM-218 review)."""
-    first_error, _ = first
-    second_error, _ = second
-    if (
-        second_error is not None
-        and is_auth_api_error(second_error)
-        and (first_error is None or not is_auth_api_error(first_error))
-    ):
-        return second
-    return first if first_error is not None else second
+    def record_many(self, pairs: tuple[tuple[StreamApiError, str], ...]) -> None:
+        for error, agent in pairs:
+            self.record(error, agent)
+
+    def clear(self, *agents: str) -> None:
+        for agent in agents:
+            self._errors.pop(str(agent), None)
+
+    def resolve(
+        self, prefer_agent: str | None = None
+    ) -> tuple[StreamApiError | None, str | None, tuple[tuple[StreamApiError, str], ...]]:
+        """The primary error (the caller's provider first, then any auth
+        failure, since that is what needs a re-validate) plus the rest."""
+        if not self._errors:
+            return None, None, ()
+        ordered = sorted(
+            self._errors.items(),
+            key=lambda item: (item[0] != prefer_agent, not is_auth_api_error(item[1])),
+        )
+        (primary_agent, primary_error), *rest = ordered
+        return primary_error, primary_agent, tuple((error, agent) for agent, error in rest)
 
 
 async def run_local_review_loop(
@@ -248,13 +238,9 @@ async def run_local_review_loop(
         )
 
     verdicts: list[LocalVerdict] = []
-    # An auth failure that must outlive the iteration that saw it: a fixer that
-    # commits and *then* fails on auth is not an iteration-local event — the
-    # next reviewer may well approve, and the result would otherwise carry no
-    # error at all, leaving that credential un-revalidated (SYM-218 review).
-    pending_api_error: StreamApiError | None = None
-    pending_api_error_agent: str | None = None
-    pending_extra_api_errors: tuple[tuple[StreamApiError, str], ...] = ()
+    # Outlives every iteration: a failure is only resolved by proof that its
+    # provider works, not by the loop moving on.
+    ledger = _AuthErrorLedger()
     prev_findings_signature = ""
     total_cost = 0.0
     total_input_tokens = 0
@@ -279,32 +265,9 @@ async def run_local_review_loop(
         outcome: LoopOutcome,
         iterations: int,
         error: str | None = None,
-        api_error: StreamApiError | None = None,
-        api_error_agent: str | None = None,
-        extra_api_errors: tuple[tuple[StreamApiError, str], ...] = (),
+        prefer_agent: str | None = None,
     ) -> LoopResult:
-        # Anything carried from an earlier iteration still needs acting on, so
-        # it fills the slot when this outcome has no error of its own.
-        # Falls back to the current iteration's reviewer extras (function-scoped,
-        # assigned at the top of each iteration) when the caller passes none.
-        extras = extra_api_errors or stream_extra_api_errors
-        if api_error is None and pending_api_error is not None:
-            api_error = pending_api_error
-            api_error_agent = pending_api_error_agent
-            extras = (*extras, *pending_extra_api_errors)
-        elif pending_api_error is not None:
-            # A later error took the slot. The earlier primary rides along when
-            # it names a DIFFERENT connection; its extras ride along regardless,
-            # since they name providers of their own and the repeated-primary
-            # case must not swallow them (SYM-218 review).
-            if (
-                pending_api_error is not api_error
-                and pending_api_error_agent
-                and pending_api_error_agent != api_error_agent
-            ):
-                extras = (*extras, (pending_api_error, pending_api_error_agent))
-            extras = (*extras, *pending_extra_api_errors)
-        extras = _dedupe_api_errors(extras, primary=api_error, primary_agent=api_error_agent)
+        api_error, api_error_agent, extras = ledger.resolve(prefer_agent)
         return LoopResult(
             outcome=outcome,
             iterations=iterations,
@@ -312,9 +275,7 @@ async def run_local_review_loop(
             error=error,
             api_error=api_error,
             api_error_agent=api_error_agent,
-            # Only meaningful alongside a primary error; a result with no
-            # api_error has nothing extra to act on either.
-            extra_api_errors=(extras if api_error is not None else ()),
+            extra_api_errors=extras,
             total_cost_usd=total_cost,
             input_tokens=total_input_tokens,
             output_tokens=total_output_tokens,
@@ -330,23 +291,19 @@ async def run_local_review_loop(
         # unparseable final attempt still reports the real cause rather than
         # the generic marker message.
         stream_error: str | None = None
-        stream_api_error: StreamApiError | None = None
-        # Which provider owns `stream_api_error`. The output attributes it
-        # (verifier pass may differ from the finder); fall back to the session's
-        # reviewer agent when it doesn't (single-pass / common case).
-        stream_api_error_agent: str | None = None
-        # Secondary (error, agent) pairs from the same output — see
-        # ReviewerOutput.extra_api_errors.
-        stream_extra_api_errors: tuple[tuple[StreamApiError, str], ...] = ()
+        last_failed_agent: str | None = None
         for attempt in range(REVIEWER_FAILURE_RETRIES + 1):
             out = await reviewer(i)
             _record_usage(out)
             if out.agent_error:
                 stream_error = out.agent_error
+            # Record first, then clear: an output never reports a provider as
+            # both failed and healthy, so order only matters for readability.
             if out.api_error is not None:
-                stream_api_error = out.api_error
-                stream_api_error_agent = out.api_error_agent or str(reviewer_agent)
-                stream_extra_api_errors = out.extra_api_errors
+                last_failed_agent = out.api_error_agent or str(reviewer_agent)
+                ledger.record(out.api_error, last_failed_agent)
+            ledger.record_many(out.extra_api_errors)
+            ledger.clear(*out.healthy_agents)
             if not out.ok:
                 reviewer_error = out.error or "reviewer failed"
                 if attempt < REVIEWER_FAILURE_RETRIES:
@@ -355,14 +312,8 @@ async def run_local_review_loop(
                     outcome=LoopOutcome.REVIEWER_FAILED,
                     iterations=i + 1,
                     error=reviewer_error,
-                    api_error=stream_api_error,
-                    api_error_agent=(stream_api_error_agent if stream_api_error else None),
+                    prefer_agent=last_failed_agent,
                 )
-            # This attempt recovered, so only ITS errors are still live: a
-            # previous attempt's 401 must not ride along on a successful retry,
-            # or the lifecycle expires a connection that just proved healthy.
-            # (An error the same output carries — e.g. a finder 401 merged with
-            # a clean verifier — is preserved, since it comes from `out`.)
             parsed = parse_local_review_output(
                 agent=reviewer_agent,
                 stdout=out.stdout,
@@ -371,60 +322,6 @@ async def run_local_review_loop(
             )
             if parsed.kind == LocalVerdictKind.UNPARSEABLE and attempt < REVIEWER_FAILURE_RETRIES:
                 continue
-            # Only a parseable verdict means this attempt truly recovered, so
-            # only then do earlier attempts' errors stop being live. The FINAL
-            # attempt can also be unparseable (no `continue` left to take), and
-            # clearing there would drop the first attempt's typed transient/auth
-            # signal from the REVIEWER_FAILED result (SYM-218 review).
-            if parsed.kind != LocalVerdictKind.UNPARSEABLE:
-                stream_api_error = out.api_error
-                stream_api_error_agent = (
-                    (out.api_error_agent or str(reviewer_agent))
-                    if out.api_error is not None
-                    else None
-                )
-                # Providers this attempt never spoke for keep their earlier
-                # failures: a retry that fails in the finder says nothing about
-                # a verifier that never ran (SYM-218 review).
-                touched = _providers_named(
-                    out.api_error_agent or str(reviewer_agent) if out.api_error else None,
-                    out.extra_api_errors,
-                )
-                untouched = tuple(
-                    (error, agent)
-                    for error, agent in (
-                        *stream_extra_api_errors,
-                        *(
-                            ((stream_api_error, stream_api_error_agent),)
-                            if stream_api_error is not None and stream_api_error_agent
-                            else ()
-                        ),
-                    )
-                    if agent not in touched
-                )
-                stream_extra_api_errors = (
-                    (*out.extra_api_errors, *untouched) if out.api_error is not None else untouched
-                )
-            elif out.api_error is not None:
-                # An unparseable final attempt with its own error still reports
-                # that error rather than the earlier attempt's.
-                stream_api_error = out.api_error
-                stream_api_error_agent = out.api_error_agent or str(reviewer_agent)
-                stream_extra_api_errors = out.extra_api_errors
-            if out.healthy_agents:
-                healthy = set(out.healthy_agents)
-                if stream_api_error_agent in healthy:
-                    stream_api_error = None
-                    stream_api_error_agent = None
-                stream_extra_api_errors = tuple(
-                    (e, a) for e, a in stream_extra_api_errors if a not in healthy
-                )
-                if pending_api_error_agent in healthy:
-                    pending_api_error = None
-                    pending_api_error_agent = None
-                pending_extra_api_errors = tuple(
-                    (e, a) for e, a in pending_extra_api_errors if a not in healthy
-                )
             verdict = parsed
             break
 
@@ -433,8 +330,7 @@ async def run_local_review_loop(
                 outcome=LoopOutcome.REVIEWER_FAILED,
                 iterations=i + 1,
                 error=reviewer_error or stream_error or "reviewer failed",
-                api_error=stream_api_error,
-                api_error_agent=(stream_api_error_agent if stream_api_error else None),
+                prefer_agent=last_failed_agent,
             )
         verdicts.append(verdict)
 
@@ -459,16 +355,14 @@ async def run_local_review_loop(
             return _result(
                 outcome=LoopOutcome.APPROVED,
                 iterations=i + 1,
-                api_error=stream_api_error,
-                api_error_agent=(stream_api_error_agent if stream_api_error else None),
+                prefer_agent=last_failed_agent,
             )
         if verdict.kind == LocalVerdictKind.UNPARSEABLE:
             return _result(
                 outcome=LoopOutcome.REVIEWER_FAILED,
                 iterations=i + 1,
                 error=stream_error or "reviewer emitted no verdict marker",
-                api_error=stream_api_error,
-                api_error_agent=(stream_api_error_agent if stream_api_error else None),
+                prefer_agent=last_failed_agent,
             )
 
         # CHANGES_REQUESTED — gate on the merged-findings digest before paying
@@ -480,21 +374,17 @@ async def run_local_review_loop(
                 outcome=LoopOutcome.STUCK_LOOP,
                 iterations=i + 1,
                 error="reviewer produced the same findings twice in a row",
-                api_error=stream_api_error,
-                api_error_agent=(stream_api_error_agent if stream_api_error else None),
+                prefer_agent=last_failed_agent,
             )
         prev_findings_signature = findings_signature
 
-        # The reviewer's auth failure must outlive this iteration: a successful
-        # fixer followed by a clean approval next round would otherwise drop it,
-        # and so would a blocked fixer returning immediately (SYM-218 review).
-        if stream_api_error is not None:
-            pending_api_error = stream_api_error
-            pending_api_error_agent = stream_api_error_agent
-            pending_extra_api_errors = stream_extra_api_errors
-
         fix = await fixer(i, verdict)
         _record_usage(fix)
+        # Whatever the fixer reports goes on the ledger; a clean run clears its
+        # provider, since completing proves that credential works.
+        ledger.record(fix.api_error, fixer_agent)
+        if fix.api_error is None and fix.ok:
+            ledger.clear(fixer_agent)
         # A blocked fix-run halts the loop before the next review pass: the
         # branch is waiting on a human action, so re-reviewing or pushing is
         # pointless. Checked before `ok` because a blocked run exited 0.
@@ -503,51 +393,19 @@ async def run_local_review_loop(
                 outcome=LoopOutcome.FIX_RUN_BLOCKED,
                 iterations=i + 1,
                 error=fix.blocked_reason or "fix-run blocked on a human action",
+                prefer_agent=fixer_agent if fix.api_error else last_failed_agent,
             )
         if not fix.ok:
-            _fix_failure_error, _fix_failure_agent = _prefer_auth_error(
-                (fix.api_error, fixer_agent if fix.api_error else None),
-                (stream_api_error, stream_api_error_agent if stream_api_error else None),
-            )
             return _result(
                 outcome=LoopOutcome.FIX_RUN_FAILED,
                 iterations=i + 1,
                 error=fix.error or "fix-run failed",
-                # A fixer that failed without its own provider error must not
-                # erase the reviewer's surviving auth failure — a LoopResult
-                # exists, so the lifecycle's shared-log fallback won't run and
-                # that connection would stay connected (SYM-218 review).
-                api_error=_fix_failure_error,
-                api_error_agent=_fix_failure_agent,
+                prefer_agent=fixer_agent if fix.api_error else last_failed_agent,
             )
-        if fix.api_error is not None:
-            # A fixer that committed and *then* failed on auth is still an auth
-            # failure the daemon must act on: carry it so the eventual result
-            # (APPROVED, EXHAUSTED, ...) surfaces the provider (SYM-218 review).
-            # A pending error from another provider is demoted to an extra
-            # rather than overwritten — both connections need action.
-            if (
-                pending_api_error is not None
-                and pending_api_error_agent
-                and pending_api_error_agent != fixer_agent
-            ):
-                pending_extra_api_errors = (
-                    *pending_extra_api_errors,
-                    (pending_api_error, pending_api_error_agent),
-                )
-            pending_api_error = fix.api_error
-            pending_api_error_agent = fixer_agent
 
-    return _result(
-        outcome=LoopOutcome.EXHAUSTED,
-        iterations=cap,
-        # `stream_api_error`/`stream_api_error_agent` from the final
-        # iteration's reviewer call are still bound here (for-loop bodies
-        # don't scope in Python) — surface a lingering auth failure even
-        # when the cap was hit rather than the reviewer failing outright.
-        api_error=stream_api_error,
-        api_error_agent=(stream_api_error_agent if stream_api_error else None),
-    )
+    # Anything still on the ledger when the cap is hit is unresolved by
+    # definition, so EXHAUSTED surfaces it like any other outcome.
+    return _result(outcome=LoopOutcome.EXHAUSTED, iterations=cap)
 
 
 __all__ = [
