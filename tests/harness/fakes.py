@@ -202,7 +202,7 @@ class FakeRunner:
         self, events: list[RunnerEvent], spec: RunnerSpec
     ) -> AsyncIterator[RunnerEvent]:
         conversation = spec.conversation
-        refused = False
+        closed = False
         for ev in events:
             # Keep the control-channel contract LocalRunner keeps (SYM-235):
             # a scripted control request goes to the spec's handler and is
@@ -214,14 +214,18 @@ class FakeRunner:
             # its own turn keeps its terminal output and its exit code — a fake
             # that synthesised a kill instead would let SYM-236 exercise a
             # failure production would not take, and would never let it check
-            # the parsing of a real refusal result. What the refusal does do is
-            # close the channel: later requests are still withheld, but the
-            # handler no longer hears them.
+            # the parsing of a real refusal result. What a refusal does do is
+            # close the channel — and so does the end of the turn, which shuts
+            # stdin for real. Past either, requests are still withheld from the
+            # event stream but the handler no longer hears them: it has side
+            # effects, and a rotation whose answer cannot be delivered spends
+            # the connection's single-use refresh token for nothing.
             if conversation is not None and ev.kind == "stdout" and ev.line:
                 frame = read_agent_frame(ev.line)
+                closed = closed or frame.turn_end
                 if frame.control:
-                    if frame.request is not None and not refused:
-                        refused = not await self._answered(conversation, frame.request)
+                    if frame.request is not None and not closed:
+                        closed = not await self._answered(conversation, frame.request)
                     continue
             yield ev
 

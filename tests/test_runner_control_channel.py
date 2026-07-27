@@ -606,6 +606,25 @@ async def test_fake_runner_stops_asking_the_handler_after_a_refusal(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_fake_runner_stops_asking_after_the_scripted_turn_ends(tmp_path: Path) -> None:
+    # The mirror of `test_a_request_arriving_after_the_turn_ended_is_not_acted_on`:
+    # the end-of-turn marker shuts stdin for real, so a request after it can
+    # never be answered. A fake that asked anyway would let an orchestrator test
+    # rotate a token production would not have rotated.
+    fake = _scripted(['{"type": "result", "result": "SYMPHONY_DONE"}', _control_request("req-1")])
+    handler = _Handler({"accessToken": "tok-1"})
+    events = [
+        ev
+        async for ev in fake.run(
+            _fake_spec(tmp_path, "r-fake-late-turn", _talking(handler=handler))
+        )
+    ]
+    assert handler.seen == []
+    for line in _stdout(events):
+        assert "control_request" not in line
+
+
+@pytest.mark.asyncio
 async def test_fake_runner_treats_a_raising_handler_as_a_refusal(tmp_path: Path) -> None:
     # A handler that blows up must not blow up the run: the real channel logs
     # it and answers with an error, exactly as it would a plain refusal.
