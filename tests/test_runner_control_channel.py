@@ -22,7 +22,12 @@ from typing import Any, cast
 
 import pytest
 
-from symphony.agent.control_channel import ControlChannel, ControlRequest, Conversation
+from symphony.agent.control_channel import (
+    ControlChannel,
+    ControlHandler,
+    ControlRequest,
+    Conversation,
+)
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.agent.runners.local import LocalRunner
 from tests.harness.fakes import FakeRunner
@@ -359,11 +364,14 @@ async def test_an_answer_that_cannot_be_delivered_is_a_refusal(tmp_path: Path) -
 class _FakeStdin:
     """Enough of `StreamWriter` for the channel, and a record of what it wrote."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, broken: bool = False) -> None:
         self.frames: list[dict[str, Any]] = []
         self.closed = False
+        self.broken = broken
 
     def write(self, data: bytes) -> None:
+        if self.broken:
+            raise BrokenPipeError("the child closed its read end")
         self.frames.append(json.loads(data))
 
     async def drain(self) -> None:
@@ -376,12 +384,97 @@ class _FakeStdin:
         self.closed = True
 
 
-def _channel(handler: _Handler | None) -> tuple[ControlChannel, _FakeStdin]:
-    stdin = _FakeStdin()
+def _channel(
+    handler: ControlHandler | None, *, broken: bool = False, drain: float = 5.0
+) -> tuple[ControlChannel, _FakeStdin]:
+    stdin = _FakeStdin(broken=broken)
     channel = ControlChannel(
-        cast(asyncio.StreamWriter, stdin), Conversation("hi", handler), run_id="r-unit"
+        cast(asyncio.StreamWriter, stdin),
+        Conversation("hi", handler),
+        run_id="r-unit",
+        handler_drain_secs=drain,
     )
     return channel, stdin
+
+
+class _SlowHandler:
+    """Stands in for the dispenser mid-rotation: slow, and not safe to abandon."""
+
+    def __init__(self, secs: float) -> None:
+        self.secs = secs
+        self.started = False
+        self.finished = False
+
+    async def __call__(self, request: ControlRequest) -> Mapping[str, object] | None:
+        self.started = True
+        await asyncio.sleep(self.secs)
+        self.finished = True
+        return {"accessToken": "tok-1"}
+
+
+@pytest.mark.asyncio
+async def test_a_prompt_that_cannot_be_delivered_ends_the_run() -> None:
+    # A child that has closed its read end but is still alive never hears the
+    # prompt, so it never answers and never finishes. Waiting for the stall
+    # watchdog to notice costs minutes.
+    channel, _ = _channel(None, broken=True)
+    await channel.send_prompt("hi")
+    assert channel.refused.is_set()
+    await channel.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_stops_the_requests_queued_behind_it() -> None:
+    # The burst case: several requests arrive before the first is answered.
+    # Running their handlers side by side would mean a refusal cannot stop the
+    # ones already under way — and each one is a token rotation.
+    handler = _Handler(None)
+    channel, _ = _channel(handler)
+    assert channel.intercept(_control_request("req-1")) is True
+    assert channel.intercept(_control_request("req-2")) is True
+    assert channel.intercept(_control_request("req-3")) is True
+    await asyncio.wait_for(channel.refused.wait(), timeout=2)
+    await asyncio.sleep(0.05)
+    assert [r.request_id for r in handler.seen] == ["req-1"]
+    await channel.aclose()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_lets_a_rotation_in_flight_finish() -> None:
+    # The dispenser may already have spent the connection's single-use refresh
+    # token. Cancelling before it can store the replacement leaves the shared
+    # credential unusable for every later run, until an operator reconnects.
+    handler = _SlowHandler(0.3)
+    channel, stdin = _channel(handler)
+    assert channel.intercept(_control_request("req-1")) is True
+    await asyncio.sleep(0.05)
+    assert handler.started and not handler.finished
+    await channel.aclose()
+    assert handler.finished
+    assert [f["response"]["request_id"] for f in stdin.frames] == ["req-1"]
+
+
+@pytest.mark.asyncio
+async def test_cleanup_gives_up_on_a_handler_that_overruns() -> None:
+    handler = _SlowHandler(30.0)
+    channel, _ = _channel(handler, drain=0.2)
+    assert channel.intercept(_control_request("req-1")) is True
+    await asyncio.sleep(0.05)
+    await asyncio.wait_for(channel.aclose(), timeout=5)
+    assert handler.started and not handler.finished
+
+
+@pytest.mark.asyncio
+async def test_a_failed_codex_turn_closes_stdin() -> None:
+    # `turn.failed` / `error` end a turn as surely as `turn.completed`. Holding
+    # stdin open for one turns a terminal error the caller could have read into
+    # a stall timeout.
+    for line in ('{"type": "turn.failed"}', '{"type": "error"}'):
+        channel, stdin = _channel(None)
+        assert channel.intercept(line) is False
+        await asyncio.sleep(0.05)
+        assert stdin.closed, line
+        await channel.aclose()
 
 
 @pytest.mark.asyncio

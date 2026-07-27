@@ -50,10 +50,18 @@ log = logging.getLogger(__name__)
 
 # Protocol traffic on the agent's stdout. None of it is agent output.
 _CONTROL_TYPES = frozenset({"control_request", "control_response", "control_cancel_request"})
-# The agent says the turn is over: claude's `result`, codex's `turn.completed`.
-_TURN_END_TYPES = frozenset({"result", "turn.completed"})
+# The agent says the turn is over. Claude: `result`. Codex: `turn.completed`,
+# or `turn.failed`/`error` when the turn ends badly — an auth or API failure is
+# still an ending, and leaving stdin open for one turns a terminal error the
+# caller could have read into a silent stall.
+_TURN_END_TYPES = frozenset({"result", "turn.completed", "turn.failed", "error"})
 
 _REFUSAL_MESSAGE = "the host refused the request"
+# How long a handler already under way gets to land before it is cancelled.
+# Sized to the dispenser's own budget: a rotation cut off after the token
+# endpoint answered, but before the replacement is stored, kills the shared
+# credential for everyone.
+_HANDLER_DRAIN_SECS = 25.0
 
 
 @dataclass(frozen=True)
@@ -191,18 +199,31 @@ class ControlChannel:
         conversation: Conversation,
         *,
         run_id: str,
+        handler_drain_secs: float = _HANDLER_DRAIN_SECS,
     ) -> None:
         self._stdin = stdin
         self._handler = conversation.handler
         self._run_id = run_id
+        self._handler_drain_secs = handler_drain_secs
         self._tasks: set[asyncio.Task[None]] = set()
+        # One request at a time. The agent can ask several times in a burst —
+        # three in ~1.2s in the SYM-232 spike — and running those handlers side
+        # by side means a refusal cannot stop the ones already under way. The
+        # dispenser serializes internally anyway, so this costs nothing.
+        self._answering = asyncio.Lock()
         self._turn_over = False
         # Raised once a request has been declined. The runner watches it and
         # ends the run rather than letting the agent wait out its retry window.
         self.refused = asyncio.Event()
 
     async def send_prompt(self, text: str) -> None:
-        await self._write(_user_message(text))
+        """Open the conversation. A prompt that does not land ends the run.
+
+        A child that has closed its read end but is still alive would otherwise
+        never hear the prompt, never answer, and never finish — the run would
+        sit there until the stall watchdog noticed, minutes later."""
+        if not await self._write(_user_message(text)):
+            await self._refuse(None, "the prompt could not be delivered")
 
     def intercept(self, line: str) -> bool:
         """Take one stdout line. True when it was protocol traffic.
@@ -232,17 +253,53 @@ class ControlChannel:
         return frame.control
 
     async def aclose(self) -> None:
-        """Abandon any in-flight handler and close stdin. Idempotent."""
+        """Let an in-flight handler land, then close stdin. Idempotent.
+
+        Cancelling a handler is not free. The dispenser may already have spent
+        the shared connection's single-use refresh token; killing it before it
+        can persist the replacement leaves the stored credential unusable for
+        every later run, and only an operator reconnect brings it back. So an
+        in-flight handler is given its budget to finish, and cancelled only if
+        it overruns."""
         tasks = list(self._tasks)
-        for task in tasks:
-            task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            with suppress(TimeoutError):
+                await asyncio.wait_for(
+                    # Shielded: the timeout must cancel the wait, not the work.
+                    asyncio.shield(asyncio.gather(*tasks, return_exceptions=True)),
+                    timeout=self._handler_drain_secs,
+                )
+            unfinished = [t for t in tasks if not t.done()]
+            if unfinished:
+                log.warning(
+                    "cancelling %d control handler(s) for run_id=%s after %.0fs",
+                    len(unfinished),
+                    self._run_id,
+                    self._handler_drain_secs,
+                )
+                for task in unfinished:
+                    task.cancel()
+                await asyncio.gather(*unfinished, return_exceptions=True)
         self._close_stdin()
 
     # --- internals ---------------------------------------------------------
 
     async def _answer(self, request: ControlRequest) -> None:
+        async with self._answering:
+            if self._turn_over:
+                # A sibling request refused while this one waited its turn.
+                # Nothing can reach the agent now, and asking the handler
+                # anyway would spend a single-use refresh token on an answer
+                # with nowhere to go.
+                log.warning(
+                    "not answering %s for run_id=%s: the channel closed while it queued",
+                    request.subtype,
+                    self._run_id,
+                )
+                return
+            await self._answer_now(request)
+
+    async def _answer_now(self, request: ControlRequest) -> None:
         payload: Mapping[str, object] | None = None
         if self._handler is None:
             log.warning(
