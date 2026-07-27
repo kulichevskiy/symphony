@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from collections.abc import Mapping
 from pathlib import Path
@@ -230,6 +231,61 @@ async def test_the_one_directional_mode_is_unchanged(tmp_path: Path) -> None:
     assert '{"type": "assistant", "text": "prompt:none"}' in _stdout(events)
     exits = [e for e in events if e.kind == "exit"]
     assert exits and exits[0].returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_a_frame_with_a_non_string_type_is_just_output(tmp_path: Path) -> None:
+    # Classification runs inside the stdout pump, and a set lookup on an
+    # unhashable value raises. One malformed provider frame would then kill the
+    # pump, losing the rest of the run's output and leaving stdin open: a stall
+    # timeout, several minutes later, with no hint of where it came from.
+    runner = LocalRunner()
+    spec = _spec(tmp_path, "r-malformed", "--malformed", conversation=_talking())
+    events = await _collect(runner, spec, within=15)
+    assert '{"type": ["control_request"], "text": "not a string type"}' in _stdout(events)
+    assert '{"type": "result", "result": "SYMPHONY_DONE"}' in _stdout(events)
+    assert events[-1].kind == "exit"
+
+
+@pytest.mark.asyncio
+async def test_a_refused_run_that_ignores_sigterm_is_killed(tmp_path: Path) -> None:
+    # The refusal path exists to end a run promptly. An agent that catches
+    # SIGTERM would otherwise live to the stall deadline — minutes — which is
+    # the exact wait being avoided.
+    runner = LocalRunner()
+    handler = _Handler(None)
+    spec = _spec(
+        tmp_path,
+        "r-deaf",
+        "--ask-token",
+        "--linger",
+        "--deaf",
+        conversation=_talking(handler=handler),
+    )
+    events = await _collect(runner, spec, within=LINGER_SECS - 5)
+    assert handler.seen
+    assert events[-1].kind == "exit"
+    assert not [e for e in events if e.kind == "stall_timeout"]
+
+
+@pytest.mark.asyncio
+async def test_abandoning_a_run_leaves_no_child_and_no_bookkeeping(tmp_path: Path) -> None:
+    # Whatever ends the iteration — shutdown, a cancelled task, a caller that
+    # stops reading — must not leave the agent running or the run registered.
+    runner = LocalRunner()
+    spec = _spec(tmp_path, "r-abandoned", "--ask-token", "--linger", conversation=_talking())
+    pid: int | None = None
+    stream = runner.run(spec)
+    async with asyncio.timeout(15):
+        async for ev in stream:
+            if ev.kind == "started":
+                pid = ev.pid
+                break
+    await stream.aclose()
+    assert pid is not None
+    assert runner._active == {}
+    with pytest.raises(ProcessLookupError):
+        os.killpg(pid, 0)
 
 
 # --- the contract the harness's deterministic runner has to keep -----------

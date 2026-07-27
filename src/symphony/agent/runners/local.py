@@ -23,6 +23,7 @@ import tempfile
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from pathlib import Path
+from typing import Any
 
 from ...credentials import RunCredentials, materialize_credentials
 from ..control_channel import ControlChannel
@@ -226,11 +227,6 @@ class LocalRunner:
             return
 
         self._active[spec.run_id] = proc
-        if spec.run_id in self._pending_kills:
-            self._pending_kills.discard(spec.run_id)
-            with suppress(ProcessLookupError):
-                _terminate_process_group(proc.pid)
-        yield RunnerEvent(kind="started", pid=proc.pid)
         channel: ControlChannel | None = None
         if conversation is not None and proc.stdin is not None:
             channel = ControlChannel(proc.stdin, conversation, run_id=spec.run_id)
@@ -379,24 +375,39 @@ class LocalRunner:
             with suppress(TimeoutError):
                 await asyncio.wait_for(asyncio.shield(wait_task), timeout=_REFUSAL_GRACE_SECS)
             if proc.returncode is None:
+                # SIGTERM then SIGKILL, the escalation `kill()` and the
+                # watchdog already use: an agent that catches SIGTERM would
+                # otherwise live to the stall deadline — minutes — which is
+                # the exact wait this path exists to avoid.
                 with suppress(ProcessLookupError):
                     _terminate_process_group(proc.pid)
+                try:
+                    await asyncio.wait_for(asyncio.shield(wait_task), timeout=5.0)
+                except TimeoutError:
+                    with suppress(ProcessLookupError):
+                        _kill_process_group(proc.pid)
 
         stdout_task = asyncio.create_task(pump(proc.stdout, "stdout"))
         stderr_task = asyncio.create_task(pump(proc.stderr, "stderr"))
         wait_task = asyncio.create_task(proc.wait())
         refusal_task = asyncio.create_task(refusal_guard(channel)) if channel is not None else None
         watch_task = asyncio.create_task(watchdog())
-        # Only now, with the pumps and the watchdog live. A prompt bigger than
-        # the pipe buffer blocks in `drain()` until the child reads it, and a
-        # write made before this point would block with nobody draining stdout
-        # and no timer able to end the run.
-        if channel is not None and conversation is not None:
-            await channel.send_prompt(conversation.prompt)
         drain_deadline: float | None = None
         cleaned_process_group = False
 
         try:
+            if spec.run_id in self._pending_kills:
+                self._pending_kills.discard(spec.run_id)
+                with suppress(ProcessLookupError):
+                    _terminate_process_group(proc.pid)
+            yield RunnerEvent(kind="started", pid=proc.pid)
+            # The prompt goes out only now: after the pumps and the watchdog,
+            # so a prompt bigger than the pipe buffer has something draining
+            # stdout and a timer able to end the run while it blocks in
+            # `drain()`; and inside this region, so a cancellation mid-write
+            # still tears down the child, the tasks and the credential home.
+            if channel is not None and conversation is not None:
+                await channel.send_prompt(conversation.prompt)
             while True:
                 # Drain queued events; if process has exited and queue is empty, stop.
                 try:
@@ -446,12 +457,27 @@ class LocalRunner:
             else:
                 yield RunnerEvent(kind="exit", returncode=proc.returncode)
         finally:
-            if refusal_task is not None:
-                refusal_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await refusal_task
+            # Reached on the normal path, where the tasks are already done, and
+            # on every exit that skips it: a cancellation, a closed generator,
+            # an exception. A caller that stops reading right after `started`
+            # used to leave the child running, the run registered and the
+            # credential home on disk. Each step is guarded and repeatable.
+            spawned: tuple[asyncio.Task[Any] | None, ...] = (
+                stdout_task,
+                stderr_task,
+                watch_task,
+                wait_task,
+                refusal_task,
+            )
+            for spawned_task in spawned:
+                if spawned_task is not None and not spawned_task.done():
+                    spawned_task.cancel()
+            await asyncio.gather(*(t for t in spawned if t is not None), return_exceptions=True)
             if channel is not None:
                 await channel.aclose()
+            if proc.returncode is None:
+                with suppress(ProcessLookupError):
+                    _terminate_process_group(proc.pid)
             self._active.pop(spec.run_id, None)
             _remove_cred_home(cred_home)
 

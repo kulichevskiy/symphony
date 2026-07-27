@@ -13,11 +13,14 @@ Flags:
                 in the SYM-232 spike, so a run has to survive a burst of them.
   --linger      after a refusal, sleep past any sane test timeout, standing in
                 for the real CLI waiting out its own retry window
+  --deaf        ignore SIGTERM, so only SIGKILL can end this process
+  --malformed   emit a frame whose `type` is a list, not a string
 """
 
 from __future__ import annotations
 
 import json
+import signal
 import sys
 import time
 
@@ -58,6 +61,10 @@ def ask_for_token(argv: list[str], nth: int) -> bool:
 
 def main() -> int:
     argv = sys.argv[1:]
+    if "--deaf" in argv:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    if "--malformed" in argv:
+        emit({"type": ["control_request"], "text": "not a string type"})
     line = sys.stdin.readline()
     if not line:
         emit({"type": "assistant", "text": "prompt:none"})

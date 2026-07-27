@@ -116,6 +116,11 @@ def read_agent_frame(line: str) -> AgentFrame:
     if not isinstance(event, dict):
         return _AGENT_OUTPUT
     kind = event.get("type")
+    # A frozenset lookup on an unhashable value raises, and this runs inside
+    # the stdout pump: one malformed frame would kill the pump, lose the rest
+    # of the run's output and leave stdin open — a stall, not a parse error.
+    if not isinstance(kind, str):
+        return _AGENT_OUTPUT
     if kind not in _CONTROL_TYPES:
         return AgentFrame(turn_end=kind in _TURN_END_TYPES)
     if kind != "control_request":
