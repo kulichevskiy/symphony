@@ -347,7 +347,11 @@ async def refresh_claude_credential_outcome(
         if response.status_code != 200:
             # 5xx/429 is the endpoint being unhappy, not the credential being
             # dead; 4xx (invalid_grant, revoked/consumed refresh token) is.
-            transient = response.status_code >= 500 or response.status_code == 429
+            # 408 is the exception among the 4xx: the endpoint (or something in
+            # front of it) gave up waiting for the request, which says nothing
+            # about the refresh token — reading it as "dead" would expire the
+            # shared connection and block every run over a slow network.
+            transient = response.status_code >= 500 or response.status_code in (408, 429)
             log.warning(
                 "claude token refresh failed with HTTP %d (transient=%s)",
                 response.status_code,
@@ -365,6 +369,13 @@ async def refresh_claude_credential_outcome(
     finally:
         if owns_client:
             await http.aclose()
+    if not isinstance(token, dict):
+        # A 200 carrying valid-but-unexpected JSON (`[]`, a bare string) parses
+        # fine and then explodes on `.get` — outside the handler above, so it
+        # would escape a function whose contract is "never raises" and reach
+        # callers as silence instead of a refusal.
+        log.warning("claude token refresh returned a non-object body")
+        return ClaudeRefreshOutcome(None)
     access_token = token.get("access_token")
     if not isinstance(access_token, str) or not access_token:
         return ClaudeRefreshOutcome(None)

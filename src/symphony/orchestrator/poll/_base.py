@@ -56,6 +56,7 @@ from ...claude_login import (
     refresh_claude_credential,
     refresh_claude_credential_outcome,
 )
+from ...claude_token_dispenser import ClaudeTokenDispenser
 from ...codex_login import (
     codex_credential_expires_within,
     codex_expires_at,
@@ -520,6 +521,20 @@ class _OrchestratorBase:
         # the refresh token is one-shot, so a second exchange with the same
         # token would kill the fresh credential the first one just minted.
         self._claude_refresh_lock = asyncio.Lock()
+        # The one place allowed to rotate the shared Claude token (SYM-234).
+        # Shares the lock above on purpose: a mid-run rotation and a proactive
+        # keep-fresh refresh would otherwise exchange the same one-shot refresh
+        # token concurrently, each killing what the other just minted. Not yet
+        # wired to runs — the control channel is SYM-235/236 — but it already
+        # owns the read side, so there is one definition of "the current token
+        # and its generation".
+        self.claude_token_dispenser = ClaudeTokenDispenser(
+            conn,
+            self._cipher,
+            self._credential_write_back,
+            lock=self._claude_refresh_lock,
+            now=self._now,
+        )
         # Serializes proactive codex refreshes (SYM-217): the CLI rotates a
         # one-shot refresh token, so concurrent codex dispatches must not each
         # clone + refresh the same auth.json (OpenAI: one auth.json per
@@ -3053,25 +3068,6 @@ class _OrchestratorBase:
     async def _resolve_claude_credential(self) -> str | None:
         return await self._resolve_agent_credential("claude")
 
-    async def _resolve_claude_credential_and_generation(self) -> tuple[str, int] | None:
-        """The stored Claude credential and the generation it was stored under,
-        from one row read (SYM-233) — see `get_credential_and_generation` for
-        why they must not be read apart. `None` under exactly the conditions
-        `_resolve_agent_credential` returns `None`: not UI-connected, or the
-        stored credential no longer decrypts."""
-        status = await db.oauth_connections.get_status(self._conn, "claude")
-        if status is None or status.status not in ("connected", "expired"):
-            return None
-        try:
-            snapshot = await db.oauth_connections.get_credential_and_generation(
-                self._conn, "claude", self._cipher
-            )
-        except (CredentialDecryptError, CredentialKeyMissingError):
-            return None
-        if snapshot is None or not snapshot[0]:
-            return None
-        return snapshot
-
     async def _maybe_refresh_claude_credential(self, credential: str) -> str | None:
         """Proactive central token refresh (Config v2 4/9; SYM-227).
 
@@ -3599,7 +3595,7 @@ class _OrchestratorBase:
             # run is handed and the generation it is stamped with have to come
             # from the same row snapshot, or a reconnect landing between them
             # stamps the run as holding a newer token than it does.
-            snapshot = await self._resolve_claude_credential_and_generation()
+            snapshot = await self.claude_token_dispenser.snapshot()
             if snapshot is None:
                 return {}
             stored, generation = snapshot

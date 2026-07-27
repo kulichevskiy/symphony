@@ -92,26 +92,40 @@ async def get_credential(
     return cipher.decrypt(bytes(row["credential"]))
 
 
-async def get_credential_and_generation(
-    conn: aiosqlite.Connection, provider: str, cipher: CredentialCipher
-) -> tuple[str, int] | None:
-    """The provider's decrypted credential together with the generation it was
-    stored under, read in one shot; `None` if there is no row.
+@dataclass(frozen=True)
+class ConnectionSnapshot:
+    """One row read whole: the decrypted credential plus the status and
+    generation it was stored under."""
 
-    Reading the two separately would leave a window in which a reconnect lands
-    between them and a run ends up stamped with a generation newer than the
-    token it is actually holding (SYM-233) — the one direction that matters,
-    since a stamp that looks current reads as "this run holds the newest token"
-    and would provoke a rotation instead of a hand-out. Same decrypt-error
-    contract as `get_credential`."""
+    credential: str
+    generation: int
+    status: str
+
+
+async def get_connection_snapshot(
+    conn: aiosqlite.Connection, provider: str, cipher: CredentialCipher
+) -> ConnectionSnapshot | None:
+    """The provider's credential, generation and status from a single row read;
+    `None` if there is no row. Same decrypt-error contract as `get_credential`.
+
+    Reading these apart leaves a window for a write to land between them and
+    produce a mixture of two row versions. Both mixtures bite (SYM-233/234): a
+    run stamped with a generation newer than the token it holds later reads as
+    "holds the newest token" and provokes a rotation instead of a hand-out, and
+    a `connected` status paired with a credential a liveness Test has since
+    rejected lets a request through an armed gate."""
     cur = await conn.execute(
-        "SELECT credential, generation FROM oauth_connections WHERE provider = ?",
+        "SELECT credential, generation, status FROM oauth_connections WHERE provider = ?",
         (provider,),
     )
     row = await cur.fetchone()
     if row is None:
         return None
-    return cipher.decrypt(bytes(row["credential"])), int(row["generation"])
+    return ConnectionSnapshot(
+        credential=cipher.decrypt(bytes(row["credential"])),
+        generation=int(row["generation"]),
+        status=str(row["status"]),
+    )
 
 
 async def get_refresh_token(
@@ -140,13 +154,26 @@ async def set_connection(
     expires_at: str | None = None,
     updated_at: str = "",
     updated_by: str = "",
+    expect_connected_generation: int | None = None,
     commit: bool = True,
-) -> None:
+) -> bool:
     """Encrypt `credential` (and `refresh_token`, if the provider's token
-    exchange returned one) and upsert the provider's row.
+    exchange returned one) and upsert the provider's row. Returns whether the
+    row was written.
 
     `commit=False` lets a caller fold this into a larger atomic transaction it
     commits itself.
+
+    `expect_connected_generation` makes the write compare-and-set *inside the
+    statement*, and update-only (SYM-234): it lands solely if the row still
+    exists, is still `connected`, and still holds that generation. A caller that
+    checks those separately leaves a window in which a liveness Test expires the
+    row, or an operator disconnects it, between the check and the write — and
+    since this function re-persists as `connected`, the write would silently
+    clear a reconnect gate that had just been armed, or resurrect a connection
+    that had just been deleted. The generation counter still advances on a
+    refused write, leaving a gap; gaps are harmless because the counter only
+    ever has to be monotonic, never dense.
 
     Every upsert advances the provider's `generation` (SYM-233) — this is the
     one choke point through which a replacement credential reaches the store,
@@ -171,34 +198,61 @@ async def set_connection(
     )
     row = await cur.fetchone()
     generation = int(row["generation"]) if row is not None else 1
-    await conn.execute(
-        """
-        INSERT INTO oauth_connections
-            (provider, credential, refresh_token, status, expires_at, updated_at, updated_by,
-             generation)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(provider) DO UPDATE SET
-            credential = excluded.credential,
-            refresh_token = excluded.refresh_token,
-            status = excluded.status,
-            expires_at = excluded.expires_at,
-            updated_at = excluded.updated_at,
-            updated_by = excluded.updated_by,
-            generation = excluded.generation
-        """,
-        (
-            provider,
-            encrypted,
-            encrypted_refresh,
-            status,
-            expires_at,
-            updated_at,
-            updated_by,
-            generation,
-        ),
-    )
+    if expect_connected_generation is not None:
+        # Update-only, deliberately. A guarded write always means "replace the
+        # row I decided about", never "create one" — an upsert would take the
+        # INSERT path when a Disconnect removed the row mid-flight (nothing left
+        # to conflict with, so the guard on DO UPDATE never applies) and
+        # resurrect the credential the operator just deleted.
+        cur = await conn.execute(
+            """
+            UPDATE oauth_connections SET
+                credential = ?, refresh_token = ?, status = ?, expires_at = ?,
+                updated_at = ?, updated_by = ?, generation = ?
+            WHERE provider = ? AND status = 'connected' AND generation = ?
+            """,
+            (
+                encrypted,
+                encrypted_refresh,
+                status,
+                expires_at,
+                updated_at,
+                updated_by,
+                generation,
+                provider,
+                expect_connected_generation,
+            ),
+        )
+    else:
+        cur = await conn.execute(
+            """
+            INSERT INTO oauth_connections
+                (provider, credential, refresh_token, status, expires_at, updated_at, updated_by,
+                 generation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider) DO UPDATE SET
+                credential = excluded.credential,
+                refresh_token = excluded.refresh_token,
+                status = excluded.status,
+                expires_at = excluded.expires_at,
+                updated_at = excluded.updated_at,
+                updated_by = excluded.updated_by,
+                generation = excluded.generation
+            """,
+            (
+                provider,
+                encrypted,
+                encrypted_refresh,
+                status,
+                expires_at,
+                updated_at,
+                updated_by,
+                generation,
+            ),
+        )
     if commit:
         await conn.commit()
+    return cur.rowcount > 0
 
 
 async def update_status(
@@ -208,16 +262,31 @@ async def update_status(
     status: str,
     updated_at: str = "",
     updated_by: str = "",
+    expected_generation: int | None = None,
     commit: bool = True,
 ) -> None:
     """Flip a connection's `status` (e.g. `connected`→`expired` after a failed
     liveness `Test`) without touching the encrypted credential column. A no-op
-    if the provider has no row."""
-    await conn.execute(
-        "UPDATE oauth_connections SET status = ?, updated_at = ?, updated_by = ? "
-        "WHERE provider = ?",
-        (status, updated_at, updated_by, provider),
-    )
+    if the provider has no row.
+
+    `expected_generation` makes the flip compare-and-set (SYM-234): the caller
+    passes the generation it decided on, and the write no-ops if the credential
+    has been replaced since. An operator reconnect that lands between a caller's
+    read and its write must not be expired by a verdict reached about the token
+    it replaced — that would re-arm the fleet-wide dispatch gate seconds after
+    the reconnect cleared it."""
+    if expected_generation is None:
+        await conn.execute(
+            "UPDATE oauth_connections SET status = ?, updated_at = ?, updated_by = ? "
+            "WHERE provider = ?",
+            (status, updated_at, updated_by, provider),
+        )
+    else:
+        await conn.execute(
+            "UPDATE oauth_connections SET status = ?, updated_at = ?, updated_by = ? "
+            "WHERE provider = ? AND generation = ?",
+            (status, updated_at, updated_by, provider, expected_generation),
+        )
     if commit:
         await conn.commit()
 

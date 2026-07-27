@@ -213,20 +213,23 @@ async def test_the_token_and_its_generation_are_read_as_one_snapshot(tmp_path: P
         await db.oauth_connections.set_connection(
             harness.conn, provider="claude", credential=_cred("tok-v0"), cipher=cipher
         )
-        first = await db.oauth_connections.get_credential_and_generation(
-            harness.conn, "claude", cipher
+        first = await db.oauth_connections.get_connection_snapshot(harness.conn, "claude", cipher)
+        assert first is not None
+        assert (first.credential, first.generation, first.status) == (
+            _cred("tok-v0"),
+            1,
+            "connected",
         )
-        assert first == (_cred("tok-v0"), 1)
 
         await db.oauth_connections.set_connection(
             harness.conn, provider="claude", credential=_cred("tok-v1"), cipher=cipher
         )
-        assert await db.oauth_connections.get_credential_and_generation(
-            harness.conn, "claude", cipher
-        ) == (_cred("tok-v1"), 2)
+        second = await db.oauth_connections.get_connection_snapshot(harness.conn, "claude", cipher)
+        assert second is not None
+        assert (second.credential, second.generation) == (_cred("tok-v1"), 2)
 
         assert (
-            await db.oauth_connections.get_credential_and_generation(harness.conn, "codex", cipher)
+            await db.oauth_connections.get_connection_snapshot(harness.conn, "codex", cipher)
             is None
         )
     finally:
