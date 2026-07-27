@@ -208,16 +208,31 @@ async def update_status(
     status: str,
     updated_at: str = "",
     updated_by: str = "",
+    expected_generation: int | None = None,
     commit: bool = True,
 ) -> None:
     """Flip a connection's `status` (e.g. `connected`→`expired` after a failed
     liveness `Test`) without touching the encrypted credential column. A no-op
-    if the provider has no row."""
-    await conn.execute(
-        "UPDATE oauth_connections SET status = ?, updated_at = ?, updated_by = ? "
-        "WHERE provider = ?",
-        (status, updated_at, updated_by, provider),
-    )
+    if the provider has no row.
+
+    `expected_generation` makes the flip compare-and-set (SYM-234): the caller
+    passes the generation it decided on, and the write no-ops if the credential
+    has been replaced since. An operator reconnect that lands between a caller's
+    read and its write must not be expired by a verdict reached about the token
+    it replaced — that would re-arm the fleet-wide dispatch gate seconds after
+    the reconnect cleared it."""
+    if expected_generation is None:
+        await conn.execute(
+            "UPDATE oauth_connections SET status = ?, updated_at = ?, updated_by = ? "
+            "WHERE provider = ?",
+            (status, updated_at, updated_by, provider),
+        )
+    else:
+        await conn.execute(
+            "UPDATE oauth_connections SET status = ?, updated_at = ?, updated_by = ? "
+            "WHERE provider = ? AND generation = ?",
+            (status, updated_at, updated_by, provider, expected_generation),
+        )
     if commit:
         await conn.commit()
 

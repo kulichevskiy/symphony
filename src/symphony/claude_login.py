@@ -365,6 +365,13 @@ async def refresh_claude_credential_outcome(
     finally:
         if owns_client:
             await http.aclose()
+    if not isinstance(token, dict):
+        # A 200 carrying valid-but-unexpected JSON (`[]`, a bare string) parses
+        # fine and then explodes on `.get` — outside the handler above, so it
+        # would escape a function whose contract is "never raises" and reach
+        # callers as silence instead of a refusal.
+        log.warning("claude token refresh returned a non-object body")
+        return ClaudeRefreshOutcome(None)
     access_token = token.get("access_token")
     if not isinstance(access_token, str) or not access_token:
         return ClaudeRefreshOutcome(None)

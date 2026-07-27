@@ -305,6 +305,86 @@ async def test_a_reconnect_landing_mid_rotation_is_not_overwritten(tmp_path: Pat
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_an_expiry_landing_mid_rotation_is_not_cleared_by_the_write_back(
+    tmp_path: Path,
+) -> None:
+    """A liveness Test (or any other path) that expires the row while the
+    exchange is in flight leaves the credential untouched, so a
+    credential-only CAS would sail through — and `write_back` re-persists as
+    `connected`, silently clearing a reconnect gate that was just armed. The
+    minted token is dropped instead."""
+    conn, dispenser = await _open(tmp_path)
+
+    async def _expire_mid_flight(request: httpx.Request) -> httpx.Response:
+        await db.oauth_connections.update_status(conn, provider="claude", status="expired")
+        return _minted("tok-rotated")
+
+    respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(side_effect=_expire_mid_flight)
+    try:
+        await _store(conn, _cred("tok-v0"))
+
+        served = await dispenser.request(1)
+
+        assert isinstance(served, TokenRefusal)
+        assert served.permanent is True
+        status = await db.oauth_connections.get_status(conn, "claude")
+        assert status is not None and status.status == "expired"
+        assert await _stored_token(conn) == "tok-v0"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_expiring_is_guarded_by_the_generation_the_verdict_was_reached_about(
+    tmp_path: Path,
+) -> None:
+    """The escalation write is compare-and-set on the generation. An operator
+    reconnect landing between the verdict and the write must not be expired by
+    a judgement passed on the credential it replaced — that re-arms the
+    fleet-wide gate seconds after the reconnect cleared it."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _store(conn, _cred("tok-v0"))
+
+        # The reconnect lands first; the stale verdict then no-ops.
+        await _store(conn, _cred("tok-operator"))
+        await db.oauth_connections.update_status(
+            conn, provider="claude", status="expired", updated_by="dispenser", expected_generation=1
+        )
+        status = await db.oauth_connections.get_status(conn, "claude")
+        assert status is not None and status.status == "connected"
+
+        # A verdict about the generation actually stored still lands.
+        await db.oauth_connections.update_status(
+            conn, provider="claude", status="expired", updated_by="dispenser", expected_generation=2
+        )
+        status = await db.oauth_connections.get_status(conn, "claude")
+        assert status is not None and status.status == "expired"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_malformed_success_body_is_refused_rather_than_raised(tmp_path: Path) -> None:
+    """A 200 carrying valid-but-unexpected JSON must still produce an answer.
+    Raising out of `request` would reach the control-channel caller as silence,
+    and it waits out its whole timeout before the run dies."""
+    respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(return_value=httpx.Response(200, json=[]))
+    conn, dispenser = await _open(tmp_path)
+    try:
+        await _store(conn, _cred("tok-v0"))
+
+        served = await dispenser.request(1)
+
+        assert isinstance(served, TokenRefusal)
+        assert served.permanent is True
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_an_expired_or_absent_connection_is_refused_rather_than_resurrected(
     tmp_path: Path,
 ) -> None:

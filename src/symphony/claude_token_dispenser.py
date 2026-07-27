@@ -240,7 +240,9 @@ class ClaudeTokenDispenser:
                         "the claude refresh token was rejected after an abandoned attempt",
                         permanent=False,
                     )
-                return await self._expire("the claude refresh token was rejected")
+                return await self._expire(
+                    "the claude refresh token was rejected", stored.generation
+                )
             if time.monotonic() + self._retry_backoff_secs >= deadline:
                 return TokenRefusal(
                     "the claude token endpoint could not be reached in time", permanent=False
@@ -261,6 +263,22 @@ class ClaudeTokenDispenser:
         ends up holding. A reconnect that landed mid-exchange therefore wins
         without a special case: the CAS no-ops and the operator's token is what
         gets handed out."""
+        # Re-check before writing. The exchange above was a network round-trip,
+        # and something else — a liveness Test, another agent path — may have
+        # expired the row in the meantime. `write_back` CASes on the *credential*
+        # only and re-persists whatever it writes as `connected`, so without this
+        # a rotation would silently clear the reconnect gate a check just armed
+        # (the same guard `_revalidate_claude_after_auth_failure` carries).
+        gated = await self._stored()
+        if gated is None or gated.status != "connected":
+            log.info(
+                "claude rotation finished but the connection is no longer live; "
+                "dropping the minted token rather than clearing the gate"
+            )
+            return TokenRefusal(
+                "the claude connection was expired while its token was being rotated",
+                permanent=True,
+            )
         rotated = await self._write_back.write_back(
             _PROVIDER,
             refreshed,
@@ -282,21 +300,30 @@ class ClaudeTokenDispenser:
         request quietly fails (the SYM-233 unreadable-blob rule)."""
         token = claude_access_token(stored.credential)
         if token is None:
-            return await self._expire("the stored claude credential holds no access token")
+            return await self._expire(
+                "the stored claude credential holds no access token", stored.generation
+            )
         return TokenGrant(token=token, generation=stored.generation, rotated=rotated)
 
-    async def _expire(self, reason: str) -> TokenRefusal:
+    async def _expire(self, reason: str, generation: int) -> TokenRefusal:
         """Mark the shared connection expired. This *is* the escalation: it arms
         the reconnect dispatch gate, which parks the affected issues with an
         operator-facing "reconnect it on the Connections page" reason. Reserved
         for failures that cannot clear on their own — a transient one must never
-        come through here, or one flaky exchange becomes a fleet-wide outage."""
+        come through here, or one flaky exchange becomes a fleet-wide outage.
+
+        Guarded by the generation the verdict was reached about: an operator
+        reconnect landing between that verdict and this write must not be
+        expired by it. The refusal still stands for *this* run — its token is
+        genuinely unusable — but the fleet keeps the connection the operator
+        just restored."""
         await db.oauth_connections.update_status(
             self._conn,
             provider=_PROVIDER,
             status="expired",
             updated_at=self._now().strftime(_ISO_FORMAT),
             updated_by="dispenser",
+            expected_generation=generation,
         )
         return TokenRefusal(reason, permanent=True)
 
