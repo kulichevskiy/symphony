@@ -66,6 +66,7 @@ from .claude_login import (
 )
 from .credentials import CredentialWriteBack
 from .crypto import CredentialCipher, CredentialDecryptError, CredentialKeyMissingError
+from .db.oauth_connections import ConnectionSnapshot
 
 log = logging.getLogger(__name__)
 
@@ -107,13 +108,6 @@ class TokenRefusal:
 
 
 TokenResponse = TokenGrant | TokenRefusal
-
-
-@dataclass(frozen=True)
-class _StoredConnection:
-    credential: str
-    generation: int
-    status: str
 
 
 class ClaudeTokenDispenser:
@@ -216,12 +210,12 @@ class ClaudeTokenDispenser:
             return await self._hand_out(stored)
         return await self._rotate(stored, deadline)
 
-    async def _rotate(self, stored: _StoredConnection, deadline: float) -> TokenResponse:
+    async def _rotate(self, stored: ConnectionSnapshot, deadline: float) -> TokenResponse:
         retried = False
         while True:
             outcome = await self._exchange(stored.credential, deadline)
             if outcome.credential is not None:
-                return await self._persist(outcome.credential, expected_prior=stored.credential)
+                return await self._persist(outcome.credential, prior=stored)
             # A reconnect (or the daemon's own refresh) that landed while our
             # doomed exchange was in flight wins — the connection is fine, the
             # credential we started from is simply no longer the stored one.
@@ -253,24 +247,48 @@ class ClaudeTokenDispenser:
     async def _exchange(self, credential: str, deadline: float) -> ClaudeRefreshOutcome:
         """One token exchange, bounded by what is left of the budget rather than
         by the module's own 30s default — which is exactly the caller's timeout,
-        so an exchange that runs to it is indistinguishable from silence."""
-        async with httpx.AsyncClient(timeout=self._left(deadline)) as client:
-            return await refresh_claude_credential_outcome(credential, client=client)
+        so an exchange that runs to it is indistinguishable from silence.
 
-    async def _persist(self, refreshed: str, *, expected_prior: str) -> TokenResponse:
-        """Write the freshly minted credential back under a compare-and-swap on
-        the credential the exchange started from, then serve whatever the row
-        ends up holding. A reconnect that landed mid-exchange therefore wins
-        without a special case: the CAS no-ops and the operator's token is what
-        gets handed out."""
-        # Re-check before writing. The exchange above was a network round-trip,
-        # and something else — a liveness Test, another agent path — may have
-        # expired the row in the meantime. `write_back` CASes on the *credential*
-        # only and re-persists whatever it writes as `connected`, so without this
-        # a rotation would silently clear the reconnect gate a check just armed
-        # (the same guard `_revalidate_claude_after_auth_failure` carries).
-        gated = await self._stored()
-        if gated is None or gated.status != "connected":
+        The httpx timeout alone does not cap the exchange: it applies *per
+        operation* (connect, write, pool, each read), so a slow-but-progressing
+        response can outlive any of them and still overrun. The `asyncio`
+        deadline around the whole thing is the one that actually holds."""
+        remaining = self._left(deadline)
+        try:
+            async with asyncio.timeout(remaining):
+                async with httpx.AsyncClient(timeout=remaining) as client:
+                    return await refresh_claude_credential_outcome(credential, client=client)
+        except TimeoutError:
+            # Abandoned, not answered — which is why `_rotate` stops treating a
+            # later rejection as proof of a dead account once this has happened.
+            log.warning("claude token exchange abandoned after %.1fs", remaining)
+            return ClaudeRefreshOutcome(None, transient=True)
+
+    async def _persist(self, refreshed: str, *, prior: ConnectionSnapshot) -> TokenResponse:
+        """Write the freshly minted credential back, then serve whatever the row
+        ends up holding.
+
+        The write is compare-and-set on the row `prior` was read from — same
+        credential, same generation, still `connected` — and the last of those
+        is enforced inside the statement, because `write_back` re-persists as
+        `connected` and a check made a few awaits earlier would let a rotation
+        silently clear a reconnect gate armed in between. Anything that lands
+        mid-exchange therefore wins without a special case: the CAS no-ops and
+        the row's own current state is what gets served."""
+        rotated = await self._write_back.write_back(
+            _PROVIDER,
+            refreshed,
+            expires_at=claude_expires_at(refreshed),
+            expected_prior=prior.credential,
+            expect_connected_generation=prior.generation,
+        )
+        stored = await self._stored()
+        if stored is None:
+            return TokenRefusal(
+                "the claude connection was removed while its token was being rotated",
+                permanent=True,
+            )
+        if stored.status != "connected":
             log.info(
                 "claude rotation finished but the connection is no longer live; "
                 "dropping the minted token rather than clearing the gate"
@@ -279,21 +297,11 @@ class ClaudeTokenDispenser:
                 "the claude connection was expired while its token was being rotated",
                 permanent=True,
             )
-        rotated = await self._write_back.write_back(
-            _PROVIDER,
-            refreshed,
-            expires_at=claude_expires_at(refreshed),
-            expected_prior=expected_prior,
-        )
-        stored = await self._stored()
-        if stored is None:
-            return TokenRefusal(
-                "the claude connection was removed while its token was being rotated",
-                permanent=True,
-            )
         return await self._hand_out(stored, rotated=rotated)
 
-    async def _hand_out(self, stored: _StoredConnection, *, rotated: bool = False) -> TokenResponse:
+    async def _hand_out(
+        self, stored: ConnectionSnapshot, *, rotated: bool = False
+    ) -> TokenResponse:
         """Serve what the row currently holds. A blob with no readable access
         token can't serve anyone, whatever generation was named — expire it so
         the Connections page says so instead of reading `connected` while every
@@ -327,17 +335,19 @@ class ClaudeTokenDispenser:
         )
         return TokenRefusal(reason, permanent=True)
 
-    async def _stored(self) -> _StoredConnection | None:
-        status = await db.oauth_connections.get_status(self._conn, _PROVIDER)
-        if status is None or status.status not in ("connected", "expired"):
-            return None
+    async def _stored(self) -> ConnectionSnapshot | None:
+        """The row as one consistent read. Status and credential must come from
+        the same row version: a `connected` read paired with a credential a
+        liveness Test rejected a moment later would let a request through an
+        armed gate."""
         try:
-            snapshot = await db.oauth_connections.get_credential_and_generation(
+            snapshot = await db.oauth_connections.get_connection_snapshot(
                 self._conn, _PROVIDER, self._cipher
             )
         except (CredentialDecryptError, CredentialKeyMissingError):
             return None
-        if snapshot is None or not snapshot[0]:
+        if snapshot is None or not snapshot.credential:
             return None
-        credential, generation = snapshot
-        return _StoredConnection(credential=credential, generation=generation, status=status.status)
+        if snapshot.status not in ("connected", "expired"):
+            return None
+        return snapshot

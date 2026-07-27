@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 
 import aiosqlite
@@ -312,7 +313,7 @@ async def test_an_expiry_landing_mid_rotation_is_not_cleared_by_the_write_back(
     exchange is in flight leaves the credential untouched, so a
     credential-only CAS would sail through — and `write_back` re-persists as
     `connected`, silently clearing a reconnect gate that was just armed. The
-    minted token is dropped instead."""
+    write refuses inside the statement and the minted token is dropped."""
     conn, dispenser = await _open(tmp_path)
 
     async def _expire_mid_flight(request: httpx.Request) -> httpx.Response:
@@ -330,6 +331,95 @@ async def test_an_expiry_landing_mid_rotation_is_not_cleared_by_the_write_back(
         status = await db.oauth_connections.get_status(conn, "claude")
         assert status is not None and status.status == "expired"
         assert await _stored_token(conn) == "tok-v0"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_the_write_back_cas_is_enforced_inside_the_statement(tmp_path: Path) -> None:
+    """The gate check and the write are separate awaits, so a liveness Test can
+    land between them. The condition therefore travels into the SQL: the write
+    lands only while the row is still the connected generation it was decided
+    about."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    cipher = CredentialCipher(_KEY)
+    write_back = CredentialWriteBack(conn, cipher)
+    try:
+        await _store(conn, _cred("tok-v0"))
+        await db.oauth_connections.update_status(conn, provider="claude", status="expired")
+
+        # An expired row would normally be re-persisted as `connected`; guarded,
+        # it is refused instead.
+        assert (
+            await write_back.write_back("claude", _cred("tok-new"), expect_connected_generation=1)
+            is False
+        )
+        status = await db.oauth_connections.get_status(conn, "claude")
+        assert status is not None and status.status == "expired"
+        assert await _stored_token(conn) == "tok-v0"
+
+        # A superseded generation is refused too, even while connected.
+        await _store(conn, _cred("tok-operator"))
+        assert (
+            await write_back.write_back("claude", _cred("tok-new"), expect_connected_generation=1)
+            is False
+        )
+        assert await _stored_token(conn) == "tok-operator"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_request_timeout_is_retried_rather_than_read_as_a_dead_account(
+    tmp_path: Path,
+) -> None:
+    """408 is the one 4xx that says nothing about the refresh token — something
+    gave up waiting for the request. Reading it as a rejection would expire the
+    shared connection and block every run over a slow network."""
+    route = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(
+        side_effect=[httpx.Response(408, json={}), _minted("tok-new")]
+    )
+    conn, dispenser = await _open(tmp_path, budget_secs=30.0, retry_backoff_secs=0.01)
+    try:
+        await _store(conn, _cred("tok-v0"))
+
+        served = await dispenser.request(1)
+
+        assert served == TokenGrant(token="tok-new", generation=2, rotated=True)
+        assert route.call_count == 2
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_slow_exchange_is_abandoned_at_the_deadline(tmp_path: Path) -> None:
+    """An httpx timeout applies per operation — connect, write, pool, each read
+    — so a slow-but-progressing response outlives all of them and still overruns
+    the budget. The absolute deadline is what actually holds; overrunning would
+    answer after the caller has given up, which is the silence this exists to
+    avoid."""
+
+    async def _never_finishes(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(30)
+        return _minted("tok-new")
+
+    respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(side_effect=_never_finishes)
+    conn, dispenser = await _open(tmp_path, budget_secs=0.2, retry_backoff_secs=0.01)
+    try:
+        await _store(conn, _cred("tok-v0"))
+
+        started = time.monotonic()
+        served = await dispenser.request(1)
+        elapsed = time.monotonic() - started
+
+        assert isinstance(served, TokenRefusal)
+        # Abandoned, never answered — so the connection must not be expired.
+        assert served.permanent is False
+        assert elapsed < 10
+        status = await db.oauth_connections.get_status(conn, "claude")
+        assert status is not None and status.status == "connected"
     finally:
         await conn.close()
 

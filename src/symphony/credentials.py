@@ -254,6 +254,7 @@ class CredentialWriteBack:
         *,
         expires_at: str | None = None,
         expected_prior: str | None = None,
+        expect_connected_generation: int | None = None,
     ) -> bool:
         """Persist `credential` for `provider` if a live DB connection exists and
         the stored value differs. Returns True when a write happened.
@@ -267,6 +268,14 @@ class CredentialWriteBack:
         no-ops when the row no longer matches — an operator's mid-run
         disconnect/reconnect wins over the finished run's stale material
         instead of being resurrected/overwritten by it.
+
+        `expect_connected_generation` pushes that CAS down into the statement
+        (SYM-234), additionally requiring the row to still be `connected`. The
+        checks above run between awaits, so a liveness Test can expire the row
+        after them — and because this method re-persists as `connected`, the
+        write would silently clear the reconnect gate that Test just armed. A
+        caller that must not resurrect an expired row passes the generation it
+        decided about.
         """
         async with self._lock(provider):
             status = await db.oauth_connections.get_status(self._conn, provider)
@@ -289,7 +298,7 @@ class CredentialWriteBack:
                     provider,
                 )
                 return False
-            await db.oauth_connections.set_connection(
+            wrote = await db.oauth_connections.set_connection(
                 self._conn,
                 provider=provider,
                 credential=credential,
@@ -298,7 +307,15 @@ class CredentialWriteBack:
                 expires_at=expires_at,
                 updated_at=self._now().strftime(_ISO_FORMAT),
                 updated_by="write-back",
+                expect_connected_generation=expect_connected_generation,
             )
+            if not wrote:
+                log.info(
+                    "%s write-back skipped: the row stopped being the connected generation "
+                    "it was decided about — in-statement CAS no-op",
+                    provider,
+                )
+                return False
             log.info("%s credential written back after runtime refresh", provider)
             return True
 

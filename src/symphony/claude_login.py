@@ -347,7 +347,11 @@ async def refresh_claude_credential_outcome(
         if response.status_code != 200:
             # 5xx/429 is the endpoint being unhappy, not the credential being
             # dead; 4xx (invalid_grant, revoked/consumed refresh token) is.
-            transient = response.status_code >= 500 or response.status_code == 429
+            # 408 is the exception among the 4xx: the endpoint (or something in
+            # front of it) gave up waiting for the request, which says nothing
+            # about the refresh token — reading it as "dead" would expire the
+            # shared connection and block every run over a slow network.
+            transient = response.status_code >= 500 or response.status_code in (408, 429)
             log.warning(
                 "claude token refresh failed with HTTP %d (transient=%s)",
                 response.status_code,
