@@ -227,8 +227,8 @@ async def run_local_review_session(
     wall_clock_secs: int = 0,
     binding_env: dict[str, str] | None = None,
     # Per-run agent credential envs keyed by agent ("claude" ->
-    # {CLAUDE_CONFIG_DIR...}, "codex" -> {CODEX_HOME...}); each pass gets only
-    # ITS agent's env — never another agent's credentials.
+    # {CLAUDE_CODE_OAUTH_TOKEN...}, "codex" -> {CODEX_HOME...}); each pass gets
+    # only ITS agent's env — never another agent's credentials.
     agent_envs: dict[str, dict[str, str]] | None = None,
     mcp_servers: Mapping[str, Any] | None = None,
     last_message_dir: Path,

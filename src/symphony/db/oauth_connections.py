@@ -38,6 +38,11 @@ class ConnectionStatus:
     expires_at: str | None
     updated_at: str
     updated_by: str
+    # Which minting of this provider's credential the row currently holds
+    # (SYM-233). Advanced by `set_connection` on every credential replacement,
+    # so a run stamped with an older value is known to be holding a superseded
+    # token without anything having to compare the secrets themselves.
+    generation: int = 1
 
 
 def _row_to_status(row: aiosqlite.Row) -> ConnectionStatus:
@@ -47,13 +52,14 @@ def _row_to_status(row: aiosqlite.Row) -> ConnectionStatus:
         expires_at=None if row["expires_at"] is None else str(row["expires_at"]),
         updated_at=str(row["updated_at"]),
         updated_by=str(row["updated_by"]),
+        generation=int(row["generation"]),
     )
 
 
 async def get_status(conn: aiosqlite.Connection, provider: str) -> ConnectionStatus | None:
     """The provider's non-secret status row, or `None` if never connected."""
     cur = await conn.execute(
-        "SELECT provider, status, expires_at, updated_at, updated_by "
+        "SELECT provider, status, expires_at, updated_at, updated_by, generation "
         "FROM oauth_connections WHERE provider = ?",
         (provider,),
     )
@@ -64,7 +70,7 @@ async def get_status(conn: aiosqlite.Connection, provider: str) -> ConnectionSta
 async def list_statuses(conn: aiosqlite.Connection) -> list[ConnectionStatus]:
     """Every provider's status row (credential column never read)."""
     cur = await conn.execute(
-        "SELECT provider, status, expires_at, updated_at, updated_by "
+        "SELECT provider, status, expires_at, updated_at, updated_by, generation "
         "FROM oauth_connections ORDER BY provider ASC"
     )
     return [_row_to_status(row) for row in await cur.fetchall()]
@@ -84,6 +90,28 @@ async def get_credential(
     if row is None:
         return None
     return cipher.decrypt(bytes(row["credential"]))
+
+
+async def get_credential_and_generation(
+    conn: aiosqlite.Connection, provider: str, cipher: CredentialCipher
+) -> tuple[str, int] | None:
+    """The provider's decrypted credential together with the generation it was
+    stored under, read in one shot; `None` if there is no row.
+
+    Reading the two separately would leave a window in which a reconnect lands
+    between them and a run ends up stamped with a generation newer than the
+    token it is actually holding (SYM-233) — the one direction that matters,
+    since a stamp that looks current reads as "this run holds the newest token"
+    and would provoke a rotation instead of a hand-out. Same decrypt-error
+    contract as `get_credential`."""
+    cur = await conn.execute(
+        "SELECT credential, generation FROM oauth_connections WHERE provider = ?",
+        (provider,),
+    )
+    row = await cur.fetchone()
+    if row is None:
+        return None
+    return cipher.decrypt(bytes(row["credential"])), int(row["generation"])
 
 
 async def get_refresh_token(
@@ -119,23 +147,55 @@ async def set_connection(
 
     `commit=False` lets a caller fold this into a larger atomic transaction it
     commits itself.
+
+    Every upsert advances the provider's `generation` (SYM-233) — this is the
+    one choke point through which a replacement credential reaches the store,
+    so the counter is exactly "how many times has this provider's credential
+    been minted". Callers that must not bump it (a status flip, a no-op
+    write-back) don't come through here: `write_back` returns early when the
+    credential is unchanged, and `update_status` leaves the column alone.
+
+    The counter is kept in `oauth_credential_generations`, which `delete` does
+    not touch, so it keeps climbing across a Disconnect → Reconnect instead of
+    restarting at 1 and colliding with the stamp of a run still in flight.
     """
     encrypted = cipher.encrypt(credential)
     encrypted_refresh = cipher.encrypt(refresh_token) if refresh_token is not None else None
+    cur = await conn.execute(
+        """
+        INSERT INTO oauth_credential_generations (provider, generation) VALUES (?, 1)
+        ON CONFLICT(provider) DO UPDATE SET generation = oauth_credential_generations.generation + 1
+        RETURNING generation
+        """,
+        (provider,),
+    )
+    row = await cur.fetchone()
+    generation = int(row["generation"]) if row is not None else 1
     await conn.execute(
         """
         INSERT INTO oauth_connections
-            (provider, credential, refresh_token, status, expires_at, updated_at, updated_by)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+            (provider, credential, refresh_token, status, expires_at, updated_at, updated_by,
+             generation)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(provider) DO UPDATE SET
             credential = excluded.credential,
             refresh_token = excluded.refresh_token,
             status = excluded.status,
             expires_at = excluded.expires_at,
             updated_at = excluded.updated_at,
-            updated_by = excluded.updated_by
+            updated_by = excluded.updated_by,
+            generation = excluded.generation
         """,
-        (provider, encrypted, encrypted_refresh, status, expires_at, updated_at, updated_by),
+        (
+            provider,
+            encrypted,
+            encrypted_refresh,
+            status,
+            expires_at,
+            updated_at,
+            updated_by,
+            generation,
+        ),
     )
     if commit:
         await conn.commit()
@@ -192,7 +252,11 @@ async def assert_cipher_usable(conn: aiosqlite.Connection, cipher: CredentialCip
 
 async def delete(conn: aiosqlite.Connection, provider: str, *, commit: bool = True) -> None:
     """Drop the provider's row entirely — `Disconnect` clears the connection, so
-    the encrypted credential is gone, not merely marked disconnected. Idempotent."""
+    the encrypted credential is gone, not merely marked disconnected. Idempotent.
+
+    Deliberately leaves `oauth_credential_generations` alone: the generation
+    must keep climbing across a reconnect, or a run stamped before the
+    disconnect could later be mistaken for one holding the current token."""
     await conn.execute("DELETE FROM oauth_connections WHERE provider = ?", (provider,))
     if commit:
         await conn.commit()

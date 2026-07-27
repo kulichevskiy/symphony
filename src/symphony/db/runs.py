@@ -656,6 +656,30 @@ async def clear_review_rearm_retry(conn: aiosqlite.Connection, run_id: str) -> N
     await conn.commit()
 
 
+async def stamp_claude_token_generation(
+    conn: aiosqlite.Connection, run_id: str, generation: int
+) -> None:
+    """Record which minting of the shared Claude token this run was dispatched
+    on (SYM-233). Written at dispatch, so it outlives a daemon restart and a
+    later tick can tell a run holding the current token from one holding a
+    superseded one. A no-op for a run_id with no row."""
+    await conn.execute(
+        "UPDATE runs SET claude_token_generation = ? WHERE id = ?",
+        (generation, run_id),
+    )
+    await conn.commit()
+
+
+async def claude_token_generation(conn: aiosqlite.Connection, run_id: str) -> int | None:
+    """The generation this run was dispatched on, or `None` when it was never
+    stamped — an ambiently-authenticated run, not generation zero."""
+    cur = await conn.execute("SELECT claude_token_generation FROM runs WHERE id = ?", (run_id,))
+    row = await cur.fetchone()
+    if row is None or row["claude_token_generation"] is None:
+        return None
+    return int(row["claude_token_generation"])
+
+
 async def has_review_rearm_retry(conn: aiosqlite.Connection, run_id: str) -> bool:
     cur = await conn.execute(
         "SELECT 1 FROM review_rearm_retries WHERE run_id = ? LIMIT 1",

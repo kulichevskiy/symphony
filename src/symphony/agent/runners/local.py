@@ -34,16 +34,22 @@ _STREAM_READ_CHUNK_BYTES = 64 * 1024
 _OVERSIZED_LINE_PREFIX_BYTES = 64 * 1024
 _JSON_ID_RE = re.compile(r'"(?:id|item_id)"\s*:\s*"([^"]+)"')
 
-# When a run is backed by a DB-materialized agent credential (a private
-# CLAUDE_CONFIG_DIR / CODEX_HOME written from `oauth_connections`), the
-# daemon host's own ambient agent-auth env must NOT leak into the child:
-# Claude Code and codex both prefer an ambient API-key/OAuth-token env var
-# over the on-disk credential, so a stray host `ANTHROPIC_API_KEY` would
-# silently win over the UI-connected account (the SYM-206 hazard). We scrub
-# these from the *inherited* env only — a binding that sets one explicitly
-# via `env:` (landing in `spec.env`) still overrides, as always.
+# When a run is backed by a DB-materialized agent credential (a claude bearer
+# token in `CLAUDE_CODE_OAUTH_TOKEN`, or a private CODEX_HOME, both written
+# from `oauth_connections`), the daemon host's own ambient agent-auth env must
+# NOT leak into the child: Claude Code and codex both prefer an ambient
+# API-key env var over the credential we hand them, so a stray host
+# `ANTHROPIC_API_KEY` would silently win over the UI-connected account (the
+# SYM-206 hazard). We scrub these from the *inherited* env only — a binding
+# that sets one explicitly via `env:` (landing in `spec.env`) still overrides,
+# as always.
+#
+# The marker for claude is the token itself (SYM-233): the run no longer gets a
+# config dir to key off, and the token env var it does get is the one thing an
+# inherited value could shadow — which the merge already settles, since
+# `spec.env` wins.
 _AGENT_AMBIENT_AUTH_ENV: dict[str, tuple[str, ...]] = {
-    "CLAUDE_CONFIG_DIR": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
+    "CLAUDE_CODE_OAUTH_TOKEN": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
     "CODEX_HOME": ("OPENAI_API_KEY", "CODEX_API_KEY"),
 }
 

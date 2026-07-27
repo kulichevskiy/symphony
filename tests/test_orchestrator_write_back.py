@@ -1,8 +1,15 @@
-"""Daemon wiring: per-run Claude credential materialization + write-back
+"""Daemon wiring: per-run agent credential materialization + write-back
 (Config v2 3/9). The write-back unit is covered in test_credential_write_back;
-this pins the orchestrator seam — a connected Claude row is materialized into a
-private per-run CLAUDE_CONFIG_DIR, a refreshed credential is re-persisted from
-that dir at finalize, and the dir is torn down."""
+this pins the orchestrator seam — a connected row is materialized for the run,
+the central refresh runs before dispatch, and a credential the run itself
+refreshed is re-persisted at finalize.
+
+The two agents materialize differently since SYM-233: claude gets a bearer
+access token in the environment (the only source that arms the CLI's mid-run
+auth recovery, and nothing on disk to tear down), codex still gets a private
+per-run CODEX_HOME. The file-side of the contract — mid-run refresh, CAS
+write-back, teardown — is therefore pinned on codex; the token side on claude.
+See also test_claude_token_generation."""
 
 from __future__ import annotations
 
@@ -47,56 +54,26 @@ def _cred(token: str, expires_ms: int = 4102444800000) -> str:
 
 
 @pytest.mark.asyncio
-async def test_materialize_finalize_round_trip_with_refresh(tmp_path: Path) -> None:
-    """A connected Claude row materializes into a private per-run dir; a
-    mid-run refresh (file rewrite) is written back at finalize; the dir is
-    removed. A second run then materializes the refreshed credential — two
-    sequential runs, no re-auth."""
+async def test_sequential_runs_take_whatever_token_is_current(tmp_path: Path) -> None:
+    """Each run reads the store at dispatch, so a credential replaced between
+    two runs (operator reconnect, central refresh) reaches the second one —
+    two sequential runs, no re-auth."""
     harness = await Harness.create(tmp_path, config=_config(tmp_path))
     try:
         cipher = CredentialCipher(ENC_KEY)
         await db.oauth_connections.set_connection(
             harness.conn, provider="claude", credential=_cred("tok-v0"), cipher=cipher
         )
+        assert await harness.orch._materialize_claude_env("claude") == {  # noqa: SLF001
+            "CLAUDE_CODE_OAUTH_TOKEN": "tok-v0"
+        }
 
-        env = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
-        config_dir = Path(env["CLAUDE_CONFIG_DIR"])
-        cred_file = config_dir / ".credentials.json"
-        assert cred_file.read_text(encoding="utf-8") == _cred("tok-v0")
-
-        # The CLI refreshes the token in place mid-run.
-        cred_file.write_text(_cred("tok-v1"), encoding="utf-8")
-        await harness.orch._finalize_claude_env(env)  # noqa: SLF001
-        assert await db.oauth_connections.get_credential(harness.conn, "claude", cipher) == _cred(
-            "tok-v1"
-        )
-        assert config_dir.name not in os.listdir(config_dir.parent)  # torn down
-
-        # Run 2 starts from the refreshed credential.
-        env2 = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
-        dir2 = Path(env2["CLAUDE_CONFIG_DIR"])
-        assert dir2 != config_dir
-        assert (dir2 / ".credentials.json").read_text(encoding="utf-8") == _cred("tok-v1")
-        await harness.orch._finalize_claude_env(env2)  # noqa: SLF001
-    finally:
-        await harness.close()
-
-
-@pytest.mark.asyncio
-async def test_concurrent_runs_get_separate_dirs(tmp_path: Path) -> None:
-    harness = await Harness.create(tmp_path, config=_config(tmp_path))
-    try:
-        cipher = CredentialCipher(ENC_KEY)
         await db.oauth_connections.set_connection(
-            harness.conn, provider="claude", credential=_cred("tok"), cipher=cipher
+            harness.conn, provider="claude", credential=_cred("tok-v1"), cipher=cipher
         )
-        env_a = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
-        env_b = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
-        try:
-            assert env_a["CLAUDE_CONFIG_DIR"] != env_b["CLAUDE_CONFIG_DIR"]
-        finally:
-            await harness.orch._finalize_claude_env(env_a)  # noqa: SLF001
-            await harness.orch._finalize_claude_env(env_b)  # noqa: SLF001
+        assert await harness.orch._materialize_claude_env("claude") == {  # noqa: SLF001
+            "CLAUDE_CODE_OAUTH_TOKEN": "tok-v1"
+        }
     finally:
         await harness.close()
 
@@ -162,19 +139,10 @@ async def test_near_expiry_refreshes_exactly_once_under_concurrency(tmp_path: Pa
             harness.orch._materialize_claude_env("claude"),  # noqa: SLF001
             harness.orch._materialize_claude_env("claude"),  # noqa: SLF001
         )
-        try:
-            assert route.call_count == 1
-            for env in (env_a, env_b):
-                blob = json.loads(
-                    (Path(env["CLAUDE_CONFIG_DIR"]) / ".credentials.json").read_text()
-                )
-                assert blob["claudeAiOauth"]["accessToken"] == "tok-new"
-                # SYM-228: the run's copy is access-token-only.
-                assert "refreshToken" not in blob["claudeAiOauth"]
-                assert blob["claudeAiOauth"]["scopes"] == ["user:inference"]
-        finally:
-            await harness.orch._finalize_claude_env(env_a)  # noqa: SLF001
-            await harness.orch._finalize_claude_env(env_b)  # noqa: SLF001
+        assert route.call_count == 1
+        # Both runs carry the refreshed access token — and only that: the
+        # one-shot refresh token never leaves the DB (SYM-228/233).
+        assert env_a == env_b == {"CLAUDE_CODE_OAUTH_TOKEN": "tok-new"}
         stored = await db.oauth_connections.get_credential(harness.conn, "claude", cipher)
         assert json.loads(stored)["claudeAiOauth"]["accessToken"] == "tok-new"
         status = await db.oauth_connections.get_status(harness.conn, "claude")
@@ -231,12 +199,8 @@ async def test_keeps_token_fresh_far_beyond_wall_clock(tmp_path: Path) -> None:
             cipher=cipher,
         )
         env = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
-        try:
-            assert route.call_count == 1
-            blob = json.loads((Path(env["CLAUDE_CONFIG_DIR"]) / ".credentials.json").read_text())
-            assert blob["claudeAiOauth"]["accessToken"] == "tok-fresh"
-        finally:
-            await harness.orch._finalize_claude_env(env)  # noqa: SLF001
+        assert route.call_count == 1
+        assert env == {"CLAUDE_CODE_OAUTH_TOKEN": "tok-fresh"}
         stored = await db.oauth_connections.get_credential(harness.conn, "claude", cipher)
         assert json.loads(stored)["claudeAiOauth"]["accessToken"] == "tok-fresh"
         status = await db.oauth_connections.get_status(harness.conn, "claude")
@@ -263,12 +227,8 @@ async def test_keep_fresh_refresh_failure_fails_open(tmp_path: Path) -> None:
             cipher=cipher,
         )
         env = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
-        try:
-            assert env.get("CLAUDE_CONFIG_DIR")  # dispatch proceeds on the live token
-            blob = json.loads((Path(env["CLAUDE_CONFIG_DIR"]) / ".credentials.json").read_text())
-            assert blob["claudeAiOauth"]["accessToken"] == "tok-live"
-        finally:
-            await harness.orch._finalize_claude_env(env)  # noqa: SLF001
+        # Dispatch proceeds on the still-live token.
+        assert env == {"CLAUDE_CODE_OAUTH_TOKEN": "tok-live"}
         status = await db.oauth_connections.get_status(harness.conn, "claude")
         assert status is not None and status.status == "connected"
     finally:
@@ -324,27 +284,30 @@ async def test_refresh_failure_marks_expired_and_blocks_materialization(tmp_path
 @pytest.mark.asyncio
 async def test_cas_write_back_skips_when_row_changed_mid_run(tmp_path: Path) -> None:
     """Config v2 5/9: an operator reconnect while a run is in flight wins over
-    the run's stale refreshed credential — the finalize write-back CAS no-ops."""
+    the run's stale refreshed credential — the finalize write-back CAS no-ops.
+
+    Pinned on codex: it is the agent that still refreshes its own materialized
+    copy mid-run, so it is the only one whose finalize can race a reconnect."""
     harness = await Harness.create(tmp_path, config=_config(tmp_path))
     try:
         cipher = CredentialCipher(ENC_KEY)
         await db.oauth_connections.set_connection(
-            harness.conn, provider="claude", credential=_cred("tok-run-start"), cipher=cipher
+            harness.conn, provider="codex", credential=_codex_cred("tok-run-start"), cipher=cipher
         )
-        env = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
+        env = await harness.orch._materialize_claude_env("codex")  # noqa: SLF001
         # Mid-run: the CLI refreshes its private copy...
-        (Path(env["CLAUDE_CONFIG_DIR"]) / ".credentials.json").write_text(
-            _cred("tok-run-refreshed"), encoding="utf-8"
+        (Path(env["CODEX_HOME"]) / "auth.json").write_text(
+            _codex_cred("tok-run-refreshed"), encoding="utf-8"
         )
         # ...while the operator reconnects in the UI (row replaced).
         await db.oauth_connections.set_connection(
-            harness.conn, provider="claude", credential=_cred("tok-reconnected"), cipher=cipher
+            harness.conn, provider="codex", credential=_codex_cred("tok-reconnected"), cipher=cipher
         )
         await harness.orch._finalize_claude_env(env)  # noqa: SLF001
         # The reconnect sticks; the stale run material did not overwrite it.
-        assert await db.oauth_connections.get_credential(harness.conn, "claude", cipher) == _cred(
-            "tok-reconnected"
-        )
+        assert await db.oauth_connections.get_credential(
+            harness.conn, "codex", cipher
+        ) == _codex_cred("tok-reconnected")
     finally:
         await harness.close()
 
@@ -355,17 +318,17 @@ async def test_disconnect_mid_run_is_not_resurrected(tmp_path: Path) -> None:
     try:
         cipher = CredentialCipher(ENC_KEY)
         await db.oauth_connections.set_connection(
-            harness.conn, provider="claude", credential=_cred("tok"), cipher=cipher
+            harness.conn, provider="codex", credential=_codex_cred("tok"), cipher=cipher
         )
-        env = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
-        (Path(env["CLAUDE_CONFIG_DIR"]) / ".credentials.json").write_text(
-            _cred("tok-refreshed"), encoding="utf-8"
+        env = await harness.orch._materialize_claude_env("codex")  # noqa: SLF001
+        (Path(env["CODEX_HOME"]) / "auth.json").write_text(
+            _codex_cred("tok-refreshed"), encoding="utf-8"
         )
         # Operator disconnects mid-run: the row is deleted.
-        await db.oauth_connections.delete(harness.conn, "claude")
+        await db.oauth_connections.delete(harness.conn, "codex")
         await harness.orch._finalize_claude_env(env)  # noqa: SLF001
         # Disconnect sticks — write_back's no-row guard keeps it deleted.
-        assert await db.oauth_connections.get_status(harness.conn, "claude") is None
+        assert await db.oauth_connections.get_status(harness.conn, "codex") is None
     finally:
         await harness.close()
 
@@ -752,12 +715,7 @@ async def test_materialized_claude_creds_have_no_refresh_token(tmp_path: Path) -
             cipher=cipher,
         )
         env = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
-        try:
-            blob = json.loads((Path(env["CLAUDE_CONFIG_DIR"]) / ".credentials.json").read_text())
-            assert blob["claudeAiOauth"]["accessToken"] == "tok"
-            assert "refreshToken" not in blob["claudeAiOauth"]
-        finally:
-            await harness.orch._finalize_claude_env(env)  # noqa: SLF001
+        assert env == {"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
         # The DB retains the full credential (incl. the refresh token).
         stored = json.loads(
             await db.oauth_connections.get_credential(harness.conn, "claude", cipher)

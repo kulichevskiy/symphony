@@ -49,12 +49,12 @@ from ...agent.prompt import implement_prompt
 from ...agent.runner import Runner, RunnerSpec
 from ...agent.runners.local import LocalRunner
 from ...claude_login import (
+    claude_access_token,
     claude_credential_expires_within,
     claude_expires_at,
     read_claude_credential,
     refresh_claude_credential,
     refresh_claude_credential_outcome,
-    strip_claude_refresh_token,
 )
 from ...codex_login import (
     codex_credential_expires_within,
@@ -3053,6 +3053,25 @@ class _OrchestratorBase:
     async def _resolve_claude_credential(self) -> str | None:
         return await self._resolve_agent_credential("claude")
 
+    async def _resolve_claude_credential_and_generation(self) -> tuple[str, int] | None:
+        """The stored Claude credential and the generation it was stored under,
+        from one row read (SYM-233) — see `get_credential_and_generation` for
+        why they must not be read apart. `None` under exactly the conditions
+        `_resolve_agent_credential` returns `None`: not UI-connected, or the
+        stored credential no longer decrypts."""
+        status = await db.oauth_connections.get_status(self._conn, "claude")
+        if status is None or status.status not in ("connected", "expired"):
+            return None
+        try:
+            snapshot = await db.oauth_connections.get_credential_and_generation(
+                self._conn, "claude", self._cipher
+            )
+        except (CredentialDecryptError, CredentialKeyMissingError):
+            return None
+        if snapshot is None or not snapshot[0]:
+            return None
+        return snapshot
+
     async def _maybe_refresh_claude_credential(self, credential: str) -> str | None:
         """Proactive central token refresh (Config v2 4/9; SYM-227).
 
@@ -3209,7 +3228,7 @@ class _OrchestratorBase:
         RECONNECT after the run started (`run_started_at`) — a fresh reconnect
         must not be flagged for a stale run's failure."""
         provider = provider or agent
-        if provider not in _AGENT_CRED_LAYOUT or api_error is None:
+        if provider not in _AGENT_CRED_PROVIDERS or api_error is None:
             return False
         if not _looks_like_auth_error(api_error):
             return False
@@ -3396,11 +3415,14 @@ class _OrchestratorBase:
         failed inside `_materialize_claude_env` flips the row to `expired` and
         yields `{}` — the run must then be blocked, not silently started on
         ambient credentials (Config v2 5/9 review fix)."""
-        if agent not in _AGENT_CRED_LAYOUT:
+        if agent not in _AGENT_CRED_PROVIDERS:
             return None
         # Checked even when materialization produced an env: a row that is
         # still `expired` after materialization (e.g. a blob with no parseable
         # expiry that skipped the proactive refresh) must not dispatch.
+        # Covers both ways materialization can refuse a claude run: a failed
+        # proactive refresh and an unreadable stored blob both expire the row,
+        # so neither can fall through to ambient host auth.
         return await self._claude_expired_block_reason(agent)
 
     async def _flag_auth_failure_from_log(
@@ -3413,7 +3435,7 @@ class _OrchestratorBase:
         own started_at (from the runs row) anchors the stale-run guard. Returns
         the SYM-229 requeue signal (see `_flag_claude_auth_failure`): True when
         the connection was re-validated and this run should be requeued."""
-        if agent not in _AGENT_CRED_LAYOUT or returncode in (0, None):
+        if agent not in _AGENT_CRED_PROVIDERS or returncode in (0, None):
             return False
         stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
         if stdout is None:
@@ -3537,22 +3559,32 @@ class _OrchestratorBase:
             force_requeue=True,
         )
 
-    async def _materialize_claude_env(self, agent: str) -> dict[str, str]:
-        """Per-run Claude credential materialization (Config v2 3/9).
+    async def _materialize_claude_env(
+        self, agent: str, *, run_id: str | None = None
+    ) -> dict[str, str]:
+        """Per-run agent credential materialization (Config v2 3/9).
 
-        For a Claude run with a UI-stored credential, writes it into a private,
-        single-run config dir and returns `{"CLAUDE_CONFIG_DIR": ...}` so the
-        CLI authenticates off the DB copy — concurrent runs each get their own
-        dir, so they can never race one shared credentials file. The claude copy
-        is access-token-only (the refresh token is stripped, SYM-228) so a run
-        cannot rotate the one-shot refresh token. Returns `{}`
-        (and materializes nothing) for non-Claude runs or when Claude isn't
-        UI-connected. The caller MUST pass the returned env to
-        `_finalize_claude_env` when the run ends — that reads the (possibly
-        refreshed) credential back for the DB write-back and removes the dir."""
-        if agent not in _AGENT_CRED_LAYOUT:
+        Claude (SYM-233) is handed its bearer access token through the
+        environment — `{"CLAUDE_CODE_OAUTH_TOKEN": ...}`, nothing written to
+        disk. The environment is the only token source that arms the CLI's
+        mid-run auth recovery, so this is what makes a run survivable across a
+        rotation at all; a materialized credentials file never could. Only the
+        access token travels: the one-shot refresh token stays in the DB and
+        the daemon owns rotation centrally (SYM-227/228). When `run_id` is
+        given, the run is stamped with the token generation it started on, so a
+        later tick can tell whether it still holds the current token.
+
+        Codex still gets a private, single-run `CODEX_HOME` written from the DB
+        copy — concurrent runs each get their own dir, so they can never race
+        one shared credentials file.
+
+        Returns `{}` (and materializes nothing) for a non-agent run, when the
+        provider isn't UI-connected, or when a required refresh failed. The
+        caller MUST pass the returned env to `_finalize_claude_env` when the run
+        ends — that reads the (possibly refreshed) credential back for the DB
+        write-back and removes the dir."""
+        if agent not in _AGENT_CRED_PROVIDERS:
             return {}
-        env_var, filename = _AGENT_CRED_LAYOUT[agent]
         credential = await self._resolve_agent_credential(agent)
         if credential is None:
             return {}
@@ -3561,76 +3593,101 @@ class _OrchestratorBase:
         # codex via the CLI). Claude blocks dispatch on a hard refresh failure;
         # codex is fail-open (its refresh is best-effort — see the method).
         if agent == "claude":
-            credential = await self._maybe_refresh_claude_credential(credential)
-            if credential is None:
+            if await self._maybe_refresh_claude_credential(credential) is None:
                 return {}
-        elif agent == "codex":
-            credential = await self._maybe_refresh_codex_credential(credential)
-            if credential is None:
+            # Re-read rather than use what the refresh returned: the token the
+            # run is handed and the generation it is stamped with have to come
+            # from the same row snapshot, or a reconnect landing between them
+            # stamps the run as holding a newer token than it does.
+            snapshot = await self._resolve_claude_credential_and_generation()
+            if snapshot is None:
                 return {}
-        # SYM-228: a claude run gets an access-token-only copy — the one-shot
-        # refresh token is stripped so the CLI cannot rotate it (the daemon owns
-        # rotation centrally, SYM-227). The DB row keeps the full credential.
-        # codex is unchanged.
-        run_credential = strip_claude_refresh_token(credential) if agent == "claude" else credential
-        config_dir = Path(tempfile.mkdtemp(prefix=f"symphony-{agent}-"))
+            stored, generation = snapshot
+            token = claude_access_token(stored)
+            if token is None:
+                # A stored blob we can't read an access token out of must block
+                # dispatch, not fall through to whatever ambient auth the host
+                # happens to have (the SYM-206 hazard). Expiring the row is what
+                # blocks it: it arms the existing reconnect gate and makes the
+                # Connections card say so, instead of leaving a card reading
+                # `connected` while every dispatch quietly returns spawn_failed.
+                log.warning("claude credential holds no readable access token; expiring the row")
+                await db.oauth_connections.update_status(
+                    self._conn,
+                    provider="claude",
+                    status="expired",
+                    updated_at=self._now().strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    updated_by="unreadable",
+                )
+                return {}
+            if run_id is not None:
+                await self._stamp_claude_token_generation(run_id, generation)
+            return {_CLAUDE_TOKEN_ENV: token}
+        run_credential = await self._maybe_refresh_codex_credential(credential)
+        if run_credential is None:
+            return {}
+        config_dir = Path(tempfile.mkdtemp(prefix="symphony-codex-"))
         try:
             os.chmod(config_dir, 0o700)
-            credentials_path = config_dir / filename
+            credentials_path = config_dir / _CODEX_CRED_FILE
             credentials_path.write_text(run_credential, encoding="utf-8")
             credentials_path.chmod(0o600)
             # Pristine copy of what this run started from — the CAS guard the
-            # finalize write-back compares against (Config v2 5/9). For claude
-            # this is the stripped copy; the run can't rotate it, so the claude
-            # write-back is a no-op and the daemon-owned DB credential stands.
-            prior_path = config_dir / f"{filename}.orig"
+            # finalize write-back compares against (Config v2 5/9).
+            prior_path = config_dir / f"{_CODEX_CRED_FILE}.orig"
             prior_path.write_text(run_credential, encoding="utf-8")
             prior_path.chmod(0o600)
-            if agent == "codex":
-                # CODEX_HOME replaces the CLI's whole config dir, not just its
-                # auth: carry the deployment's config.toml (model/profile
-                # settings) into the per-run home so a UI-connected codex run
-                # doesn't silently drop it (Config v2 6/9 review fix).
-                default_toml = default_codex_credentials_path().parent / "config.toml"
-                if default_toml.exists():
-                    shutil.copy2(default_toml, config_dir / "config.toml")
-                # Force file-backed auth in the per-run home: a copied
-                # keyring/auto setting would make the run read the OS store,
-                # not our materialized auth.json (Config v2 6/9 review fix).
-                pin_file_auth_storage(config_dir)
+            # CODEX_HOME replaces the CLI's whole config dir, not just its
+            # auth: carry the deployment's config.toml (model/profile
+            # settings) into the per-run home so a UI-connected codex run
+            # doesn't silently drop it (Config v2 6/9 review fix).
+            default_toml = default_codex_credentials_path().parent / "config.toml"
+            if default_toml.exists():
+                shutil.copy2(default_toml, config_dir / "config.toml")
+            # Force file-backed auth in the per-run home: a copied
+            # keyring/auto setting would make the run read the OS store,
+            # not our materialized auth.json (Config v2 6/9 review fix).
+            pin_file_auth_storage(config_dir)
         except OSError:
-            log.warning("%s credential materialization failed", agent, exc_info=True)
+            log.warning("codex credential materialization failed", exc_info=True)
             shutil.rmtree(config_dir, ignore_errors=True)
             return {}
-        return {env_var: str(config_dir)}
+        return {_CODEX_HOME_ENV: str(config_dir)}
+
+    async def _stamp_claude_token_generation(self, run_id: str, generation: int) -> None:
+        """Record on the run row which minting of the shared Claude token this
+        run was dispatched on (SYM-233). Best-effort: a bookkeeping write must
+        never take down a dispatch that is otherwise ready to go."""
+        try:
+            await db.runs.stamp_claude_token_generation(self._conn, run_id, generation)
+        except Exception:  # noqa: BLE001 — a stamp failure must not block dispatch
+            log.warning("claude token generation stamp failed for run %s", run_id, exc_info=True)
 
     async def _finalize_claude_env(self, claude_env: dict[str, str]) -> None:
-        """Tear down a `_materialize_claude_env` dir: persist the (possibly
-        refreshed) credential back to the DB if it changed (OAuth in UI 5/7),
-        then remove the per-run dir. A no-op for `{}`. Never raises into the
-        finished run — write-back is best-effort."""
-        for agent, (env_var, filename) in _AGENT_CRED_LAYOUT.items():
-            config_dir = claude_env.get(env_var)
-            if not config_dir:
-                continue
-            credential = read_claude_credential(Path(config_dir) / filename)
-            prior = read_claude_credential(Path(config_dir) / f"{filename}.orig")
-            if credential and credential != prior:
-                expires_at = (
-                    claude_expires_at(credential)
-                    if agent == "claude"
-                    else codex_expires_at(credential)
+        """Tear down what `_materialize_claude_env` created: persist the
+        credential the run refreshed in place back to the DB if it changed
+        (OAuth in UI 5/7), then remove the per-run dir.
+
+        Only codex has anything to finalize — a claude env is a bare token with
+        no file behind it and no way for the run to rotate it, so both `{}` and
+        a claude env fall through as no-ops. Never raises into the finished
+        run — write-back is best-effort."""
+        config_dir = claude_env.get(_CODEX_HOME_ENV)
+        if not config_dir:
+            return
+        credential = read_claude_credential(Path(config_dir) / _CODEX_CRED_FILE)
+        prior = read_claude_credential(Path(config_dir) / f"{_CODEX_CRED_FILE}.orig")
+        if credential and credential != prior:
+            try:
+                await self._credential_write_back.write_back(
+                    "codex",
+                    credential,
+                    expires_at=codex_expires_at(credential),
+                    expected_prior=prior,
                 )
-                try:
-                    await self._credential_write_back.write_back(
-                        agent,
-                        credential,
-                        expires_at=expires_at,
-                        expected_prior=prior,
-                    )
-                except Exception:  # noqa: BLE001 — write-back must never break a finished run
-                    log.warning("%s credential write-back failed", agent, exc_info=True)
-            shutil.rmtree(config_dir, ignore_errors=True)
+            except Exception:  # noqa: BLE001 — write-back must never break a finished run
+                log.warning("codex credential write-back failed", exc_info=True)
+        shutil.rmtree(config_dir, ignore_errors=True)
 
     async def _run_stage_command(
         self,
@@ -3669,11 +3726,12 @@ class _OrchestratorBase:
             workspace_path=workspace_path,
         )
         run_credentials = await self._resolve_run_credentials(binding)
-        # Per-run private CLAUDE_CONFIG_DIR from the DB credential (Config v2
-        # 3/9); binding env still overrides. Materialized LAST — everything
-        # between here and the `finally` that tears it down must be
-        # infallible, or a setup failure would leak the dir (review fix).
-        claude_env = await self._materialize_claude_env(role.agent)
+        # Per-run agent credential from the DB (Config v2 3/9): a claude bearer
+        # token in the environment, a private CODEX_HOME for codex; binding env
+        # still overrides. Materialized LAST — everything between here and the
+        # `finally` that tears it down must be infallible, or a setup failure
+        # would leak the dir (review fix).
+        claude_env = await self._materialize_claude_env(role.agent, run_id=run_id)
         blocked = await self._post_materialize_block_reason(role.agent, claude_env)
         if blocked is not None:
             log.warning("run %s not dispatched: %s", run_id, blocked)
@@ -3996,7 +4054,7 @@ class _OrchestratorBase:
         run_credentials = await self._resolve_run_credentials(binding)
         # See `_run_stage_command`: materialized last so nothing fallible sits
         # between the dir's creation and the `finally` that tears it down.
-        claude_env = await self._materialize_claude_env(role.agent)
+        claude_env = await self._materialize_claude_env(role.agent, run_id=run_id)
         blocked = await self._post_materialize_block_reason(role.agent, claude_env)
         if blocked is not None:
             log.warning("run %s not dispatched: %s", run_id, blocked)
@@ -4789,13 +4847,19 @@ def _read_log_best_effort(log_path: Path) -> str | None:
         return None
 
 
-# Agent provider -> (env var the CLI reads its config dir from, credential
-# filename inside it). The per-run materialization/finalize pair (Config v2
-# 3/9 + 6/9) treats both agent CLIs uniformly through this table.
-_AGENT_CRED_LAYOUT: dict[str, tuple[str, str]] = {
-    "claude": ("CLAUDE_CONFIG_DIR", ".credentials.json"),
-    "codex": ("CODEX_HOME", "auth.json"),
-}
+# Agent providers whose credential can come from `oauth_connections` — the
+# membership test behind every "is this an agent auth path" branch (dispatch
+# gates, auth-failure flagging, per-agent credential envs).
+_AGENT_CRED_PROVIDERS: frozenset[str] = frozenset({"claude", "codex"})
+
+# How each agent CLI is handed its credential. Claude reads a bearer access
+# token from the environment (SYM-233) — the only source that arms its mid-run
+# auth recovery; a materialized credentials file does not arm it at all, so a
+# file-fed run could never survive a token rotation no matter what the daemon
+# did. Codex still reads a private per-run config dir (Config v2 6/9).
+_CLAUDE_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
+_CODEX_HOME_ENV = "CODEX_HOME"
+_CODEX_CRED_FILE = "auth.json"
 
 # Refresh horizon when no wall-clock cap is configured (Config v2 4/9): a
 # token must outlive the longest plausible run so the CLI never refreshes.
