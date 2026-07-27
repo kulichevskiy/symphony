@@ -20,7 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from symphony.agent.control_channel import is_control_frame, read_control_request
+from symphony.agent.control_channel import ControlRequest, Conversation, read_agent_frame
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.github.client import (
     DEFAULT_LOG_TAIL_BYTES,
@@ -189,8 +189,8 @@ class FakeRunner:
             self._queue.append(events)
 
     def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
-        if spec.prompt is not None:
-            self.prompts.append(spec.prompt)
+        if spec.conversation is not None:
+            self.prompts.append(spec.conversation.prompt)
         stage_q = self._stage_queues.get(spec.stage)
         if stage_q:
             return self._aiter(stage_q.pop(0), spec)
@@ -201,18 +201,37 @@ class FakeRunner:
     async def _aiter(
         self, events: list[RunnerEvent], spec: RunnerSpec
     ) -> AsyncIterator[RunnerEvent]:
+        conversation = spec.conversation
         for ev in events:
             # Keep the control-channel contract LocalRunner keeps (SYM-235):
             # a scripted control request is answered through the spec's handler
-            # and withheld from the event stream, so orchestrator tests written
-            # against this fake aren't testing a fiction.
-            if spec.prompt is not None and ev.kind == "stdout" and ev.line:
-                if is_control_frame(ev.line):
-                    request = read_control_request(ev.line)
-                    if request is not None and spec.control_handler is not None:
-                        await spec.control_handler(request)
+            # and withheld from the event stream, and a refusal ends the run
+            # right there — a fake that kept going would make every SYM-236
+            # orchestrator test written on it a fiction.
+            if conversation is not None and ev.kind == "stdout" and ev.line:
+                frame = read_agent_frame(ev.line)
+                if frame.control:
+                    if frame.request is not None and not await self._answered(
+                        conversation, frame.request
+                    ):
+                        yield RunnerEvent(kind="exit", returncode=-15)
+                        return
                     continue
             yield ev
+
+    @staticmethod
+    async def _answered(conversation: Conversation, request: ControlRequest) -> bool:
+        """True when the handler supplied a payload; False on any refusal.
+
+        Mirrors `ControlChannel._answer`: a handler that raises is a refusal,
+        not a crash.
+        """
+        if conversation.handler is None:
+            return False
+        try:
+            return await conversation.handler(request) is not None
+        except Exception:  # noqa: BLE001 — the real channel swallows this too
+            return False
 
     async def _default_aiter(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
         # Mirror a real run: announce the PID first so the orchestrator records

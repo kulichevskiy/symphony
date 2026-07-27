@@ -16,7 +16,7 @@ Three hazards shape the interface.
 **Control frames must never reach the run's event stream.** They share a pipe
 with the agent's own output, so a run that forwarded them would corrupt
 completion markers, cost accounting and verdict parsing at once — and it would
-not look like an auth bug when it happened. `observe()` reports whether it
+not look like an auth bug when it happened. `intercept()` reports whether it
 swallowed the line, and the caller filters on that.
 
 **The agent will not exit while stdin is open.** In stream-json input mode the
@@ -25,9 +25,10 @@ closes stdin as soon as the agent reports the turn finished. That is what turns
 "keep stdin open for the run's lifetime" into a run that actually ends.
 
 **A refusal must not cost the agent's whole retry window.** When the handler
-declines, the channel answers with an error and closes stdin rather than going
-quiet, and raises `refused` so the caller can stop the run instead of waiting
-for the agent to time out on its own.
+declines — which for a token request is the dispenser's own Refusal surfacing
+one layer up — the channel answers with an error and closes stdin rather than
+going quiet, and raises `refused` so the caller can stop the run instead of
+waiting for the agent to time out on its own.
 
 Handlers run as their own tasks rather than inline: one recovery produces
 several requests in quick succession (observed in the SYM-232 spike) and a
@@ -69,40 +70,73 @@ class ControlRequest:
 ControlHandler = Callable[[ControlRequest], Awaitable[Mapping[str, object] | None]]
 
 
-def _decode(line: str) -> Mapping[str, Any] | None:
+@dataclass(frozen=True)
+class Conversation:
+    """What turns a run from a monologue into a conversation.
+
+    One field on the spec rather than two, because the prompt and the handler
+    are never useful apart: a prompt on stdin with nobody to answer the
+    questions it provokes is exactly the hang this mode exists to remove.
+    """
+
+    prompt: str
+    handler: ControlHandler | None = None
+
+
+@dataclass(frozen=True)
+class AgentFrame:
+    """What one line of the agent's stdout is, to a run holding a channel.
+
+    `control` is the load-bearing bit: control traffic shares the pipe with the
+    agent's own output and must be withheld from the run's events. `request` is
+    the question to answer, absent on control frames that ask nothing of us.
+    `turn_end` says the agent considers the turn finished, which is the cue to
+    close stdin.
+    """
+
+    control: bool = False
+    request: ControlRequest | None = None
+    turn_end: bool = False
+
+
+_AGENT_OUTPUT = AgentFrame()
+
+
+def read_agent_frame(line: str) -> AgentFrame:
+    """Classify one stdout line, decoding it exactly once.
+
+    The single place that decides what counts as protocol traffic. Both the
+    real channel and the harness's deterministic runner go through it, so the
+    two cannot drift apart on the wire shape.
+    """
     try:
         event = json.loads(line)
     except (ValueError, TypeError):
-        return None
-    return event if isinstance(event, dict) else None
-
-
-def is_control_frame(line: str) -> bool:
-    """True when `line` is protocol traffic rather than agent output."""
-    event = _decode(line)
-    return event is not None and event.get("type") in _CONTROL_TYPES
-
-
-def read_control_request(line: str) -> ControlRequest | None:
-    """The control request `line` carries, or None if it carries none.
-
-    Shared with the harness's deterministic runner so the two cannot drift
-    apart on the wire shape.
-    """
-    event = _decode(line)
-    if event is None or event.get("type") != "control_request":
-        return None
+        return _AGENT_OUTPUT
+    if not isinstance(event, dict):
+        return _AGENT_OUTPUT
+    kind = event.get("type")
+    if kind not in _CONTROL_TYPES:
+        return AgentFrame(turn_end=kind in _TURN_END_TYPES)
+    if kind != "control_request":
+        return AgentFrame(control=True)
     raw = event.get("request")
     request: Mapping[str, Any] = raw if isinstance(raw, dict) else {}
+    # Shape observed in the SYM-232 spike: the id at the top level, the subtype
+    # inside `request`. The id is read from either spot because a run that
+    # cannot name the request it is answering simply dies.
     request_id = event.get("request_id") or request.get("request_id")
-    subtype = request.get("subtype") or event.get("subtype")
+    subtype = request.get("subtype")
     if not isinstance(request_id, str) or not isinstance(subtype, str):
         log.warning("ignoring a control request with no request_id/subtype: %.200s", line)
-        return None
-    return ControlRequest(request_id=request_id, subtype=subtype, request=request)
+        return AgentFrame(control=True)
+    return AgentFrame(
+        control=True,
+        request=ControlRequest(request_id=request_id, subtype=subtype, request=request),
+    )
 
 
-def user_message(text: str) -> Mapping[str, object]:
+def _user_message(text: str) -> Mapping[str, object]:
     """The stream-json frame that carries a prompt to the agent."""
     return {
         "type": "user",
@@ -110,7 +144,7 @@ def user_message(text: str) -> Mapping[str, object]:
     }
 
 
-def success_response(request_id: str, payload: Mapping[str, object]) -> Mapping[str, object]:
+def _success_response(request_id: str, payload: Mapping[str, object]) -> Mapping[str, object]:
     return {
         "type": "control_response",
         "response": {
@@ -121,7 +155,7 @@ def success_response(request_id: str, payload: Mapping[str, object]) -> Mapping[
     }
 
 
-def error_response(request_id: str, message: str) -> Mapping[str, object]:
+def _error_response(request_id: str, message: str) -> Mapping[str, object]:
     return {
         "type": "control_response",
         "response": {"subtype": "error", "request_id": request_id, "error": message},
@@ -131,19 +165,19 @@ def error_response(request_id: str, message: str) -> Mapping[str, object]:
 class ControlChannel:
     """The stdin side of one run, and the answers that travel down it.
 
-    Feed every stdout line through `observe()`; it returns True for the lines
+    Feed every stdout line through `intercept()`; it returns True for the lines
     that belong to the protocol and must be withheld from the run's events.
     """
 
     def __init__(
         self,
         stdin: asyncio.StreamWriter,
-        handler: ControlHandler | None,
+        conversation: Conversation,
         *,
         run_id: str,
     ) -> None:
         self._stdin = stdin
-        self._handler = handler
+        self._handler = conversation.handler
         self._run_id = run_id
         self._tasks: set[asyncio.Task[None]] = set()
         self._turn_over = False
@@ -152,26 +186,20 @@ class ControlChannel:
         self.refused = asyncio.Event()
 
     async def send_prompt(self, text: str) -> None:
-        await self._write(user_message(text))
+        await self._write(_user_message(text))
 
-    def observe(self, line: str) -> bool:
+    def intercept(self, line: str) -> bool:
         """Take one stdout line. True when it was protocol traffic.
 
         Also notices the agent's end-of-turn marker and closes stdin, since an
         agent whose stdin stays open never exits on its own.
         """
-        event = _decode(line)
-        if event is None:
-            return False
-        kind = event.get("type")
-        if kind not in _CONTROL_TYPES:
-            if kind in _TURN_END_TYPES:
-                self._end_turn()
-            return False
-        request = read_control_request(line)
-        if request is not None:
-            self._spawn(self._answer(request))
-        return True
+        frame = read_agent_frame(line)
+        if frame.turn_end:
+            self._end_turn()
+        if frame.request is not None:
+            self._spawn(self._answer(frame.request))
+        return frame.control
 
     async def aclose(self) -> None:
         """Abandon any in-flight handler and close stdin. Idempotent."""
@@ -205,13 +233,13 @@ class ControlChannel:
                 )
         if payload is None:
             log.warning("refusing control request %s for run_id=%s", request.subtype, self._run_id)
-            await self._write(error_response(request.request_id, _REFUSAL_MESSAGE))
+            await self._write(_error_response(request.request_id, _REFUSAL_MESSAGE))
             # Nothing better is coming, so don't leave the agent listening.
             self._end_turn()
             self.refused.set()
             return
         log.info("answered control request %s for run_id=%s", request.subtype, self._run_id)
-        await self._write(success_response(request.request_id, payload))
+        await self._write(_success_response(request.request_id, payload))
 
     def _end_turn(self) -> None:
         if self._turn_over:

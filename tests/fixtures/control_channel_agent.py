@@ -8,7 +8,9 @@ stdin ends it. That last part is the point: a runner that forgets to close stdin
 leaves this process hanging exactly the way it would leave a real one.
 
 Flags:
-  --ask-token   emit one `control_request` and block until it is answered
+  --ask-token   emit one `control_request` and block until it is answered.
+                Repeatable: one 401 recovery produced three requests in ~1.2s
+                in the SYM-232 spike, so a run has to survive a burst of them.
   --linger      after a refusal, sleep past any sane test timeout, standing in
                 for the real CLI waiting out its own retry window
 """
@@ -31,25 +33,27 @@ def prompt_text(line: str) -> str:
     return str(json.loads(line)["message"]["content"][0]["text"])
 
 
-def ask_for_token(argv: list[str]) -> None:
+def ask_for_token(argv: list[str], nth: int) -> bool:
+    """Ask once. False once the answer means there is no point asking again."""
     emit(
         {
             "type": "control_request",
-            "request_id": "req-1",
+            "request_id": f"req-{nth}",
             "request": {"subtype": "oauth_token_refresh"},
         }
     )
     reply = sys.stdin.readline()
     if not reply:
         emit({"type": "assistant", "text": "token:eof"})
-        return
+        return False
     response = json.loads(reply)["response"]
     if response.get("subtype") == "success":
         emit({"type": "assistant", "text": "token:" + response["response"]["accessToken"]})
-        return
+        return True
     emit({"type": "assistant", "text": "token:refused"})
     if "--linger" in argv:
         time.sleep(LINGER_SECS)
+    return False
 
 
 def main() -> int:
@@ -60,8 +64,9 @@ def main() -> int:
         emit({"type": "result", "result": "SYMPHONY_DONE"})
         return 0
     emit({"type": "assistant", "text": "prompt:" + prompt_text(line)})
-    if "--ask-token" in argv:
-        ask_for_token(argv)
+    for nth in range(1, argv.count("--ask-token") + 1):
+        if not ask_for_token(argv, nth):
+            break
     emit({"type": "result", "result": "SYMPHONY_DONE"})
     for _ in sys.stdin:
         pass
