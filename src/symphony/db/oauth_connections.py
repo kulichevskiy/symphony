@@ -164,14 +164,16 @@ async def set_connection(
     `commit=False` lets a caller fold this into a larger atomic transaction it
     commits itself.
 
-    `expect_connected_generation` makes the upsert compare-and-set *inside the
-    statement* (SYM-234): the write lands only if the row is still `connected`
-    and still holds that generation. A caller that checks those separately
-    leaves a window in which a liveness Test expires the row between its check
-    and its write — and since this function re-persists as `connected`, the
-    write would silently clear a reconnect gate that had just been armed. The
-    generation counter still advances on a refused write, leaving a gap; gaps
-    are harmless because the counter only ever has to be monotonic, never dense.
+    `expect_connected_generation` makes the write compare-and-set *inside the
+    statement*, and update-only (SYM-234): it lands solely if the row still
+    exists, is still `connected`, and still holds that generation. A caller that
+    checks those separately leaves a window in which a liveness Test expires the
+    row, or an operator disconnects it, between the check and the write — and
+    since this function re-persists as `connected`, the write would silently
+    clear a reconnect gate that had just been armed, or resurrect a connection
+    that had just been deleted. The generation counter still advances on a
+    refused write, leaving a gap; gaps are harmless because the counter only
+    ever has to be monotonic, never dense.
 
     Every upsert advances the provider's `generation` (SYM-233) — this is the
     one choke point through which a replacement credential reaches the store,
@@ -196,41 +198,58 @@ async def set_connection(
     )
     row = await cur.fetchone()
     generation = int(row["generation"]) if row is not None else 1
-    guard = (
-        ""
-        if expect_connected_generation is None
-        else " WHERE oauth_connections.status = 'connected' AND oauth_connections.generation = ?"
-    )
-    params: list[object] = [
-        provider,
-        encrypted,
-        encrypted_refresh,
-        status,
-        expires_at,
-        updated_at,
-        updated_by,
-        generation,
-    ]
     if expect_connected_generation is not None:
-        params.append(expect_connected_generation)
-    cur = await conn.execute(
-        f"""
-        INSERT INTO oauth_connections
-            (provider, credential, refresh_token, status, expires_at, updated_at, updated_by,
-             generation)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(provider) DO UPDATE SET
-            credential = excluded.credential,
-            refresh_token = excluded.refresh_token,
-            status = excluded.status,
-            expires_at = excluded.expires_at,
-            updated_at = excluded.updated_at,
-            updated_by = excluded.updated_by,
-            generation = excluded.generation
-        {guard}
-        """,
-        params,
-    )
+        # Update-only, deliberately. A guarded write always means "replace the
+        # row I decided about", never "create one" — an upsert would take the
+        # INSERT path when a Disconnect removed the row mid-flight (nothing left
+        # to conflict with, so the guard on DO UPDATE never applies) and
+        # resurrect the credential the operator just deleted.
+        cur = await conn.execute(
+            """
+            UPDATE oauth_connections SET
+                credential = ?, refresh_token = ?, status = ?, expires_at = ?,
+                updated_at = ?, updated_by = ?, generation = ?
+            WHERE provider = ? AND status = 'connected' AND generation = ?
+            """,
+            (
+                encrypted,
+                encrypted_refresh,
+                status,
+                expires_at,
+                updated_at,
+                updated_by,
+                generation,
+                provider,
+                expect_connected_generation,
+            ),
+        )
+    else:
+        cur = await conn.execute(
+            """
+            INSERT INTO oauth_connections
+                (provider, credential, refresh_token, status, expires_at, updated_at, updated_by,
+                 generation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider) DO UPDATE SET
+                credential = excluded.credential,
+                refresh_token = excluded.refresh_token,
+                status = excluded.status,
+                expires_at = excluded.expires_at,
+                updated_at = excluded.updated_at,
+                updated_by = excluded.updated_by,
+                generation = excluded.generation
+            """,
+            (
+                provider,
+                encrypted,
+                encrypted_refresh,
+                status,
+                expires_at,
+                updated_at,
+                updated_by,
+                generation,
+            ),
+        )
     if commit:
         await conn.commit()
     return cur.rowcount > 0

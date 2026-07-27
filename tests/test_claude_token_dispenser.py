@@ -370,6 +370,56 @@ async def test_the_write_back_cas_is_enforced_inside_the_statement(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_a_guarded_write_never_recreates_a_disconnected_connection(tmp_path: Path) -> None:
+    """A guarded write means "replace the row I decided about", never "create
+    one". An upsert would take the INSERT path once a Disconnect removed the row
+    — nothing left to conflict with, so the guard on the update never applies —
+    and resurrect as `connected` the credential the operator just deleted."""
+    conn = await db.connect(tmp_path / "state.sqlite")
+    cipher = CredentialCipher(_KEY)
+    try:
+        await _store(conn, _cred("tok-v0"))
+        await db.oauth_connections.delete(conn, "claude")
+
+        wrote = await db.oauth_connections.set_connection(
+            conn,
+            provider="claude",
+            credential=_cred("tok-rotated"),
+            cipher=cipher,
+            expect_connected_generation=1,
+        )
+
+        assert wrote is False
+        assert await db.oauth_connections.get_status(conn, "claude") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_disconnect_landing_mid_rotation_is_not_undone(tmp_path: Path) -> None:
+    """The same race end to end: the operator disconnects while the exchange is
+    in flight, and the rotation must not bring the connection back."""
+    conn, dispenser = await _open(tmp_path)
+
+    async def _disconnect_mid_flight(request: httpx.Request) -> httpx.Response:
+        await db.oauth_connections.delete(conn, "claude")
+        return _minted("tok-rotated")
+
+    respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(side_effect=_disconnect_mid_flight)
+    try:
+        await _store(conn, _cred("tok-v0"))
+
+        served = await dispenser.request(1)
+
+        assert isinstance(served, TokenRefusal)
+        assert served.permanent is True
+        assert await db.oauth_connections.get_status(conn, "claude") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 @respx.mock
 async def test_a_request_timeout_is_retried_rather_than_read_as_a_dead_account(
     tmp_path: Path,
