@@ -621,16 +621,18 @@ async def test_runner_scrubs_symphony_env_from_agent(tmp_path: Path, monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_runner_scrubs_ambient_claude_auth_when_config_dir_materialized(
+async def test_runner_scrubs_ambient_claude_auth_when_a_token_is_materialized(
     tmp_path: Path,
     monkeypatch,  # type: ignore[no-untyped-def]
 ) -> None:
-    """When a run carries a materialized CLAUDE_CONFIG_DIR (a DB-resolved Claude
-    credential), the daemon host's ambient ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN
-    must NOT leak into the child — Claude Code prefers an ambient token over the
-    on-disk credential, so the host key would silently win over the UI-connected
-    account (the SYM-206 hazard). GitHub/Linear env is unaffected (SYM-215 scope)."""
+    """When a run carries a materialized Claude bearer token (SYM-233), the
+    daemon host's ambient ANTHROPIC_API_KEY must NOT leak into the child —
+    Claude Code prefers an ambient API key over the token we hand it, so the
+    host key would silently win over the UI-connected account (the SYM-206
+    hazard). An inherited CLAUDE_CODE_OAUTH_TOKEN loses to the run's own on the
+    merge. GitHub/Linear env is unaffected (SYM-215 scope)."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "host-key")
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "host-auth")
     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "host-oauth")
     monkeypatch.setenv("LINEAR_API_KEY", "keep-linear")
     runner = LocalRunner()
@@ -641,15 +643,15 @@ async def test_runner_scrubs_ambient_claude_auth_when_config_dir_materialized(
             "sh",
             "-c",
             'printf "%s|%s|%s|%s\\n" "${ANTHROPIC_API_KEY:-unset}" '
-            '"${CLAUDE_CODE_OAUTH_TOKEN:-unset}" "${LINEAR_API_KEY:-unset}" '
-            '"${CLAUDE_CONFIG_DIR:-unset}"',
+            '"${ANTHROPIC_AUTH_TOKEN:-unset}" "${LINEAR_API_KEY:-unset}" '
+            '"${CLAUDE_CODE_OAUTH_TOKEN:-unset}"',
         ],
         stall_secs=10,
-        env={"CLAUDE_CONFIG_DIR": str(tmp_path / "cfg")},
+        env={"CLAUDE_CODE_OAUTH_TOKEN": "run-token"},
     )
     events = [ev async for ev in runner.run(spec)]
     lines = [ev.line for ev in events if ev.kind == "stdout"]
-    assert lines == [f"unset|unset|keep-linear|{tmp_path / 'cfg'}"]
+    assert lines == ["unset|unset|keep-linear|run-token"]
 
 
 @pytest.mark.asyncio
@@ -682,8 +684,8 @@ async def test_runner_keeps_ambient_agent_auth_without_materialized_cred(
     tmp_path: Path,
     monkeypatch,  # type: ignore[no-untyped-def]
 ) -> None:
-    """No materialized agent credential (no CLAUDE_CONFIG_DIR / CODEX_HOME in
-    spec.env) → ambient agent-auth env is left untouched. The scrub is scoped to
+    """No materialized agent credential (no CLAUDE_CODE_OAUTH_TOKEN / CODEX_HOME
+    in spec.env) → ambient agent-auth env is left untouched. The scrub is scoped to
     UI-backed runs; a binding running purely on ambient host auth still works."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "host-key")
     monkeypatch.setenv("OPENAI_API_KEY", "host-openai")
@@ -709,7 +711,7 @@ async def test_runner_binding_agent_auth_override_survives_scrub(
     monkeypatch,  # type: ignore[no-untyped-def]
 ) -> None:
     """A binding that sets ANTHROPIC_API_KEY explicitly via `env:` still wins even
-    when CLAUDE_CONFIG_DIR is materialized — the scrub only strips *inherited*
+    when a Claude token is materialized — the scrub only strips *inherited*
     ambient auth, never a per-binding override."""
     monkeypatch.setenv("ANTHROPIC_API_KEY", "host-key")
     runner = LocalRunner()
@@ -719,7 +721,7 @@ async def test_runner_binding_agent_auth_override_survives_scrub(
         command=["sh", "-c", 'printf "%s\\n" "${ANTHROPIC_API_KEY:-unset}"'],
         stall_secs=10,
         env={
-            "CLAUDE_CONFIG_DIR": str(tmp_path / "cfg"),
+            "CLAUDE_CODE_OAUTH_TOKEN": "run-token",
             "ANTHROPIC_API_KEY": "binding-key",
         },
     )

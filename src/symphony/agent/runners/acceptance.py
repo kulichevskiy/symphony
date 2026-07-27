@@ -205,8 +205,8 @@ async def run_acceptance(
     codex_model: str = DEFAULT_CODEX_MODEL,
     claude_model: str | None = None,
     effort: str | None = None,
-    # Per-run credential env from the orchestrator (e.g. CLAUDE_CONFIG_DIR,
-    # Config v2 3/9) — merged under every spec's own env.
+    # Per-run credential env from the orchestrator (e.g.
+    # CLAUDE_CODE_OAUTH_TOKEN, Config v2 3/9) — merged under every spec's own env.
     extra_env: dict[str, str] | None = None,
 ) -> AcceptanceVerdict:
     # `{log_root}/{run_id}.log` is the run's tailable log — the acceptance

@@ -142,8 +142,9 @@ async def run_verify_session(
     usage_handler: Callable[[Usage], object] | None = None,
     fix_log_path: Path | None = None,
     allow_fixes: bool = True,
-    # Per-run credential env for the agent fix turn (e.g. CLAUDE_CONFIG_DIR,
-    # Config v2 3/9), resolved lazily: a green verify_cmd never launches an
+    # Per-run credential env for the agent fix turn (e.g.
+    # CLAUDE_CODE_OAUTH_TOKEN, Config v2 3/9), resolved lazily: a green
+    # verify_cmd never launches an
     # agent, so it must not materialize (or refresh) credentials at all.
     extra_env_provider: Callable[[], Awaitable[dict[str, str]]] | None = None,
 ) -> VerifyResult:

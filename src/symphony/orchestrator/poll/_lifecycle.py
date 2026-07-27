@@ -43,7 +43,7 @@ from ...pipeline.verify import VerifyResult, run_verify_session
 from ...tokens import effective_tokens
 from ...tracker import Issue as LinearIssue
 from ._base import (
-    _AGENT_CRED_LAYOUT,
+    _AGENT_CRED_PROVIDERS,
     _binding_storage_key,
     _local_review_status_from_result,
     _OrchestratorBase,
@@ -1604,7 +1604,9 @@ class _LifecycleMixin(_OrchestratorBase):
                 for lr_agent in ("claude", "codex"):
                     if lr_agent not in lr_role_agents:
                         continue
-                    env_for_agent = await self._materialize_claude_env(lr_agent)
+                    env_for_agent = await self._materialize_claude_env(
+                        lr_agent, run_id=local_review_run_id
+                    )
                     agent_envs[lr_agent] = env_for_agent
                     claude_env.update(env_for_agent)
                     # Post-materialize gate: a refresh that failed inside
@@ -1658,7 +1660,7 @@ class _LifecycleMixin(_OrchestratorBase):
                 # codex fixer), flipping the card + arming the dispatch gate.
                 lr_api_error = result.api_error if result is not None else None
                 lr_failed_agent = result.api_error_agent if result is not None else None
-                if lr_api_error is not None and lr_failed_agent in _AGENT_CRED_LAYOUT:
+                if lr_api_error is not None and lr_failed_agent in _AGENT_CRED_PROVIDERS:
                     # Recorded under the parent run id so the caller's requeue
                     # decision reuses THIS verdict rather than re-validating (a
                     # second refresh could fail transiently and undo it).
@@ -1677,7 +1679,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     for extra_error, extra_agent in (
                         result.extra_api_errors if result is not None else ()
                     ):
-                        if extra_agent in _AGENT_CRED_LAYOUT and extra_agent != lr_failed_agent:
+                        if extra_agent in _AGENT_CRED_PROVIDERS and extra_agent != lr_failed_agent:
                             extra_usable = await self._flag_claude_auth_failure(
                                 extra_agent,
                                 extra_error,
@@ -1708,7 +1710,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     lr_roles_agents = {reviewer_role.agent, verifier_role.agent, fixer_role.agent}
                     if len(lr_roles_agents) == 1:
                         (lr_scrape_agent,) = lr_roles_agents
-                        if lr_scrape_agent in _AGENT_CRED_LAYOUT:
+                        if lr_scrape_agent in _AGENT_CRED_PROVIDERS:
                             scraped_requeue = await self._flag_auth_failure_from_log(
                                 lr_scrape_agent,
                                 self.config.log_root / f"{local_review_run_id}.log",
@@ -2130,7 +2132,9 @@ class _LifecycleMixin(_OrchestratorBase):
 
         async def _verify_fix_env() -> dict[str, str]:
             if not verify_claude_env:
-                verify_claude_env.update(await self._materialize_claude_env(fixer_role.agent))
+                verify_claude_env.update(
+                    await self._materialize_claude_env(fixer_role.agent, run_id=verify_run_id)
+                )
                 blocked = await self._post_materialize_block_reason(
                     fixer_role.agent, verify_claude_env
                 )

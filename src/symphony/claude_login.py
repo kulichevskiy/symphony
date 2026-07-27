@@ -259,30 +259,28 @@ def claude_expires_at(raw: str) -> str | None:
     return datetime.fromtimestamp(expires_ms / 1000, tz=UTC).strftime(_ISO_FORMAT)
 
 
+def claude_access_token(raw: str) -> str | None:
+    """The bearer access token inside the stored credential blob, or `None`
+    when the blob isn't the expected shape.
+
+    This is what a run is handed (SYM-233): the CLI reads it from the
+    environment, which is the only source that arms its mid-run auth recovery —
+    a materialized credentials file does not. The refresh token stays in the
+    DB, so a run cannot rotate it."""
+    parsed = _parse_claude_oauth(raw)
+    if parsed is None:
+        return None
+    _, oauth = parsed
+    token = oauth.get("accessToken")
+    return token if isinstance(token, str) and token else None
+
+
 def claude_credential_expired(raw: str) -> bool:
     """Whether the stored credential's access token is past its `expiresAt`.
     A blob with no parseable expiry is treated as not-expired — the card's
     `Test` reflects "live" rather than flipping a usable connection to expired
     on a format we don't recognize."""
     return claude_credential_expires_within(raw, 0.0)
-
-
-def strip_claude_refresh_token(raw: str) -> str:
-    """Return the credential blob with the one-shot refresh token removed
-    (SYM-228). A run's CLI then holds a bearer access token it cannot rotate, so
-    concurrent runs — and a single issue's own claude processes — can't consume
-    each other's refresh token ("Not logged in" mid-run). The daemon keeps the
-    full credential, refresh token included, in the DB and owns rotation
-    centrally (SYM-227). Input that isn't the expected blob is returned
-    unchanged."""
-    parsed = _parse_claude_oauth(raw)
-    if parsed is None:
-        return raw
-    payload, oauth = parsed
-    if "refreshToken" not in oauth:
-        return raw
-    payload["claudeAiOauth"] = {k: v for k, v in oauth.items() if k != "refreshToken"}
-    return json.dumps(payload)
 
 
 def claude_credential_expires_within(raw: str, horizon_secs: float) -> bool:
