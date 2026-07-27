@@ -288,6 +288,70 @@ async def test_abandoning_a_run_leaves_no_child_and_no_bookkeeping(tmp_path: Pat
         os.killpg(pid, 0)
 
 
+@pytest.mark.asyncio
+async def test_an_unaddressable_request_ends_the_run_rather_than_stalling(
+    tmp_path: Path,
+) -> None:
+    # No request_id means no way to reply. The agent is already blocked on that
+    # reply, so saying nothing costs the run its whole stall window — minutes,
+    # with nothing in the events to say why.
+    runner = LocalRunner()
+    handler = _Handler({"accessToken": "tok-1"})
+    spec = _spec(
+        tmp_path, "r-no-id", "--ask-token", "--no-id", conversation=_talking(handler=handler)
+    )
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    events = await _collect(runner, spec, within=15)
+    assert not handler.seen
+    assert loop.time() - started < 10
+    assert events[-1].kind == "exit"
+    assert not [e for e in events if e.kind == "stall_timeout"]
+
+
+@pytest.mark.asyncio
+async def test_a_request_naming_nothing_is_still_answered(tmp_path: Path) -> None:
+    # Addressable but unintelligible. It reaches the handler with an empty
+    # subtype, which no handler recognises — and its refusal is a prompt,
+    # correctly addressed error rather than silence.
+    runner = LocalRunner()
+    handler = _Handler(None)
+    spec = _spec(
+        tmp_path,
+        "r-no-subtype",
+        "--ask-token",
+        "--no-subtype",
+        conversation=_talking(handler=handler),
+    )
+    events = await _collect(runner, spec, within=15)
+    assert [r.subtype for r in handler.seen] == [""]
+    assert '{"type": "assistant", "text": "token:refused"}' in _stdout(events)
+    assert events[-1].kind == "exit"
+
+
+@pytest.mark.asyncio
+async def test_an_answer_that_cannot_be_delivered_is_a_refusal(tmp_path: Path) -> None:
+    # A handler may honour its contract and still hand back something that will
+    # not serialize. The agent cannot tell the difference between a lost answer
+    # and no answer, so neither may we: it is a refusal, not a log line.
+    runner = LocalRunner()
+    handler = _Handler({"accessToken": object()})
+    spec = _spec(
+        tmp_path,
+        "r-unserializable",
+        "--ask-token",
+        "--linger",
+        conversation=_talking(handler=handler),
+    )
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    events = await _collect(runner, spec, within=LINGER_SECS - 5)
+    assert handler.seen
+    assert loop.time() - started < LINGER_SECS / 2
+    assert events[-1].kind == "exit"
+    assert not [e for e in events if e.kind == "stall_timeout"]
+
+
 # --- the contract the harness's deterministic runner has to keep -----------
 
 

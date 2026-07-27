@@ -15,6 +15,8 @@ Flags:
                 for the real CLI waiting out its own retry window
   --deaf        ignore SIGTERM, so only SIGKILL can end this process
   --malformed   emit a frame whose `type` is a list, not a string
+  --no-id       ask with a request the host has no way to address
+  --no-subtype  ask with a request that names nothing
 """
 
 from __future__ import annotations
@@ -36,15 +38,21 @@ def prompt_text(line: str) -> str:
     return str(json.loads(line)["message"]["content"][0]["text"])
 
 
+def request_frame(argv: list[str], nth: int) -> dict[str, object]:
+    if "--no-id" in argv:
+        return {"type": "control_request", "request": {"subtype": "oauth_token_refresh"}}
+    if "--no-subtype" in argv:
+        return {"type": "control_request", "request_id": f"req-{nth}", "request": {}}
+    return {
+        "type": "control_request",
+        "request_id": f"req-{nth}",
+        "request": {"subtype": "oauth_token_refresh"},
+    }
+
+
 def ask_for_token(argv: list[str], nth: int) -> bool:
     """Ask once. False once the answer means there is no point asking again."""
-    emit(
-        {
-            "type": "control_request",
-            "request_id": f"req-{nth}",
-            "request": {"subtype": "oauth_token_refresh"},
-        }
-    )
+    emit(request_frame(argv, nth))
     reply = sys.stdin.readline()
     if not reply:
         emit({"type": "assistant", "text": "token:eof"})

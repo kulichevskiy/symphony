@@ -91,12 +91,15 @@ class AgentFrame:
     agent's own output and must be withheld from the run's events. `request` is
     the question to answer, absent on control frames that ask nothing of us.
     `turn_end` says the agent considers the turn finished, which is the cue to
-    close stdin.
+    close stdin. `unanswerable` marks a request the agent is already blocked on
+    and that nobody can address — the one case where silence would cost the run
+    its whole stall window.
     """
 
     control: bool = False
     request: ControlRequest | None = None
     turn_end: bool = False
+    unanswerable: bool = False
 
 
 _AGENT_OUTPUT = AgentFrame()
@@ -131,10 +134,18 @@ def read_agent_frame(line: str) -> AgentFrame:
     # inside `request`. The id is read from either spot because a run that
     # cannot name the request it is answering simply dies.
     request_id = event.get("request_id") or request.get("request_id")
+    if not isinstance(request_id, str):
+        # The agent is waiting on a response we have no way to address. Saying
+        # nothing costs the run its stall window; the channel ends it instead.
+        log.warning("a control request arrived with no usable request_id: %.200s", line)
+        return AgentFrame(control=True, unanswerable=True)
     subtype = request.get("subtype")
-    if not isinstance(request_id, str) or not isinstance(subtype, str):
-        log.warning("ignoring a control request with no request_id/subtype: %.200s", line)
-        return AgentFrame(control=True)
+    if not isinstance(subtype, str):
+        # Addressable but unintelligible. Hand it on anyway: the handler will
+        # not recognise it, and its refusal is a prompt, correctly addressed
+        # error rather than silence.
+        log.warning("a control request arrived with no subtype: %.200s", line)
+        subtype = ""
     return AgentFrame(
         control=True,
         request=ControlRequest(request_id=request_id, subtype=subtype, request=request),
@@ -204,6 +215,8 @@ class ControlChannel:
             self._end_turn()
         if frame.request is not None:
             self._spawn(self._answer(frame.request))
+        elif frame.unanswerable:
+            self._spawn(self._refuse(None, "the request could not be understood"))
         return frame.control
 
     async def aclose(self) -> None:
@@ -237,14 +250,25 @@ class ControlChannel:
                     request.subtype,
                 )
         if payload is None:
-            log.warning("refusing control request %s for run_id=%s", request.subtype, self._run_id)
-            await self._write(_error_response(request.request_id, _REFUSAL_MESSAGE))
-            # Nothing better is coming, so don't leave the agent listening.
-            self._end_turn()
-            self.refused.set()
+            await self._refuse(request.request_id, _REFUSAL_MESSAGE)
+            return
+        if not await self._write(_success_response(request.request_id, payload)):
+            # The answer exists but could not be handed over — an unserializable
+            # payload, a child that died mid-write. The agent is still blocked,
+            # so this is a refusal like any other, not something to log and walk
+            # away from.
+            await self._refuse(request.request_id, "the answer could not be delivered")
             return
         log.info("answered control request %s for run_id=%s", request.subtype, self._run_id)
-        await self._write(_success_response(request.request_id, payload))
+
+    async def _refuse(self, request_id: str | None, reason: str) -> None:
+        """Decline, tell the agent so, and stop the run waiting on us."""
+        log.warning("refusing a control request for run_id=%s: %s", self._run_id, reason)
+        if request_id is not None:
+            await self._write(_error_response(request_id, reason))
+        # Nothing better is coming, so don't leave the agent listening.
+        self._end_turn()
+        self.refused.set()
 
     def _end_turn(self) -> None:
         if self._turn_over:
@@ -262,19 +286,32 @@ class ControlChannel:
             if not self._stdin.is_closing():
                 self._stdin.close()
 
-    async def _write(self, frame: Mapping[str, object]) -> None:
+    async def _write(self, frame: Mapping[str, object]) -> bool:
+        """Put one frame on the agent's stdin. False if it did not get there.
+
+        Callers must act on False: a frame the agent never received leaves it
+        waiting, and waiting costs the run its whole stall window."""
         if self._stdin.is_closing():
             log.warning(
                 "dropping a %s frame for run_id=%s: stdin is closed", frame["type"], self._run_id
             )
-            return
+            return False
         try:
-            self._stdin.write((json.dumps(frame) + "\n").encode())
+            payload = (json.dumps(frame) + "\n").encode()
+        except (TypeError, ValueError):
+            log.exception(
+                "could not serialize a %s frame for run_id=%s", frame["type"], self._run_id
+            )
+            return False
+        try:
+            self._stdin.write(payload)
             await self._stdin.drain()
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001 — the child may have died mid-write
             log.warning("could not write to run_id=%s stdin: %s", self._run_id, e)
+            return False
+        return True
 
     def _spawn(self, coro: Coroutine[Any, Any, None]) -> None:
         task = asyncio.ensure_future(coro)
