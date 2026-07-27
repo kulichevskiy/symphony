@@ -18,10 +18,11 @@ import os
 import sys
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
-from symphony.agent.control_channel import ControlRequest, Conversation
+from symphony.agent.control_channel import ControlChannel, ControlRequest, Conversation
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.agent.runners.local import LocalRunner
 from tests.harness.fakes import FakeRunner
@@ -350,6 +351,65 @@ async def test_an_answer_that_cannot_be_delivered_is_a_refusal(tmp_path: Path) -
     assert loop.time() - started < LINGER_SECS / 2
     assert events[-1].kind == "exit"
     assert not [e for e in events if e.kind == "stall_timeout"]
+
+
+# --- the channel on its own, where the ordering is exact -------------------
+
+
+class _FakeStdin:
+    """Enough of `StreamWriter` for the channel, and a record of what it wrote."""
+
+    def __init__(self) -> None:
+        self.frames: list[dict[str, Any]] = []
+        self.closed = False
+
+    def write(self, data: bytes) -> None:
+        self.frames.append(json.loads(data))
+
+    async def drain(self) -> None:
+        return None
+
+    def is_closing(self) -> bool:
+        return self.closed
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _channel(handler: _Handler | None) -> tuple[ControlChannel, _FakeStdin]:
+    stdin = _FakeStdin()
+    channel = ControlChannel(
+        cast(asyncio.StreamWriter, stdin), Conversation("hi", handler), run_id="r-unit"
+    )
+    return channel, stdin
+
+
+@pytest.mark.asyncio
+async def test_a_closed_channel_stops_handing_requests_to_the_handler() -> None:
+    # The handler has side effects: the dispenser would burn a single-use
+    # refresh token minting an answer that stdin can no longer carry. A request
+    # arriving after the refusal is still protocol traffic and still withheld —
+    # it just must not be acted on.
+    handler = _Handler(None)
+    channel, stdin = _channel(handler)
+    assert channel.intercept(_control_request("req-1")) is True
+    await asyncio.wait_for(channel.refused.wait(), timeout=2)
+    assert channel.intercept(_control_request("req-2")) is True
+    await asyncio.sleep(0.05)
+    assert [r.request_id for r in handler.seen] == ["req-1"]
+    assert [f["response"]["request_id"] for f in stdin.frames] == ["req-1"]
+    await channel.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_request_arriving_after_the_turn_ended_is_not_acted_on() -> None:
+    handler = _Handler({"accessToken": "tok-1"})
+    channel, _ = _channel(handler)
+    assert channel.intercept('{"type": "result", "result": "done"}') is False
+    assert channel.intercept(_control_request("req-1")) is True
+    await asyncio.sleep(0.05)
+    assert handler.seen == []
+    await channel.aclose()
 
 
 # --- the contract the harness's deterministic runner has to keep -----------

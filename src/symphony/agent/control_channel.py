@@ -213,10 +213,22 @@ class ControlChannel:
         frame = read_agent_frame(line)
         if frame.turn_end:
             self._end_turn()
-        if frame.request is not None:
-            self._spawn(self._answer(frame.request))
-        elif frame.unanswerable:
+        if frame.request is None and frame.unanswerable:
             self._spawn(self._refuse(None, "the request could not be understood"))
+        elif frame.request is not None:
+            if self._turn_over:
+                # stdin is shut: whatever the handler produced could not be
+                # handed over. That matters because the handler has side
+                # effects — the dispenser would burn a single-use refresh token
+                # minting an answer with nowhere to go. Still withheld from the
+                # event stream; simply not acted on.
+                log.warning(
+                    "not answering %s for run_id=%s: the channel is already closed",
+                    frame.request.subtype,
+                    self._run_id,
+                )
+            else:
+                self._spawn(self._answer(frame.request))
         return frame.control
 
     async def aclose(self) -> None:
