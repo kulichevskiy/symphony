@@ -202,20 +202,26 @@ class FakeRunner:
         self, events: list[RunnerEvent], spec: RunnerSpec
     ) -> AsyncIterator[RunnerEvent]:
         conversation = spec.conversation
+        refused = False
         for ev in events:
             # Keep the control-channel contract LocalRunner keeps (SYM-235):
-            # a scripted control request is answered through the spec's handler
-            # and withheld from the event stream, and a refusal ends the run
-            # right there — a fake that kept going would make every SYM-236
-            # orchestrator test written on it a fiction.
+            # a scripted control request goes to the spec's handler and is
+            # withheld from the event stream, so orchestrator tests written
+            # against this fake aren't testing a fiction.
+            #
+            # A refusal does NOT truncate the script. The real runner closes
+            # stdin and gives the agent a grace period, and an agent that ends
+            # its own turn keeps its terminal output and its exit code — a fake
+            # that synthesised a kill instead would let SYM-236 exercise a
+            # failure production would not take, and would never let it check
+            # the parsing of a real refusal result. What the refusal does do is
+            # close the channel: later requests are still withheld, but the
+            # handler no longer hears them.
             if conversation is not None and ev.kind == "stdout" and ev.line:
                 frame = read_agent_frame(ev.line)
                 if frame.control:
-                    if frame.request is not None and not await self._answered(
-                        conversation, frame.request
-                    ):
-                        yield RunnerEvent(kind="exit", returncode=-15)
-                        return
+                    if frame.request is not None and not refused:
+                        refused = not await self._answered(conversation, frame.request)
                     continue
             yield ev
 

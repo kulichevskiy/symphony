@@ -354,31 +354,48 @@ async def test_fake_runner_matches_local_runner_on_the_control_exchange(
 
 
 @pytest.mark.asyncio
-async def test_fake_runner_ends_a_refused_run_the_way_local_runner_does(
-    tmp_path: Path,
-) -> None:
-    # The divergence that would matter most: a fake that shrugged off a refusal
-    # and kept emitting its scripted `result` would let SYM-236 build its
-    # recovery tests on a run that never actually dies.
+async def test_fake_runner_keeps_a_refused_runs_own_ending(tmp_path: Path) -> None:
+    # A refusal does not entitle the fake to invent a kill. The real runner
+    # closes stdin and waits, and an agent that ends its own turn keeps its
+    # terminal output and its exit code — see
+    # `test_a_refused_run_that_ends_itself_keeps_its_own_exit_code`. A fake that
+    # synthesised `-15` would let SYM-236 exercise a path production does not
+    # take, and would never let it check the parsing of a real refusal result.
     fake = _scripted(_AGENT_STREAM)
     handler = _Handler(None)
     events = [
         ev
         async for ev in fake.run(_fake_spec(tmp_path, "r-fake-refused", _talking(handler=handler)))
     ]
-    assert handler.seen
-    assert '{"type": "result", "result": "SYMPHONY_DONE"}' not in _stdout(events)
+    assert [r.request_id for r in handler.seen] == ["req-1"]
+    assert '{"type": "result", "result": "SYMPHONY_DONE"}' in _stdout(events)
     assert events[-1].kind == "exit"
-    assert events[-1].returncode != 0
+    assert events[-1].returncode == 0
+
+
+@pytest.mark.asyncio
+async def test_fake_runner_stops_asking_the_handler_after_a_refusal(tmp_path: Path) -> None:
+    # The real channel closes stdin on a refusal, so nothing that arrives after
+    # it reaches the handler — though it is still protocol traffic and still
+    # must not surface as agent output.
+    fake = _scripted([*_AGENT_STREAM, _control_request("req-2")])
+    handler = _Handler(None)
+    events = [
+        ev async for ev in fake.run(_fake_spec(tmp_path, "r-fake-late", _talking(handler=handler)))
+    ]
+    assert [r.request_id for r in handler.seen] == ["req-1"]
+    for line in _stdout(events):
+        assert "control_request" not in line
 
 
 @pytest.mark.asyncio
 async def test_fake_runner_treats_a_raising_handler_as_a_refusal(tmp_path: Path) -> None:
-    fake = _scripted(_AGENT_STREAM)
+    # A handler that blows up must not blow up the run: the real channel logs
+    # it and answers with an error, exactly as it would a plain refusal.
+    fake = _scripted([*_AGENT_STREAM, _control_request("req-2")])
     handler = _Handler(None, boom=True)
     events = [
         ev async for ev in fake.run(_fake_spec(tmp_path, "r-fake-boom", _talking(handler=handler)))
     ]
-    assert handler.seen
+    assert [r.request_id for r in handler.seen] == ["req-1"]
     assert events[-1].kind == "exit"
-    assert events[-1].returncode != 0
