@@ -25,6 +25,7 @@ from contextlib import suppress
 from pathlib import Path
 
 from ...credentials import RunCredentials, materialize_credentials
+from ..control_channel import ControlChannel
 from ..runner import RunnerEvent, RunnerSpec
 
 _STREAM_DRAIN_SECS = 2.0
@@ -198,6 +199,10 @@ class LocalRunner:
                 _remove_cred_home(cred_home)
                 raise
             env = {**env, **cred_env, **spec.env}
+        # Control-channel mode (SYM-235): the prompt travels on stdin and stdin
+        # stays open so the agent can ask questions mid-run. Every other spawn
+        # site keeps /dev/null, where no control traffic is possible.
+        conversational = spec.prompt is not None
         try:
             proc = await asyncio.create_subprocess_exec(
                 *spec.command,
@@ -206,7 +211,7 @@ class LocalRunner:
                 start_new_session=True,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE if conversational else asyncio.subprocess.DEVNULL,
                 # Buffer watermark only. The pump below frames JSONL itself
                 # so one codex line may exceed this without being dropped.
                 limit=_SUBPROCESS_BUFFER_LIMIT,
@@ -222,6 +227,10 @@ class LocalRunner:
             with suppress(ProcessLookupError):
                 _terminate_process_group(proc.pid)
         yield RunnerEvent(kind="started", pid=proc.pid)
+        channel: ControlChannel | None = None
+        if conversational and proc.stdin is not None:
+            channel = ControlChannel(proc.stdin, spec.control_handler, run_id=spec.run_id)
+            await channel.send_prompt(spec.prompt or "")
         stalled = asyncio.Event()
         wall_clock_hit = asyncio.Event()
         events: asyncio.Queue[RunnerEvent] = asyncio.Queue()
@@ -241,6 +250,12 @@ class LocalRunner:
                 line = raw_line.decode(errors="replace")
                 hb.last_line = loop.time()
                 if kind == "stdout":
+                    # Protocol traffic is activity (it refreshed the heartbeat
+                    # above) but it is not the agent's output — forwarding it
+                    # would corrupt completion markers, cost accounting and
+                    # verdict parsing alike.
+                    if channel is not None and channel.observe(line):
+                        return
                     hb.observe(line)
                 await events.put(RunnerEvent(kind=kind, line=line))  # type: ignore[arg-type]
 
@@ -350,8 +365,17 @@ class LocalRunner:
                         await proc.wait()
                 return
 
+        async def refusal_guard(channel: ControlChannel) -> None:
+            # A refused request is unrecoverable for this run. The agent would
+            # otherwise sit out its own retry window before dying; end it now.
+            await channel.refused.wait()
+            log.warning("ending run_id=%s: a control request was refused", spec.run_id)
+            with suppress(ProcessLookupError):
+                _terminate_process_group(proc.pid)
+
         stdout_task = asyncio.create_task(pump(proc.stdout, "stdout"))
         stderr_task = asyncio.create_task(pump(proc.stderr, "stderr"))
+        refusal_task = asyncio.create_task(refusal_guard(channel)) if channel is not None else None
         watch_task = asyncio.create_task(watchdog())
         wait_task = asyncio.create_task(proc.wait())
         drain_deadline: float | None = None
@@ -407,6 +431,12 @@ class LocalRunner:
             else:
                 yield RunnerEvent(kind="exit", returncode=proc.returncode)
         finally:
+            if refusal_task is not None:
+                refusal_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await refusal_task
+            if channel is not None:
+                await channel.aclose()
             self._active.pop(spec.run_id, None)
             _remove_cred_home(cred_home)
 

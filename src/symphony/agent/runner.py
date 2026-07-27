@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 if TYPE_CHECKING:
     from ..credentials import RunCredentials
+    from .control_channel import ControlHandler
 
 
 @dataclass
@@ -55,6 +56,18 @@ class RunnerSpec:
     # host isn't `github.com`, and a credential store written for the wrong
     # host never matches on push (SYM-199 review fix).
     github_host: str = "github.com"
+    # Control-channel mode (SYM-235). Setting `prompt` switches the run from a
+    # monologue to a conversation: the prompt is delivered as a message on
+    # stdin instead of riding in `command`, stdin stays open for the run, and
+    # the agent's control requests are answered through `control_handler`.
+    # Leaving it `None` keeps the one-directional shape every other spawn site
+    # still uses — stdin is /dev/null and no control traffic is possible.
+    prompt: str | None = None
+    # Answers the agent's control requests, or returns None to refuse (which
+    # ends the run rather than making the agent wait out its retry window).
+    # The runner never inspects what travels through here, so it stays ignorant
+    # of tokens; the dispenser is what plugs in.
+    control_handler: ControlHandler | None = None
 
 
 @dataclass

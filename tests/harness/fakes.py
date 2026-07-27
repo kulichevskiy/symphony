@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from symphony.agent.control_channel import is_control_frame, read_control_request
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.github.client import (
     DEFAULT_LOG_TAIL_BYTES,
@@ -97,6 +98,8 @@ class FakeRunner:
         self._queue: list[list[RunnerEvent]] = []
         self._stage_queues: dict[str, list[list[RunnerEvent]]] = {}
         self._pid = itertools.count(10000)
+        # Prompts delivered over the control channel, in order (SYM-235).
+        self.prompts: list[str] = []
 
     def enqueue(self, events: list[RunnerEvent]) -> None:
         """Pre-program the event sequence for the next `run()` call."""
@@ -186,15 +189,29 @@ class FakeRunner:
             self._queue.append(events)
 
     def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        if spec.prompt is not None:
+            self.prompts.append(spec.prompt)
         stage_q = self._stage_queues.get(spec.stage)
         if stage_q:
-            return self._aiter(stage_q.pop(0))
+            return self._aiter(stage_q.pop(0), spec)
         if self._queue:
-            return self._aiter(self._queue.pop(0))
+            return self._aiter(self._queue.pop(0), spec)
         return self._default_aiter(spec)
 
-    async def _aiter(self, events: list[RunnerEvent]) -> AsyncIterator[RunnerEvent]:
+    async def _aiter(
+        self, events: list[RunnerEvent], spec: RunnerSpec
+    ) -> AsyncIterator[RunnerEvent]:
         for ev in events:
+            # Keep the control-channel contract LocalRunner keeps (SYM-235):
+            # a scripted control request is answered through the spec's handler
+            # and withheld from the event stream, so orchestrator tests written
+            # against this fake aren't testing a fiction.
+            if spec.prompt is not None and ev.kind == "stdout" and ev.line:
+                if is_control_frame(ev.line):
+                    request = read_control_request(ev.line)
+                    if request is not None and spec.control_handler is not None:
+                        await spec.control_handler(request)
+                    continue
             yield ev
 
     async def _default_aiter(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
