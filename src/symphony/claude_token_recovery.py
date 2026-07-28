@@ -19,6 +19,7 @@ does not remove a guarantee.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Awaitable, Callable, Mapping
 
 from .agent.control_channel import ControlRequest, Decline
@@ -32,6 +33,24 @@ log = logging.getLogger(__name__)
 OAUTH_TOKEN_REFRESH = "oauth_token_refresh"
 _ACCESS_TOKEN_FIELD = "accessToken"
 
+# How long a freshly granted token is treated as still being adopted.
+#
+# One 401 does not produce one request. The CLI asked three times in ~1.2s in
+# the SYM-232 spike, and the channel serializes them, so the second question
+# arrives after the first has already been answered — possibly long after, if
+# the rotation it triggered took most of the dispenser's budget. Answering each
+# from the dispenser would rotate once per question, because by then this run
+# names the generation it was *just given*, which is the current one. Every
+# rotation invalidates the token the previous one handed over: the SYM-234
+# cascade, reproduced inside a single run.
+#
+# A repeat inside this window is therefore the same 401 asking again, not a new
+# one. Nothing plausible makes a token minted seconds ago fail on its own — a
+# fresh one carries hours of nominal TTL — and in the case that does, a
+# concurrent rotation, the dispenser's own compare-and-swap hands out the
+# stored token rather than minting another.
+_BURST_WINDOW_SECS = 60.0
+
 # Records the generation the run now holds. Injected rather than written here
 # so the stamp keeps one definition — and one best-effort guard — with the one
 # the dispatch path already makes.
@@ -42,10 +61,13 @@ class ClaudeTokenRecovery:
     """One run's side of mid-run token recovery: a `ControlHandler` that hands
     back a fresh access token, or refuses.
 
-    Stateful on purpose. The generation it names when complaining has to be the
-    one it currently holds, not the one it was dispatched with: a run that
-    recovers, works on, and is rejected again would otherwise name a
-    superseded generation and be handed back the same token that just failed.
+    Stateful on purpose, and in two ways that pull against each other. The
+    generation it names has to be the one it currently holds, not the one it
+    was dispatched with — a run that recovers, works on, and is rejected again
+    would otherwise name a superseded generation and be handed back the token
+    that just failed. But the same advance turns one 401's burst of questions
+    into a rotation apiece, so a question repeated inside `_BURST_WINDOW_SECS`
+    is answered from the last grant instead of from the dispenser.
     """
 
     def __init__(
@@ -55,13 +77,18 @@ class ClaudeTokenRecovery:
         run_id: str,
         generation: int,
         restamp: Restamp,
+        burst_window_secs: float = _BURST_WINDOW_SECS,
+        now: Callable[[], float] | None = None,
     ) -> None:
         self._dispenser = dispenser
         self._run_id = run_id
         self._generation = generation
         self._restamp = restamp
+        self._burst_window_secs = burst_window_secs
+        self._now = now or time.monotonic
         self._count = 0
         self._refused_retryably = False
+        self._granted: tuple[str, float] | None = None
 
     @property
     def refused_retryably(self) -> bool:
@@ -88,6 +115,16 @@ class ClaudeTokenRecovery:
                 self._count,
             )
 
+    def _still_being_adopted(self) -> str | None:
+        """The token this run was last given, while it is too new to have
+        failed on its own. None once the window has passed."""
+        if self._granted is None:
+            return None
+        token, granted_at = self._granted
+        if self._now() - granted_at >= self._burst_window_secs:
+            return None
+        return token
+
     async def __call__(self, request: ControlRequest) -> Mapping[str, object] | Decline | None:
         if request.subtype != OAUTH_TOKEN_REFRESH:
             # Declined, not refused. The CLI's control vocabulary is far wider
@@ -100,6 +137,15 @@ class ClaudeTokenRecovery:
                 request.subtype,
             )
             return Decline("the host does not answer that request")
+        repeat = self._still_being_adopted()
+        if repeat is not None:
+            log.info(
+                "run_id=%s asked again within %.0fs of its last token; answering with that one "
+                "rather than rotating again",
+                self._run_id,
+                self._burst_window_secs,
+            )
+            return {_ACCESS_TOKEN_FIELD: repeat}
         served = await self._dispenser.request(self._generation)
         if not isinstance(served, TokenGrant):
             log.warning(
@@ -112,6 +158,7 @@ class ClaudeTokenRecovery:
             return None
         self._count += 1
         self._generation = served.generation
+        self._granted = (served.token, self._now())
         await self._restamp(served.generation)
         log.info(
             "run_id=%s recovered its claude token mid-run: recovery #%d, now on generation %d (%s)",

@@ -134,13 +134,30 @@ class _Stamps:
         self.seen.append(generation)
 
 
-def _recovery(dispenser: object, *, generation: int = 4) -> tuple[ClaudeTokenRecovery, _Stamps]:
+class _Clock:
+    """A hand-wound monotonic clock, so a test can say how much later the
+    agent asked again without waiting for it."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, secs: float) -> None:
+        self.now += secs
+
+
+def _recovery(
+    dispenser: object, *, generation: int = 4, clock: _Clock | None = None
+) -> tuple[ClaudeTokenRecovery, _Stamps]:
     stamps = _Stamps(seen=[])
     recovery = ClaudeTokenRecovery(
         dispenser,  # type: ignore[arg-type]
         run_id="run-1",
         generation=generation,
         restamp=stamps,
+        now=clock or _Clock(),
     )
     return recovery, stamps
 
@@ -163,19 +180,43 @@ async def test_a_rejected_token_is_replaced_and_the_run_restamped() -> None:
 
 @pytest.mark.asyncio
 async def test_the_second_complaint_names_the_generation_the_run_now_holds() -> None:
-    """A run rejected twice must not name the generation it was dispatched
-    with the second time: the dispenser would read it as "nobody has rotated
-    yet" and burn a rotation handing back the token that just failed."""
+    """A run rejected again much later must not name the generation it was
+    dispatched with: the dispenser would read it as "nobody has rotated yet"
+    and burn a rotation handing back the token that just failed."""
     dispenser = _FakeDispenser(
         TokenGrant(token="tok-v5", generation=5, rotated=True),
         TokenGrant(token="tok-v6", generation=6, rotated=True),
     )
-    recovery, stamps = _recovery(dispenser, generation=4)
+    clock = _Clock()
+    recovery, stamps = _recovery(dispenser, generation=4, clock=clock)
 
     await recovery(_asked())
+    clock.advance(3600)
     assert await recovery(_asked()) == {"accessToken": "tok-v6"}
     assert dispenser.asked == [4, 5]
     assert stamps.seen == [5, 6]
+
+
+@pytest.mark.asyncio
+async def test_one_401s_burst_of_questions_costs_one_rotation() -> None:
+    """The cascade this would otherwise recreate inside a single run.
+
+    One 401 asked three times in ~1.2s in the SYM-232 spike. Each answer
+    advances the generation this run names, so asking the dispenser again would
+    find it naming the current one and rotate — and every rotation invalidates
+    the token the previous one just handed over."""
+    dispenser = _FakeDispenser(TokenGrant(token="tok-v5", generation=5, rotated=True))
+    clock = _Clock()
+    recovery, stamps = _recovery(dispenser, generation=4, clock=clock)
+
+    answers = []
+    for _ in range(3):
+        answers.append(await recovery(_asked()))
+        clock.advance(0.4)
+
+    assert answers == [{"accessToken": "tok-v5"}] * 3
+    assert dispenser.asked == [4]
+    assert stamps.seen == [5]
 
 
 @pytest.mark.asyncio
@@ -229,9 +270,11 @@ async def test_recoveries_are_counted_and_said_out_loud(
         TokenGrant(token="tok-v5", generation=5, rotated=True),
         TokenGrant(token="tok-v6", generation=6, rotated=True),
     )
-    recovery, _ = _recovery(dispenser)
+    clock = _Clock()
+    recovery, _ = _recovery(dispenser, clock=clock)
     with caplog.at_level(logging.INFO, logger="symphony.claude_token_recovery"):
         await recovery(_asked())
+        clock.advance(3600)
         await recovery(_asked())
         recovery.log_tally()
     assert "recovery #1" in caplog.text
@@ -702,5 +745,39 @@ async def test_a_retryable_refusal_stops_the_tail_re_validating(tmp_path: Path) 
         assert await harness.orch._claude_auth_requeue_signal(  # noqa: SLF001
             "claude", None, run_id="run-1"
         )
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_a_binding_that_overrides_a_control_variable_is_left_alone(
+    tmp_path: Path,
+) -> None:
+    """The three control variables are only correct together, and `binding.env`
+    wins the merge. A binding zeroing the 401 wait would leave a run armed on
+    this side — prompt on stdin, handler attached — and deaf on the other,
+    losing recovery silently. Silence is the problem: a run that never asks
+    looks exactly like a run that never needed to."""
+    harness = await _daemon(tmp_path)
+    try:
+        binding = _binding().model_copy(update={"env": {"CLAUDE_CODE_OAUTH_401_WAIT_MS": "0"}})
+        harness.runner.enqueue([RunnerEvent(kind="started", pid=1), *_done()])
+        await harness.orch._run_stage_command(  # noqa: SLF001
+            binding=binding,
+            issue=_issue(),
+            command=build_runner_command(
+                "claude", PROMPT, workspace_path=harness.config.workspace_root
+            ),
+            run_id="run-1",
+            workspace_path=harness.config.workspace_root,
+            stage="implement",
+            role=ResolvedRole(agent="claude"),
+            prior_total=0.0,
+            prompt=PROMPT,
+        )
+        spec = harness.runner.specs[0]
+        assert spec.conversation is None
+        assert PROMPT in spec.command
+        assert "CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH" not in spec.env
     finally:
         await harness.close()

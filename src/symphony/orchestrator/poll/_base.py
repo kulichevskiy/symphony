@@ -3718,15 +3718,12 @@ class _OrchestratorBase:
         """
         conversation: Conversation | None = None
         recovery: ClaudeTokenRecovery | None = None
-        # `_CLAUDE_TOKEN_ENV not in binding.env`: a binding supplying its own
-        # token means the run is not authenticating as the UI-connected
-        # account, so rotating that account mid-run would hand the run a
-        # stranger's token — and `binding.env` wins the merge below.
+        control_env = claude_control_channel_env()
         if (
             role.agent == "claude"
             and prompt is not None
             and _CLAUDE_TOKEN_ENV in claude_env
-            and _CLAUDE_TOKEN_ENV not in binding.env
+            and not _binding_owns_claude_auth(binding.env, control_env)
         ):
             argv = claude_control_channel_argv(command, prompt)
             generation = (
@@ -3751,7 +3748,7 @@ class _OrchestratorBase:
                 )
                 conversation = Conversation(prompt=prompt, handler=recovery)
                 command = argv
-                claude_env = {**claude_env, **claude_control_channel_env()}
+                claude_env = {**claude_env, **control_env}
         return _Dispatch(
             spec=RunnerSpec(
                 run_id=run_id,
@@ -5016,6 +5013,27 @@ _AGENT_CRED_PROVIDERS: frozenset[str] = frozenset({"claude", "codex"})
 # file-fed run could never survive a token rotation no matter what the daemon
 # did. Codex still reads a private per-run config dir (Config v2 6/9).
 _CLAUDE_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
+
+
+def _binding_owns_claude_auth(
+    binding_env: Mapping[str, str], control_env: Mapping[str, str]
+) -> bool:
+    """Whether a binding's own `env:` decides any part of a claude run's auth
+    or its control channel — in which case the run stays one-directional.
+
+    `binding.env` wins the merge, so both cases are silent. A binding supplying
+    the token means the run is not the UI-connected account at all, and
+    rotating that account mid-run would hand it a stranger's token. A binding
+    touching one of the control-channel variables is subtler and worse: by the
+    time the value lands, the prompt has already moved to stdin and a handler
+    is attached, so a `401_WAIT_MS` of `0` leaves a run armed on this side and
+    deaf on the other. It would still finish — it just quietly loses the
+    recovery, and quietly is the problem: a run that never asks looks exactly
+    like a run that never needed to.
+    """
+    return _CLAUDE_TOKEN_ENV in binding_env or bool(binding_env.keys() & control_env.keys())
+
+
 _CODEX_HOME_ENV = "CODEX_HOME"
 _CODEX_CRED_FILE = "auth.json"
 
