@@ -115,15 +115,26 @@ def test_the_environment_arms_the_clis_own_recovery() -> None:
 
 class _FakeDispenser:
     """Stands in for the dispenser: records the generations it was complained
-    to about, answers from a script."""
+    to about, answers from a script, and reports what the shared row holds."""
 
-    def __init__(self, *responses: TokenResponse) -> None:
+    def __init__(self, *responses: TokenResponse, stored: int | None = None) -> None:
         self._responses = list(responses)
         self.asked: list[int] = []
+        # What `snapshot()` reports. None means "whatever this run last got",
+        # i.e. nobody else has rotated — the ordinary case.
+        self.stored = stored
+        self._last_granted: int | None = None
 
     async def request(self, generation: int) -> TokenResponse:
         self.asked.append(generation)
-        return self._responses.pop(0)
+        served = self._responses.pop(0)
+        if isinstance(served, TokenGrant):
+            self._last_granted = served.generation
+        return served
+
+    async def snapshot(self) -> tuple[str, int] | None:
+        current = self.stored if self.stored is not None else self._last_granted
+        return None if current is None else ("blob", current)
 
 
 @dataclass
@@ -217,6 +228,31 @@ async def test_one_401s_burst_of_questions_costs_one_rotation() -> None:
     assert answers == [{"accessToken": "tok-v5"}] * 3
     assert dispenser.asked == [4]
     assert stamps.seen == [5]
+
+
+@pytest.mark.asyncio
+async def test_a_rotation_by_someone_else_ends_the_burst_early() -> None:
+    """The window says a repeat is too soon to be a new rejection. It stops
+    saying that once someone else has moved underneath us.
+
+    Another run's rotation, or an operator reconnect, landing inside the window
+    means the token this run holds really is superseded — so the repeat is a
+    genuine second 401, and replaying the cached token would cost the run the
+    recovery this ticket exists to give it. Naming an older generation gets a
+    hand-out, so asking again is free."""
+    dispenser = _FakeDispenser(
+        TokenGrant(token="tok-v5", generation=5, rotated=True),
+        TokenGrant(token="tok-v7", generation=7, rotated=False),
+    )
+    clock = _Clock()
+    recovery, _ = _recovery(dispenser, generation=4, clock=clock)
+
+    assert await recovery(_asked()) == {"accessToken": "tok-v5"}
+    dispenser.stored = 7  # somebody else rotated while this run was adopting
+    clock.advance(0.4)
+
+    assert await recovery(_asked()) == {"accessToken": "tok-v7"}
+    assert dispenser.asked == [4, 5]
 
 
 @pytest.mark.asyncio
@@ -781,3 +817,34 @@ async def test_a_binding_that_overrides_a_control_variable_is_left_alone(
         assert "CLAUDE_CODE_SDK_HAS_OAUTH_REFRESH" not in spec.env
     finally:
         await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_a_binding_with_its_own_anthropic_key_is_left_alone(tmp_path: Path) -> None:
+    """The CLI prefers `ANTHROPIC_API_KEY` over the OAuth token, and the runner
+    deliberately preserves a binding's own copy. Such a run is not the
+    UI-connected account, so a 401 against that private credential must not
+    rotate the shared one and answer with a token from it."""
+    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        harness = await _daemon(tmp_path / key)
+        try:
+            binding = _binding().model_copy(update={"env": {key: "sk-private"}})
+            harness.runner.enqueue([RunnerEvent(kind="started", pid=1), *_done()])
+            await harness.orch._run_stage_command(  # noqa: SLF001
+                binding=binding,
+                issue=_issue(),
+                command=build_runner_command(
+                    "claude", PROMPT, workspace_path=harness.config.workspace_root
+                ),
+                run_id="run-1",
+                workspace_path=harness.config.workspace_root,
+                stage="implement",
+                role=ResolvedRole(agent="claude"),
+                prior_total=0.0,
+                prompt=PROMPT,
+            )
+            spec = harness.runner.specs[0]
+            assert spec.conversation is None, key
+            assert PROMPT in spec.command, key
+        finally:
+            await harness.close()

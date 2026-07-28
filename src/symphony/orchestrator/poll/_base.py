@@ -50,7 +50,7 @@ from ...agent.model_usage import ModelUsage, parse_model_usage
 from ...agent.process import parse_event_line
 from ...agent.prompt import implement_prompt
 from ...agent.runner import Runner, RunnerSpec
-from ...agent.runners.local import LocalRunner
+from ...agent.runners.local import CLAUDE_AMBIENT_AUTH_ENV, LocalRunner
 from ...claude_login import (
     claude_access_token,
     claude_credential_expires_within,
@@ -5021,17 +5021,22 @@ def _binding_owns_claude_auth(
     """Whether a binding's own `env:` decides any part of a claude run's auth
     or its control channel — in which case the run stays one-directional.
 
-    `binding.env` wins the merge, so both cases are silent. A binding supplying
-    the token means the run is not the UI-connected account at all, and
-    rotating that account mid-run would hand it a stranger's token. A binding
-    touching one of the control-channel variables is subtler and worse: by the
-    time the value lands, the prompt has already moved to stdin and a handler
-    is attached, so a `401_WAIT_MS` of `0` leaves a run armed on this side and
-    deaf on the other. It would still finish — it just quietly loses the
-    recovery, and quietly is the problem: a run that never asks looks exactly
-    like a run that never needed to.
+    `binding.env` wins the merge, so every case here is silent. A binding
+    supplying the token — or an `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`,
+    which the CLI prefers over the OAuth token and which the runner
+    deliberately preserves for exactly that reason — means the run is not the
+    UI-connected account at all. Arming it would let a 401 against a private
+    credential rotate the shared account and answer with a token from it.
+
+    A binding touching one of the control-channel variables is subtler and
+    worse: by the time the value lands, the prompt has already moved to stdin
+    and a handler is attached, so a `401_WAIT_MS` of `0` leaves a run armed on
+    this side and deaf on the other. It would still finish — it just quietly
+    loses the recovery, and quietly is the problem: a run that never asks looks
+    exactly like a run that never needed to.
     """
-    return _CLAUDE_TOKEN_ENV in binding_env or bool(binding_env.keys() & control_env.keys())
+    owned = {_CLAUDE_TOKEN_ENV, *CLAUDE_AMBIENT_AUTH_ENV, *control_env}
+    return bool(binding_env.keys() & owned)
 
 
 _CODEX_HOME_ENV = "CODEX_HOME"

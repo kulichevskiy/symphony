@@ -115,13 +115,25 @@ class ClaudeTokenRecovery:
                 self._count,
             )
 
-    def _still_being_adopted(self) -> str | None:
-        """The token this run was last given, while it is too new to have
-        failed on its own. None once the window has passed."""
+    async def _still_being_adopted(self) -> str | None:
+        """The token this run was last given, while replaying it is still the
+        right answer. None once it is not, and the dispenser decides instead.
+
+        Two conditions, because the clock alone is not enough. The window says
+        the question is too soon to be a new rejection. The generation says
+        nobody has moved underneath us: another run's rotation, or an operator
+        reconnect, can land inside the window, and then this really is a second
+        401 — the token we hold is genuinely superseded and replaying it would
+        cost the run the recovery this whole ticket exists to give it. Going to
+        the dispenser in that case is free: naming an older generation gets a
+        hand-out, not a rotation."""
         if self._granted is None:
             return None
         token, granted_at = self._granted
         if self._now() - granted_at >= self._burst_window_secs:
+            return None
+        stored = await self._dispenser.snapshot()
+        if stored is None or stored[1] != self._generation:
             return None
         return token
 
@@ -137,7 +149,7 @@ class ClaudeTokenRecovery:
                 request.subtype,
             )
             return Decline("the host does not answer that request")
-        repeat = self._still_being_adopted()
+        repeat = await self._still_being_adopted()
         if repeat is not None:
             log.info(
                 "run_id=%s asked again within %.0fs of its last token; answering with that one "
