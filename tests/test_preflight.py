@@ -709,6 +709,31 @@ def test_preflight_rejects_codex_model_missing_from_live_catalog(
     assert "Codex model 'gpt-missing' is not available" in result.output
 
 
+def test_preflight_skips_codex_validation_for_stale_catalog(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
+
+    async def _catalog(**_kwargs: Any) -> CodexCatalog:
+        return CodexCatalog(
+            models=("gpt-previous",),
+            efforts_by_model={"gpt-previous": ("high",)},
+            source="stale",
+        )
+
+    monkeypatch.setattr("symphony.cli.codex_catalog_client.get", _catalog)
+    binding = _ready_binding()
+    binding["roles"] = {"implement": {"agent": "codex", "model": "gpt-new"}}
+    _seed_preflight_db(tmp_path, monkeypatch, [binding])
+
+    result = CliRunner().invoke(main, ["preflight"])
+
+    assert result.exit_code == 0, result.output
+    assert "skipping Codex model/effort validation" in result.output
+
+
 def test_preflight_skips_codex_profile_when_bindings_do_not_use_codex(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]

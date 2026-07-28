@@ -110,7 +110,7 @@ class CodexCatalogClient:
                 *self.command,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
                 env=env,
             )
             try:
@@ -128,6 +128,7 @@ class CodexCatalogClient:
                             "capabilities": {},
                         },
                     )
+                    await self._notify(proc, "initialized")
                     models: list[str] = []
                     efforts_by_model: dict[str, tuple[str, ...]] = {}
                     cursor: str | None = None
@@ -171,6 +172,13 @@ class CodexCatalogClient:
                         with suppress(ProcessLookupError):
                             proc.kill()
                         await proc.wait()
+
+    @staticmethod
+    async def _notify(proc: asyncio.subprocess.Process, method: str) -> None:
+        if proc.stdin is None:
+            raise ValueError("Codex app-server has no stdio transport")
+        proc.stdin.write((json.dumps({"method": method}) + "\n").encode())
+        await proc.stdin.drain()
 
     @staticmethod
     async def _request(

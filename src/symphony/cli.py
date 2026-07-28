@@ -698,7 +698,7 @@ async def _preflight_validate_capabilities(cfg: Config, codex_catalog: CodexCata
                 claude_checks.add((binding_key, role.model, role.effort, resolved_model))
 
     ok = True
-    if codex_pairs and codex_catalog.source == "static":
+    if codex_pairs and codex_catalog.source != "live":
         click.echo(
             "  ⚠ skipping Codex model/effort validation: live model catalog unavailable",
             err=True,

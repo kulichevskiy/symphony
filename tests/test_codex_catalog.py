@@ -20,11 +20,15 @@ from pathlib import Path
 
 assert Path(os.environ["CODEX_HOME"], "auth.json").read_text() == '{"tokens":{}}'
 
+initialized = False
 for line in sys.stdin:
     request = json.loads(line)
     if request["method"] == "initialize":
         print(json.dumps({"id": request["id"], "result": {}}), flush=True)
+    elif request["method"] == "initialized":
+        initialized = True
     elif request["method"] == "model/list":
+        assert initialized
         print(json.dumps({
             "id": request["id"],
             "result": {
@@ -68,6 +72,8 @@ count = int(count_path.read_text()) + 1 if count_path.exists() else 1
 count_path.write_text(str(count))
 for line in sys.stdin:
     request = json.loads(line)
+    if request["method"] == "initialized":
+        continue
     result = {{}} if request["method"] == "initialize" else {{
         "data": [{{
             "model": "gpt-dynamic",
@@ -121,6 +127,8 @@ from pathlib import Path
 auth_path = Path(os.environ["CODEX_HOME"], "auth.json")
 for line in sys.stdin:
     request = json.loads(line)
+    if request["method"] == "initialized":
+        continue
     if request["method"] == "initialize":
         result = {}
     else:
