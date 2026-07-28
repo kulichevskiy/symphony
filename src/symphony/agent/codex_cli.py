@@ -7,6 +7,13 @@ the isolation boundary. No permissions profile is provisioned as a result.
 
 from __future__ import annotations
 
+import json
+
+
+def codex_reasoning_effort_config(effort: str) -> str:
+    """Serialize one effort value as a single TOML basic string."""
+    return f"model_reasoning_effort={json.dumps(effort, ensure_ascii=False)}"
+
 
 def build_codex_workspace_write_command(
     *, prompt: str, codex_model: str, effort: str | None = None
@@ -30,11 +37,12 @@ def build_codex_workspace_write_command(
         "--dangerously-bypass-approvals-and-sandbox",
     ]
     if effort is not None:
-        command += ["--config", f'model_reasoning_effort="{effort}"']
+        command += ["--config", codex_reasoning_effort_config(effort)]
     command += ["--model", codex_model, prompt]
     return command
 
 
 __all__ = [
     "build_codex_workspace_write_command",
+    "codex_reasoning_effort_config",
 ]

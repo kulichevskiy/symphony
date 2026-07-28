@@ -109,6 +109,7 @@ from ..db.config_repo_secrets import RepoSecretView
 from ..effective_config import OPERATIONAL_KNOBS
 
 _ROLES_ADAPTER: TypeAdapter[dict[RoleName, RoleConfig]] = TypeAdapter(dict[RoleName, RoleConfig])
+_REVIEW_LANE_ROLES = frozenset({"review_find", "review_verify"})
 
 _log = logging.getLogger(__name__)
 
@@ -809,6 +810,8 @@ async def _reject_unsupported_efforts(
             **{var: env_source.get(source, "") for var, source in binding.env.items()},
         }
         for name in get_args(RoleName):
+            if name in _REVIEW_LANE_ROLES and not binding.resolved_local_review():
+                continue
             if only_inherited:
                 binding_role = binding.roles.get(name)
                 if (

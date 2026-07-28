@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal
 
+from ..agent.codex_cli import codex_reasoning_effort_config
 from ..agent.codex_models import DEFAULT_CODEX_MODEL
 
 VERDICT_APPROVED_MARKER = "<<<VERDICT:APPROVED>>>"
@@ -736,7 +737,7 @@ def build_local_review_command(
             "--json",
         ]
         if effort is not None:
-            command.extend(["--config", f'model_reasoning_effort="{effort}"'])
+            command.extend(["--config", codex_reasoning_effort_config(effort)])
         command.extend(["--model", codex_model])
         if last_message_path is not None:
             command.extend(["-o", last_message_path])

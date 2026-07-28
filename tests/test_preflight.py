@@ -757,6 +757,23 @@ def test_preflight_skips_codex_validation_for_stale_catalog(tmp_path: Path, monk
     assert "skipping Codex model/effort validation" in result.output
 
 
+def test_preflight_skips_inactive_review_roles(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
+
+    async def _catalog(**_kwargs: Any) -> CodexCatalog:
+        return CodexCatalog(models=(), efforts_by_model={})
+
+    monkeypatch.setattr("symphony.cli.codex_catalog_client.get", _catalog)
+    _seed_preflight_db(tmp_path, monkeypatch, [_ready_binding()])
+
+    result = CliRunner().invoke(main, ["preflight"])
+
+    assert result.exit_code == 0, result.output
+    assert "Codex model" not in result.output
+
+
 def test_preflight_skips_codex_profile_when_bindings_do_not_use_codex(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]

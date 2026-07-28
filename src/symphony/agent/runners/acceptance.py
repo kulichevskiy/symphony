@@ -18,6 +18,7 @@ from symphony.agent.claude_cli import (
     BUILDER_SETTING_SOURCES,
     claude_builder_settings,
 )
+from symphony.agent.codex_cli import codex_reasoning_effort_config
 from symphony.agent.codex_models import DEFAULT_CODEX_MODEL
 from symphony.agent.process import parse_event_line
 from symphony.agent.runner import Runner, RunnerEvent, RunnerSpec
@@ -1059,7 +1060,7 @@ def build_acceptance_command(
     if agent == "codex":
         command = ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox", "--json"]
         if effort is not None:
-            command.extend(["--config", f'model_reasoning_effort="{effort}"'])
+            command.extend(["--config", codex_reasoning_effort_config(effort)])
         command.extend(["--model", codex_model, prompt])
         return command
     command = [

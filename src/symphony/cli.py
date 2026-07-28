@@ -688,6 +688,8 @@ async def _preflight_validate_capabilities(cfg: Config, codex_catalog: CodexCata
         # the same way here or this validates the wrong model (SYM-191 review).
         binding_env = {**os.environ, **binding.env}
         for name in get_args(RoleName):
+            if name in _REVIEW_LANE_ROLES and not binding.resolved_local_review():
+                continue
             role = binding.resolved_role(name, cfg.roles)
             if role.agent == "codex":
                 codex_pairs.add((role.codex_model_arg(), role.effort))

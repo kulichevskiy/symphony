@@ -111,6 +111,75 @@ for line in sys.stdin:
 
 
 @pytest.mark.asyncio
+async def test_catalog_client_does_not_reuse_stale_catalog_for_new_generation(
+    tmp_path: Path,
+) -> None:
+    server = tmp_path / "app_server.py"
+    server.write_text(
+        """
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["method"] == "initialized":
+        continue
+    result = {} if request["method"] == "initialize" else {
+        "data": [{"model": "gpt-account-a", "supportedReasoningEfforts": []}],
+        "nextCursor": None,
+    }
+    print(json.dumps({"id": request["id"], "result": result}), flush=True)
+""",
+        encoding="utf-8",
+    )
+    now = [0.0]
+    client = CodexCatalogClient(
+        command=(sys.executable, str(server)),
+        ttl_seconds=10,
+        clock=lambda: now[0],
+    )
+    first = await client.get(credential="account-a", generation=1)
+    now[0] = 11
+    client.command = ("missing-codex-for-test",)
+
+    fallback = await client.get(credential="account-b", generation=2)
+
+    assert first.models == ("gpt-account-a",)
+    assert fallback.source == "static"
+    assert "gpt-account-a" not in fallback.models
+
+
+@pytest.mark.asyncio
+async def test_catalog_client_throttles_failed_refreshes(tmp_path: Path) -> None:
+    count_path = tmp_path / "attempts"
+    server = tmp_path / "failing_app_server.py"
+    server.write_text(
+        f"""
+from pathlib import Path
+
+count_path = Path({str(count_path)!r})
+count = int(count_path.read_text()) + 1 if count_path.exists() else 1
+count_path.write_text(str(count))
+""",
+        encoding="utf-8",
+    )
+    now = [0.0]
+    client = CodexCatalogClient(
+        command=(sys.executable, str(server)),
+        failure_ttl_seconds=10,
+        clock=lambda: now[0],
+    )
+
+    first = await client.get(credential="{}", generation=1)
+    second = await client.get(credential="{}", generation=1)
+    now[0] = 11
+    third = await client.get(credential="{}", generation=1)
+
+    assert first.source == second.source == third.source == "static"
+    assert count_path.read_text() == "2"
+
+
+@pytest.mark.asyncio
 async def test_catalog_client_uses_static_fallback_without_credential() -> None:
     client = CodexCatalogClient(command=("missing-codex-for-test",))
 

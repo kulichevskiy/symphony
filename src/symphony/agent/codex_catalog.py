@@ -40,10 +40,13 @@ class CodexCatalogClient:
     command: tuple[str, ...] = ("codex", "app-server")
     timeout_seconds: float = 5.0
     ttl_seconds: float = 600.0
+    failure_ttl_seconds: float = 30.0
     clock: Callable[[], float] = time.monotonic
     _cached_generation: int | None = field(default=None, init=False)
     _cached_at: float = field(default=0.0, init=False)
     _last_success: CodexCatalog | None = field(default=None, init=False)
+    _failed_generation: int | None = field(default=None, init=False)
+    _failed_at: float = field(default=0.0, init=False)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False)
 
     async def get(
@@ -58,6 +61,11 @@ class CodexCatalogClient:
             return STATIC_CODEX_CATALOG
         now = self.clock()
         if (
+            self._failed_generation == generation
+            and now - self._failed_at < self.failure_ttl_seconds
+        ):
+            return self._fallback(generation)
+        if (
             self._last_success is not None
             and self._cached_generation == generation
             and now - self._cached_at < self.ttl_seconds
@@ -65,6 +73,11 @@ class CodexCatalogClient:
             return self._last_success
         async with self._lock:
             now = self.clock()
+            if (
+                self._failed_generation == generation
+                and now - self._failed_at < self.failure_ttl_seconds
+            ):
+                return self._fallback(generation)
             if (
                 self._last_success is not None
                 and self._cached_generation == generation
@@ -75,11 +88,9 @@ class CodexCatalogClient:
                 catalog, refreshed_credential = await self._fetch(credential)
             except (TimeoutError, OSError, ValueError):
                 log.warning("Codex model discovery failed; using cached fallback", exc_info=True)
-                return (
-                    replace(self._last_success, source="stale")
-                    if self._last_success is not None
-                    else STATIC_CODEX_CATALOG
-                )
+                self._failed_generation = generation
+                self._failed_at = now
+                return self._fallback(generation)
             cached_generation = generation
             if refreshed_credential != credential and write_back is not None:
                 try:
@@ -92,7 +103,13 @@ class CodexCatalogClient:
             self._last_success = catalog
             self._cached_generation = cached_generation
             self._cached_at = now
+            self._failed_generation = None
             return catalog
+
+    def _fallback(self, generation: int) -> CodexCatalog:
+        if self._last_success is not None and self._cached_generation == generation:
+            return replace(self._last_success, source="stale")
+        return STATIC_CODEX_CATALOG
 
     async def _fetch(self, credential: str) -> tuple[CodexCatalog, str]:
         with tempfile.TemporaryDirectory(prefix="symphony-codex-catalog-") as raw_home:

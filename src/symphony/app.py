@@ -152,6 +152,13 @@ def create_app(
         if ui_enabled and ui_db_owns_topology and ui_db_path is not None
         else None
     )
+    # Catalog credential refreshes commit independently from config CRUD's
+    # multi-row transactions.
+    catalog_write_pool = (
+        WriteDbPool(ui_db_path)
+        if config_write_pool is not None and ui_db_path is not None
+        else None
+    )
     # Dedicated write connection for the OAuth callback/disconnect/test routes
     # (the read-only `ui_pool` can't store a freshly-minted token). Independent
     # of `ui_db_owns_topology` — connecting a provider doesn't touch bindings.
@@ -181,6 +188,8 @@ def create_app(
                 await ui_pool.close()
             if config_write_pool is not None:
                 await config_write_pool.close()
+            if catalog_write_pool is not None:
+                await catalog_write_pool.close()
             if oauth_write_pool is not None:
                 await oauth_write_pool.close()
 
@@ -189,6 +198,7 @@ def create_app(
         if ui_pool is not None
         or external_service is not None
         or config_write_pool is not None
+        or catalog_write_pool is not None
         or oauth_write_pool is not None
         else None
     )
@@ -369,7 +379,7 @@ def create_app(
         # caller that computes and passes the real value. Also requires
         # `ui_db_path` (always passed alongside it by `cli._run`) to open the
         # dedicated connection; without one the router simply doesn't mount.
-        if ui_db_owns_topology and config_write_pool is not None:
+        if ui_db_owns_topology and config_write_pool is not None and catalog_write_pool is not None:
 
             def _scheduled_slots(key: tuple[str, str, str, str, str]) -> int:
                 # The daemon reserves in-memory dispatch/fix-run slots before a
@@ -382,7 +392,7 @@ def create_app(
             async def _codex_catalog() -> CodexCatalog:
                 if credential_cipher is None:
                     return await codex_catalog_client.get(credential=None, generation=None)
-                catalog_conn = await config_write_pool.connection()
+                catalog_conn = await catalog_write_pool.connection()
                 try:
                     snapshot = await oauth_connections.get_connection_snapshot(
                         catalog_conn,
