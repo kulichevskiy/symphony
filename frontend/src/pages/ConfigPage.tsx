@@ -153,7 +153,9 @@ function effectiveAgent(
  *  override over an inherited model is still selectable — the server
  *  family-checks it against the resolved role. */
 function effortsFor(options: ConfigOptions, agent: string, model: string): string[] {
-  if (agent === "codex") return options.codex_efforts;
+  if (agent === "codex") {
+    return options.codex_efforts_by_model[model] ?? options.codex_efforts;
+  }
   if (agent === "claude") {
     return options.claude_efforts_by_model[model] ?? options.claude_efforts;
   }

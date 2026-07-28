@@ -343,7 +343,7 @@ repos:
     )
 
 
-def test_unknown_codex_model_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_future_legacy_codex_model_is_accepted(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
 repos:
@@ -353,8 +353,8 @@ repos:
     codex_model: future-codex
 {_BINDING_STATES}
 """
-    with pytest.raises(ValidationError, match="unknown Codex model"):
-        Config.model_validate(yaml.safe_load(raw))
+    cfg = Config.model_validate(yaml.safe_load(raw))
+    assert cfg.repos[0].codex_model == "future-codex"
 
 
 def test_linear_states_ready_has_no_default() -> None:
@@ -518,7 +518,7 @@ repos:
     assert cfg.repos[0].resolved_reviewer_codex_model() == "gpt-5.1-codex-max"
 
 
-def test_unknown_reviewer_codex_model_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_future_legacy_reviewer_codex_model_is_accepted(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
 repos:
@@ -529,8 +529,8 @@ repos:
     reviewer_codex_model: future-codex
 {_BINDING_STATES}
 """
-    with pytest.raises(ValidationError, match="unknown reviewer Codex model"):
-        Config.model_validate(yaml.safe_load(raw))
+    cfg = Config.model_validate(yaml.safe_load(raw))
+    assert cfg.repos[0].reviewer_codex_model == "future-codex"
 
 
 def test_invalid_review_strategy_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -959,7 +959,7 @@ repos:
         Config.model_validate(yaml.safe_load(raw))
 
 
-def test_roles_unknown_codex_model_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_roles_accept_future_codex_model_and_effort(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
 repos:
@@ -969,10 +969,12 @@ repos:
       implement:
         agent: codex
         model: future-codex
+        effort: turbo
 {_BINDING_STATES}
 """
-    with pytest.raises(ValidationError, match="unknown Codex model"):
-        Config.model_validate(yaml.safe_load(raw))
+    cfg = Config.model_validate(yaml.safe_load(raw))
+    role = cfg.repos[0].resolved_role("implement", cfg.roles)
+    assert (role.model, role.effort) == ("future-codex", "turbo")
 
 
 def test_roles_same_family_review_warns(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1107,7 +1109,7 @@ repos:
         Config.model_validate(yaml.safe_load(raw))
 
 
-def test_roles_unknown_codex_effort_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+def test_roles_future_codex_effort_is_accepted(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
 repos:
@@ -1120,8 +1122,8 @@ repos:
         effort: turbo
 {_BINDING_STATES}
 """
-    with pytest.raises(ValidationError, match="unknown Codex effort"):
-        Config.model_validate(yaml.safe_load(raw))
+    cfg = Config.model_validate(yaml.safe_load(raw))
+    assert cfg.repos[0].resolved_role("implement", cfg.roles).effort == "turbo"
 
 
 def test_roles_effort_without_model_validates_resolved_role(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -1143,10 +1145,7 @@ repos:
     assert cfg.repos[0].resolved_role("implement", cfg.roles).effort == "high"
 
 
-def test_roles_effort_without_model_bad_family_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """The resolved-role effort check still rejects an effort outside the
-    resolved agent's family even with no explicit model: agent codex + effort
-    `xhigh` (a Claude-only level) fails against the resolved codex role."""
+def test_roles_future_effort_without_model_is_accepted(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
 repos:
@@ -1158,8 +1157,8 @@ repos:
         effort: xhigh
 {_BINDING_STATES}
 """
-    with pytest.raises(ValidationError, match="unknown Codex effort"):
-        Config.model_validate(yaml.safe_load(raw))
+    cfg = Config.model_validate(yaml.safe_load(raw))
+    assert cfg.repos[0].resolved_role("implement", cfg.roles).effort == "xhigh"
 
 
 def test_roles_effort_without_model_claude_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

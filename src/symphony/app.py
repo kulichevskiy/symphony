@@ -17,11 +17,20 @@ from starlette.responses import Response
 from starlette.types import Scope
 from uvicorn import Config as UvicornConfig
 
+from .agent.codex_catalog import CodexCatalog, codex_catalog_client
 from .auth import Auth0Settings, create_auth_config_router, create_auth_dependency
 from .claude_login import ClaudeLoginProcess, PendingLoginRegistry, SubprocessClaudeLogin
-from .codex_login import CodexLoginProcess, SubprocessCodexLogin
+from .codex_login import CodexLoginProcess, SubprocessCodexLogin, codex_expires_at
 from .config import Config
-from .crypto import CredentialCipher, key_fingerprint, resolve_encryption_key
+from .credentials import CredentialWriteBack
+from .crypto import (
+    CredentialCipher,
+    CredentialDecryptError,
+    CredentialKeyMissingError,
+    key_fingerprint,
+    resolve_encryption_key,
+)
+from .db import oauth_connections
 from .db.config_repo_secrets import RepoSecretView
 from .github.client import GitHub
 from .github.webhook import (
@@ -147,6 +156,7 @@ def create_app(
     # (the read-only `ui_pool` can't store a freshly-minted token). Independent
     # of `ui_db_owns_topology` — connecting a provider doesn't touch bindings.
     oauth_write_pool = WriteDbPool(ui_db_path) if ui_enabled and ui_db_path is not None else None
+    credential_cipher: CredentialCipher | None = None
     external_service = ui_external_service
     if (
         external_service is None
@@ -274,7 +284,7 @@ def create_app(
             # which reads `.env` the same way `github_oauth_client_id` above does.
             # An empty key auto-provisions from/into the data volume next to the
             # DB (Config v2 2/9) instead of leaving the cipher unavailable.
-            cipher = (
+            credential_cipher = (
                 oauth_cipher
                 if oauth_cipher is not None
                 else CredentialCipher(
@@ -290,7 +300,7 @@ def create_app(
             app.include_router(
                 create_claude_oauth_router(
                     oauth_write_pool.connection,
-                    cipher=cipher,
+                    cipher=credential_cipher,
                     registry=PendingLoginRegistry[ClaudeLoginProcess](),
                     login_factory=(
                         claude_login_factory
@@ -307,7 +317,7 @@ def create_app(
             app.include_router(
                 create_codex_oauth_router(
                     oauth_write_pool.connection,
-                    cipher=cipher,
+                    cipher=credential_cipher,
                     registry=PendingLoginRegistry[CodexLoginProcess](),
                     login_factory=(
                         codex_login_factory
@@ -330,7 +340,7 @@ def create_app(
                         base_config.linear_oauth_client_secret,
                     ),
                 },
-                cipher=cipher,
+                cipher=credential_cipher,
                 state_store=OAuthStateStore(),
                 clock=clock,
                 public_origin=base_config.symphony_oauth_public_origin or None,
@@ -369,6 +379,40 @@ def create_app(
                 fn = getattr(handler, "scheduled_slot_count_for_binding_key", None)
                 return int(fn(key)) if fn is not None else 0
 
+            async def _codex_catalog() -> CodexCatalog:
+                if credential_cipher is None:
+                    return await codex_catalog_client.get(credential=None, generation=None)
+                catalog_conn = await config_write_pool.connection()
+                try:
+                    snapshot = await oauth_connections.get_connection_snapshot(
+                        catalog_conn,
+                        "codex",
+                        credential_cipher,
+                    )
+                except (CredentialDecryptError, CredentialKeyMissingError):
+                    snapshot = None
+                if snapshot is None or snapshot.status != "connected":
+                    return await codex_catalog_client.get(credential=None, generation=None)
+
+                async def _write_back(credential: str) -> int | None:
+                    wrote = await CredentialWriteBack(catalog_conn, credential_cipher).write_back(
+                        "codex",
+                        credential,
+                        expires_at=codex_expires_at(credential),
+                        expected_prior=snapshot.credential,
+                        expect_connected_generation=snapshot.generation,
+                    )
+                    if not wrote:
+                        return None
+                    status = await oauth_connections.get_status(catalog_conn, "codex")
+                    return status.generation if status is not None else None
+
+                return await codex_catalog_client.get(
+                    credential=snapshot.credential,
+                    generation=snapshot.generation,
+                    write_back=_write_back,
+                )
+
             app.include_router(
                 create_config_crud_router(
                     config_write_pool.connection,
@@ -378,6 +422,7 @@ def create_app(
                     clock=clock,
                     scheduled_slots=_scheduled_slots,
                     repo_secret_view=cast(RepoSecretView | None, ui_repo_secret_view),
+                    codex_catalog_provider=_codex_catalog,
                 ),
                 dependencies=api_dependencies,
             )

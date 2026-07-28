@@ -12,6 +12,7 @@ from click.testing import CliRunner
 
 from symphony import db
 from symphony.agent.claude_models import fetch_claude_effort_capabilities
+from symphony.agent.codex_catalog import CodexCatalog
 from symphony.cli import main
 
 
@@ -493,7 +494,7 @@ def test_preflight_validates_with_binding_supplied_api_key(tmp_path: Path, monke
     result = CliRunner().invoke(main, ["preflight"])
     assert result.exit_code == 0, result.output
     assert "claude model 'sonnet' supports effort 'high'" in result.output
-    assert "skipping" not in result.output
+    assert "skipping claude" not in result.output
     # The binding-resolved secret — not an empty string — reached the fetcher.
     assert seen_keys == ["sk-from-binding"]
 
@@ -628,9 +629,7 @@ def test_preflight_rejects_unsupported_model_effort_pair(tmp_path: Path, monkeyp
     )
 
 
-def test_preflight_checks_codex_pair_via_family_enum(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """Codex (model, effort) pairs are checked against the fixed family enum,
-    not the Models API — the claude fetcher is never called."""
+def test_preflight_checks_codex_pair_via_live_catalog(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     _isolate_codex_home(tmp_path, monkeypatch)
     _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
@@ -639,6 +638,14 @@ def test_preflight_checks_codex_pair_via_family_enum(tmp_path: Path, monkeypatch
         raise AssertionError("claude Models API must not be queried for codex")
 
     monkeypatch.setattr("symphony.cli.fetch_claude_effort_capabilities", _boom)
+
+    async def _catalog(**_kwargs: Any) -> CodexCatalog:
+        return CodexCatalog(
+            models=("gpt-5.1-codex",),
+            efforts_by_model={"gpt-5.1-codex": ("low", "high")},
+        )
+
+    monkeypatch.setattr("symphony.cli.codex_catalog_client.get", _catalog)
     _seed_preflight_db(
         tmp_path,
         monkeypatch,
@@ -647,6 +654,59 @@ def test_preflight_checks_codex_pair_via_family_enum(tmp_path: Path, monkeypatch
     result = CliRunner().invoke(main, ["preflight"])
     assert result.exit_code == 0, result.output
     assert "codex model 'gpt-5.1-codex' supports effort 'high'" in result.output
+
+
+def test_preflight_rejects_codex_effort_missing_from_live_catalog(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
+
+    async def _catalog(**_kwargs: Any) -> CodexCatalog:
+        return CodexCatalog(
+            models=("gpt-5.6-luna",),
+            efforts_by_model={"gpt-5.6-luna": ("low", "high")},
+        )
+
+    monkeypatch.setattr("symphony.cli.codex_catalog_client.get", _catalog)
+    _seed_preflight_db(
+        tmp_path,
+        monkeypatch,
+        [_role_effort_binding("ultra", agent="codex", model="gpt-5.6-luna")],
+    )
+
+    result = CliRunner().invoke(main, ["preflight"])
+
+    assert result.exit_code == 1, result.output
+    assert (
+        "effort 'ultra' not supported by codex model 'gpt-5.6-luna'; "
+        "supported: low, high" in result.output
+    )
+
+
+def test_preflight_rejects_codex_model_missing_from_live_catalog(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
+
+    async def _catalog(**_kwargs: Any) -> CodexCatalog:
+        return CodexCatalog(
+            models=("gpt-available",),
+            efforts_by_model={"gpt-available": ("high",)},
+        )
+
+    monkeypatch.setattr("symphony.cli.codex_catalog_client.get", _catalog)
+    binding = _ready_binding()
+    binding["roles"] = {"implement": {"agent": "codex", "model": "gpt-missing"}}
+    _seed_preflight_db(tmp_path, monkeypatch, [binding])
+
+    result = CliRunner().invoke(main, ["preflight"])
+
+    assert result.exit_code == 1, result.output
+    assert "Codex model 'gpt-missing' is not available" in result.output
 
 
 def test_preflight_skips_codex_profile_when_bindings_do_not_use_codex(

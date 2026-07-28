@@ -79,7 +79,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from ..agent.claude_models import _resolve_alias_model_id, fetch_claude_effort_capabilities
-from ..agent.codex_models import SUPPORTED_CODEX_EFFORTS, SUPPORTED_CODEX_MODELS
+from ..agent.codex_catalog import STATIC_CODEX_CATALOG, CodexCatalog
 from ..config import (
     _LEGACY_ROLE_FIELDS,
     CLAUDE_MODEL_ALIASES,
@@ -884,6 +884,7 @@ def create_config_crud_router(
     clock: Callable[[], datetime] | None = None,
     scheduled_slots: Callable[[tuple[str, str, str, str, str]], int] | None = None,
     repo_secret_view: RepoSecretView | None = None,
+    codex_catalog_provider: Callable[[], Awaitable[CodexCatalog]] | None = None,
 ) -> APIRouter:
     """Router mounting the binding CRUD + options endpoints under `/api/config`.
 
@@ -947,11 +948,27 @@ def create_config_crud_router(
             alias: caps if caps is not None else family_efforts
             for alias, caps in zip(aliases, results, strict=True)
         }
+        codex_catalog = (
+            await codex_catalog_provider()
+            if codex_catalog_provider is not None
+            else STATIC_CODEX_CATALOG
+        )
+        codex_efforts_by_model = {
+            model: list(codex_catalog.efforts_by_model.get(model, ()))
+            for model in codex_catalog.models
+        }
         return {
             "agent_families": ["claude", "codex"],
-            "codex_models": sorted(SUPPORTED_CODEX_MODELS),
+            "codex_models": list(codex_catalog.models),
             "claude_aliases": sorted(CLAUDE_MODEL_ALIASES),
-            "codex_efforts": sorted(SUPPORTED_CODEX_EFFORTS),
+            "codex_efforts": sorted(
+                {
+                    effort
+                    for efforts in codex_catalog.efforts_by_model.values()
+                    for effort in efforts
+                }
+            ),
+            "codex_efforts_by_model": codex_efforts_by_model,
             # Family-wide union — the fallback the form uses for a full
             # `claude-*` model ID typed in advanced JSON (no per-alias entry).
             "claude_efforts": family_efforts,

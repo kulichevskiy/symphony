@@ -458,6 +458,8 @@ export interface ConfigOptions {
   codex_models: string[];
   claude_aliases: string[];
   codex_efforts: string[];
+  /** Codex efforts advertised by `model/list`, in the catalog's order. */
+  codex_efforts_by_model: Record<string, string[]>;
   /** Family-wide Claude effort union — the fallback for a full `claude-*`
    *  model ID with no per-alias entry. */
   claude_efforts: string[];

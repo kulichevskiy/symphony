@@ -9,10 +9,14 @@ column and Codex token deltas) — it no longer gates any run.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 
 from ..agent.codex_models import DEFAULT_CODEX_MODEL, pricing_for_codex_model
 from ..agent.process import Usage
+
+log = logging.getLogger(__name__)
+_WARNED_MISSING_PRICING: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -41,7 +45,13 @@ def estimate_codex_cost_usd(
     model: str = DEFAULT_CODEX_MODEL,
 ) -> float:
     """Estimate Codex USD cost from token usage when CLI output has no price."""
-    pricing = pricing_for_codex_model(model)
+    try:
+        pricing = pricing_for_codex_model(model)
+    except ValueError:
+        if model not in _WARNED_MISSING_PRICING:
+            _WARNED_MISSING_PRICING.add(model)
+            log.warning("Codex pricing unavailable for model %r; recording zero cost", model)
+        return 0.0
     cached = max(cached_input_tokens, 0)
     billable_input = max(input_tokens - cached, 0)
     return (
