@@ -25,10 +25,13 @@ closes stdin as soon as the agent reports the turn finished. That is what turns
 "keep stdin open for the run's lifetime" into a run that actually ends.
 
 **A refusal must not cost the agent's whole retry window.** When the handler
-declines — which for a token request is the dispenser's own Refusal surfacing
+refuses — which for a token request is the dispenser's own Refusal surfacing
 one layer up — the channel answers with an error and closes stdin rather than
 going quiet, and raises `refused` so the caller can stop the run instead of
-waiting for the agent to time out on its own.
+waiting for the agent to time out on its own. A handler that merely does not
+recognise a request returns `Decline` instead, which answers the same error
+without ending the run: the CLI's control vocabulary is far wider than the one
+question this host handles, and a healthy run must not die of a question.
 
 Handlers run as their own tasks rather than inline: one recovery produces
 several requests in quick succession (observed in the SYM-232 spike) and a
@@ -73,9 +76,26 @@ class ControlRequest:
     request: Mapping[str, object]
 
 
-# Answers with the response payload, or None to refuse. Refusing is a normal
-# outcome — an expired connection nobody can rotate is a refusal, not a crash.
-ControlHandler = Callable[[ControlRequest], Awaitable[Mapping[str, object] | None]]
+@dataclass(frozen=True)
+class Decline:
+    """Say no to one request and let the agent carry on.
+
+    Deliberately distinct from returning None. None means the run cannot
+    continue — the thing it asked for, it cannot have — and the channel ends
+    the conversation. A `Decline` is the milder case: a question this host
+    simply does not handle. The agent gets a correctly addressed error for the
+    request it made and decides for itself what that means, which for anything
+    other than a dead token is not "die". Silence is not the third option: the
+    agent is blocked on an answer either way.
+    """
+
+    reason: str
+
+
+# Answers with the response payload, a `Decline`, or None to refuse. Refusing
+# is a normal outcome — an expired connection nobody can rotate is a refusal,
+# not a crash.
+ControlHandler = Callable[[ControlRequest], Awaitable[Mapping[str, object] | Decline | None]]
 
 
 @dataclass(frozen=True)
@@ -300,7 +320,7 @@ class ControlChannel:
             await self._answer_now(request)
 
     async def _answer_now(self, request: ControlRequest) -> None:
-        payload: Mapping[str, object] | None = None
+        payload: Mapping[str, object] | Decline | None = None
         if self._handler is None:
             log.warning(
                 "run_id=%s asked for %s but the run carries no control handler",
@@ -318,6 +338,15 @@ class ControlChannel:
                     self._run_id,
                     request.subtype,
                 )
+        if isinstance(payload, Decline):
+            log.warning(
+                "declining %s for run_id=%s: %s", request.subtype, self._run_id, payload.reason
+            )
+            if not await self._write(_error_response(request.request_id, payload.reason)):
+                # The agent is still blocked on an answer that never arrived,
+                # which is the one case a decline cannot be walked away from.
+                await self._refuse(request.request_id, "the answer could not be delivered")
+            return
         if payload is None:
             await self._refuse(request.request_id, _REFUSAL_MESSAGE)
             return

@@ -100,6 +100,9 @@ class FakeRunner:
         self._pid = itertools.count(10000)
         # Prompts delivered over the control channel, in order (SYM-235).
         self.prompts: list[str] = []
+        # Every spec dispatched, in order — how a test asks what shape a run was
+        # given (argv, env, conversation) rather than only what came back out.
+        self.specs: list[RunnerSpec] = []
 
     def enqueue(self, events: list[RunnerEvent]) -> None:
         """Pre-program the event sequence for the next `run()` call."""
@@ -189,6 +192,7 @@ class FakeRunner:
             self._queue.append(events)
 
     def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        self.specs.append(spec)
         if spec.conversation is not None:
             self.prompts.append(spec.conversation.prompt)
         stage_q = self._stage_queues.get(spec.stage)
@@ -231,10 +235,11 @@ class FakeRunner:
 
     @staticmethod
     async def _answered(conversation: Conversation, request: ControlRequest) -> bool:
-        """True when the handler supplied a payload; False on any refusal.
+        """True when the handler answered at all; False only on a refusal.
 
         Mirrors `ControlChannel._answer`: a handler that raises is a refusal,
-        not a crash.
+        not a crash — and a `Decline` is an answer, so it leaves the channel
+        open exactly as the real one does.
         """
         if conversation.handler is None:
             return False
