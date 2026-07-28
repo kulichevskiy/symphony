@@ -177,7 +177,7 @@ class _Dispatch:
     """
 
     spec: RunnerSpec
-    recovery: ClaudeTokenRecovery | None = None
+    recovery: ClaudeTokenRecovery | None
 
 
 @dataclass(frozen=True)
@@ -3455,6 +3455,16 @@ class _OrchestratorBase:
         the connection was re-validated and this run should be requeued."""
         if agent not in _AGENT_CRED_PROVIDERS or returncode in (0, None):
             return False
+        # A verdict this run already has wins, and mid-run token recovery is
+        # what can reach one before here (SYM-236). Re-validating on top of it
+        # would spend a second exchange against an endpoint the dispenser has
+        # just found unreachable — and expire the shared connection when that
+        # one fails too. The cache exists for exactly this (see
+        # `_record_claude_auth_verdict`); the tail was the last reader not
+        # honouring it.
+        cached = self._claude_auth_revalidated.get(run_id)
+        if cached is not None:
+            return cached
         stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
         if stdout is None:
             return False
@@ -3672,7 +3682,7 @@ class _OrchestratorBase:
             return {}
         return {_CODEX_HOME_ENV: str(config_dir)}
 
-    async def _dispatch_spec(
+    async def _build_dispatch(
         self,
         *,
         binding: RepoBinding,
@@ -3708,9 +3718,20 @@ class _OrchestratorBase:
         """
         conversation: Conversation | None = None
         recovery: ClaudeTokenRecovery | None = None
-        if role.agent == "claude" and prompt is not None and _CLAUDE_TOKEN_ENV in claude_env:
+        # `_CLAUDE_TOKEN_ENV not in binding.env`: a binding supplying its own
+        # token means the run is not authenticating as the UI-connected
+        # account, so rotating that account mid-run would hand the run a
+        # stranger's token — and `binding.env` wins the merge below.
+        if (
+            role.agent == "claude"
+            and prompt is not None
+            and _CLAUDE_TOKEN_ENV in claude_env
+            and _CLAUDE_TOKEN_ENV not in binding.env
+        ):
             argv = claude_control_channel_argv(command, prompt)
-            generation = await db.runs.claude_token_generation(self._conn, run_id)
+            generation = (
+                None if argv is None else await db.runs.claude_token_generation(self._conn, run_id)
+            )
             if argv is None:
                 log.warning(
                     "run %s keeps the one-directional shape: its command does not carry the "
@@ -3748,24 +3769,29 @@ class _OrchestratorBase:
             recovery=recovery,
         )
 
-    def _settle_refused_recovery(self, run_id: str, recovery: ClaudeTokenRecovery | None) -> None:
-        """A run ended by a *retryable* refusal must requeue, not park.
+    def _settle_recovery(self, run_id: str, recovery: ClaudeTokenRecovery | None) -> None:
+        """Account for what mid-run token recovery did, now the run has ended.
 
-        Today such a run dies printing a 401 the log classifier recognises, and
-        the daemon re-validates and requeues it. Armed, the channel answers the
-        request with an error and the runner ends the run within seconds —
-        often before the agent has printed anything classifiable, which would
-        park an issue that today comes back on its own. `permanent=False` is the
-        dispenser saying the connection is untouched and still believed good:
-        the same verdict a re-validate would have reached, without spending a
-        second refresh to reach it.
+        Both halves have to land before the runner tail classifies the run's
+        log, which is why this sits in the `finally` rather than after it.
 
-        A permanent refusal is left alone — the dispenser has already armed the
-        reconnect gate and parking is correct — and so is a run some other
-        detection point has already reached a verdict about."""
-        if recovery is None or not recovery.refused_retryably:
+        The tally is the only evidence the mechanism works at all. The verdict
+        is the guarantee the ticket keeps: a run refused *retryably* — a busy
+        dispenser, a token endpoint that could not be reached — comes back,
+        which is what it does today.
+
+        Recording that verdict here also stops the runner tail re-validating,
+        and that matters more than the requeue. The dispenser has just failed
+        to reach the token endpoint and deliberately left the connection alone
+        (`permanent=False`); a second exchange moments later fails the same way,
+        and the tail expires the shared row on it — one blip gating every other
+        run, the SYM-234 cascade. A permanent refusal is left alone: the
+        dispenser has already armed the reconnect gate and parking is correct.
+        So is a run some other detection point already has a verdict about."""
+        if recovery is None:
             return
-        if run_id in self._claude_auth_revalidated:
+        recovery.log_tally()
+        if not recovery.refused_retryably or run_id in self._claude_auth_revalidated:
             return
         log.info("run %s was refused a replacement token retryably; requeueing it", run_id)
         self._record_claude_auth_verdict(run_id, True)
@@ -3863,7 +3889,7 @@ class _OrchestratorBase:
             # happens — the file is unchanged from its pristine copy).
             await self._finalize_claude_env(claude_env)
             return UsageDelta(), "spawn_failed", None
-        dispatch = await self._dispatch_spec(
+        dispatch = await self._build_dispatch(
             binding=binding,
             role=role,
             command=command,
@@ -3926,14 +3952,12 @@ class _OrchestratorBase:
             # the refreshed credential from the per-run dir back to the DB and
             # remove the dir (Config v2 3/9).
             await self._finalize_claude_env(claude_env)
-            if dispatch.recovery is not None:
-                dispatch.recovery.log_tally()
+            self._settle_recovery(run_id, dispatch.recovery)
         # Remember what this run actually ran with: a hot config reload can
         # swap the role's agent afterwards, and the auth paths must key off
         # the agent that produced this log (SYM-229 review).
         _remember_bounded(self._run_launched_agents, run_id, role.agent)
         await self._flag_auth_failure_from_log(role.agent, log_path, final_returncode, run_id)
-        self._settle_refused_recovery(run_id, dispatch.recovery)
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
         )
@@ -4196,7 +4220,7 @@ class _OrchestratorBase:
             # happens — the file is unchanged from its pristine copy).
             await self._finalize_claude_env(claude_env)
             return UsageDelta(), "spawn_failed", None
-        dispatch = await self._dispatch_spec(
+        dispatch = await self._build_dispatch(
             binding=binding,
             role=role,
             command=command,
@@ -4271,14 +4295,12 @@ class _OrchestratorBase:
             # See `_run_stage_command`: a Claude fix/review run can also refresh
             # its token in place — write back from the per-run dir + tear down.
             await self._finalize_claude_env(claude_env)
-            if dispatch.recovery is not None:
-                dispatch.recovery.log_tally()
+            self._settle_recovery(run_id, dispatch.recovery)
         # Remember what this run actually ran with: a hot config reload can
         # swap the role's agent afterwards, and the auth paths must key off
         # the agent that produced this log (SYM-229 review).
         _remember_bounded(self._run_launched_agents, run_id, role.agent)
         await self._flag_auth_failure_from_log(role.agent, log_path, final_returncode, run_id)
-        self._settle_refused_recovery(run_id, dispatch.recovery)
         await _record_run_model_usage(
             self._conn, run_id, log_path, codex_model=role_attribution_codex_model(role)
         )
@@ -4994,8 +5016,6 @@ _AGENT_CRED_PROVIDERS: frozenset[str] = frozenset({"claude", "codex"})
 # file-fed run could never survive a token rotation no matter what the daemon
 # did. Codex still reads a private per-run config dir (Config v2 6/9).
 _CLAUDE_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
-
-
 _CODEX_HOME_ENV = "CODEX_HOME"
 _CODEX_CRED_FILE = "auth.json"
 

@@ -8,9 +8,9 @@ handler to answer. Two of the three is a run that hangs or a run that never
 asks, and neither failure announces itself.
 
 At the orchestrator seam, that a run whose token is rejected mid-flight
-finishes the work it had already done — and that everything the ticket held
-back (merge, acceptance, codex, a deployment on ambient auth) keeps the
-one-directional shape it has today.
+finishes the work it had already done — and that everything held back (local
+review, acceptance, the merge pass, codex, a deployment on ambient auth, a
+binding bringing its own token) keeps the one-directional shape it has today.
 
 And throughout, that the recovery is *counted*. There is no config flag behind
 this mechanism, so the tally in the log is the only way to tell a working
@@ -544,9 +544,9 @@ async def test_a_run_with_no_connection_to_rotate_stays_one_directional(tmp_path
 
 @pytest.mark.asyncio
 async def test_a_caller_that_passes_no_prompt_is_untouched(tmp_path: Path) -> None:
-    """How merge and acceptance runs stay out of this: they never pass a
-    prompt, so their dispatch is byte-for-byte what it was. Holding them back
-    is the point — the mode proves itself on one path first."""
+    """How local review, acceptance and the merge pass stay out of this: they
+    never pass a prompt, so their dispatch is byte-for-byte what it was.
+    Holding them back is the point — the mode proves itself first."""
     harness = await _daemon(tmp_path)
     try:
         harness.runner.enqueue([RunnerEvent(kind="started", pid=1), *_done()])
@@ -619,6 +619,87 @@ async def test_a_question_this_host_does_not_answer_does_not_kill_the_run(
         )
         assert await _dispatch(harness) == ("exit", 0)
         assert not await harness.orch._claude_auth_requeue_signal(  # noqa: SLF001
+            "claude", None, run_id="run-1"
+        )
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+async def test_a_binding_that_brings_its_own_token_is_left_alone(tmp_path: Path) -> None:
+    """A binding supplying `CLAUDE_CODE_OAUTH_TOKEN` through `env:` is not
+    authenticating as the UI-connected account — and `binding.env` wins the
+    merge. Arming that run would let a mid-flight rejection rotate an account
+    it never used and hand it a stranger's token."""
+    harness = await _daemon(tmp_path)
+    try:
+        binding = _binding().model_copy(update={"env": {CLAUDE_TOKEN_ENV: "byo-token"}})
+        harness.runner.enqueue([RunnerEvent(kind="started", pid=1), *_done()])
+        await harness.orch._run_stage_command(  # noqa: SLF001
+            binding=binding,
+            issue=_issue(),
+            command=build_runner_command(
+                "claude", PROMPT, workspace_path=harness.config.workspace_root
+            ),
+            run_id="run-1",
+            workspace_path=harness.config.workspace_root,
+            stage="implement",
+            role=ResolvedRole(agent="claude"),
+            prior_total=0.0,
+            prompt=PROMPT,
+        )
+        spec = harness.runner.specs[0]
+        assert spec.conversation is None
+        assert spec.env[CLAUDE_TOKEN_ENV] == "byo-token"
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_a_retryable_refusal_stops_the_tail_re_validating(tmp_path: Path) -> None:
+    """The regression arming would otherwise introduce, and the reason the
+    verdict is recorded before the runner tail reads the log.
+
+    A refused run does print a 401 — that is why the agent asked in the first
+    place. Left alone, the tail would classify it and re-validate: a second
+    exchange against the endpoint the dispenser has just found unreachable,
+    moments later, failing the same way — and the tail expires the shared row
+    on that, gating every other run. One blip, fleet-wide outage: the SYM-234
+    cascade, re-entered through the back door."""
+    endpoint = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(return_value=httpx.Response(503, json={}))
+    harness = await _daemon(tmp_path)
+    try:
+        harness.orch.claude_token_dispenser = ClaudeTokenDispenser(
+            harness.conn,
+            CredentialCipher(ENC_KEY),
+            CredentialWriteBack(harness.conn, CredentialCipher(ENC_KEY)),
+            budget_secs=0.01,
+            retry_backoff_secs=0.01,
+        )
+        harness.runner.enqueue(
+            [
+                RunnerEvent(kind="started", pid=1),
+                _control_request(),
+                RunnerEvent(
+                    kind="stdout",
+                    line=json.dumps(
+                        {"type": "result", "is_error": True, "result": "Not logged in"}
+                    ),
+                ),
+                RunnerEvent(kind="exit", returncode=1),
+            ]
+        )
+        assert await _dispatch(harness) == ("exit", 1)
+
+        # One exchange, the dispenser's own — no second one from the tail. The
+        # connection is untouched, and the run comes back rather than parking
+        # for an operator who has nothing to fix.
+        assert endpoint.call_count == 1
+        status = await db.oauth_connections.get_status(harness.conn, "claude")
+        assert status is not None
+        assert status.status == "connected"
+        assert await harness.orch._claude_auth_requeue_signal(  # noqa: SLF001
             "claude", None, run_id="run-1"
         )
     finally:
