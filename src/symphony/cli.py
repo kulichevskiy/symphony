@@ -689,11 +689,10 @@ async def _preflight_validate_capabilities(cfg: Config, codex_catalog: CodexCata
         binding_env = {**os.environ, **binding.env}
         for name in get_args(RoleName):
             role = binding.resolved_role(name, cfg.roles)
-            if role.model is None:
-                continue
             if role.agent == "codex":
-                codex_pairs.add((role.model, role.effort))
-            elif role.effort is not None:
+                codex_pairs.add((role.codex_model_arg(), role.effort))
+                continue
+            if role.model is not None and role.effort is not None:
                 resolved_model = _resolve_alias_model_id(role.model, binding_env)
                 claude_checks.add((binding_key, role.model, role.effort, resolved_model))
 

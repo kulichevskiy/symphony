@@ -9,7 +9,11 @@ from symphony.agent.codex_catalog import CodexCatalogClient
 
 
 @pytest.mark.asyncio
-async def test_catalog_client_reads_visible_models_and_ordered_efforts(tmp_path: Path) -> None:
+async def test_catalog_client_reads_visible_models_and_ordered_efforts(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("OPENAI_API_KEY", "host-openai-key")
+    monkeypatch.setenv("CODEX_API_KEY", "host-codex-key")
     server = tmp_path / "fake_app_server.py"
     server.write_text(
         """
@@ -19,6 +23,8 @@ import sys
 from pathlib import Path
 
 assert Path(os.environ["CODEX_HOME"], "auth.json").read_text() == '{"tokens":{}}'
+assert "OPENAI_API_KEY" not in os.environ
+assert "CODEX_API_KEY" not in os.environ
 
 initialized = False
 for line in sys.stdin:

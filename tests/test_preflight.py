@@ -656,6 +656,31 @@ def test_preflight_checks_codex_pair_via_live_catalog(tmp_path: Path, monkeypatc
     assert "codex model 'gpt-5.1-codex' supports effort 'high'" in result.output
 
 
+def test_preflight_validates_default_codex_model_and_effort(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    _isolate_codex_home(tmp_path, monkeypatch)
+    _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
+
+    async def _catalog(**_kwargs: Any) -> CodexCatalog:
+        return CodexCatalog(
+            models=("gpt-5.1-codex",),
+            efforts_by_model={"gpt-5.1-codex": ("low", "high")},
+        )
+
+    monkeypatch.setattr("symphony.cli.codex_catalog_client.get", _catalog)
+    binding = _ready_binding()
+    binding["roles"] = {"implement": {"agent": "codex", "effort": "ultra"}}
+    _seed_preflight_db(tmp_path, monkeypatch, [binding])
+
+    result = CliRunner().invoke(main, ["preflight"])
+
+    assert result.exit_code == 1, result.output
+    assert (
+        "effort 'ultra' not supported by codex model 'gpt-5.1-codex'; "
+        "supported: low, high" in result.output
+    )
+
+
 def test_preflight_rejects_codex_effort_missing_from_live_catalog(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]

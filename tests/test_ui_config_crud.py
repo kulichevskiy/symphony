@@ -1849,6 +1849,71 @@ async def test_save_rejects_unsupported_claude_effort(tmp_path: Path, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_save_rejects_unsupported_codex_effort(tmp_path: Path) -> None:
+    async def _catalog() -> CodexCatalog:
+        return CodexCatalog(
+            models=("gpt-5.6-luna",),
+            efforts_by_model={"gpt-5.6-luna": ("low", "high")},
+        )
+
+    conn, _ = await _open(tmp_path)
+    try:
+        app = _drain_app(conn, codex_catalog_provider=_catalog)
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(
+                        roles={
+                            "implement": {
+                                "agent": "codex",
+                                "model": "gpt-5.6-luna",
+                                "effort": "ultra",
+                            }
+                        }
+                    )
+                },
+            )
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["detail"][0]["loc"] == ["roles"]
+        assert "does not support effort 'ultra'" in resp.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_global_roles_save_rejects_unsupported_codex_effort(tmp_path: Path) -> None:
+    async def _catalog() -> CodexCatalog:
+        return CodexCatalog(
+            models=("gpt-5.6-luna",),
+            efforts_by_model={"gpt-5.6-luna": ("low", "high")},
+        )
+
+    conn, _ = await _open(tmp_path)
+    try:
+        app = _drain_app(conn, codex_catalog_provider=_catalog)
+        async with _client(app) as client:
+            resp = await client.put(
+                "/api/config/roles",
+                json={
+                    "roles": {
+                        "implement": {
+                            "agent": "codex",
+                            "model": "gpt-5.6-luna",
+                            "effort": "ultra",
+                        }
+                    },
+                    "version": 0,
+                },
+            )
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["detail"][0]["loc"] == ["roles"]
+        assert "does not support effort 'ultra'" in resp.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_stale_effort_on_unrelated_binding_does_not_block_save(
     tmp_path: Path,
     monkeypatch,  # type: ignore[no-untyped-def]

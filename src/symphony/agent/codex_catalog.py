@@ -105,6 +105,8 @@ class CodexCatalogClient:
             auth_path.write_text(credential, encoding="utf-8")
             auth_path.chmod(0o600)
             env = dict(os.environ)
+            env.pop("OPENAI_API_KEY", None)
+            env.pop("CODEX_API_KEY", None)
             env["CODEX_HOME"] = str(codex_home)
             proc = await asyncio.create_subprocess_exec(
                 *self.command,
