@@ -709,9 +709,7 @@ def test_preflight_rejects_codex_model_missing_from_live_catalog(
     assert "Codex model 'gpt-missing' is not available" in result.output
 
 
-def test_preflight_skips_codex_validation_for_stale_catalog(
-    tmp_path: Path, monkeypatch
-) -> None:  # type: ignore[no-untyped-def]
+def test_preflight_skips_codex_validation_for_stale_catalog(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     _isolate_codex_home(tmp_path, monkeypatch)
     _install_fake(monkeypatch, _FakeLinear(viewer_keys=["ENG"], states={"ENG": _STD_STATES}))
