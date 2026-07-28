@@ -35,3 +35,15 @@ def test_build_codex_workspace_write_command_carries_effort() -> None:
     assert configs == ['model_reasoning_effort="high"']
     assert argv[argv.index("--model") + 1] == "gpt-5.1-codex"
     assert argv[-1] == "fix this"
+
+
+def test_build_codex_workspace_write_command_escapes_effort_as_toml_string() -> None:
+    argv = build_codex_workspace_write_command(
+        prompt="fix this",
+        codex_model="gpt-future",
+        effort='high"\nmodel="injected',
+    )
+
+    assert argv[argv.index("--config") + 1] == (
+        'model_reasoning_effort="high\\"\\nmodel=\\"injected"'
+    )

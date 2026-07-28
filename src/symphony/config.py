@@ -26,11 +26,7 @@ from dotenv import dotenv_values
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .agent.codex_models import (
-    DEFAULT_CODEX_MODEL,
-    SUPPORTED_CODEX_EFFORTS,
-    SUPPORTED_CODEX_MODELS,
-)
+from .agent.codex_models import DEFAULT_CODEX_MODEL
 from .github.client import MergeStrategy
 from .ui.status import CanonicalState
 
@@ -107,6 +103,13 @@ class RoleConfig(BaseModel):
     model: str | None = None
     effort: str | None = None
 
+    @field_validator("model", "effort")
+    @classmethod
+    def _non_empty_value(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("must not be empty")
+        return value
+
 
 class ResolvedRole(BaseModel):
     """A role after merge + back-compat defaults are applied.
@@ -139,7 +142,7 @@ def _role_model_in_family(agent: Literal["claude", "codex"], model: str | None) 
     if model is None:
         return True
     if agent == "codex":
-        return model in SUPPORTED_CODEX_MODELS
+        return bool(model.strip())
     # Aliases (opus/sonnet/haiku) plus full `claude-*` IDs verbatim — the
     # latter already flow through `--model` today, and the importer preserves
     # a pinned full ID when no alias applies (SYM-188).
@@ -150,7 +153,7 @@ def _role_effort_in_family(agent: Literal["claude", "codex"], effort: str | None
     if effort is None:
         return True
     if agent == "codex":
-        return effort in SUPPORTED_CODEX_EFFORTS
+        return bool(effort.strip())
     return effort in SUPPORTED_CLAUDE_EFFORTS
 
 
@@ -468,9 +471,8 @@ class RepoBinding(BaseModel):
     @field_validator("codex_model")
     @classmethod
     def _known_codex_model(cls, value: str) -> str:
-        if value not in SUPPORTED_CODEX_MODELS:
-            supported = ", ".join(sorted(SUPPORTED_CODEX_MODELS))
-            raise ValueError(f"unknown Codex model {value!r}; supported: {supported}")
+        if not value.strip():
+            raise ValueError("Codex model must not be empty")
         return value
 
     @field_validator("reviewer_codex_model")
@@ -478,9 +480,8 @@ class RepoBinding(BaseModel):
     def _known_reviewer_codex_model(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        if value not in SUPPORTED_CODEX_MODELS:
-            supported = ", ".join(sorted(SUPPORTED_CODEX_MODELS))
-            raise ValueError(f"unknown reviewer Codex model {value!r}; supported: {supported}")
+        if not value.strip():
+            raise ValueError("reviewer Codex model must not be empty")
         return value
 
     def resolved_local_review(self) -> bool:
@@ -916,13 +917,9 @@ class Config(BaseModel):
                 # any of the five roles — no per-role wiring gate.
                 role = binding.resolved_role(name, self.roles)
                 if explicit_model and not _role_model_in_family(role.agent, role.model):
-                    if role.agent == "codex":
-                        family, supported = "Codex", sorted(SUPPORTED_CODEX_MODELS)
-                    else:
-                        family, supported = "Claude", sorted(CLAUDE_MODEL_ALIASES)
                     raise ValueError(
-                        f"role {name!r}: unknown {family} model {role.model!r}; "
-                        f"supported: {', '.join(supported)}"
+                        f"role {name!r}: unknown Claude model {role.model!r}; "
+                        f"supported: {', '.join(sorted(CLAUDE_MODEL_ALIASES))}"
                     )
                 if explicit_effort and role.agent == "claude" and role.model is None:
                     # No model resolves (the ordinary default: claude builders
@@ -942,14 +939,10 @@ class Config(BaseModel):
                     # inherited model still validates (SYM-191). The exact
                     # `(model, effort)` capability pair is a separate online
                     # check the save path and preflight run.
-                    if role.agent == "codex":
-                        family, supported = "Codex", sorted(SUPPORTED_CODEX_EFFORTS)
-                    else:
-                        family, supported = "Claude", sorted(SUPPORTED_CLAUDE_EFFORTS)
                     raise ValueError(
-                        f"role {name!r}: unknown {family} effort "
+                        f"role {name!r}: unknown Claude effort "
                         f"{role.effort!r}; supported: "
-                        f"{', '.join(supported)}"
+                        f"{', '.join(sorted(SUPPORTED_CLAUDE_EFFORTS))}"
                     )
             if not self.repos:
                 # The synthetic binding isn't a real one; its own diversity

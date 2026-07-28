@@ -27,12 +27,19 @@ import click
 
 from . import db
 from .agent.claude_models import _resolve_alias_model_id, fetch_claude_effort_capabilities
-from .agent.codex_models import SUPPORTED_CODEX_EFFORTS
+from .agent.codex_catalog import CodexCatalog, codex_catalog_client
 from .app import build_server_config, create_app
 from .auth import Auth0Settings
+from .codex_login import codex_expires_at
 from .config import Config, RepoBinding, RoleName, Secrets
-from .credentials import CredentialResolver
-from .crypto import CredentialCipher, EncryptionKeyLostError, resolve_encryption_key
+from .credentials import CredentialResolver, CredentialWriteBack
+from .crypto import (
+    CredentialCipher,
+    CredentialDecryptError,
+    CredentialKeyMissingError,
+    EncryptionKeyLostError,
+    resolve_encryption_key,
+)
 from .effective_config import ConfigBootError, assemble_effective_config
 from .github.webhook import GitHubWebhookSettings
 from .linear.client import Linear, LinearError, LinearIssue
@@ -645,19 +652,19 @@ async def _preflight_configured_bindings(cfg: Config, trackers: TrackerRegistry)
     return ok
 
 
-async def _preflight_validate_capabilities(cfg: Config) -> bool:
+async def _preflight_validate_capabilities(cfg: Config, codex_catalog: CodexCatalog) -> bool:
     """Validate each resolved `(model, effort)` pair against the live source.
 
-    claude pairs are checked against the Models API `capabilities.effort`
-    tree; codex pairs against the fixed family enum. This is the *online*
-    check — preflight only. Daemon boot stays structural (the roles matrix's
-    family-enum check) and never queries the network.
+    Claude pairs are checked against the Models API `capabilities.effort`
+    tree; Codex pairs against app-server `model/list`. This is the *online*
+    check — preflight only. Daemon boot stays structural and never queries a
+    provider.
     """
     # Each binding runs claude with the key the runner injects: its own `env:`
     # ANTHROPIC_API_KEY (resolved from `.env` when assembling DB bindings) takes
     # precedence over the process env, matching `{**os.environ, **spec.env}`.
     env_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    codex_pairs: set[tuple[str, str]] = set()
+    codex_pairs: set[tuple[str, str | None]] = set()
     # (key, model, effort, resolved_model); key "" means no API key is available
     # for that binding (claude runs via CLI auth). Keying by the resolved key
     # exercises every distinct binding key, so a present-but-broken one fails
@@ -681,18 +688,31 @@ async def _preflight_validate_capabilities(cfg: Config) -> bool:
         # the same way here or this validates the wrong model (SYM-191 review).
         binding_env = {**os.environ, **binding.env}
         for name in get_args(RoleName):
-            role = binding.resolved_role(name, cfg.roles)
-            if role.effort is None or role.model is None:
+            if name in _REVIEW_LANE_ROLES and not binding.resolved_local_review():
                 continue
+            role = binding.resolved_role(name, cfg.roles)
             if role.agent == "codex":
-                codex_pairs.add((role.model, role.effort))
-            else:
+                codex_pairs.add((role.codex_model_arg(), role.effort))
+                continue
+            if role.model is not None and role.effort is not None:
                 resolved_model = _resolve_alias_model_id(role.model, binding_env)
                 claude_checks.add((binding_key, role.model, role.effort, resolved_model))
 
     ok = True
-    for model, effort in sorted(codex_pairs):
-        ok = _report_effort_support("codex", model, effort, sorted(SUPPORTED_CODEX_EFFORTS)) and ok
+    if codex_pairs and codex_catalog.source != "live":
+        click.echo(
+            "  ⚠ skipping Codex model/effort validation: live model catalog unavailable",
+            err=True,
+        )
+    elif codex_pairs:
+        for model, effort in sorted(codex_pairs, key=lambda pair: (pair[0], pair[1] or "")):
+            codex_supported = codex_catalog.efforts_by_model.get(model)
+            if codex_supported is None:
+                click.echo(f"Codex model {model!r} is not available", err=True)
+                ok = False
+                continue
+            if effort is not None:
+                ok = _report_effort_support("codex", model, effort, list(codex_supported)) and ok
 
     # One Models API call per distinct (key, resolved_model): every binding key
     # AND every distinct alias pin is exercised at least once.
@@ -775,13 +795,50 @@ async def _preflight() -> None:
             # resolved when building the tracker registry below.
             async with _configured_tracker_registry(cfg, conn) as (trackers, _):
                 ok = await _preflight_configured_bindings(cfg, trackers)
-            caps_ok = await _preflight_validate_capabilities(cfg)
+            codex_catalog = await _preflight_codex_catalog(conn, cfg)
+            caps_ok = await _preflight_validate_capabilities(cfg, codex_catalog)
         except ValueError as e:
             click.echo(str(e), err=True)
             sys.exit(2)
         sys.exit(0 if (ok and caps_ok) else 1)
     finally:
         await conn.close()
+
+
+async def _preflight_codex_catalog(conn: aiosqlite.Connection, cfg: Config) -> CodexCatalog:
+    if not _config_can_run_codex_cli(cfg):
+        return await codex_catalog_client.get(credential=None, generation=None)
+    try:
+        snapshot = await db.oauth_connections.get_connection_snapshot(
+            conn,
+            "codex",
+            CredentialCipher(cfg.symphony_encryption_key),
+        )
+    except (CredentialDecryptError, CredentialKeyMissingError):
+        snapshot = None
+    if snapshot is None or snapshot.status != "connected":
+        return await codex_catalog_client.get(credential=None, generation=None)
+
+    async def _write_back(credential: str) -> int | None:
+        wrote = await CredentialWriteBack(
+            conn, CredentialCipher(cfg.symphony_encryption_key)
+        ).write_back(
+            "codex",
+            credential,
+            expires_at=codex_expires_at(credential),
+            expected_prior=snapshot.credential,
+            expect_connected_generation=snapshot.generation,
+        )
+        if not wrote:
+            return None
+        status = await db.oauth_connections.get_status(conn, "codex")
+        return status.generation if status is not None else None
+
+    return await codex_catalog_client.get(
+        credential=snapshot.credential,
+        generation=snapshot.generation,
+        write_back=_write_back,
+    )
 
 
 @main.group()

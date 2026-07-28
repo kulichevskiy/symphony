@@ -56,9 +56,13 @@ const config: ConfigView = {
 
 const OPTIONS: ConfigOptions = {
   agent_families: ["claude", "codex"],
-  codex_models: ["gpt-5.1-codex"],
+  codex_models: ["gpt-5.1-codex", "gpt-5.6-sol"],
   claude_aliases: ["haiku", "opus", "sonnet"],
   codex_efforts: ["high", "low", "medium", "minimal"],
+  codex_efforts_by_model: {
+    "gpt-5.1-codex": ["minimal", "low", "medium", "high"],
+    "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
+  },
   claude_efforts: ["high", "low", "max", "medium", "xhigh"],
   claude_efforts_by_model: {
     opus: ["low", "medium", "high"],
@@ -956,6 +960,28 @@ describe("RoleMatrixEditor", () => {
       />,
     );
     expect(effortOpts()).toEqual(["", "low", "medium"]);
+  });
+
+  it("varies Codex effort options by the selected model", () => {
+    render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={{ implement: { agent: "codex", model: "gpt-5.6-sol" } }}
+        options={OPTIONS}
+        onChange={() => undefined}
+      />,
+    );
+
+    const effort = screen.getByLabelText("binding implement effort") as HTMLSelectElement;
+    expect([...effort.options].map((option) => option.value)).toEqual([
+      "",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+      "ultra",
+    ]);
   });
 
   it("clears model/effort when the agent changes families", () => {

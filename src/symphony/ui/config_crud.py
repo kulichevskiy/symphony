@@ -79,7 +79,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from ..agent.claude_models import _resolve_alias_model_id, fetch_claude_effort_capabilities
-from ..agent.codex_models import SUPPORTED_CODEX_EFFORTS, SUPPORTED_CODEX_MODELS
+from ..agent.codex_catalog import STATIC_CODEX_CATALOG, CodexCatalog
 from ..config import (
     _LEGACY_ROLE_FIELDS,
     CLAUDE_MODEL_ALIASES,
@@ -109,6 +109,7 @@ from ..db.config_repo_secrets import RepoSecretView
 from ..effective_config import OPERATIONAL_KNOBS
 
 _ROLES_ADAPTER: TypeAdapter[dict[RoleName, RoleConfig]] = TypeAdapter(dict[RoleName, RoleConfig])
+_REVIEW_LANE_ROLES = frozenset({"review_find", "review_verify"})
 
 _log = logging.getLogger(__name__)
 
@@ -667,6 +668,7 @@ async def _assemble_and_validate(
     candidate: RepoBinding,
     *,
     exclude_id: int | None,
+    codex_catalog: CodexCatalog = STATIC_CODEX_CATALOG,
 ) -> tuple[list[str], int]:
     """Assemble the trial effective config (system knobs + all DB bindings, the
     candidate swapped in for `exclude_id`, + global matrix) and re-run the
@@ -691,7 +693,7 @@ async def _assemble_and_validate(
     # unrelated binding (e.g. saved fail-open before ANTHROPIC_API_KEY was set)
     # must not block *this* save. The all-bindings sweep is reserved for
     # `put_roles`, where a global change really does reach every binding.
-    await _reject_unsupported_efforts(trial, bindings=[candidate])
+    await _reject_unsupported_efforts(trial, bindings=[candidate], codex_catalog=codex_catalog)
     # `validate_roles_matrix` warns for every binding in the trial set; only the
     # candidate's own warnings are relevant to this save (others are unchanged).
     prefix = f"binding {candidate.project_key}/{candidate.github_repo}:"
@@ -733,11 +735,16 @@ def _binding_anthropic_key(
 
 
 async def _reject_unsupported_efforts(
-    trial: Config, *, bindings: list[RepoBinding] | None = None, only_inherited: bool = False
+    trial: Config,
+    *,
+    bindings: list[RepoBinding] | None = None,
+    only_inherited: bool = False,
+    codex_catalog: CodexCatalog = STATIC_CODEX_CATALOG,
 ) -> None:
-    """Re-run the preflight capability check for every resolved *claude*
-    `(model, effort)` pair in `trial` — the same online Models-API source
-    preflight uses, keyed the same way (per binding, its own `env:`
+    """Re-run provider capability checks for every resolved role in `trial`.
+
+    Claude uses the same online Models-API source as preflight, keyed the same
+    way (per binding, its own `env:`
     ANTHROPIC_API_KEY taking precedence over the process key) — so a
     deployment whose key lives only in a binding's `env:` is validated the
     same way it will actually run, not silently skipped. Likewise, a binding's
@@ -746,9 +753,11 @@ async def _reject_unsupported_efforts(
     `sonnet`/`opus`/`haiku` alias, matching the runner's `{**os.environ,
     **spec.env}` precedence — otherwise this would validate the alias against
     whatever the process pins it to, not what that binding's subprocess
-    actually runs (SYM-191 review). codex efforts are
-    the fixed family enum (already checked structurally by
-    `validate_roles_matrix`). A `None` result (no ANTHROPIC_API_KEY anywhere
+    actually runs (SYM-191 review). Codex uses the app-server catalog. A live
+    catalog rejects unavailable models; static/stale fallback remains
+    forward-compatible with unknown models but validates every known pair.
+
+    A `None` Claude result (no ANTHROPIC_API_KEY anywhere
     for that binding) skips the pair: the daemon may run claude via CLI auth,
     and the structural family check already ran — exactly preflight's
     fail-open-on-no-key behavior. A key IS present but the Models-API call
@@ -801,6 +810,8 @@ async def _reject_unsupported_efforts(
             **{var: env_source.get(source, "") for var, source in binding.env.items()},
         }
         for name in get_args(RoleName):
+            if name in _REVIEW_LANE_ROLES and not binding.resolved_local_review():
+                continue
             if only_inherited:
                 binding_role = binding.roles.get(name)
                 if (
@@ -811,7 +822,24 @@ async def _reject_unsupported_efforts(
                 ):
                     continue
             role = binding.resolved_role(name, trial.roles)
-            if role.agent != "claude" or role.effort is None:
+            if role.agent == "codex":
+                model = role.codex_model_arg()
+                codex_supported = codex_catalog.efforts_by_model.get(model)
+                if codex_supported is None:
+                    if codex_catalog.source == "live":
+                        raise _validation_error(
+                            ["roles"],
+                            f"codex model {model!r} is not available",
+                        )
+                    continue
+                if role.effort is not None and role.effort not in codex_supported:
+                    raise _validation_error(
+                        ["roles"],
+                        f"codex model {model!r} does not support effort "
+                        f"{role.effort!r}; supported: {', '.join(codex_supported)}",
+                    )
+                continue
+            if role.effort is None:
                 continue
             if role.model is None:
                 raise _validation_error(
@@ -884,6 +912,7 @@ def create_config_crud_router(
     clock: Callable[[], datetime] | None = None,
     scheduled_slots: Callable[[tuple[str, str, str, str, str]], int] | None = None,
     repo_secret_view: RepoSecretView | None = None,
+    codex_catalog_provider: Callable[[], Awaitable[CodexCatalog]] | None = None,
 ) -> APIRouter:
     """Router mounting the binding CRUD + options endpoints under `/api/config`.
 
@@ -911,6 +940,13 @@ def create_config_crud_router(
     def _base_config() -> Config:
         current = config_provider() if callable(config_provider) else config_provider
         return current if current is not None else Config()
+
+    async def _codex_catalog() -> CodexCatalog:
+        return (
+            await codex_catalog_provider()
+            if codex_catalog_provider is not None
+            else STATIC_CODEX_CATALOG
+        )
 
     # Resolve `updated_by` from the auth token email, or `local` without Auth0.
     if auth_dependency is None:
@@ -947,11 +983,23 @@ def create_config_crud_router(
             alias: caps if caps is not None else family_efforts
             for alias, caps in zip(aliases, results, strict=True)
         }
+        codex_catalog = await _codex_catalog()
+        codex_efforts_by_model = {
+            model: list(codex_catalog.efforts_by_model.get(model, ()))
+            for model in codex_catalog.models
+        }
         return {
             "agent_families": ["claude", "codex"],
-            "codex_models": sorted(SUPPORTED_CODEX_MODELS),
+            "codex_models": list(codex_catalog.models),
             "claude_aliases": sorted(CLAUDE_MODEL_ALIASES),
-            "codex_efforts": sorted(SUPPORTED_CODEX_EFFORTS),
+            "codex_efforts": sorted(
+                {
+                    effort
+                    for efforts in codex_catalog.efforts_by_model.values()
+                    for effort in efforts
+                }
+            ),
+            "codex_efforts_by_model": codex_efforts_by_model,
             # Family-wide union — the fallback the form uses for a full
             # `claude-*` model ID typed in advanced JSON (no per-alias entry).
             "claude_efforts": family_efforts,
@@ -1043,7 +1091,11 @@ def create_config_crud_router(
         # cells: a binding pinning its own explicit `(model, effort)` for a
         # role is unaffected by this write and must not block it (SYM-191
         # review) — that binding's own save already validated its pair.
-        await _reject_unsupported_efforts(trial, only_inherited=True)
+        await _reject_unsupported_efforts(
+            trial,
+            only_inherited=True,
+            codex_catalog=await _codex_catalog(),
+        )
         binding_snapshot = {row.id: row.version for row in existing}
         async with lock:
             # Cheap, DB-only recheck: a binding created/updated/deleted during
@@ -1191,7 +1243,13 @@ def create_config_crud_router(
         # Assembly + validation (including the external Models-API capability
         # check, up to the full 30s httpx timeout) runs before the lock is
         # acquired — see the matching comment in `put_roles` for why.
-        wgs, globals_version = await _assemble_and_validate(conn, base, binding, exclude_id=None)
+        wgs, globals_version = await _assemble_and_validate(
+            conn,
+            base,
+            binding,
+            exclude_id=None,
+            codex_catalog=await _codex_catalog(),
+        )
         async with lock:
             fresh_others = await _other_bindings(conn, base, exclude_id=None)
             # Re-check the cheap, DB-state-dependent duplicate-selector
@@ -1327,7 +1385,11 @@ def create_config_crud_router(
         # its own optimistic-lock `version` check, so a concurrent change
         # lands as a 409, not a lost update.
         wgs, globals_version = await _assemble_and_validate(
-            conn, base, binding, exclude_id=binding_id
+            conn,
+            base,
+            binding,
+            exclude_id=binding_id,
+            codex_catalog=await _codex_catalog(),
         )
         async with lock:
             # Drain guard: a natural-key or branch-affecting edit would detach

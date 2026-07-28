@@ -271,9 +271,9 @@ async def test_mixed_matrix_resolves_per_role_without_legacy_fields(tmp_path: Pa
 
 
 @pytest.mark.asyncio
-async def test_invalid_db_role_combo_refuses_boot(tmp_path: Path) -> None:
+async def test_future_codex_model_from_db_is_accepted(tmp_path: Path) -> None:
     """DB roles bypass `Config`'s constructor validators via `model_copy`;
-    assembly must re-run the same family check YAML `repos:`/`roles:` gets."""
+    assembly keeps future Codex model IDs structurally valid."""
     conn = await db.connect(tmp_path / "state.sqlite")
     await db.config_bindings.insert(
         conn,
@@ -284,13 +284,11 @@ async def test_invalid_db_role_combo_refuses_boot(tmp_path: Path) -> None:
         },
         key=("ENG", "org/api", "", "linear", "default"),
     )
-    # `codex` agent paired with a Claude-only model alias — invalid combo the
-    # YAML loader's `_validate_roles` would reject at construction time.
     await db.config_globals.set_globals(
-        conn, roles={"implement": {"agent": "codex", "model": "opus"}}, migrated_at="t"
+        conn, roles={"implement": {"agent": "codex", "model": "gpt-future"}}, migrated_at="t"
     )
-    with pytest.raises(ConfigBootError, match="invalid role configuration"):
-        await assemble_effective_config(conn, _base(tmp_path))
+    cfg = await assemble_effective_config(conn, _base(tmp_path))
+    assert cfg.roles["implement"].model == "gpt-future"
     await conn.close()
 
 

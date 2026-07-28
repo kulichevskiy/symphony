@@ -18,6 +18,7 @@ function stubBodyFor(url: string): unknown {
       codex_models: [],
       claude_aliases: [],
       codex_efforts: [],
+      codex_efforts_by_model: {},
       claude_efforts: [],
       claude_efforts_by_model: {},
       merge_strategies: ["squash", "merge", "rebase"],
@@ -25,6 +26,9 @@ function stubBodyFor(url: string): unknown {
   }
   if (url.includes("/api/config/roles")) {
     return { roles: {}, version: 0 };
+  }
+  if (url.includes("/api/config/knobs")) {
+    return { knobs: [], version: 0 };
   }
   if (url.includes("/api/config")) {
     return {

@@ -19,8 +19,10 @@ import respx
 from fastapi import FastAPI
 
 from symphony import db
+from symphony.agent.codex_catalog import CodexCatalog
 from symphony.app import create_app
 from symphony.config import Config
+from symphony.crypto import CredentialCipher
 from symphony.db import config_bindings, config_repo_secrets
 from symphony.effective_config import assemble_effective_config
 from symphony.ui.config_crud import create_config_crud_router
@@ -42,7 +44,9 @@ def _binding_key_str(rec: dict[str, Any]) -> str:
     )
 
 
-def _drain_app(conn: Any, *, scheduled_slots: Any = None) -> FastAPI:
+def _drain_app(
+    conn: Any, *, scheduled_slots: Any = None, codex_catalog_provider: Any = None
+) -> FastAPI:
     """A minimal app mounting only the CRUD router, so a test can inject a
     `scheduled_slots` provider (the in-memory drain-guard input the daemon
     supplies in production)."""
@@ -59,6 +63,7 @@ def _drain_app(conn: Any, *, scheduled_slots: Any = None) -> FastAPI:
                 linear_api_key="test-linear-key",
             ),
             scheduled_slots=scheduled_slots,
+            codex_catalog_provider=codex_catalog_provider,
         )
     )
     return app
@@ -81,6 +86,7 @@ def _app(
     auth: bool = False,
     github_webhook_secret: str = "test-global-secret",
     linear_api_key: str = "test-linear-key",
+    oauth_cipher: CredentialCipher | None = None,
 ) -> Any:
     # A global secret/key is set by default so tests unrelated to a specific
     # check don't trip it; the tests for each check override the relevant
@@ -95,6 +101,7 @@ def _app(
             linear_api_key=linear_api_key,
         ),
         auth0_settings=_settings() if auth else None,
+        oauth_cipher=oauth_cipher,
     )
 
 
@@ -406,7 +413,7 @@ async def test_roles_matrix_error_shows_roles_path(tmp_path: Path) -> None:
                 "/api/config/bindings",
                 json={
                     "payload": _payload(
-                        roles={"implement": {"agent": "codex", "model": "not-a-model"}}
+                        roles={"implement": {"agent": "claude", "model": "gpt-5.1-codex"}}
                     )
                 },
             )
@@ -1256,6 +1263,117 @@ async def test_options_payload(tmp_path: Path, monkeypatch) -> None:  # type: ig
         assert body["merge_strategies"] == ["squash", "merge", "rebase"]
         assert set(body["claude_aliases"]) == {"opus", "sonnet", "haiku"}
         assert "gpt-5.1-codex" in body["codex_models"]
+        assert {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} <= set(body["codex_models"])
+        assert body["codex_efforts_by_model"]["gpt-5.6-sol"] == [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max",
+            "ultra",
+        ]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_options_payload_uses_dynamic_codex_catalog(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    async def _claude_caps(model: str, api_key: str | None = None) -> list[str] | None:
+        return None
+
+    async def _codex_catalog() -> CodexCatalog:
+        return CodexCatalog(
+            models=("gpt-future",),
+            efforts_by_model={"gpt-future": ("low", "ultra")},
+        )
+
+    monkeypatch.setattr("symphony.ui.config_crud.fetch_claude_effort_capabilities", _claude_caps)
+    conn, _ = await _open(tmp_path)
+    try:
+        app = _drain_app(conn, codex_catalog_provider=_codex_catalog)
+        async with _client(app) as client:
+            body = (await client.get("/api/config/options")).json()
+        assert body["codex_models"] == ["gpt-future"]
+        assert body["codex_efforts_by_model"] == {"gpt-future": ["low", "ultra"]}
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_options_payload_discovers_with_connected_codex_credential(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    cipher = CredentialCipher("test-catalog-key")
+    conn, db_path = await _open(tmp_path)
+    await db.oauth_connections.set_connection(
+        conn,
+        provider="codex",
+        credential='{"tokens":{"access_token":"secret"}}',
+        cipher=cipher,
+        status="connected",
+    )
+    seen: list[tuple[str | None, int | None]] = []
+    catalog_connections: list[Any] = []
+    config_connections: list[Any] = []
+
+    class _WriteBack:
+        def __init__(self, conn: Any, _cipher: Any) -> None:
+            catalog_connections.append(conn)
+
+        async def write_back(self, *_args: Any, **_kwargs: Any) -> bool:
+            return False
+
+    original_insert = config_bindings.insert
+
+    async def _capturing_insert(conn: Any, *args: Any, **kwargs: Any) -> Any:
+        config_connections.append(conn)
+        return await original_insert(conn, *args, **kwargs)
+
+    async def _catalog(
+        *,
+        credential: str | None,
+        generation: int | None,
+        write_back: Any = None,
+    ) -> CodexCatalog:
+        seen.append((credential, generation))
+        await write_back('{"tokens":{"access_token":"rotated"}}')
+        return CodexCatalog(
+            models=("gpt-entitled",),
+            efforts_by_model={"gpt-entitled": ("high",)},
+        )
+
+    monkeypatch.setattr("symphony.app.codex_catalog_client.get", _catalog)
+    monkeypatch.setattr("symphony.app.CredentialWriteBack", _WriteBack)
+    monkeypatch.setattr(config_bindings, "insert", _capturing_insert)
+    try:
+        app = _app(conn, db_path, oauth_cipher=cipher)
+        async with _client(app) as client:
+            body = (await client.get("/api/config/options")).json()
+            created = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(
+                        roles={
+                            "implement": {
+                                "agent": "codex",
+                                "model": "gpt-entitled",
+                                "effort": "high",
+                            }
+                        }
+                    )
+                },
+            )
+        assert body["codex_models"] == ["gpt-entitled"]
+        assert created.status_code == 201, created.text
+        assert seen == [
+            ('{"tokens":{"access_token":"secret"}}', 1),
+            ('{"tokens":{"access_token":"secret"}}', 1),
+        ]
+        assert len(catalog_connections) == 2
+        assert len(config_connections) == 1
+        assert all(
+            catalog_conn is not config_connections[0] for catalog_conn in catalog_connections
+        )
     finally:
         await conn.close()
 
@@ -1767,6 +1885,89 @@ async def test_save_rejects_unsupported_claude_effort(tmp_path: Path, monkeypatc
             )
             assert resp.status_code == 422, resp.text
             assert resp.json()["detail"][0]["loc"] == ["roles"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_save_rejects_unsupported_codex_effort(tmp_path: Path) -> None:
+    async def _catalog() -> CodexCatalog:
+        return CodexCatalog(
+            models=("gpt-5.6-luna",),
+            efforts_by_model={"gpt-5.6-luna": ("low", "high")},
+        )
+
+    conn, _ = await _open(tmp_path)
+    try:
+        app = _drain_app(conn, codex_catalog_provider=_catalog)
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(
+                        roles={
+                            "implement": {
+                                "agent": "codex",
+                                "model": "gpt-5.6-luna",
+                                "effort": "ultra",
+                            }
+                        }
+                    )
+                },
+            )
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["detail"][0]["loc"] == ["roles"]
+        assert "does not support effort 'ultra'" in resp.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_save_skips_inactive_codex_review_roles(tmp_path: Path) -> None:
+    async def _catalog() -> CodexCatalog:
+        return CodexCatalog(models=(), efforts_by_model={})
+
+    conn, _ = await _open(tmp_path)
+    try:
+        app = _drain_app(conn, codex_catalog_provider=_catalog)
+        async with _client(app) as client:
+            resp = await client.post(
+                "/api/config/bindings",
+                json={"payload": _payload()},
+            )
+        assert resp.status_code == 201, resp.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_global_roles_save_rejects_unsupported_codex_effort(tmp_path: Path) -> None:
+    async def _catalog() -> CodexCatalog:
+        return CodexCatalog(
+            models=("gpt-5.6-luna",),
+            efforts_by_model={"gpt-5.6-luna": ("low", "high")},
+        )
+
+    conn, _ = await _open(tmp_path)
+    try:
+        app = _drain_app(conn, codex_catalog_provider=_catalog)
+        async with _client(app) as client:
+            resp = await client.put(
+                "/api/config/roles",
+                json={
+                    "roles": {
+                        "implement": {
+                            "agent": "codex",
+                            "model": "gpt-5.6-luna",
+                            "effort": "ultra",
+                        }
+                    },
+                    "version": 0,
+                },
+            )
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["detail"][0]["loc"] == ["roles"]
+        assert "does not support effort 'ultra'" in resp.text
     finally:
         await conn.close()
 
