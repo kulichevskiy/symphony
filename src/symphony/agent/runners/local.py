@@ -23,11 +23,17 @@ import tempfile
 from collections.abc import AsyncIterator
 from contextlib import suppress
 from pathlib import Path
+from typing import Any
 
 from ...credentials import RunCredentials, materialize_credentials
+from ..control_channel import ControlChannel
 from ..runner import RunnerEvent, RunnerSpec
 
 _STREAM_DRAIN_SECS = 2.0
+# How long a refused run gets to end its own turn before it is terminated.
+_REFUSAL_GRACE_SECS = 2.0
+# How long a terminated process group gets before SIGKILL.
+_TERMINATE_GRACE_SECS = 5.0
 _WATCHDOG_POLL_SECS = 1.0
 _SUBPROCESS_BUFFER_LIMIT = 4 * 1024 * 1024
 _STREAM_READ_CHUNK_BYTES = 64 * 1024
@@ -198,6 +204,10 @@ class LocalRunner:
                 _remove_cred_home(cred_home)
                 raise
             env = {**env, **cred_env, **spec.env}
+        # Control-channel mode (SYM-235): the prompt travels on stdin and stdin
+        # stays open so the agent can ask questions mid-run. Every other spawn
+        # site keeps /dev/null, where no control traffic is possible.
+        conversation = spec.conversation
         try:
             proc = await asyncio.create_subprocess_exec(
                 *spec.command,
@@ -206,7 +216,9 @@ class LocalRunner:
                 start_new_session=True,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                stdin=asyncio.subprocess.DEVNULL,
+                stdin=asyncio.subprocess.PIPE
+                if conversation is not None
+                else asyncio.subprocess.DEVNULL,
                 # Buffer watermark only. The pump below frames JSONL itself
                 # so one codex line may exceed this without being dropped.
                 limit=_SUBPROCESS_BUFFER_LIMIT,
@@ -217,11 +229,9 @@ class LocalRunner:
             return
 
         self._active[spec.run_id] = proc
-        if spec.run_id in self._pending_kills:
-            self._pending_kills.discard(spec.run_id)
-            with suppress(ProcessLookupError):
-                _terminate_process_group(proc.pid)
-        yield RunnerEvent(kind="started", pid=proc.pid)
+        channel: ControlChannel | None = None
+        if conversation is not None and proc.stdin is not None:
+            channel = ControlChannel(proc.stdin, conversation, run_id=spec.run_id)
         stalled = asyncio.Event()
         wall_clock_hit = asyncio.Event()
         events: asyncio.Queue[RunnerEvent] = asyncio.Queue()
@@ -241,6 +251,11 @@ class LocalRunner:
                 line = raw_line.decode(errors="replace")
                 hb.last_line = loop.time()
                 if kind == "stdout":
+                    # Protocol traffic is activity (it refreshed the
+                    # heartbeat above) but it is not agent output; see
+                    # `control_channel` for why forwarding it is the hazard.
+                    if channel is not None and channel.intercept(line):
+                        return
                     hb.observe(line)
                 await events.put(RunnerEvent(kind=kind, line=line))  # type: ignore[arg-type]
 
@@ -350,14 +365,42 @@ class LocalRunner:
                         await proc.wait()
                 return
 
+        async def refusal_guard(channel: ControlChannel) -> None:
+            # A refused request is unrecoverable for this run: the agent would
+            # otherwise sit out its own retry window before dying. The channel
+            # has already answered with an error and closed stdin, so give the
+            # agent a moment to end its turn and report — a run that dies on
+            # SIGTERM loses its final result and cost frame, and looks to the
+            # state machine like a plain crash rather than a refusal.
+            await channel.refused.wait()
+            log.warning("ending run_id=%s: a control request was refused", spec.run_id)
+            with suppress(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(wait_task), timeout=_REFUSAL_GRACE_SECS)
+            # An agent that catches SIGTERM would otherwise live to the stall
+            # deadline — minutes — which is the exact wait this path avoids.
+            await _stop_process_group(proc)
+
         stdout_task = asyncio.create_task(pump(proc.stdout, "stdout"))
         stderr_task = asyncio.create_task(pump(proc.stderr, "stderr"))
-        watch_task = asyncio.create_task(watchdog())
         wait_task = asyncio.create_task(proc.wait())
+        refusal_task = asyncio.create_task(refusal_guard(channel)) if channel is not None else None
+        watch_task = asyncio.create_task(watchdog())
         drain_deadline: float | None = None
         cleaned_process_group = False
 
         try:
+            if spec.run_id in self._pending_kills:
+                self._pending_kills.discard(spec.run_id)
+                with suppress(ProcessLookupError):
+                    _terminate_process_group(proc.pid)
+            yield RunnerEvent(kind="started", pid=proc.pid)
+            # The prompt goes out only now: after the pumps and the watchdog,
+            # so a prompt bigger than the pipe buffer has something draining
+            # stdout and a timer able to end the run while it blocks in
+            # `drain()`; and inside this region, so a cancellation mid-write
+            # still tears down the child, the tasks and the credential home.
+            if channel is not None and conversation is not None:
+                await channel.send_prompt(conversation.prompt)
             while True:
                 # Drain queued events; if process has exited and queue is empty, stop.
                 try:
@@ -407,6 +450,28 @@ class LocalRunner:
             else:
                 yield RunnerEvent(kind="exit", returncode=proc.returncode)
         finally:
+            # Reached on the normal path, where the tasks are already done, and
+            # on every exit that skips it: a cancellation, a closed generator,
+            # an exception. A caller that stops reading right after `started`
+            # used to leave the child running, the run registered and the
+            # credential home on disk. Each step is guarded and repeatable.
+            # Stopping the child first is what lets `wait_task` finish and reap
+            # it: cancelling that task with the process still up leaves a
+            # zombie for as long as the daemon lives.
+            await _stop_process_group(proc)
+            spawned: tuple[asyncio.Task[Any] | None, ...] = (
+                stdout_task,
+                stderr_task,
+                watch_task,
+                wait_task,
+                refusal_task,
+            )
+            for spawned_task in spawned:
+                if spawned_task is not None and not spawned_task.done():
+                    spawned_task.cancel()
+            await asyncio.gather(*(t for t in spawned if t is not None), return_exceptions=True)
+            if channel is not None:
+                await channel.aclose()
             self._active.pop(spec.run_id, None)
             _remove_cred_home(cred_home)
 
@@ -415,17 +480,27 @@ class LocalRunner:
         if proc is None:
             self._pending_kills.add(run_id)
             return
-        if proc.returncode is not None:
-            return
+        await _stop_process_group(proc)
+
+
+async def _stop_process_group(proc: asyncio.subprocess.Process) -> None:
+    """End a run's process group and wait for the child to be reaped.
+
+    SIGTERM, then SIGKILL if it is ignored — the escalation every caller here
+    wants, in one place. Returning only once the child is reaped matters as
+    much as the signals: a caller that signals and walks away leaves a zombie
+    behind for as long as the daemon lives."""
+    if proc.returncode is not None:
+        return
+    with suppress(ProcessLookupError):
+        _terminate_process_group(proc.pid)
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=_TERMINATE_GRACE_SECS)
+    except TimeoutError:
         with suppress(ProcessLookupError):
-            _terminate_process_group(proc.pid)
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=5.0)
-        except TimeoutError:
-            with suppress(ProcessLookupError):
-                _kill_process_group(proc.pid)
-            with suppress(Exception):
-                await proc.wait()
+            _kill_process_group(proc.pid)
+        with suppress(Exception):
+            await proc.wait()
 
 
 def _remove_cred_home(cred_home: str | None) -> None:

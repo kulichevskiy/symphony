@@ -20,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from symphony.agent.control_channel import ControlRequest, Conversation, read_agent_frame
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.github.client import (
     DEFAULT_LOG_TAIL_BYTES,
@@ -97,6 +98,8 @@ class FakeRunner:
         self._queue: list[list[RunnerEvent]] = []
         self._stage_queues: dict[str, list[list[RunnerEvent]]] = {}
         self._pid = itertools.count(10000)
+        # Prompts delivered over the control channel, in order (SYM-235).
+        self.prompts: list[str] = []
 
     def enqueue(self, events: list[RunnerEvent]) -> None:
         """Pre-program the event sequence for the next `run()` call."""
@@ -186,16 +189,59 @@ class FakeRunner:
             self._queue.append(events)
 
     def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        if spec.conversation is not None:
+            self.prompts.append(spec.conversation.prompt)
         stage_q = self._stage_queues.get(spec.stage)
         if stage_q:
-            return self._aiter(stage_q.pop(0))
+            return self._aiter(stage_q.pop(0), spec)
         if self._queue:
-            return self._aiter(self._queue.pop(0))
+            return self._aiter(self._queue.pop(0), spec)
         return self._default_aiter(spec)
 
-    async def _aiter(self, events: list[RunnerEvent]) -> AsyncIterator[RunnerEvent]:
+    async def _aiter(
+        self, events: list[RunnerEvent], spec: RunnerSpec
+    ) -> AsyncIterator[RunnerEvent]:
+        conversation = spec.conversation
+        closed = False
         for ev in events:
+            # Keep the control-channel contract LocalRunner keeps (SYM-235):
+            # a scripted control request goes to the spec's handler and is
+            # withheld from the event stream, so orchestrator tests written
+            # against this fake aren't testing a fiction.
+            #
+            # A refusal does NOT truncate the script. The real runner closes
+            # stdin and gives the agent a grace period, and an agent that ends
+            # its own turn keeps its terminal output and its exit code — a fake
+            # that synthesised a kill instead would let SYM-236 exercise a
+            # failure production would not take, and would never let it check
+            # the parsing of a real refusal result. What a refusal does do is
+            # close the channel — and so does the end of the turn, which shuts
+            # stdin for real. Past either, requests are still withheld from the
+            # event stream but the handler no longer hears them: it has side
+            # effects, and a rotation whose answer cannot be delivered spends
+            # the connection's single-use refresh token for nothing.
+            if conversation is not None and ev.kind == "stdout" and ev.line:
+                frame = read_agent_frame(ev.line)
+                closed = closed or frame.turn_end
+                if frame.control:
+                    if frame.request is not None and not closed:
+                        closed = not await self._answered(conversation, frame.request)
+                    continue
             yield ev
+
+    @staticmethod
+    async def _answered(conversation: Conversation, request: ControlRequest) -> bool:
+        """True when the handler supplied a payload; False on any refusal.
+
+        Mirrors `ControlChannel._answer`: a handler that raises is a refusal,
+        not a crash.
+        """
+        if conversation.handler is None:
+            return False
+        try:
+            return await conversation.handler(request) is not None
+        except Exception:  # noqa: BLE001 — the real channel swallows this too
+            return False
 
     async def _default_aiter(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
         # Mirror a real run: announce the PID first so the orchestrator records

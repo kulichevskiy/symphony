@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 if TYPE_CHECKING:
     from ..credentials import RunCredentials
+    from .control_channel import Conversation
 
 
 @dataclass
@@ -55,6 +56,15 @@ class RunnerSpec:
     # host isn't `github.com`, and a credential store written for the wrong
     # host never matches on push (SYM-199 review fix).
     github_host: str = "github.com"
+    # Control-channel mode (SYM-235). Set it and the run becomes a
+    # conversation: the prompt is delivered as a message on stdin instead of
+    # riding in `command`, stdin stays open, and the agent's control requests
+    # are answered through the conversation's handler. The runner never
+    # inspects what travels through that handler, so it stays ignorant of
+    # tokens; the dispenser is what plugs in. Leaving it `None` keeps the
+    # one-directional shape every other spawn site still uses — stdin is
+    # /dev/null and no control traffic is possible.
+    conversation: Conversation | None = None
 
 
 @dataclass
