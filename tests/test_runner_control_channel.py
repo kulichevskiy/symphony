@@ -27,6 +27,7 @@ from symphony.agent.control_channel import (
     ControlHandler,
     ControlRequest,
     Conversation,
+    Decline,
 )
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.agent.runners.local import LocalRunner
@@ -39,12 +40,14 @@ LINGER_SECS = 30
 class _Handler:
     """Records what it was asked and answers with a canned payload."""
 
-    def __init__(self, payload: Mapping[str, object] | None, *, boom: bool = False) -> None:
+    def __init__(
+        self, payload: Mapping[str, object] | Decline | None, *, boom: bool = False
+    ) -> None:
         self.payload = payload
         self.boom = boom
         self.seen: list[ControlRequest] = []
 
-    async def __call__(self, request: ControlRequest) -> Mapping[str, object] | None:
+    async def __call__(self, request: ControlRequest) -> Mapping[str, object] | Decline | None:
         self.seen.append(request)
         if self.boom:
             raise RuntimeError("handler exploded")
@@ -420,6 +423,39 @@ async def test_a_prompt_that_cannot_be_delivered_ends_the_run() -> None:
     channel, _ = _channel(None, broken=True)
     await channel.send_prompt("hi")
     assert channel.refused.is_set()
+    await channel.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_declined_request_is_answered_without_ending_the_run() -> None:
+    # The CLI's control vocabulary is far wider than the one question a host
+    # answers, and it can ask mid-run. Refusing an unrecognised one would kill a
+    # healthy run over a question; a decline says no and lets it carry on.
+    handler = _Handler(Decline("the host does not answer that request"))
+    channel, stdin = _channel(handler)
+    assert channel.intercept(_control_request("req-1")) is True
+    await asyncio.sleep(0.05)
+    assert not channel.refused.is_set()
+    assert not stdin.closed
+    assert stdin.frames[0]["response"] == {
+        "subtype": "error",
+        "request_id": "req-1",
+        "error": "the host does not answer that request",
+    }
+    # And the next question is still heard: nothing was closed behind it.
+    assert channel.intercept(_control_request("req-2")) is True
+    await asyncio.sleep(0.05)
+    assert [r.request_id for r in handler.seen] == ["req-1", "req-2"]
+    await channel.aclose()
+
+
+@pytest.mark.asyncio
+async def test_a_decline_that_cannot_be_delivered_ends_the_run() -> None:
+    # The agent is blocked on an answer either way. A decline the child never
+    # receives is silence, and silence costs the run its whole stall window.
+    channel, _ = _channel(_Handler(Decline("nope")), broken=True)
+    assert channel.intercept(_control_request("req-1")) is True
+    await asyncio.wait_for(channel.refused.wait(), timeout=2)
     await channel.aclose()
 
 

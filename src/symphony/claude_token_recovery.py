@@ -1,0 +1,185 @@
+"""Answering a run whose Claude token was rejected mid-flight (SYM-236).
+
+The dispenser (SYM-234) decides what a complaining run should be given; the
+control channel (SYM-235) carries the question and the answer. This is the
+piece between them: it turns one `control_request` into one dispenser request,
+remembers what the run now holds, and counts what actually happened.
+
+The count is not decoration. There is no config flag behind this mechanism —
+the deliberate decision was that the safety net is the existing restart path,
+not a switch — so the only way to tell a working recovery from one that has
+never been exercised is that a run says how many times it recovered.
+
+A refusal is a normal outcome, not an error: the channel turns it into a
+correctly addressed error frame and ends the run, which is exactly what
+happens today when a token goes bad mid-run. This ticket removes a cost; it
+does not remove a guarantee.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections.abc import Awaitable, Callable, Mapping
+
+from .agent.control_channel import ControlRequest, Decline
+from .claude_token_dispenser import ClaudeTokenDispenser, TokenGrant
+
+log = logging.getLogger(__name__)
+
+# The only question this host knows how to answer. The subtype and the field
+# the CLI reads the answer out of are both wire shapes observed end-to-end in
+# the SYM-232 spike.
+OAUTH_TOKEN_REFRESH = "oauth_token_refresh"
+_ACCESS_TOKEN_FIELD = "accessToken"
+
+# How long a freshly granted token is treated as still being adopted.
+#
+# One 401 does not produce one request. The CLI asked three times in ~1.2s in
+# the SYM-232 spike, and the channel serializes them, so the second question
+# arrives after the first has already been answered — possibly long after, if
+# the rotation it triggered took most of the dispenser's budget. Answering each
+# from the dispenser would rotate once per question, because by then this run
+# names the generation it was *just given*, which is the current one. Every
+# rotation invalidates the token the previous one handed over: the SYM-234
+# cascade, reproduced inside a single run.
+#
+# A repeat inside this window is therefore the same 401 asking again, not a new
+# one. Nothing plausible makes a token minted seconds ago fail on its own — a
+# fresh one carries hours of nominal TTL — and in the case that does, a
+# concurrent rotation, the dispenser's own compare-and-swap hands out the
+# stored token rather than minting another.
+_BURST_WINDOW_SECS = 60.0
+
+# Records the generation the run now holds. Injected rather than written here
+# so the stamp keeps one definition — and one best-effort guard — with the one
+# the dispatch path already makes.
+Restamp = Callable[[int], Awaitable[None]]
+
+
+class ClaudeTokenRecovery:
+    """One run's side of mid-run token recovery: a `ControlHandler` that hands
+    back a fresh access token, or refuses.
+
+    Stateful on purpose, and in two ways that pull against each other. The
+    generation it names has to be the one it currently holds, not the one it
+    was dispatched with — a run that recovers, works on, and is rejected again
+    would otherwise name a superseded generation and be handed back the token
+    that just failed. But the same advance turns one 401's burst of questions
+    into a rotation apiece, so a question repeated inside `_BURST_WINDOW_SECS`
+    is answered from the last grant instead of from the dispenser.
+    """
+
+    def __init__(
+        self,
+        dispenser: ClaudeTokenDispenser,
+        *,
+        run_id: str,
+        generation: int,
+        restamp: Restamp,
+        burst_window_secs: float = _BURST_WINDOW_SECS,
+        now: Callable[[], float] | None = None,
+    ) -> None:
+        self._dispenser = dispenser
+        self._run_id = run_id
+        self._generation = generation
+        self._restamp = restamp
+        self._burst_window_secs = burst_window_secs
+        self._now = now or time.monotonic
+        self._count = 0
+        self._refused_retryably = False
+        self._granted: tuple[str, float] | None = None
+
+    @property
+    def refused_retryably(self) -> bool:
+        """Whether this run was refused a replacement for a reason that could
+        clear on its own — a busy dispenser, an unreachable token endpoint.
+
+        The connection is untouched and still believed good, so the run should
+        come back rather than park. That distinction is the dispenser's own
+        (`TokenRefusal.permanent`); it is surfaced here because by the time the
+        run ends, the refusal is the only thing that explains why."""
+        return self._refused_retryably
+
+    def log_tally(self) -> None:
+        """Say what recovery did for this run, once it has ended.
+
+        Silent when it did nothing: an armed run that never needed a
+        replacement is the common case and would drown the signal. This line is
+        the only evidence the mechanism works at all — a run that recovers and
+        finishes otherwise looks exactly like a run that was never at risk."""
+        if self._count:
+            log.info(
+                "run_id=%s finished after %d mid-run claude token recovery(ies)",
+                self._run_id,
+                self._count,
+            )
+
+    async def _still_being_adopted(self) -> str | None:
+        """The token this run was last given, while replaying it is still the
+        right answer. None once it is not, and the dispenser decides instead.
+
+        Two conditions, because the clock alone is not enough. The window says
+        the question is too soon to be a new rejection. The generation says
+        nobody has moved underneath us: another run's rotation, or an operator
+        reconnect, can land inside the window, and then this really is a second
+        401 — the token we hold is genuinely superseded and replaying it would
+        cost the run the recovery this whole ticket exists to give it. Going to
+        the dispenser in that case is free: naming an older generation gets a
+        hand-out, not a rotation."""
+        if self._granted is None:
+            return None
+        token, granted_at = self._granted
+        if self._now() - granted_at >= self._burst_window_secs:
+            return None
+        stored = await self._dispenser.snapshot()
+        if stored is None or stored[1] != self._generation:
+            return None
+        return token
+
+    async def __call__(self, request: ControlRequest) -> Mapping[str, object] | Decline | None:
+        if request.subtype != OAUTH_TOKEN_REFRESH:
+            # Declined, not refused. The CLI's control vocabulary is far wider
+            # than the one question this host advertises, and killing a healthy
+            # run over an unrecognised one would be a worse bug than the one
+            # this ticket fixes. The agent gets a proper error and decides.
+            log.warning(
+                "run_id=%s asked its host for %r, which this host does not answer",
+                self._run_id,
+                request.subtype,
+            )
+            return Decline("the host does not answer that request")
+        repeat = await self._still_being_adopted()
+        if repeat is not None:
+            log.info(
+                "run_id=%s asked again within %.0fs of its last token; answering with that one "
+                "rather than rotating again",
+                self._run_id,
+                self._burst_window_secs,
+            )
+            return {_ACCESS_TOKEN_FIELD: repeat}
+        served = await self._dispenser.request(self._generation)
+        if not isinstance(served, TokenGrant):
+            log.warning(
+                "run_id=%s could not recover its claude token (%s): %s",
+                self._run_id,
+                "permanent" if served.permanent else "retryable",
+                served.reason,
+            )
+            self._refused_retryably = not served.permanent
+            return None
+        self._count += 1
+        self._generation = served.generation
+        self._granted = (served.token, self._now())
+        await self._restamp(served.generation)
+        log.info(
+            "run_id=%s recovered its claude token mid-run: recovery #%d, now on generation %d (%s)",
+            self._run_id,
+            self._count,
+            served.generation,
+            "rotated" if served.rotated else "handed out",
+        )
+        return {_ACCESS_TOKEN_FIELD: served.token}
+
+
+__all__ = ["OAUTH_TOKEN_REFRESH", "ClaudeTokenRecovery"]

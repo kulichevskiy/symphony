@@ -248,6 +248,7 @@ class _AcceptanceMixin(_OrchestratorBase):
             activity_stage: str | None = None,
             prior_total: float = 0.0,
             clear_pid_on_finish: bool = False,
+            prompt: str | None = None,
         ) -> tuple[UsageDelta, str, int | None]: ...
         def _schedule_merge(
             self,

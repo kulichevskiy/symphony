@@ -30,6 +30,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -43,11 +44,13 @@ from ...agent.activity import (
     digest_fingerprint,
     format_activity_digest,
 )
+from ...agent.claude_cli import claude_control_channel_argv, claude_control_channel_env
+from ...agent.control_channel import Conversation
 from ...agent.model_usage import ModelUsage, parse_model_usage
 from ...agent.process import parse_event_line
 from ...agent.prompt import implement_prompt
 from ...agent.runner import Runner, RunnerSpec
-from ...agent.runners.local import LocalRunner
+from ...agent.runners.local import CLAUDE_AMBIENT_AUTH_ENV, LocalRunner
 from ...claude_login import (
     claude_access_token,
     claude_credential_expires_within,
@@ -57,6 +60,7 @@ from ...claude_login import (
     refresh_claude_credential_outcome,
 )
 from ...claude_token_dispenser import ClaudeTokenDispenser
+from ...claude_token_recovery import ClaudeTokenRecovery
 from ...codex_login import (
     codex_credential_expires_within,
     codex_expires_at,
@@ -157,6 +161,23 @@ class _ImplementHandoff:
 
     blocked_reason: str
     operator_comment: str
+
+
+@dataclass(frozen=True)
+class _Dispatch:
+    """What a run loop needs to start a run and to account for it afterwards.
+
+    The spec and the recovery come out of one call because they are only
+    correct together: the spec is what carries the conversation into the
+    runner, and the recovery is what that conversation calls. A caller holding
+    one without the other cannot say what happened to the run.
+
+    `recovery` is None whenever the run was left one-directional, which is
+    every run before SYM-236 and most of them after it.
+    """
+
+    spec: RunnerSpec
+    recovery: ClaudeTokenRecovery | None
 
 
 @dataclass(frozen=True)
@@ -2849,6 +2870,7 @@ class _OrchestratorBase:
             stage="implement",
             role=role,
             prior_total=prior_total,
+            prompt=prompt,
         )
         return cumulative_usage, final_kind, final_returncode, role
 
@@ -3433,6 +3455,16 @@ class _OrchestratorBase:
         the connection was re-validated and this run should be requeued."""
         if agent not in _AGENT_CRED_PROVIDERS or returncode in (0, None):
             return False
+        # A verdict this run already has wins, and mid-run token recovery is
+        # what can reach one before here (SYM-236). Re-validating on top of it
+        # would spend a second exchange against an endpoint the dispenser has
+        # just found unreachable — and expire the shared connection when that
+        # one fails too. The cache exists for exactly this (see
+        # `_record_claude_auth_verdict`); the tail was the last reader not
+        # honouring it.
+        cached = self._claude_auth_revalidated.get(run_id)
+        if cached is not None:
+            return cached
         stdout = await asyncio.to_thread(_read_log_best_effort, log_path)
         if stdout is None:
             return False
@@ -3650,6 +3682,117 @@ class _OrchestratorBase:
             return {}
         return {_CODEX_HOME_ENV: str(config_dir)}
 
+    async def _build_dispatch(
+        self,
+        *,
+        binding: RepoBinding,
+        role: ResolvedRole,
+        command: list[str],
+        prompt: str | None,
+        run_id: str,
+        workspace_path: Path,
+        stage: str,
+        claude_env: dict[str, str],
+        credentials: RunCredentials | None,
+    ) -> _Dispatch:
+        """The spec a run is started from, with mid-run token recovery armed
+        where it applies (SYM-236).
+
+        Arming is decided here and nowhere else because its three parts are
+        only correct together: the prompt moves to stdin, the environment
+        declares that this host can answer a token request, and a handler is
+        attached that actually answers one. A run given two of the three either
+        never hears its prompt or asks a question nobody is listening for.
+
+        Four cases keep the one-directional shape, and none of them is a
+        failure — each is exactly today's behaviour: a codex agent, a caller
+        that passed no prompt (local review, acceptance and the merge pass,
+        deliberately held back until the mode has proven itself), a deployment
+        running on ambient host auth with no connection to rotate, and an argv
+        the prompt cannot be lifted out of.
+
+        The generation comes from the run row rather than from the dispatch
+        that stamped it, on purpose: the stamp is what a later tick reads, so a
+        run whose stamp did not land has nothing durable to complain by and is
+        better left unarmed than armed against a record that does not exist.
+        """
+        conversation: Conversation | None = None
+        recovery: ClaudeTokenRecovery | None = None
+        control_env = claude_control_channel_env()
+        if (
+            role.agent == "claude"
+            and prompt is not None
+            and _CLAUDE_TOKEN_ENV in claude_env
+            and not _binding_owns_claude_auth(binding.env, control_env)
+        ):
+            argv = claude_control_channel_argv(command, prompt)
+            generation = (
+                None if argv is None else await db.runs.claude_token_generation(self._conn, run_id)
+            )
+            if argv is None:
+                log.warning(
+                    "run %s keeps the one-directional shape: its command does not carry the "
+                    "prompt where the control channel expects it",
+                    run_id,
+                )
+            elif generation is None:
+                log.warning(
+                    "run %s carries no token generation; dispatching one-directional", run_id
+                )
+            else:
+                recovery = ClaudeTokenRecovery(
+                    self.claude_token_dispenser,
+                    run_id=run_id,
+                    generation=generation,
+                    restamp=partial(self._stamp_claude_token_generation, run_id),
+                )
+                conversation = Conversation(prompt=prompt, handler=recovery)
+                command = argv
+                claude_env = {**claude_env, **control_env}
+        return _Dispatch(
+            spec=RunnerSpec(
+                run_id=run_id,
+                workspace_path=workspace_path,
+                command=command,
+                env={**claude_env, **binding.env},
+                stall_secs=self.config.stall_timeout_secs,
+                command_secs=self.config.command_timeout_secs,
+                wall_clock_secs=self.config.wall_clock_timeout_secs,
+                stage=stage,
+                credentials=credentials,
+                github_host=github_host_for_repo(binding.github_repo),
+                conversation=conversation,
+            ),
+            recovery=recovery,
+        )
+
+    def _settle_recovery(self, run_id: str, recovery: ClaudeTokenRecovery | None) -> None:
+        """Account for what mid-run token recovery did, now the run has ended.
+
+        Both halves have to land before the runner tail classifies the run's
+        log, which is why this sits in the `finally` rather than after it.
+
+        The tally is the only evidence the mechanism works at all. The verdict
+        is the guarantee the ticket keeps: a run refused *retryably* — a busy
+        dispenser, a token endpoint that could not be reached — comes back,
+        which is what it does today.
+
+        Recording that verdict here also stops the runner tail re-validating,
+        and that matters more than the requeue. The dispenser has just failed
+        to reach the token endpoint and deliberately left the connection alone
+        (`permanent=False`); a second exchange moments later fails the same way,
+        and the tail expires the shared row on it — one blip gating every other
+        run, the SYM-234 cascade. A permanent refusal is left alone: the
+        dispenser has already armed the reconnect gate and parking is correct.
+        So is a run some other detection point already has a verdict about."""
+        if recovery is None:
+            return
+        recovery.log_tally()
+        if not recovery.refused_retryably or run_id in self._claude_auth_revalidated:
+            return
+        log.info("run %s was refused a replacement token retryably; requeueing it", run_id)
+        self._record_claude_auth_verdict(run_id, True)
+
     async def _stamp_claude_token_generation(self, run_id: str, generation: int) -> None:
         """Record on the run row which minting of the shared Claude token this
         run was dispatched on (SYM-233). Best-effort: a bookkeeping write must
@@ -3697,7 +3840,15 @@ class _OrchestratorBase:
         stage: str,
         role: ResolvedRole,
         prior_total: float,
+        prompt: str | None = None,
     ) -> tuple[UsageDelta, str, int | None]:
+        """Run one stage command and consume its events.
+
+        `prompt` is what `command` was built from. Passing it opts the run into
+        the control-channel mode (SYM-236) when the agent is claude: the prompt
+        is delivered on stdin instead, and a token rejected mid-run is replaced
+        rather than fatal. Omitting it keeps the one-directional shape.
+        """
         storage_issue_id = storage_issue_id or issue.id
         blocked = await self._claude_expired_block_reason(role.agent)
         if blocked is not None:
@@ -3735,22 +3886,21 @@ class _OrchestratorBase:
             # happens — the file is unchanged from its pristine copy).
             await self._finalize_claude_env(claude_env)
             return UsageDelta(), "spawn_failed", None
-        spec = RunnerSpec(
+        dispatch = await self._build_dispatch(
+            binding=binding,
+            role=role,
+            command=command,
+            prompt=prompt,
             run_id=run_id,
             workspace_path=workspace_path,
-            command=command,
-            env={**claude_env, **binding.env},
-            stall_secs=self.config.stall_timeout_secs,
-            command_secs=self.config.command_timeout_secs,
-            wall_clock_secs=self.config.wall_clock_timeout_secs,
             stage=stage,
+            claude_env=claude_env,
             credentials=run_credentials,
-            github_host=github_host_for_repo(binding.github_repo),
         )
         self._active_run_ids.add(run_id)
         try:
             with log_path.open("a", encoding="utf-8") as logf:
-                async for ev in self._runner.run(spec):
+                async for ev in self._runner.run(dispatch.spec):
                     if ev.kind == "started" and ev.pid is not None:
                         await db.runs.update_pid(self._conn, run_id, ev.pid)
                     elif ev.kind == "stdout" and ev.line is not None:
@@ -3799,6 +3949,7 @@ class _OrchestratorBase:
             # the refreshed credential from the per-run dir back to the DB and
             # remove the dir (Config v2 3/9).
             await self._finalize_claude_env(claude_env)
+            self._settle_recovery(run_id, dispatch.recovery)
         # Remember what this run actually ran with: a hot config reload can
         # swap the role's agent afterwards, and the auth paths must key off
         # the agent that produced this log (SYM-229 review).
@@ -3839,6 +3990,7 @@ class _OrchestratorBase:
             issue=issue,
             activity_stage="review_fix",
             prior_total=prior_total,
+            prompt=prompt,
         )
 
     async def _run_fix_dispatch(
@@ -3986,9 +4138,10 @@ class _OrchestratorBase:
             binding_key=_binding_storage_key(binding),
         )
         role = binding.resolved_role("implement", self.config.roles)
+        prompt = dirty_tree_fix_prompt(dirty_files)
         command = build_fix_runner_command(
             role.agent,
-            dirty_tree_fix_prompt(dirty_files),
+            prompt,
             codex_model=role_codex_model(role),
             claude_model=role_claude_model(role),
             effort=role.effort,
@@ -4004,6 +4157,7 @@ class _OrchestratorBase:
                 role=role,
                 binding=binding,
                 issue=issue,
+                prompt=prompt,
             )
             await _add_run_usage(self._conn, fix_run_id, usage)
             transition = on_runner_event(
@@ -4034,7 +4188,12 @@ class _OrchestratorBase:
         activity_stage: str | None = None,
         prior_total: float = 0.0,
         clear_pid_on_finish: bool = False,
+        prompt: str | None = None,
     ) -> tuple[UsageDelta, str, int | None]:
+        """Run one fix-run command and consume its events.
+
+        `prompt` opts the run into the control-channel mode exactly as it does
+        in `_run_stage_command` — see there."""
         blocked = await self._claude_expired_block_reason(role.agent)
         if blocked is not None:
             log.warning("run %s not dispatched: %s", run_id, blocked)
@@ -4058,17 +4217,16 @@ class _OrchestratorBase:
             # happens — the file is unchanged from its pristine copy).
             await self._finalize_claude_env(claude_env)
             return UsageDelta(), "spawn_failed", None
-        spec = RunnerSpec(
+        dispatch = await self._build_dispatch(
+            binding=binding,
+            role=role,
+            command=command,
+            prompt=prompt,
             run_id=run_id,
             workspace_path=workspace_path,
-            command=command,
-            env={**claude_env, **binding.env},
-            stall_secs=self.config.stall_timeout_secs,
-            command_secs=self.config.command_timeout_secs,
-            wall_clock_secs=self.config.wall_clock_timeout_secs,
             stage=stage,
+            claude_env=claude_env,
             credentials=run_credentials,
-            github_host=github_host_for_repo(binding.github_repo),
         )
         activity = (
             self._activity_session(
@@ -4084,7 +4242,7 @@ class _OrchestratorBase:
         self._active_run_ids.add(run_id)
         try:
             with log_path.open("a", encoding="utf-8") as logf:
-                async for ev in self._runner.run(spec):
+                async for ev in self._runner.run(dispatch.spec):
                     if ev.kind == "started" and ev.pid is not None:
                         await db.runs.update_pid(self._conn, run_id, ev.pid)
                     elif ev.kind == "stdout" and ev.line is not None:
@@ -4134,6 +4292,7 @@ class _OrchestratorBase:
             # See `_run_stage_command`: a Claude fix/review run can also refresh
             # its token in place — write back from the per-run dir + tear down.
             await self._finalize_claude_env(claude_env)
+            self._settle_recovery(run_id, dispatch.recovery)
         # Remember what this run actually ran with: a hot config reload can
         # swap the role's agent afterwards, and the auth paths must key off
         # the agent that produced this log (SYM-229 review).
@@ -4854,6 +5013,32 @@ _AGENT_CRED_PROVIDERS: frozenset[str] = frozenset({"claude", "codex"})
 # file-fed run could never survive a token rotation no matter what the daemon
 # did. Codex still reads a private per-run config dir (Config v2 6/9).
 _CLAUDE_TOKEN_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
+
+
+def _binding_owns_claude_auth(
+    binding_env: Mapping[str, str], control_env: Mapping[str, str]
+) -> bool:
+    """Whether a binding's own `env:` decides any part of a claude run's auth
+    or its control channel — in which case the run stays one-directional.
+
+    `binding.env` wins the merge, so every case here is silent. A binding
+    supplying the token — or an `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`,
+    which the CLI prefers over the OAuth token and which the runner
+    deliberately preserves for exactly that reason — means the run is not the
+    UI-connected account at all. Arming it would let a 401 against a private
+    credential rotate the shared account and answer with a token from it.
+
+    A binding touching one of the control-channel variables is subtler and
+    worse: by the time the value lands, the prompt has already moved to stdin
+    and a handler is attached, so a `401_WAIT_MS` of `0` leaves a run armed on
+    this side and deaf on the other. It would still finish — it just quietly
+    loses the recovery, and quietly is the problem: a run that never asks looks
+    exactly like a run that never needed to.
+    """
+    owned = {_CLAUDE_TOKEN_ENV, *CLAUDE_AMBIENT_AUTH_ENV, *control_env}
+    return bool(binding_env.keys() & owned)
+
+
 _CODEX_HOME_ENV = "CODEX_HOME"
 _CODEX_CRED_FILE = "auth.json"
 

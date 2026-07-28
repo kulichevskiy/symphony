@@ -54,8 +54,14 @@ _JSON_ID_RE = re.compile(r'"(?:id|item_id)"\s*:\s*"([^"]+)"')
 # config dir to key off, and the token env var it does get is the one thing an
 # inherited value could shadow — which the merge already settles, since
 # `spec.env` wins.
+# Named separately because the dispatch path needs the same list: a binding
+# that sets one of these is authenticating the run as something other than the
+# UI-connected account, which decides whether mid-run token recovery can be
+# armed at all (SYM-236).
+CLAUDE_AMBIENT_AUTH_ENV: tuple[str, ...] = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
+
 _AGENT_AMBIENT_AUTH_ENV: dict[str, tuple[str, ...]] = {
-    "CLAUDE_CODE_OAUTH_TOKEN": ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
+    "CLAUDE_CODE_OAUTH_TOKEN": CLAUDE_AMBIENT_AUTH_ENV,
     "CODEX_HOME": ("OPENAI_API_KEY", "CODEX_API_KEY"),
 }
 

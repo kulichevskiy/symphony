@@ -1163,6 +1163,7 @@ class _MergeMixin(_OrchestratorBase):
             stage="review_fix",
             role=role,
             prior_total=prior_total,
+            prompt=prompt,
         )
 
     async def _mark_merge_conflict_fix_needs_approval(
@@ -1269,6 +1270,7 @@ class _MergeMixin(_OrchestratorBase):
                     stage="review_fix",
                     role=role,
                     prior_total=prior_total,
+                    prompt=prompt,
                 )
             except Exception as e:  # noqa: BLE001
                 log.exception(
