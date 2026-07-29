@@ -1528,6 +1528,45 @@ async def test_binding_rejects_unknown_role_cell_field(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_binding_agent_override_drops_cross_family_global_model(
+    tmp_path: Path,
+) -> None:
+    """Switching a binding from an inherited Codex builder to Claude must not
+    leave hidden fix/accept cells inheriting the global Codex model."""
+    conn, db_path = await _open(tmp_path)
+    try:
+        app = _app(conn, db_path)
+        async with _client(app) as client:
+            put = await client.put(
+                "/api/config/roles",
+                json={
+                    "roles": {
+                        role: {"agent": "codex", "model": "gpt-5.6-sol"}
+                        for role in ("implement", "fix", "accept")
+                    },
+                    "version": 0,
+                },
+            )
+            assert put.status_code == 200, put.text
+
+            created = await client.post(
+                "/api/config/bindings",
+                json={
+                    "payload": _payload(
+                        roles={
+                            "implement": {"agent": "claude", "model": "opus"},
+                            "fix": {"agent": "claude"},
+                            "accept": {"agent": "claude"},
+                        }
+                    )
+                },
+            )
+            assert created.status_code == 201, created.text
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_roles_put_version_conflict(tmp_path: Path) -> None:
     conn, db_path = await _open(tmp_path)
     try:
