@@ -601,7 +601,10 @@ class RepoBinding(BaseModel):
 
         Deep-merges per field: a per-binding `roles[name]` field wins over the
         global `roles[name]` field, and an unset field falls back to the
-        back-compat default derived from the legacy top-level fields.
+        back-compat default derived from the legacy top-level fields. An
+        explicit binding agent that differs from the explicit global agent is
+        a family boundary: model/effort values from the other family are not
+        inherited.
 
         `visual_acceptance=True` (the `accept` role for a `dev`/`preview`
         acceptance run) forces an unconfigured `accept` default off codex:
@@ -613,6 +616,13 @@ class RepoBinding(BaseModel):
         """
         binding_role = self.roles.get(name)
         global_role = (global_roles or {}).get(name)
+        changes_family = (
+            binding_role is not None
+            and binding_role.agent is not None
+            and global_role is not None
+            and global_role.agent is not None
+            and binding_role.agent != global_role.agent
+        )
         agent: Literal["claude", "codex"] | None = None
         model: str | None = None
         effort: str | None = None
@@ -624,9 +634,9 @@ class RepoBinding(BaseModel):
             )
         if agent is None and global_role is not None:
             agent = global_role.agent
-        if model is None and global_role is not None:
+        if model is None and global_role is not None and not changes_family:
             model = global_role.model
-        if effort is None and global_role is not None:
+        if effort is None and global_role is not None and not changes_family:
             effort = global_role.effort
         if agent is None:
             agent = self._default_role_agent(name, global_roles)

@@ -943,6 +943,15 @@ repos:
     assert rf.agent == "codex" and rf.model == "gpt-5.1-codex"
 
 
+def test_roles_agent_override_is_a_family_inheritance_boundary() -> None:
+    binding = _review_binding(roles={"accept": RoleConfig(agent="claude")})
+    global_roles = {"accept": RoleConfig(agent="codex", model="gpt-5.6-sol", effort="ultra")}
+
+    accept = binding.resolved_role("accept", global_roles)
+
+    assert (accept.agent, accept.model, accept.effort) == ("claude", None, None)
+
+
 def test_roles_unknown_claude_model_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""
