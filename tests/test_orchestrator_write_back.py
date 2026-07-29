@@ -304,6 +304,151 @@ async def test_freshly_minted_token_not_re_refreshed(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 @respx.mock
+async def test_keep_fresh_rotation_deferred_while_runs_hold_the_token(tmp_path: Path) -> None:
+    """SYM-230: rotating the shared token invalidates the access-token-only
+    copies (SYM-228) already handed to in-flight runs — they cannot self-heal
+    and die on "Not logged in" with hours of nominal TTL left. So a keep-fresh
+    rotation is deferred while any run still holds the token, and taken as soon
+    as the fleet drains."""
+    route = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"access_token": "tok-fresh", "refresh_token": "rt-2", "expires_in": 28800},
+        )
+    )
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        # Run A starts on a freshly minted token — nothing to rotate.
+        await db.oauth_connections.set_connection(
+            harness.conn,
+            provider="claude",
+            credential=_cred_in("tok-a", 8 * 60 * 60),
+            cipher=cipher,
+        )
+        env_a = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
+        assert route.call_count == 0
+
+        # Time passes: the same token is now inside the keep-fresh margin (but
+        # still far outside a run's wall clock, so run A is not dying of the
+        # clock). Run B dispatching must NOT rotate it out from under run A.
+        await db.oauth_connections.set_connection(
+            harness.conn,
+            provider="claude",
+            credential=_cred_in("tok-a", 3 * 60 * 60),
+            cipher=cipher,
+        )
+        env_b = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
+        assert route.call_count == 0
+        blob = json.loads((Path(env_b["CLAUDE_CONFIG_DIR"]) / ".credentials.json").read_text())
+        assert blob["claudeAiOauth"]["accessToken"] == "tok-a"
+
+        await harness.orch._finalize_claude_env(env_a)  # noqa: SLF001
+        await harness.orch._finalize_claude_env(env_b)  # noqa: SLF001
+
+        # Fleet drained: the deferred rotation is taken on the next dispatch.
+        env_c = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
+        try:
+            assert route.call_count == 1
+            blob = json.loads((Path(env_c["CLAUDE_CONFIG_DIR"]) / ".credentials.json").read_text())
+            assert blob["claudeAiOauth"]["accessToken"] == "tok-fresh"
+        finally:
+            await harness.orch._finalize_claude_env(env_c)  # noqa: SLF001
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_dying_token_still_rotates_with_runs_in_flight(tmp_path: Path) -> None:
+    """SYM-230: the in-flight deferral only covers tokens that outlive a run's
+    wall clock. Once the stored token would die mid-run, rotating is strictly
+    better than not — the in-flight runs lose it to the clock either way, and
+    the dispatching run must not start on a doomed token."""
+    route = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"access_token": "tok-fresh", "refresh_token": "rt-2", "expires_in": 28800},
+        )
+    )
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn,
+            provider="claude",
+            credential=_cred_in("tok-a", 8 * 60 * 60),
+            cipher=cipher,
+        )
+        env_a = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="claude", credential=_cred_soon("tok-a"), cipher=cipher
+        )
+        env_b = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
+        try:
+            assert route.call_count == 1
+            blob = json.loads((Path(env_b["CLAUDE_CONFIG_DIR"]) / ".credentials.json").read_text())
+            assert blob["claudeAiOauth"]["accessToken"] == "tok-fresh"
+        finally:
+            await harness.orch._finalize_claude_env(env_a)  # noqa: SLF001
+            await harness.orch._finalize_claude_env(env_b)  # noqa: SLF001
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_auth_failure_revalidate_does_not_rotate_under_live_runs(tmp_path: Path) -> None:
+    """SYM-230: the SYM-229 re-validate refreshes unconditionally, so one run's
+    auth failure rotated the token out from under every sibling still running —
+    a self-sustaining cascade (each killed sibling triggers the next rotation).
+    While runs hold a stored token that still outlives their wall clock, the
+    failure is attributed to an earlier rotation: requeue the run on the stored
+    token without rotating. Once the fleet drains, the re-validate refreshes for
+    real again."""
+    route = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"access_token": "tok-fresh", "refresh_token": "rt-2", "expires_in": 28800},
+        )
+    )
+
+    class _AuthError:
+        message = "Not logged in · Please run /login"
+        status = None
+
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn,
+            provider="claude",
+            credential=_cred_in("tok-a", 8 * 60 * 60),
+            cipher=cipher,
+        )
+        env_a = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
+        requeued = await harness.orch._flag_claude_auth_failure(  # noqa: SLF001
+            "claude", _AuthError()
+        )
+        assert requeued is True
+        assert route.call_count == 0
+        status = await db.oauth_connections.get_status(harness.conn, "claude")
+        assert status is not None and status.status == "connected"
+        stored = await db.oauth_connections.get_credential(harness.conn, "claude", cipher)
+        assert json.loads(stored)["claudeAiOauth"]["accessToken"] == "tok-a"
+
+        await harness.orch._finalize_claude_env(env_a)  # noqa: SLF001
+        assert (
+            await harness.orch._flag_claude_auth_failure("claude", _AuthError())  # noqa: SLF001
+            is True
+        )
+        assert route.call_count == 1
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
 async def test_refresh_failure_marks_expired_and_blocks_materialization(tmp_path: Path) -> None:
     respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(return_value=httpx.Response(400, json={}))
     harness = await Harness.create(tmp_path, config=_config(tmp_path))

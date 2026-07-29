@@ -372,6 +372,10 @@ class _OrchestratorBase:
     # daemon refresh no matter how many detection points see it, and so the
     # requeue sites can honor a verdict the runner tail already computed.
     _claude_auth_revalidated: dict[str, bool]
+    # Per-run config dirs currently holding a materialized Claude access token
+    # (SYM-230). Rotating the shared token invalidates every copy already handed
+    # out, so this is what the refresh paths consult before re-minting.
+    _claude_inflight_dirs: set[str]
     # The agent a run was actually launched with, keyed by run id. A hot config
     # reload can swap `roles.fix.agent` mid-run, so the auth paths must key off
     # what produced the log, not off whatever the role resolves to now.
@@ -576,6 +580,7 @@ class _OrchestratorBase:
         self._dispatch_run_ids: dict[str, str] = {}
         self._operator_wait_run_ids: set[str] = set()
         self._claude_auth_revalidated: dict[str, bool] = {}
+        self._claude_inflight_dirs: set[str] = set()
         self._run_launched_agents: dict[str, str] = {}
         self._implement_failed_run_bindings: dict[str, RepoBinding] = {}
         self._implement_blocked_run_bindings: dict[str, RepoBinding] = {}
@@ -3053,6 +3058,28 @@ class _OrchestratorBase:
     async def _resolve_claude_credential(self) -> str | None:
         return await self._resolve_agent_credential("claude")
 
+    def _claude_rotation_breaks_inflight(self, credential: str) -> bool:
+        """Whether re-minting the shared Claude token right now would kill the
+        runs already holding it (SYM-230).
+
+        The refresh grant rotates both halves: the new access token supersedes
+        the one it replaces. Since SYM-228 a run carries an access-token-only
+        copy it cannot self-heal, so every rotation kills the runs that hold the
+        superseded token — they die on "Not logged in" with hours of *nominal*
+        TTL left, which is exactly the reported symptom. So the daemon rotates
+        only when no run holds the token, or when the token is close enough to
+        expiry that those runs lose it to the clock anyway (there, rotating is
+        strictly better than not: the next dispatch must not start on a token
+        that dies mid-run).
+
+        Fails open by construction: a leaked registration (a run whose finalize
+        never ran) only defers rotation to the dies-mid-run trigger — the
+        pre-SYM-227 behavior — it can never strand the connection."""
+        if not self._claude_inflight_dirs:
+            return False
+        dies_mid_run_horizon = self.config.wall_clock_timeout_secs or _DEFAULT_REFRESH_HORIZON_SECS
+        return not claude_credential_expires_within(credential, dies_mid_run_horizon)
+
     async def _maybe_refresh_claude_credential(self, credential: str) -> str | None:
         """Proactive central token refresh (Config v2 4/9; SYM-227).
 
@@ -3081,6 +3108,16 @@ class _OrchestratorBase:
             if current is None:
                 return None
             if not claude_credential_expires_within(current, keep_fresh_horizon):
+                return current
+            # Keep-fresh is an optimization; not killing live runs is not
+            # (SYM-230). Defer the rotation while runs hold a token that still
+            # outlives their wall clock — the margin is hours wide, so there is
+            # ample runway to re-mint once the fleet drains.
+            if self._claude_rotation_breaks_inflight(current):
+                log.info(
+                    "claude keep-fresh rotation deferred: %d run(s) still hold the token",
+                    len(self._claude_inflight_dirs),
+                )
                 return current
             refreshed = await refresh_claude_credential(current)
             now = self._now().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -3318,6 +3355,23 @@ class _OrchestratorBase:
             current = await self._resolve_claude_credential()
             if current is None:
                 return "gated"
+            # The re-validate refresh ignores the clock, so it is the one
+            # rotation that can fire at any moment — and rotating here kills
+            # every sibling still running, each of which then reports its own
+            # auth failure and rotates again: a self-sustaining cascade
+            # (SYM-230). While runs hold a stored token that still outlives
+            # their wall clock, attribute the failure to an earlier rotation
+            # rather than to the account: the run requeues onto the stored
+            # token (newer than the one it died on) and the survivors live. A
+            # genuinely dead account is caught by the next re-validate once the
+            # fleet drains, and the requeue retry budget bounds the meantime.
+            if self._claude_rotation_breaks_inflight(current):
+                log.info(
+                    "claude re-validate skipped: %d run(s) still hold the stored token; "
+                    "requeueing without rotating",
+                    len(self._claude_inflight_dirs),
+                )
+                return "usable"
             outcome = await refresh_claude_credential_outcome(current)
             refreshed = outcome.credential
             if refreshed is None:
@@ -3602,6 +3656,10 @@ class _OrchestratorBase:
             log.warning("%s credential materialization failed", agent, exc_info=True)
             shutil.rmtree(config_dir, ignore_errors=True)
             return {}
+        if agent == "claude":
+            # This run now holds a copy of the shared access token it cannot
+            # renew; the refresh paths must not rotate it away (SYM-230).
+            self._claude_inflight_dirs.add(str(config_dir))
         return {env_var: str(config_dir)}
 
     async def _finalize_claude_env(self, claude_env: dict[str, str]) -> None:
@@ -3613,6 +3671,11 @@ class _OrchestratorBase:
             config_dir = claude_env.get(env_var)
             if not config_dir:
                 continue
+            if agent == "claude":
+                # The run no longer holds the token; it stops pinning rotation
+                # (SYM-230). Discarded first so a write-back failure below
+                # cannot leave the dir pinned forever.
+                self._claude_inflight_dirs.discard(config_dir)
             credential = read_claude_credential(Path(config_dir) / filename)
             prior = read_claude_credential(Path(config_dir) / f"{filename}.orig")
             if credential and credential != prior:
