@@ -602,9 +602,9 @@ class RepoBinding(BaseModel):
         Deep-merges per field: a per-binding `roles[name]` field wins over the
         global `roles[name]` field, and an unset field falls back to the
         back-compat default derived from the legacy top-level fields. An
-        explicit binding agent that differs from the explicit global agent is
-        a family boundary: model/effort values from the other family are not
-        inherited.
+        explicit binding agent that differs from the global role's resolved
+        agent is a family boundary: model/effort values from the other family
+        are not inherited.
 
         `visual_acceptance=True` (the `accept` role for a `dev`/`preview`
         acceptance run) forces an unconfigured `accept` default off codex:
