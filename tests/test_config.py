@@ -952,6 +952,30 @@ def test_roles_agent_override_is_a_family_inheritance_boundary() -> None:
     assert (accept.agent, accept.model, accept.effort) == ("claude", None, None)
 
 
+@pytest.mark.parametrize(
+    ("default_agent", "binding_agent", "global_model", "expected_model"),
+    [
+        ("claude", "codex", "sonnet", "gpt-5.1-codex"),
+        ("codex", "claude", "gpt-5.6-sol", None),
+    ],
+)
+def test_roles_agent_override_uses_implicit_global_family_boundary(
+    default_agent: str,
+    binding_agent: str,
+    global_model: str,
+    expected_model: str | None,
+) -> None:
+    binding = _review_binding(
+        agent=default_agent,
+        roles={"implement": RoleConfig(agent=binding_agent)},
+    )
+    global_roles = {"implement": RoleConfig(model=global_model)}
+
+    implement = binding.resolved_role("implement", global_roles)
+
+    assert (implement.agent, implement.model) == (binding_agent, expected_model)
+
+
 def test_roles_unknown_claude_model_fails(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""

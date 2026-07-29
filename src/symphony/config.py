@@ -616,12 +616,16 @@ class RepoBinding(BaseModel):
         """
         binding_role = self.roles.get(name)
         global_role = (global_roles or {}).get(name)
+        inherited_agent = (
+            global_role.agent or self._default_role_agent(name, global_roles)
+            if global_role is not None
+            else None
+        )
         changes_family = (
             binding_role is not None
             and binding_role.agent is not None
-            and global_role is not None
-            and global_role.agent is not None
-            and binding_role.agent != global_role.agent
+            and inherited_agent is not None
+            and binding_role.agent != inherited_agent
         )
         agent: Literal["claude", "codex"] | None = None
         model: str | None = None
