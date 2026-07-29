@@ -98,7 +98,7 @@ from ...pipeline.local_review import (
     extract_last_agent_message,
     is_auth_api_error,
 )
-from ...pipeline.local_review_loop import LoopOutcome, LoopResult
+from ...pipeline.local_review_loop import REVIEWER_FAILURE_RETRIES, LoopOutcome, LoopResult
 from ...pipeline.state_machine import on_runner_event
 from ...tracker import (
     DEFAULT_PROVIDER,
@@ -391,6 +391,12 @@ class _OrchestratorBase:
     # (SYM-230). Rotating the shared token invalidates every copy already handed
     # out, so this is what the refresh paths consult before re-minting.
     _claude_inflight_dirs: dict[str, _ClaudeInflightDir]
+    # The access token each run was actually handed, keyed by run id (SYM-230
+    # review). Recorded independently of `_claude_inflight_dirs` (which is
+    # popped at finalize) so it survives past the run's own dir teardown — the
+    # auth-failure re-validate needs the FAILING run's own token, and every
+    # caller finalizes before flagging.
+    _claude_run_access_tokens: dict[str, str | None]
     # The agent a run was actually launched with, keyed by run id. A hot config
     # reload can swap `roles.fix.agent` mid-run, so the auth paths must key off
     # what produced the log, not off whatever the role resolves to now.
@@ -596,6 +602,7 @@ class _OrchestratorBase:
         self._operator_wait_run_ids: set[str] = set()
         self._claude_auth_revalidated: dict[str, bool] = {}
         self._claude_inflight_dirs: dict[str, _ClaudeInflightDir] = {}
+        self._claude_run_access_tokens: dict[str, str | None] = {}
         self._run_launched_agents: dict[str, str] = {}
         self._implement_failed_run_bindings: dict[str, RepoBinding] = {}
         self._implement_blocked_run_bindings: dict[str, RepoBinding] = {}
@@ -3074,20 +3081,52 @@ class _OrchestratorBase:
         return await self._resolve_agent_credential("claude")
 
     def _claude_max_dir_hold_secs(self) -> float:
-        """Upper bound on how long a single materialized Claude dir can stay
-        registered as in-flight (SYM-230 review).
+        """Truthful upper bound on how long a single materialized Claude dir can
+        stay registered as in-flight (SYM-230 review) — used only to age a
+        leaked registration out of `_claude_active_inflight_dirs`, NOT fed
+        directly into the rotation-defer/keep-fresh decisions (see
+        `_claude_dies_mid_run_horizon_secs`, which clamps it).
 
         A dir is not held for a single wall clock: local review alone
-        materializes one dir for the whole `run_local_review_session` (find
-        pass + verify pass + up to `local_review_iteration_cap` in-loop fix
-        turns), each turn getting its own `wall_clock_timeout_secs`
-        (`local_review_session.py`). Bounding the "dies mid-run" horizon by a
-        single wall clock undercounts exactly the path that reproduced the
-        reported symptom (a local-review fix turn outliving the horizon the
-        daemon used to decide rotation was safe)."""
+        materializes one dir for the whole `run_local_review_session` (find +
+        verify pass, retried up to `REVIEWER_FAILURE_RETRIES` times each, plus
+        a fix turn), repeated for up to `local_review_iteration_cap`
+        iterations (`local_review_loop.py`) — each turn getting its own
+        `wall_clock_timeout_secs`. Bounding the hold by a single wall clock, or
+        by the global cap alone, undercounts exactly the path that reproduced
+        the reported symptom (a local-review fix turn outliving the horizon
+        the daemon used to decide rotation was safe): a binding may override
+        the cap up to 100 (`RepoBinding.resolved_local_review_iteration_cap`),
+        silently ignored by reading only `Config.local_review_iteration_cap`."""
         wall_clock = self.config.wall_clock_timeout_secs or _DEFAULT_REFRESH_HORIZON_SECS
-        turns = 2 + self.config.local_review_iteration_cap
-        return wall_clock * turns
+        global_cap = self.config.local_review_iteration_cap
+        max_cap = max(
+            [global_cap]
+            + [
+                binding.resolved_local_review_iteration_cap(global_cap)
+                for binding in self.config.repos
+            ]
+        )
+        # Per iteration: the reviewer (find + verify) retried up to
+        # REVIEWER_FAILURE_RETRIES times, plus one fix turn.
+        turns_per_iteration = 2 * (1 + REVIEWER_FAILURE_RETRIES) + 1
+        return wall_clock * max_cap * turns_per_iteration
+
+    def _claude_dies_mid_run_horizon_secs(self) -> float:
+        """The hold bound clamped for use as a horizon compared against a
+        credential's own expiry (SYM-230 review).
+
+        `_claude_max_dir_hold_secs` is truthful, but under a large
+        `wall_clock_timeout_secs`/iteration-cap combination it can exceed a
+        freshly minted access token's own ~8h TTL (`_CLAUDE_FRESH_TOKEN_TTL_SECS`)
+        — feeding the raw value into `claude_credential_expires_within` would
+        then read every credential, including one just minted, as "expiring
+        within the horizon", making `_claude_rotation_breaks_inflight` always
+        `False` and silently turning the deferral into dead code. Clamping
+        keeps this strictly below the keep-fresh ceiling
+        (`_CLAUDE_KEEP_FRESH_HORIZON_CEILING_SECS`), which is itself strictly
+        below the fresh-token TTL, for every legal knob value."""
+        return min(self._claude_max_dir_hold_secs(), _CLAUDE_DIES_MID_RUN_HORIZON_CAP_SECS)
 
     def _claude_active_inflight_dirs(self) -> dict[str, _ClaudeInflightDir]:
         """Registered dirs still within their plausible hold time.
@@ -3135,7 +3174,7 @@ class _OrchestratorBase:
             return False
         if claude_expires_at(credential) is None:
             return False
-        dies_mid_run_horizon = self._claude_max_dir_hold_secs()
+        dies_mid_run_horizon = self._claude_dies_mid_run_horizon_secs()
         return not claude_credential_expires_within(credential, dies_mid_run_horizon)
 
     async def _maybe_refresh_claude_credential(self, credential: str) -> str | None:
@@ -3161,18 +3200,26 @@ class _OrchestratorBase:
         would die mid-run. A keep-fresh miss on a token that still outlives the
         run fails open on the current token.
 
-        `keep_fresh_horizon` must strictly exceed `_claude_max_dir_hold_secs`
+        `keep_fresh_horizon` must strictly exceed `_claude_dies_mid_run_horizon_secs`
         (the horizon `_claude_rotation_breaks_inflight` defers on): otherwise,
-        once that hold bound grows past `_CLAUDE_KEEP_FRESH_HORIZON_SECS` (true
-        today for any `wall_clock_timeout_secs >= 6h`), every credential that
-        reaches the inflight check here is already within the (smaller) defer
-        horizon too, so the defer check trivially returns `False` and rotation
-        always proceeds — silently turning the deferral into dead code
-        (SYM-230 review)."""
-        keep_fresh_horizon = max(
-            _CLAUDE_KEEP_FRESH_HORIZON_SECS,
-            self._claude_max_dir_hold_secs()
-            + (self.config.wall_clock_timeout_secs or _DEFAULT_REFRESH_HORIZON_SECS),
+        every credential that reaches the inflight check here is already
+        within the (smaller) defer horizon too, so the defer check trivially
+        returns `False` and rotation always proceeds — silently turning the
+        deferral into dead code (SYM-230 review). Both are clamped below
+        `_CLAUDE_FRESH_TOKEN_TTL_SECS` (a fresh token's own ~8h TTL) via
+        `_CLAUDE_KEEP_FRESH_HORIZON_CEILING_SECS`/`_CLAUDE_DIES_MID_RUN_HORIZON_CAP_SECS`
+        for every legal `wall_clock_timeout_secs`/iteration-cap combination —
+        an unclamped horizon derived from a large wall-clock knob can itself
+        exceed that TTL, which would read a just-minted token as "expiring
+        within the horizon" and re-mint it on every dispatch (SYM-230
+        review)."""
+        keep_fresh_horizon = min(
+            max(
+                _CLAUDE_KEEP_FRESH_HORIZON_SECS,
+                self._claude_dies_mid_run_horizon_secs()
+                + (self.config.wall_clock_timeout_secs or _DEFAULT_REFRESH_HORIZON_SECS),
+            ),
+            _CLAUDE_KEEP_FRESH_HORIZON_CEILING_SECS,
         )
         if not claude_credential_expires_within(credential, keep_fresh_horizon):
             return credential
@@ -3361,7 +3408,7 @@ class _OrchestratorBase:
         # reconnect gate, so a later stale run must not silently refresh it back
         # to connected and unblock the fleet without the operator reconnect.
         if provider == "claude" and status.status == "connected":
-            verdict = await self._revalidate_claude_after_auth_failure()
+            verdict = await self._revalidate_claude_after_auth_failure(run_id)
             if verdict in ("usable", "transient"):
                 log.info(
                     "claude run auth failure cleared by a daemon re-validate (%s); "
@@ -3397,7 +3444,7 @@ class _OrchestratorBase:
             _remember_bounded(self._claude_auth_revalidated, run_id, requeue)
         return requeue
 
-    async def _revalidate_claude_after_auth_failure(self) -> str:
+    async def _revalidate_claude_after_auth_failure(self, run_id: str = "") -> str:
         """Daemon-owned re-validate of the shared Claude connection after a run
         reported an auth failure (SYM-229). Forces a central token refresh —
         ignoring the keep-fresh horizon, since the run's failure (not the clock)
@@ -3407,10 +3454,11 @@ class _OrchestratorBase:
         Verdict:
           * `usable` — the refresh succeeded and was persisted; a concurrent
             reconnect/refresh already replaced the credential the failed run
-            started from; or the stored credential is a token already proven
-            (by comparing access tokens) to have superseded one still held by
-            an in-flight sibling, so the real refresh is skipped and the run
-            requeues onto that newer token instead. Requeue the run.
+            started from; or the FAILING run's own recorded access token (by
+            `run_id`, from `_claude_run_access_tokens`) differs from the
+            currently stored one, so an earlier rotation already superseded
+            it — the real refresh is skipped and the run requeues onto that
+            newer token instead. Requeue the run.
           * `transient` — the token endpoint was unreachable/5xx/429. Says
             nothing about the credential, so the connection must NOT be expired;
             requeue with backoff (the retry budget bounds it).
@@ -3436,32 +3484,31 @@ class _OrchestratorBase:
             # rotation that can fire at any moment — and rotating here kills
             # every sibling still running, each of which then reports its own
             # auth failure and rotates again: a self-sustaining cascade
-            # (SYM-230). While runs hold a stored token that still outlives
-            # their wall clock, attribute the failure to an earlier rotation
-            # rather than to the account — but only when a rotation actually
+            # (SYM-230). Attribute the failure to an earlier rotation rather
+            # than to the account — but only when a rotation actually
             # happened: skipping unconditionally would requeue a run that
             # died on this exact stored token straight back onto it, burning
             # the retry budget while the connection stays green (the issue's
             # own timeline had no rotation between the mint and the failure).
-            # Compare access tokens: if the stored credential differs from
-            # every in-flight sibling's, some earlier rotation already
-            # superseded them and this run's failure is explained by that,
-            # not by a dead account — requeue onto the newer token without a
-            # real refresh. Otherwise fall through: nothing supports "this was
-            # just an earlier rotation", so find out for real.
-            if self._claude_rotation_breaks_inflight(current):
-                active = self._claude_active_inflight_dirs()
+            #
+            # Compare the FAILING run's OWN recorded access token — not a
+            # sibling's — against the stored one: every caller finalizes the
+            # failing run's dir (popping it from `_claude_inflight_dirs`)
+            # before flagging the auth failure, so an "any sibling still
+            # holds a different token" check never sees the failing run's own
+            # token and instead attributes a dead account to whichever
+            # unrelated sibling happens to still be registered (SYM-230
+            # review). `_claude_run_access_tokens` survives that pop. If the
+            # failing run's token is unknown (no `run_id`, or it never
+            # materialized a claude dir), fall through to the real refresh.
+            failing_run_token = self._claude_run_access_tokens.get(run_id) if run_id else None
+            if failing_run_token is not None:
                 current_token = claude_access_token(current)
-                superseded = current_token is not None and any(
-                    entry.access_token is not None and entry.access_token != current_token
-                    for entry in active.values()
-                )
-                if superseded:
+                if current_token is not None and current_token != failing_run_token:
                     log.info(
-                        "claude re-validate skipped: %d run(s) still hold a token the "
-                        "stored credential has already superseded; requeueing without "
-                        "rotating",
-                        len(active),
+                        "claude re-validate skipped: the failing run's own token has "
+                        "already been superseded by the stored credential; requeueing "
+                        "without rotating"
                     )
                     return "usable"
             outcome = await refresh_claude_credential_outcome(current)
@@ -3683,7 +3730,7 @@ class _OrchestratorBase:
             force_requeue=True,
         )
 
-    async def _materialize_claude_env(self, agent: str) -> dict[str, str]:
+    async def _materialize_claude_env(self, agent: str, *, run_id: str = "") -> dict[str, str]:
         """Per-run Claude credential materialization (Config v2 3/9).
 
         For a Claude run with a UI-stored credential, writes it into a private,
@@ -3695,7 +3742,13 @@ class _OrchestratorBase:
         (and materializes nothing) for non-Claude runs or when Claude isn't
         UI-connected. The caller MUST pass the returned env to
         `_finalize_claude_env` when the run ends — that reads the (possibly
-        refreshed) credential back for the DB write-back and removes the dir."""
+        refreshed) credential back for the DB write-back and removes the dir.
+
+        `run_id`, when given, records the access token this run was actually
+        handed (`_claude_run_access_tokens`) — kept independently of
+        `_claude_inflight_dirs` (which is popped at finalize) so an auth
+        failure reported after the run's dir was torn down can still compare
+        against the exact token that run held (SYM-230 review)."""
         if agent not in _AGENT_CRED_LAYOUT:
             return {}
         env_var, filename = _AGENT_CRED_LAYOUT[agent]
@@ -3755,6 +3808,10 @@ class _OrchestratorBase:
                 materialized_at=self._now(),
                 access_token=claude_access_token(credential),
             )
+            if run_id:
+                _remember_bounded(
+                    self._claude_run_access_tokens, run_id, claude_access_token(credential)
+                )
         return {env_var: str(config_dir)}
 
     async def _finalize_claude_env(self, claude_env: dict[str, str]) -> None:
@@ -3831,7 +3888,7 @@ class _OrchestratorBase:
         # 3/9); binding env still overrides. Materialized LAST — everything
         # between here and the `finally` that tears it down must be
         # infallible, or a setup failure would leak the dir (review fix).
-        claude_env = await self._materialize_claude_env(role.agent)
+        claude_env = await self._materialize_claude_env(role.agent, run_id=run_id)
         blocked = await self._post_materialize_block_reason(role.agent, claude_env)
         if blocked is not None:
             log.warning("run %s not dispatched: %s", run_id, blocked)
@@ -4154,7 +4211,7 @@ class _OrchestratorBase:
         run_credentials = await self._resolve_run_credentials(binding)
         # See `_run_stage_command`: materialized last so nothing fallible sits
         # between the dir's creation and the `finally` that tears it down.
-        claude_env = await self._materialize_claude_env(role.agent)
+        claude_env = await self._materialize_claude_env(role.agent, run_id=run_id)
         blocked = await self._post_materialize_block_reason(role.agent, claude_env)
         if blocked is not None:
             log.warning("run %s not dispatched: %s", run_id, blocked)
@@ -4973,6 +5030,30 @@ _DEFAULT_REFRESH_HORIZON_SECS = 2 * 60 * 60
 # die mid-run is always refreshed. Only claude uses this; codex keeps the
 # wall-clock-based horizon.
 _CLAUDE_KEEP_FRESH_HORIZON_SECS = 6 * 60 * 60
+
+# The observed lifetime of a freshly minted Claude access token (Anthropic's
+# refresh grant returns `expires_in: 28800`). Every horizon compared against a
+# credential's own expiry (the keep-fresh trigger, the rotation-defer check)
+# must sit strictly below this, or a just-minted token reads as "expiring
+# within the horizon" regardless of its actual freshness (SYM-230 review).
+_CLAUDE_FRESH_TOKEN_TTL_SECS = 8 * 60 * 60
+
+# Ceiling for `_claude_dies_mid_run_horizon_secs` (SYM-230 review): the
+# truthful max-hold bound it clamps can exceed a fresh token's own TTL under a
+# large `wall_clock_timeout_secs`/iteration-cap combination — feeding the raw
+# value straight into `claude_credential_expires_within` would then make
+# `_claude_rotation_breaks_inflight` always return `False`, silently turning
+# the rotation deferral into dead code. Must stay strictly below
+# `_CLAUDE_KEEP_FRESH_HORIZON_CEILING_SECS`.
+_CLAUDE_DIES_MID_RUN_HORIZON_CAP_SECS = 4 * 60 * 60
+
+# Ceiling for the keep-fresh horizon computed in
+# `_maybe_refresh_claude_credential` (SYM-230 review): without it, a large
+# `wall_clock_timeout_secs` pushes `keep_fresh_horizon` past
+# `_CLAUDE_FRESH_TOKEN_TTL_SECS`, so a just-minted token would be re-refreshed
+# on every dispatch instead of holding for its natural life. Must stay
+# strictly below `_CLAUDE_FRESH_TOKEN_TTL_SECS`.
+_CLAUDE_KEEP_FRESH_HORIZON_CEILING_SECS = 7 * 60 * 60
 
 
 MERGE_WAIT_RECONCILE_INTERVAL_SECS = 600

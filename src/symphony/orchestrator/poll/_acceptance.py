@@ -906,7 +906,9 @@ class _AcceptanceMixin(_OrchestratorBase):
                         # through `_run_stage_command`/`_run_runner`, so it gets
                         # the same per-run Claude credential materialization +
                         # write-back as those (Config v2 3/9).
-                        claude_env = await self._materialize_claude_env(accept_role.agent)
+                        claude_env = await self._materialize_claude_env(
+                            accept_role.agent, run_id=run_id
+                        )
                         try:
                             blocked = await self._post_materialize_block_reason(
                                 accept_role.agent, claude_env

@@ -1604,7 +1604,9 @@ class _LifecycleMixin(_OrchestratorBase):
                 for lr_agent in ("claude", "codex"):
                     if lr_agent not in lr_role_agents:
                         continue
-                    env_for_agent = await self._materialize_claude_env(lr_agent)
+                    env_for_agent = await self._materialize_claude_env(
+                        lr_agent, run_id=local_review_run_id
+                    )
                     agent_envs[lr_agent] = env_for_agent
                     claude_env.update(env_for_agent)
                     # Post-materialize gate: a refresh that failed inside
@@ -2130,7 +2132,9 @@ class _LifecycleMixin(_OrchestratorBase):
 
         async def _verify_fix_env() -> dict[str, str]:
             if not verify_claude_env:
-                verify_claude_env.update(await self._materialize_claude_env(fixer_role.agent))
+                verify_claude_env.update(
+                    await self._materialize_claude_env(fixer_role.agent, run_id=verify_run_id)
+                )
                 blocked = await self._post_materialize_block_reason(
                     fixer_role.agent, verify_claude_env
                 )
