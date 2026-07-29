@@ -454,7 +454,7 @@ async def test_stale_inflight_registration_ages_out_of_rotation_guard(tmp_path: 
 
 @pytest.mark.asyncio
 @respx.mock
-@pytest.mark.parametrize("wall_clock_timeout_secs", [7200, 0])
+@pytest.mark.parametrize("wall_clock_timeout_secs", [7200, 0, 24 * 3600])
 async def test_horizons_stay_below_fresh_token_ttl_under_configured_wall_clock(
     tmp_path: Path, wall_clock_timeout_secs: int
 ) -> None:
@@ -464,9 +464,13 @@ async def test_horizons_stay_below_fresh_token_ttl_under_configured_wall_clock(
     alone the raw bound is already 30h, and `0` falls back to a 2h default
     horizon with the same effect. Unclamped, that inverts the whole feature:
     a just-minted token would be re-refreshed on every dispatch, and the
-    rotation-defer check would always read "safe to rotate". Pin that, at
-    both knob values, a freshly minted token is never re-refreshed at
-    dispatch, and a rotation is still deferred while a dir is registered."""
+    rotation-defer check would always read "safe to rotate". `wall_clock_timeout_secs`
+    has no upper bound in config (`config.py`), so a 24h value alone (with no
+    iteration multiplier at all) already exceeds the keep-fresh horizon's
+    `max(6h, wall_clock)` and would re-refresh the just-minted 8h token on
+    every dispatch without the ceiling clamp. Pin that, at every knob value, a
+    freshly minted token is never re-refreshed at dispatch, and a rotation is
+    still deferred while a dir is registered."""
     route = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(
         return_value=httpx.Response(
             200,
@@ -575,6 +579,85 @@ async def test_auth_failure_revalidate_skips_only_on_genuine_supersession(tmp_pa
             is True
         )
         assert route.call_count == 1
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_local_review_flag_compares_its_own_token_not_the_parent_runs(
+    tmp_path: Path,
+) -> None:
+    """SYM-230 review: local review materializes its per-pass credential under
+    `local_review_run_id`, not the parent implement run's `run_id` — but the
+    caller flags the auth failure with `run_id=parent_run_id` (so the verdict
+    memo other detection points read stays keyed on the parent). Passing only
+    `run_id` for the token lookup too (the pre-fix behavior, reproduced by the
+    first call below) compares the unrelated implement run's token against the
+    stored credential: a rotation between implement dispatch and local review
+    misreads as "supersession" and skips the real re-validate for a run that
+    died on the currently stored (and about to prove dead) token — the row
+    stays green and the run requeues onto a dead token. `token_run_id` (used by
+    the real call site in `_lifecycle.py`) fixes it by comparing the local
+    review pass's OWN recorded token instead."""
+    route = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(return_value=httpx.Response(400, json={}))
+
+    class _AuthError:
+        message = "Not logged in · Please run /login"
+        status = None
+
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        # The implement run started from tok-a.
+        await db.oauth_connections.set_connection(
+            harness.conn,
+            provider="claude",
+            credential=_cred_in("tok-a", 8 * 60 * 60),
+            cipher=cipher,
+        )
+        impl_env = await harness.orch._materialize_claude_env(  # noqa: SLF001
+            "claude", run_id="impl-1"
+        )
+        await harness.orch._finalize_claude_env(impl_env)  # noqa: SLF001
+
+        # The daemon rotated to tok-b before local review dispatched; local
+        # review materializes its own dir under its own run id and dies
+        # holding the exact token still stored (no supersession for IT).
+        await db.oauth_connections.set_connection(
+            harness.conn,
+            provider="claude",
+            credential=_cred_in("tok-b", 8 * 60 * 60),
+            cipher=cipher,
+        )
+        lr_env = await harness.orch._materialize_claude_env(  # noqa: SLF001
+            "claude", run_id="lr-1"
+        )
+        await harness.orch._finalize_claude_env(lr_env)  # noqa: SLF001
+
+        # Pre-fix reproduction: flagging with only the parent's run_id (no
+        # token_run_id) compares impl-1's tok-a against the stored tok-b,
+        # misattributes the failure to a rotation, and skips the real
+        # re-validate — masking a dead token.
+        buggy_requeue = await harness.orch._flag_claude_auth_failure(  # noqa: SLF001
+            "claude", _AuthError(), run_id="impl-1"
+        )
+        assert buggy_requeue is True
+        assert route.call_count == 0
+        status = await db.oauth_connections.get_status(harness.conn, "claude")
+        assert status is not None and status.status == "connected"
+
+        # Fixed call, matching the real local-review call site: token_run_id
+        # names the pass that actually died, so the comparison is against
+        # ITS token (tok-b, a genuine match) and falls through to a real
+        # re-validate, which proves the token dead.
+        fixed_requeue = await harness.orch._flag_claude_auth_failure(  # noqa: SLF001
+            "claude", _AuthError(), run_id="impl-1", token_run_id="lr-1"
+        )
+        assert fixed_requeue is False
+        assert route.call_count == 1
+        status = await db.oauth_connections.get_status(harness.conn, "claude")
+        assert status is not None and status.status == "expired"
     finally:
         await harness.close()
 

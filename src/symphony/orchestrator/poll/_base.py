@@ -3144,6 +3144,19 @@ class _OrchestratorBase:
             if (now - entry.materialized_at).total_seconds() <= max_hold
         }
 
+    def _claude_active_inflight_dirs_holding(
+        self, credential: str
+    ) -> dict[str, _ClaudeInflightDir]:
+        """Active inflight dirs still registered under this exact access
+        token — a dir registered under an already-superseded token can no
+        longer be killed by rotating `credential` (SYM-230 review)."""
+        current_token = claude_access_token(credential)
+        return {
+            config_dir: entry
+            for config_dir, entry in self._claude_active_inflight_dirs().items()
+            if entry.access_token == current_token
+        }
+
     def _claude_rotation_breaks_inflight(self, credential: str) -> bool:
         """Whether re-minting the shared Claude token right now would kill the
         runs already holding it (SYM-230).
@@ -3168,8 +3181,14 @@ class _OrchestratorBase:
         never ran) only defers rotation to the dies-mid-run trigger — the
         pre-SYM-227 behavior — it can never strand the connection; and it ages
         out of `_claude_active_inflight_dirs` once it outlives the real max
-        hold time, so it cannot pin the guard past that."""
-        active = self._claude_active_inflight_dirs()
+        hold time, so it cannot pin the guard past that.
+
+        Only dirs still holding THIS token can be killed by rotating it: a dir
+        registered under an already-superseded token (e.g. a prior re-validate
+        rotated under it while this dir's run was still in flight) would
+        otherwise defer rotation forever for a credential that can no longer
+        harm it."""
+        active = self._claude_active_inflight_dirs_holding(credential)
         if not active:
             return False
         if claude_expires_at(credential) is None:
@@ -3237,7 +3256,7 @@ class _OrchestratorBase:
             if self._claude_rotation_breaks_inflight(current):
                 log.info(
                     "claude keep-fresh rotation deferred: %d run(s) still hold the token",
-                    len(self._claude_active_inflight_dirs()),
+                    len(self._claude_active_inflight_dirs_holding(current)),
                 )
                 return current
             refreshed = await refresh_claude_credential(current)
@@ -3346,10 +3365,19 @@ class _OrchestratorBase:
         run_started_at: str = "",
         provider: str = "",
         run_id: str = "",
+        token_run_id: str = "",
     ) -> bool:
         """After a Claude run died on an authentication error, re-validate the
         shared UI connection with a daemon-owned refresh instead of expiring it
         outright (SYM-229 blast-radius hardening).
+
+        `run_id` keys the verdict memo (`_record_claude_auth_verdict`) that
+        every other detection point for THIS run reuses. `token_run_id` is the
+        id whose materialized credential should be looked up in
+        `_claude_run_access_tokens` — they differ for local review, which
+        materializes its per-pass credential under `local_review_run_id` while
+        the verdict must stay keyed on the caller's `parent_run_id` (SYM-230
+        review). Defaults to `run_id` when the caller has only one id.
 
         A single run's 401 / "Not logged in" is usually a stale per-run token,
         not a dead account — flipping the *shared* `oauth_connections` row to
@@ -3408,7 +3436,7 @@ class _OrchestratorBase:
         # reconnect gate, so a later stale run must not silently refresh it back
         # to connected and unblock the fleet without the operator reconnect.
         if provider == "claude" and status.status == "connected":
-            verdict = await self._revalidate_claude_after_auth_failure(run_id)
+            verdict = await self._revalidate_claude_after_auth_failure(token_run_id or run_id)
             if verdict in ("usable", "transient"):
                 log.info(
                     "claude run auth failure cleared by a daemon re-validate (%s); "

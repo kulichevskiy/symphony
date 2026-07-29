@@ -910,7 +910,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     # daemon's own refresh failing expires the card and arms the
                     # dispatch gate (Config v2 5/9).
                     auth_requeue = await self._flag_claude_auth_failure(
-                        implement_role.agent, api_error
+                        implement_role.agent, api_error, run_id=run_id
                     )
                     if await self._maybe_requeue_transient_agent_failure(
                         run_id=run_id,
@@ -1670,6 +1670,7 @@ class _LifecycleMixin(_OrchestratorBase):
                         run_started_at=local_review_started_at,
                         provider=lr_failed_agent,
                         run_id=parent_run_id,
+                        token_run_id=local_review_run_id,
                     )
                     # A two-pass review can have BOTH providers fail on auth.
                     # The single `api_error` slot names one; each of the others
@@ -1685,6 +1686,7 @@ class _LifecycleMixin(_OrchestratorBase):
                                 extra_error,
                                 run_started_at=local_review_started_at,
                                 provider=extra_agent,
+                                token_run_id=local_review_run_id,
                             )
                             lr_all_usable = lr_all_usable and extra_usable
                     if not lr_all_usable:
