@@ -259,6 +259,18 @@ def claude_expires_at(raw: str) -> str | None:
     return datetime.fromtimestamp(expires_ms / 1000, tz=UTC).strftime(_ISO_FORMAT)
 
 
+def claude_access_token(raw: str) -> str | None:
+    """The stored credential's bare `accessToken`, or `None` if the blob has no
+    parseable one (SYM-230: lets a caller tell whether a stored credential is a
+    genuine rotation of a token a run already holds, vs. the very same token)."""
+    parsed = _parse_claude_oauth(raw)
+    if parsed is None:
+        return None
+    _, oauth = parsed
+    access_token = oauth.get("accessToken")
+    return access_token if isinstance(access_token, str) else None
+
+
 def claude_credential_expired(raw: str) -> bool:
     """Whether the stored credential's access token is past its `expiresAt`.
     A blob with no parseable expiry is treated as not-expired — the card's

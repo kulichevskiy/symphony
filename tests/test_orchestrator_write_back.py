@@ -330,12 +330,14 @@ async def test_keep_fresh_rotation_deferred_while_runs_hold_the_token(tmp_path: 
         assert route.call_count == 0
 
         # Time passes: the same token is now inside the keep-fresh margin (but
-        # still far outside a run's wall clock, so run A is not dying of the
-        # clock). Run B dispatching must NOT rotate it out from under run A.
+        # still far outside the real max hold time of a materialized dir —
+        # `wall_clock_timeout_secs * (2 + local_review_iteration_cap)`, 5h with
+        # this config's defaults — so run A is not dying of the clock). Run B
+        # dispatching must NOT rotate it out from under run A.
         await db.oauth_connections.set_connection(
             harness.conn,
             provider="claude",
-            credential=_cred_in("tok-a", 3 * 60 * 60),
+            credential=_cred_in("tok-a", 6 * 60 * 60),
             cipher=cipher,
         )
         env_b = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
@@ -398,14 +400,78 @@ async def test_dying_token_still_rotates_with_runs_in_flight(tmp_path: Path) -> 
 
 @pytest.mark.asyncio
 @respx.mock
-async def test_auth_failure_revalidate_does_not_rotate_under_live_runs(tmp_path: Path) -> None:
-    """SYM-230: the SYM-229 re-validate refreshes unconditionally, so one run's
-    auth failure rotated the token out from under every sibling still running —
-    a self-sustaining cascade (each killed sibling triggers the next rotation).
-    While runs hold a stored token that still outlives their wall clock, the
-    failure is attributed to an earlier rotation: requeue the run on the stored
-    token without rotating. Once the fleet drains, the re-validate refreshes for
-    real again."""
+async def test_auth_failure_revalidate_skips_only_on_genuine_supersession(tmp_path: Path) -> None:
+    """SYM-230 review: the re-validate skip must only fire when a rotation
+    genuinely already happened — proven by comparing access tokens, not merely
+    inferred from "some run still holds a token that outlives its wall clock".
+    Here the stored credential ("tok-b") differs from the token env_a was
+    handed ("tok-a"): an earlier rotation already superseded it, so the failure
+    is attributed to that rotation and the run requeues onto "tok-b" without a
+    real refresh."""
+    route = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={"access_token": "tok-fresh", "refresh_token": "rt-2", "expires_in": 28800},
+        )
+    )
+
+    class _AuthError:
+        message = "Not logged in · Please run /login"
+        status = None
+
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        await db.oauth_connections.set_connection(
+            harness.conn,
+            provider="claude",
+            credential=_cred_in("tok-a", 8 * 60 * 60),
+            cipher=cipher,
+        )
+        env_a = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
+
+        # An earlier rotation supersedes env_a's token before this run's auth
+        # failure is flagged.
+        await db.oauth_connections.set_connection(
+            harness.conn,
+            provider="claude",
+            credential=_cred_in("tok-b", 8 * 60 * 60),
+            cipher=cipher,
+        )
+        requeued = await harness.orch._flag_claude_auth_failure(  # noqa: SLF001
+            "claude", _AuthError()
+        )
+        assert requeued is True
+        assert route.call_count == 0
+        status = await db.oauth_connections.get_status(harness.conn, "claude")
+        assert status is not None and status.status == "connected"
+        stored = await db.oauth_connections.get_credential(harness.conn, "claude", cipher)
+        assert json.loads(stored)["claudeAiOauth"]["accessToken"] == "tok-b"
+
+        await harness.orch._finalize_claude_env(env_a)  # noqa: SLF001
+        # Fleet drained: the re-validate refreshes for real again.
+        assert (
+            await harness.orch._flag_claude_auth_failure("claude", _AuthError())  # noqa: SLF001
+            is True
+        )
+        assert route.call_count == 1
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_auth_failure_revalidate_refreshes_when_no_rotation_happened(
+    tmp_path: Path,
+) -> None:
+    """SYM-230 review reproduction: the reported incident had NO rotation
+    between the 05:49 mint and the 06:24 "Not logged in" failure — the run
+    died holding the exact token still stored in the DB. Skipping the
+    re-validate here (as the unconditional "some run still holds runway"
+    check used to) would requeue the run onto the identical, already-dead
+    token and burn the retry budget while the connection stayed green. With
+    no evidence of a supersession (env_a's token still matches the stored
+    credential), the guard must fall through to a real re-validate."""
     route = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(
         return_value=httpx.Response(
             200,
@@ -431,18 +497,52 @@ async def test_auth_failure_revalidate_does_not_rotate_under_live_runs(tmp_path:
             "claude", _AuthError()
         )
         assert requeued is True
-        assert route.call_count == 0
+        assert route.call_count == 1  # a real re-validate ran, not a blind skip
         status = await db.oauth_connections.get_status(harness.conn, "claude")
         assert status is not None and status.status == "connected"
         stored = await db.oauth_connections.get_credential(harness.conn, "claude", cipher)
-        assert json.loads(stored)["claudeAiOauth"]["accessToken"] == "tok-a"
-
+        assert json.loads(stored)["claudeAiOauth"]["accessToken"] == "tok-fresh"
         await harness.orch._finalize_claude_env(env_a)  # noqa: SLF001
-        assert (
-            await harness.orch._flag_claude_auth_failure("claude", _AuthError())  # noqa: SLF001
-            is True
+    finally:
+        await harness.close()
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_unknown_expiry_credential_does_not_defer_revalidate_forever(
+    tmp_path: Path,
+) -> None:
+    """SYM-230 review: `claude_credential_expires_within` returns `False` for a
+    blob with no parseable `expiresAt` (nothing to compare against) — read
+    naively by the in-flight guard, `not expires_within(...)` then reads
+    "unknown expiry" as "safely far from expiry" and defers the re-validate
+    forever while any dir is registered. A revoked account with such a blob
+    would then never expire the row. The guard must treat unknown expiry as
+    "don't defer" instead, so a dead account is still caught."""
+    route = respx.post(CLAUDE_OAUTH_TOKEN_URL).mock(return_value=httpx.Response(400, json={}))
+
+    class _AuthError:
+        message = "Not logged in · Please run /login"
+        status = None
+
+    harness = await Harness.create(tmp_path, config=_config(tmp_path))
+    try:
+        cipher = CredentialCipher(ENC_KEY)
+        no_expiry_blob = json.dumps(
+            {"claudeAiOauth": {"accessToken": "tok-a", "refreshToken": "rt-1"}}
         )
-        assert route.call_count == 1
+        await db.oauth_connections.set_connection(
+            harness.conn, provider="claude", credential=no_expiry_blob, cipher=cipher
+        )
+        env_a = await harness.orch._materialize_claude_env("claude")  # noqa: SLF001
+        requeued = await harness.orch._flag_claude_auth_failure(  # noqa: SLF001
+            "claude", _AuthError()
+        )
+        assert requeued is False
+        assert route.call_count == 1  # a refresh was actually attempted
+        status = await db.oauth_connections.get_status(harness.conn, "claude")
+        assert status is not None and status.status == "expired"
+        await harness.orch._finalize_claude_env(env_a)  # noqa: SLF001
     finally:
         await harness.close()
 
