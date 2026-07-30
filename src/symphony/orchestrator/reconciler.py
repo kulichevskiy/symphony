@@ -306,14 +306,19 @@ def _wait_generation_eligible(
     )
 
 
-def _run_is_retirable(run: db.runs.Run, *, started_at_max: str | None) -> bool:
+def _run_is_retirable(
+    run: db.runs.Run, *, started_at_max: str | None, has_open_prs: bool = False
+) -> bool:
     """Would `_supersede_finished_issue_runs` actually touch this run?
 
     A `failed`/`interrupted`/`needs_approval` row is always residue. A pidless
     `running` row only counts for the `review` stage — merge/review_fix/
     acceptance stages create pidless `running` rows for genuinely in-process
     work (see `poll/_merge.py`, `poll/_base.py`, `poll/_acceptance.py`), so
-    widening this to any stage would retire live work, not residue.
+    widening this to any stage would retire live work, not residue. A pidless
+    `review` row with an open PR is the resurrected review-monitor's own row —
+    that path owns it and will keep rewriting it, so touching it here would
+    recreate the very residue this sweep exists to remove.
     """
     if started_at_max is not None and _parse_rfc3339(run.started_at) > _parse_rfc3339(
         started_at_max
@@ -321,7 +326,12 @@ def _run_is_retirable(run: db.runs.Run, *, started_at_max: str | None) -> bool:
         return False
     if run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
         return True
-    return run.status in db.runs.LIVE_STATUSES and run.pid is None and run.stage == "review"
+    return (
+        run.status in db.runs.LIVE_STATUSES
+        and run.pid is None
+        and run.stage == "review"
+        and not has_open_prs
+    )
 
 
 def classify_linear_drift(
@@ -562,15 +572,20 @@ class Reconciler:
             # the wait is gone and every run is already retired (SYM-231).
             #
             # A wait created after `terminal_started_at_max` belongs to a later
-            # cycle and `_apply_linear_terminal_clear` will refuse to delete it
-            # (SYM-231 review) — counting it here anyway would spend a budget
-            # slot and post a comment every tick for a clear that never
-            # actually happens, forever. Only count it if there is nothing else
-            # (an older retirable run) to clear either.
-            terminal_would_clear = linear_drift in _TERMINAL_LINEAR_DRIFTS and (
-                (wait is not None and _wait_generation_eligible(wait, terminal_started_at_max))
-                or await self._has_retirable_runs(issue_id, started_at_max=terminal_started_at_max)
-            )
+            # cycle and `_apply_linear_terminal_clear` refuses to delete it,
+            # returning `False` outright regardless of any older retirable run
+            # (SYM-231 review) — mirror that hard precondition here, or this
+            # spends a budget slot and posts a comment every tick for a clear
+            # that never actually happens.
+            if wait is not None and not _wait_generation_eligible(wait, terminal_started_at_max):
+                terminal_would_clear = False
+            else:
+                terminal_would_clear = linear_drift in _TERMINAL_LINEAR_DRIFTS and (
+                    wait is not None
+                    or await self._has_retirable_runs(
+                        issue_id, started_at_max=terminal_started_at_max
+                    )
+                )
             # A wait's own binding can opt out of reconcile even though some other
             # binding matched via a PR row got us this far (see the `active
             # and linear_drift == DRIFT_LINEAR_STATE_DONE` branch below); with no
@@ -1498,7 +1513,11 @@ class Reconciler:
 
     async def _has_retirable_runs(self, issue_id: str, *, started_at_max: str | None) -> bool:
         history = await db.runs.history_for_issue(self._conn, issue_id)
-        return any(_run_is_retirable(run, started_at_max=started_at_max) for run in history)
+        has_open_prs = bool(await self._open_prs(issue_id))
+        return any(
+            _run_is_retirable(run, started_at_max=started_at_max, has_open_prs=has_open_prs)
+            for run in history
+        )
 
     async def _supersede_finished_issue_runs(
         self,
@@ -1517,8 +1536,11 @@ class Reconciler:
         and is left alone).
         """
         history = await db.runs.history_for_issue(self._conn, issue_id)
+        has_open_prs = bool(await self._open_prs(issue_id))
         for run in history:
-            if not _run_is_retirable(run, started_at_max=started_at_max):
+            if not _run_is_retirable(
+                run, started_at_max=started_at_max, has_open_prs=has_open_prs
+            ):
                 continue
             await self._supersede_run(run, ts=ts, kind=kind, detail=detail)
 
@@ -1645,6 +1667,7 @@ class Reconciler:
         await self._retire_merged_issue_bookkeeping(
             issue_id=issue_id,
             wait=None if wait_cleared else wait,
+            merged_prs=merged_prs,
             merged_at=merged_at,
             ts=ts,
         )
@@ -1654,6 +1677,7 @@ class Reconciler:
         *,
         issue_id: str,
         wait: db.operator_waits.OperatorWait | None,
+        merged_prs: list[GithubPrObservation],
         merged_at: str,
         ts: str,
     ) -> None:
@@ -1664,11 +1688,14 @@ class Reconciler:
         the issue shows as active forever (SYM-231). Guards keep this off live
         state: another still-open PR row means work is in flight; only runs/
         waits from the merged generation are retired (anything created after
-        the merge belongs to a later cycle); and the wait's own binding must not
+        the merge belongs to a later cycle); the wait's own binding must not
         have opted out of reconcile — mirroring the terminal-clear path, a
         sibling repo's PR merging must not delete a wait bound to a
         `reconcile_enabled=False` repo that has no PR row of its own to trip the
-        open-PR guard above.
+        open-PR guard above; and on a multi-binding issue, the merged PR must
+        belong to the *wait's own* repo — otherwise repo B's merge would delete
+        repo A's wait (and supersede repo A's runs) even though repo A's PR is
+        untouched.
         """
         if await self._open_prs(issue_id):
             return
@@ -1677,6 +1704,7 @@ class Reconciler:
             wait is not None
             and _parse_rfc3339(wait.created_at) <= merged_ts
             and any(binding.reconcile_enabled for binding in self._wait_matched_bindings(wait))
+            and any(pr.github_repo.casefold() == wait.github_repo.casefold() for pr in merged_prs)
         )
         if wait_eligible:
             assert wait is not None

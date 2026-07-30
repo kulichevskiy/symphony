@@ -1519,6 +1519,87 @@ async def test_reconcile_leaves_opted_out_binding_wait_and_run_alone(tmp_path: P
 
 
 @pytest.mark.asyncio
+async def test_reconcile_leaves_sibling_repo_wait_alone_even_when_enabled(tmp_path: Path) -> None:
+    """SYM-231 review: unlike the opted-out case above, `org/repo`'s binding
+    here has `reconcile_enabled=True` — the only thing that should protect its
+    wait and run is that the merged PR belongs to a different repo
+    (`org/other`) and `org/repo` has no `issue_prs` row of its own.
+    `_stale_merged_wait_is_eligible` used to look up the issue's merged PR via
+    `get_for_issue`, which returns whichever PR row sorts first regardless of
+    repo — so `org/other`'s merge would delete `org/repo`'s wait and supersede
+    its run even though `org/repo`'s own work is untouched. Covers both boot
+    sweeps: `_retire_runs_for_merged_prs` (the `needs_approval` run) and
+    `_retire_stale_waits_for_merged_prs` (the wait itself)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    merged_at = "2026-05-10T11:00:00+00:00"
+    try:
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-44", title="t", team_key="ENG")
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/other",
+            pr_number=99,
+            pr_url="https://github.com/org/other/pull/99",
+            created_at="2026-05-10T00:00:00+00:00",
+            binding_key='["ENG","org/other","frontend"]',
+        )
+        await db.issue_prs.update_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/other",
+            pr_number=99,
+            merged_at=merged_at,
+        )
+        await db.runs.create(
+            conn,
+            id="stale-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T10:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="stale-merge",
+            kind=db.operator_waits.KIND_MERGE,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="symphony",
+            created_at="2026-05-10T10:01:00+00:00",
+        )
+
+        bindings = [
+            RepoBinding(
+                linear_team_key="ENG",
+                github_repo="org/repo",
+                issue_label="symphony",
+                reconcile_enabled=True,
+                linear_states=LinearStates(ready="Todo"),
+            ),
+            RepoBinding(
+                linear_team_key="ENG",
+                github_repo="org/other",
+                issue_label="frontend",
+                reconcile_enabled=True,
+                linear_states=LinearStates(ready="Todo"),
+            ),
+        ]
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        assert await reconcile(conn, linear, bindings=bindings) == 0
+
+        run = (await db.runs.history_for_issue(conn, "iss-1"))[0]
+        assert run.status == "needs_approval"
+        assert await db.operator_waits.get(conn, "iss-1") is not None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_reconcile_leaves_opted_out_binding_residue_alone_with_no_wait(
     tmp_path: Path,
 ) -> None:

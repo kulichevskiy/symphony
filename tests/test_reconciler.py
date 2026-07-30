@@ -242,9 +242,21 @@ async def _seed_implement_failed_wait(
         id=f"run-{issue_id}",
         issue_id=issue_id,
         stage="implement",
-        status="failed",
+        status="running",
         pid=None,
         started_at="2026-05-17T10:00:00Z",
+    )
+    # `_fail_run` (poll/_base.py) always stamps `ended_at` alongside a
+    # `failed` status — leaving it NULL here would make the `_supersede_run`
+    # "already terminal with its own recorded reason" branch unreachable, so
+    # the seeded run would test a shape production never produces.
+    await db.runs.update_status(
+        conn,
+        f"run-{issue_id}",
+        "failed",
+        ended_at="2026-05-17T10:30:00Z",
+        kind="agent_error",
+        detail="agent crashed",
     )
     await db.operator_waits.upsert(
         conn,
@@ -891,8 +903,12 @@ async def test_external_merge_clears_wait_and_retires_runs(
     assert wait is None
     assert rows[1][1] == DRIFT_PR_LOCALLY_MERGED
     assert rows[1][2] == ACTION_CLEARED
-    for run_id in ("run-iss-1", "run-iss-1-merge"):
-        assert runs[run_id] == (db.runs.SUPERSEDED_STATUS, "pr_merged")
+    # `run-iss-1` is already terminal with its own recorded reason (a genuine
+    # `agent_error`, not this sweep's generic "pr_merged") — `_supersede_run`
+    # flips status only and preserves that kind. `run-iss-1-merge` has no
+    # `ended_at` yet, so it takes the generic "pr_merged" reason.
+    assert runs["run-iss-1"] == (db.runs.SUPERSEDED_STATUS, "agent_error")
+    assert runs["run-iss-1-merge"] == (db.runs.SUPERSEDED_STATUS, "pr_merged")
 
 
 @pytest.mark.asyncio
@@ -1025,6 +1041,62 @@ async def test_external_merge_leaves_opted_out_sibling_wait_alone(
                         github_repo="org/other",
                         reconcile_enabled=True,
                     ),
+                ]
+            ),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "MERGED",
+                    "mergeable": "UNKNOWN",
+                    "mergedAt": merged_at,
+                    "url": "https://github.com/org/other/pull/99",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        merged = await _merged_at(conn, github_repo="org/other")
+        runs = {run.id: run.status for run in await db.runs.history_for_issue(conn, "iss-1")}
+    finally:
+        await conn.close()
+
+    assert merged == merged_at
+    assert wait is not None
+    assert runs["run-iss-1"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_external_merge_leaves_sibling_repo_wait_alone_even_when_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SYM-231 review: unlike the opted-out case above, both bindings here have
+    `reconcile_enabled=True` — the only thing protecting `org/repo`'s wait is
+    that the merged PR belongs to a different repo (`org/other`) and `org/repo`
+    has no PR row of its own to trip the `_open_prs` guard. Without checking
+    the merged PR's repo against the wait's own repo, `org/other`'s merge would
+    delete `org/repo`'s wait and supersede its run even though `org/repo`'s
+    work is untouched."""
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    merged_at = "2026-05-17T11:59:00Z"
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn, issue_label="symphony", github_repo="org/repo")
+        await _seed_pr(
+            conn,
+            github_repo="org/other",
+            binding_key='["ENG","org/other","frontend"]',
+            pr_number=99,
+        )
+        reconciler = Reconciler(
+            Config(
+                repos=[
+                    _binding(issue_label="symphony", github_repo="org/repo"),
+                    _binding(issue_label="frontend", github_repo="org/other"),
                 ]
             ),
             conn,
@@ -1276,7 +1348,11 @@ async def test_active_linear_done_clears_wait_and_retires_runs(
     assert wait is None
     assert rows[0][1] == DRIFT_LINEAR_STATE_DONE
     assert rows[0][2] == ACTION_CLEARED
-    for run_id in ("run-iss-1", "run-iss-1-merge", "run-iss-1-review"):
+    # `run-iss-1` is already terminal with its own recorded reason (a genuine
+    # `agent_error`) — `_supersede_run` preserves it instead of overwriting
+    # with this sweep's generic "tracker_done".
+    assert runs["run-iss-1"] == (db.runs.SUPERSEDED_STATUS, "agent_error")
+    for run_id in ("run-iss-1-merge", "run-iss-1-review"):
         assert runs[run_id] == (db.runs.SUPERSEDED_STATUS, "tracker_done")
     assert ("operator_waits", "__row__", "removed", None) in transitions
     assert (
@@ -1341,8 +1417,10 @@ async def test_active_linear_done_leaves_live_pid_run_running(
         await conn.close()
 
     assert wait is None
-    for run_id in ("run-iss-1", "run-iss-1-review"):
-        assert runs[run_id] == (db.runs.SUPERSEDED_STATUS, "tracker_done")
+    # `run-iss-1` already carries its own recorded reason (`agent_error`);
+    # `_supersede_run` preserves it rather than overwriting with "tracker_done".
+    assert runs["run-iss-1"] == (db.runs.SUPERSEDED_STATUS, "agent_error")
+    assert runs["run-iss-1-review"] == (db.runs.SUPERSEDED_STATUS, "tracker_done")
     assert runs["run-iss-1-implement-live"] == ("running", "")
 
 
@@ -1493,7 +1571,9 @@ async def test_active_linear_done_leaves_run_started_after_terminal_transition(
         await conn.close()
 
     assert wait is None
-    assert runs["run-iss-1"] == (db.runs.SUPERSEDED_STATUS, "tracker_done")
+    # `run-iss-1` already carries its own recorded reason (`agent_error`);
+    # `_supersede_run` preserves it rather than overwriting with "tracker_done".
+    assert runs["run-iss-1"] == (db.runs.SUPERSEDED_STATUS, "agent_error")
     assert runs["run-iss-1-late-merge"] == ("needs_approval", "")
 
 
@@ -1641,6 +1721,18 @@ async def test_active_linear_done_preserves_ended_at_of_already_ended_run(
             kind="agent_error",
             detail="boom",
         )
+        # A `failed` row with `ended_at` still NULL (e.g. a legacy row from
+        # before `_fail_run` always stamped it) is the shape that must get
+        # `ts` stamped on supersede rather than being skipped.
+        await db.runs.create(
+            conn,
+            id="run-iss-1-never-ended",
+            issue_id="iss-1",
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-05-10T09:00:00Z",
+        )
         fake = _FakeLinear(state_name="Done")
         reconciler = Reconciler(
             Config(repos=[_binding()]),
@@ -1659,8 +1751,13 @@ async def test_active_linear_done_preserves_ended_at_of_already_ended_run(
     assert runs["run-iss-1-old-failure"].ended_at == "2026-05-10T09:30:00Z"
     assert runs["run-iss-1-old-failure"].termination_kind == "agent_error"
     assert runs["run-iss-1-old-failure"].termination_detail == "boom"
+    # `run-iss-1` (the seeded implement_failed wait's own run) already carries
+    # a recorded `ended_at`/kind, so it is preserved rather than re-stamped.
     assert runs["run-iss-1"].status == db.runs.SUPERSEDED_STATUS
-    assert runs["run-iss-1"].ended_at == NOW.isoformat()
+    assert runs["run-iss-1"].ended_at == "2026-05-17T10:30:00Z"
+    assert runs["run-iss-1"].termination_kind == "agent_error"
+    assert runs["run-iss-1-never-ended"].status == db.runs.SUPERSEDED_STATUS
+    assert runs["run-iss-1-never-ended"].ended_at == NOW.isoformat()
 
 
 @pytest.mark.asyncio
@@ -1705,12 +1802,19 @@ async def test_active_linear_done_with_opted_out_wait_binding_only_notes(
         assert await reconciler.tick() == 2
         rows = await _observation_rows(conn)
         wait = await db.operator_waits.get(conn, "iss-1")
+        transitions = await _transition_rows(conn)
     finally:
         await conn.close()
 
     assert wait is not None
     assert rows[0][1] == DRIFT_LINEAR_STATE_DONE
     assert rows[0][2] == ACTION_NOTED
+    assert (
+        "external_observations",
+        "external_state_change",
+        "linear",
+        "linear:Done",
+    ) in transitions
 
 
 @pytest.mark.asyncio

@@ -31,12 +31,13 @@ log = logging.getLogger(__name__)
 
 
 def _parse_rfc3339(s: str) -> datetime | None:
-    """Tolerant RFC3339 parse: `None` on malformed or timezone-less input
-    instead of raising, mirroring `db/runs.py::_parse_timestamp`. The startup
-    sweep parses every wait/PR row in the DB (`list_all`), unlike per-issue
-    reconcile ticks whose exceptions `tick()` catches individually — a single
-    bad legacy row (e.g. a manual SQL fixup that wrote a naive timestamp) must
-    not abort daemon boot (SYM-231 review)."""
+    """Tolerant RFC3339 parse: `None` on malformed input instead of raising,
+    mirroring `db/runs.py::_parse_timestamp`. A timezone-less input is coerced
+    to UTC rather than rejected. The startup sweep parses every wait/PR row in
+    the DB (`list_all`), unlike per-issue reconcile ticks whose exceptions
+    `tick()` catches individually — a single bad legacy row (e.g. a manual SQL
+    fixup that wrote an unparseable timestamp) must not abort daemon boot
+    (SYM-231 review)."""
     text = s.strip()
     if text.endswith("Z"):
         text = f"{text[:-1]}+00:00"
@@ -347,7 +348,8 @@ async def reconcile(
     it returns True on success/already-dead and False when the process could
     not be killed (EPERM); tests inject a recorder so no real signals fly.
 
-    Returns the number of rows flipped.
+    Returns the number of rows flipped, plus (since SYM-231) every
+    `operator_waits` row cleared by `_retire_stale_waits_for_merged_prs`.
     """
     bindings = bindings or ()
     tracker_for_context = _tracker_resolver(tracker_or_resolver)
@@ -367,7 +369,7 @@ async def reconcile(
     # `running`/`needs_approval`) — `_retire_runs_for_merged_prs` above only
     # reaches a wait alongside a run it retires, so this residue needs its own
     # sweep independent of run status (SYM-231 acceptance criterion 3).
-    flipped += await _retire_stale_waits_for_merged_prs(conn, bindings)
+    flipped += await _retire_stale_waits_for_merged_prs(conn, bindings, pid_alive)
 
     rows = await db.runs.list_live_with_pid(conn)
     for run in rows:
@@ -607,7 +609,9 @@ async def _retire_runs_for_merged_prs(
 
 
 async def _retire_stale_waits_for_merged_prs(
-    conn: aiosqlite.Connection, bindings: Sequence[RepoBinding]
+    conn: aiosqlite.Connection,
+    bindings: Sequence[RepoBinding],
+    pid_alive: Callable[[int], bool],
 ) -> int:
     """Clear every operator wait left behind on an issue whose PR is merged.
 
@@ -618,9 +622,21 @@ async def _retire_stale_waits_for_merged_prs(
     the residue SYM-231's acceptance criteria call out (SYM-226/227/228/218):
     this sweep iterates waits directly so it self-heals regardless of run
     status.
+
+    `_retire_runs_for_merged_prs` above skips any run whose pid is still alive
+    — that guard must hold here too, or this sweep clears the wait (and, via
+    `_clear_stale_merged_wait`, supersedes the issue's pre-merge terminal runs)
+    out from under the very issue the pid guard just decided has live work.
     """
+    live_issues = {
+        run.issue_id
+        for run in await db.runs.list_live_with_pid(conn)
+        if run.pid is not None and pid_alive(run.pid)
+    }
     cleared = 0
     for wait in await db.operator_waits.list_all(conn):
+        if wait.issue_id in live_issues:
+            continue
         if await _clear_stale_merged_wait(conn, issue_id=wait.issue_id, bindings=bindings):
             cleared += 1
     return cleared
@@ -638,8 +654,14 @@ async def _stale_merged_wait_is_eligible(
     so the run sweep never supersedes a run whose own wait survives this same
     check (SYM-231 review). A malformed/timezone-less timestamp (e.g. a manual
     SQL fixup row) makes the comparison undecidable, so it is treated like "no
-    merged PR info" rather than raising."""
-    merged_pr = await db.issue_prs.get_for_issue(conn, issue_id=issue_id)
+    merged PR info" rather than raising.
+
+    Looks up the merged PR by the wait's *own* repo — on a multi-binding issue,
+    `get_for_issue` would happily return a sibling repo's merged PR row and
+    clear this wait even though its own repo's PR is untouched (or has no PR
+    row at all, which `get_for_issue` cannot distinguish from "no merged PR").
+    """
+    merged_pr = await db.issue_prs.get(conn, issue_id=issue_id, github_repo=wait.github_repo)
     if merged_pr is None or merged_pr.merged_at is None:
         return False
     wait_created = _parse_rfc3339(wait.created_at)
