@@ -38,6 +38,19 @@ export const COMMAND_ORDER: CommandId[] = [
 
 const ALL_CMDS: CommandId[] = COMMAND_ORDER;
 
+/** Wait kinds whose park is an operator-wait boundary, not a dead end: the
+ *  daemon's handler for the kind honors every command listed here, and the
+ *  park comment tells the operator so. Keyed by wait kind because the
+ *  canonical state alone (`halted`/`paused`) understates the exits — e.g. a
+ *  review-failed park routes `$approve` and `$retry` to the same resume, and
+ *  `$reject`/`$stop` to Blocked. */
+const PARK_COMMANDS: Record<string, CommandId[]> = {
+  review_failed: ["approve", "retry", "reject", "stop"],
+  review_stopped: ["approve", "retry", "reject", "stop"],
+  implement_failed: ["approve", "retry", "reject", "stop"],
+  deliver_failed: ["approve", "retry", "reject", "stop"],
+};
+
 export type Applicability = {
   en: Record<CommandId, boolean>;
   why: Record<CommandId, string>;
@@ -57,6 +70,16 @@ export function applicability(status: string, waitingOn?: string | null): Applic
     en[c] = false;
     why[c] = reason;
   };
+
+  const parked = waitingOn ? PARK_COMMANDS[waitingOn] : undefined;
+  if (parked && (status === "halted" || status === "paused")) {
+    const label = waitingOn!.replace(/_/g, "-");
+    for (const c of ALL_CMDS) {
+      if (parked.includes(c)) on(c);
+      else off(c, `Not supported for a ${label} park`);
+    }
+    return { en, why };
+  }
 
   switch (status) {
     case "awaiting_review_trigger":

@@ -92,6 +92,40 @@ describe("applicability", () => {
     expect(en["skip-acceptance"]).toBe(true);
     expect(en["retry-acceptance"]).toBe(true);
   });
+
+  for (const [status, kind] of [
+    ["halted", "review_failed"],
+    ["paused", "review_stopped"],
+    ["halted", "implement_failed"],
+    ["halted", "deliver_failed"],
+  ] as const) {
+    it(`enables every exit the daemon honors for a ${kind} park`, () => {
+      const { en, why } = applicability(status, kind);
+      expect(en.approve).toBe(true);
+      expect(en.retry).toBe(true);
+      expect(en.reject).toBe(true);
+      expect(en.stop).toBe(true);
+      expect(en["skip-review"]).toBe(false);
+      expect(en["skip-acceptance"]).toBe(false);
+      expect(en["retry-acceptance"]).toBe(false);
+      expect(why["skip-review"]).toContain("park");
+    });
+  }
+
+  it("falls back to retry-only for a halted park with no known wait kind", () => {
+    const { en } = applicability("halted");
+    expect(en.retry).toBe(true);
+    expect(en.approve).toBe(false);
+    expect(en.reject).toBe(false);
+    expect(en.stop).toBe(false);
+  });
+
+  it("keeps the paused defaults for wait kinds that only resume", () => {
+    const { en } = applicability("paused", "acceptance_rejected");
+    expect(en.retry).toBe(true);
+    expect(en.stop).toBe(true);
+    expect(en.approve).toBe(false);
+  });
 });
 
 describe("CmdButton", () => {
