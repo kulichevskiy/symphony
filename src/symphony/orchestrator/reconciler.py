@@ -261,6 +261,24 @@ def _parse_rfc3339(s: str) -> datetime:
     return datetime.fromisoformat(s)
 
 
+def _run_is_retirable(run: db.runs.Run, *, started_at_max: str | None) -> bool:
+    """Would `_supersede_finished_issue_runs` actually touch this run?
+
+    A `failed`/`interrupted`/`needs_approval` row is always residue. A pidless
+    `running` row only counts for the `review` stage — merge/review_fix/
+    acceptance stages create pidless `running` rows for genuinely in-process
+    work (see `poll/_merge.py`, `poll/_base.py`, `poll/_acceptance.py`), so
+    widening this to any stage would retire live work, not residue.
+    """
+    if started_at_max is not None and _parse_rfc3339(run.started_at) > _parse_rfc3339(
+        started_at_max
+    ):
+        return False
+    if run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
+        return True
+    return run.status in db.runs.LIVE_STATUSES and run.pid is None and run.stage == "review"
+
+
 def classify_linear_drift(
     *,
     state_name: str | None,
@@ -483,6 +501,24 @@ class Reconciler:
             linear_is_canceled = (
                 linear_issue is not None and linear_issue.state_type == _CANCELED_STATE_TYPE
             )
+            # `linear_issue.updated_at` is the tracker's own state-change
+            # timestamp, so it bounds the run sweep to the generation that went
+            # terminal — a run started after the transition belongs to a new
+            # cycle (SYM-231).
+            terminal_started_at_max = (
+                linear_issue.updated_at
+                if linear_issue is not None and linear_issue.updated_at
+                else None
+            )
+            # A terminal tracker state stays a reconcile candidate forever (an
+            # unmerged `issue_prs` row, a closed-unmerged PR with no merge-like
+            # wait, a `pr.error` observation) — without checking that clearing
+            # would actually change something, this fires every tick even after
+            # the wait is gone and every run is already retired (SYM-231).
+            terminal_would_clear = linear_drift in _TERMINAL_LINEAR_DRIFTS and (
+                wait is not None
+                or await self._has_retirable_runs(issue_id, started_at_max=terminal_started_at_max)
+            )
             # A wait's own binding can opt out of reconcile even though some other
             # binding matched via a PR row got us this far (see the `active
             # and linear_drift == DRIFT_LINEAR_STATE_DONE` branch below); with no
@@ -491,7 +527,7 @@ class Reconciler:
             # terminal drift alone.
             terminal_wait_eligible = (
                 active
-                and linear_drift in _TERMINAL_LINEAR_DRIFTS
+                and terminal_would_clear
                 and (
                     wait is None
                     or any(
@@ -567,9 +603,11 @@ class Reconciler:
                     remaining -= 1
             else:
                 actions_deferred += 1
-        elif active and linear_drift == DRIFT_LINEAR_STATE_DONE:
+        elif active and linear_drift == DRIFT_LINEAR_STATE_DONE and wait is not None:
             # The wait's own binding opted out of reconcile, so we may not touch
             # its rows — record the external completion in the timeline only.
+            # (`wait is not None` excludes the "nothing left to retire" case,
+            # which must stay silent rather than re-noting every tick.)
             if remaining is None or remaining > 0:
                 linear_action = ACTION_NOTED
                 actions_taken += 1
@@ -657,6 +695,7 @@ class Reconciler:
                     drift_kind=linear_drift,
                     state_name=linear_issue.state_name,
                     ts=observed_at,
+                    started_at_max=terminal_started_at_max,
                 )
                 post_terminal_comment = True
             if github_action == ACTION_CLEARED:
@@ -1341,6 +1380,7 @@ class Reconciler:
         drift_kind: str,
         state_name: str,
         ts: str,
+        started_at_max: str | None,
     ) -> None:
         """Clear a parked wait (if any) for an issue the tracker says is finished.
 
@@ -1355,6 +1395,10 @@ class Reconciler:
         and notes the external state change for the audit timeline. All writes stay
         in the caller's transaction (``commit=False``) so a later failure rolls the
         whole clear back.
+
+        `started_at_max` (the tracker's `updated_at` at the terminal transition)
+        bounds the run sweep to the generation that finished — a run started
+        after the issue went terminal belongs to a new cycle and must survive.
         """
         canceled = drift_kind == DRIFT_LINEAR_CANCELED
         if wait is not None:
@@ -1373,6 +1417,7 @@ class Reconciler:
                 if canceled
                 else "Tracker issue done; superseding parked run"
             ),
+            started_at_max=started_at_max,
         )
         await self._note_external_state_change(
             issue_id=issue_id,
@@ -1380,6 +1425,10 @@ class Reconciler:
             state_name=state_name,
             ts=ts,
         )
+
+    async def _has_retirable_runs(self, issue_id: str, *, started_at_max: str | None) -> bool:
+        history = await db.runs.history_for_issue(self._conn, issue_id)
+        return any(_run_is_retirable(run, started_at_max=started_at_max) for run in history)
 
     async def _supersede_finished_issue_runs(
         self,
@@ -1393,36 +1442,23 @@ class Reconciler:
         """Retire the leftover runs of an issue that is finished.
 
         `started_at_max` bounds the sweep to runs of the generation that got
-        finished (used by the merged-PR path: anything started after the merge
-        belongs to a later cycle and is left alone).
+        finished (used by the merged-PR path and the tracker-terminal path:
+        anything started after the merge/state-change belongs to a later cycle
+        and is left alone).
         """
         history = await db.runs.history_for_issue(self._conn, issue_id)
         for run in history:
-            if started_at_max is not None and _parse_rfc3339(run.started_at) > _parse_rfc3339(
-                started_at_max
-            ):
-                continue
-            if run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
-                target_status = db.runs.SUPERSEDED_STATUS
-            elif run.status in db.runs.LIVE_STATUSES and run.pid is None:
-                # An in-process monitor (e.g. a review monitor left "running"
-                # while a deliver_failed wait suppressed its polling) would
-                # otherwise sit live until some unrelated poll tick notices the
-                # wait is gone — retire it here so the clear leaves a consistent
-                # audit trail immediately instead of depending on that side
-                # effect. Use SUPERSEDED_STATUS (not "completed") so the
-                # kind/detail below actually persist instead of being cleared by
-                # the SUCCESS_STATUSES path in `update_status`. A run with a pid
-                # is a live subprocess: retiring its row is the poll loop's job,
-                # not ours.
-                target_status = db.runs.SUPERSEDED_STATUS
-            else:
+            if not _run_is_retirable(run, started_at_max=started_at_max):
                 continue
             await db.runs.update_status(
                 self._conn,
                 run.id,
-                target_status,
-                ended_at=ts,
+                db.runs.SUPERSEDED_STATUS,
+                # A run that already ended (e.g. a historical `failed` row) keeps
+                # its real end timestamp — only stamp `ts` on rows that never
+                # ended, or `update_status`'s COALESCE would overwrite genuine
+                # duration/attribution audit data with the reconcile time.
+                ended_at=None if run.ended_at is not None else ts,
                 kind=kind,
                 detail=detail,
                 commit=False,
@@ -1517,15 +1553,23 @@ class Reconciler:
 
         A hand-merged PR finishes the issue without Symphony's merge path ever
         running, so nothing retires the wait and the parked/live runs it left —
-        the issue shows as active forever (SYM-231). Two guards keep this off
-        live state: another still-open PR row means work is in flight, and only
-        runs/waits from the merged generation are retired (anything created after
-        the merge belongs to a later cycle).
+        the issue shows as active forever (SYM-231). Guards keep this off live
+        state: another still-open PR row means work is in flight; only runs/
+        waits from the merged generation are retired (anything created after
+        the merge belongs to a later cycle); and the wait's own binding must not
+        have opted out of reconcile — mirroring the terminal-clear path, a
+        sibling repo's PR merging must not delete a wait bound to a
+        `reconcile_enabled=False` repo that has no PR row of its own to trip the
+        open-PR guard above.
         """
         if await self._open_prs(issue_id):
             return
         merged_ts = _parse_rfc3339(merged_at)
-        if wait is not None and _parse_rfc3339(wait.created_at) <= merged_ts:
+        if (
+            wait is not None
+            and _parse_rfc3339(wait.created_at) <= merged_ts
+            and any(binding.reconcile_enabled for binding in self._wait_matched_bindings(wait))
+        ):
             await db.operator_waits.delete(
                 self._conn,
                 issue_id,

@@ -365,6 +365,12 @@ async def reconcile(
     # instead of falling into `_preserve_pidless_review_retry_path` and minting
     # a fresh operator wait that nothing will ever retire (SYM-231).
     flipped += await _retire_runs_for_merged_prs(conn, now, pid_alive)
+    # A wait can outlive every run it was ever paired with (e.g. an
+    # `implement_failed` wait parked on a run that is already `failed`, not
+    # `running`/`needs_approval`) — `_retire_runs_for_merged_prs` above only
+    # reaches a wait alongside a run it retires, so this residue needs its own
+    # sweep independent of run status (SYM-231 acceptance criterion 3).
+    flipped += await _retire_stale_waits_for_merged_prs(conn)
 
     for run in await db.runs.list_live_review_without_pid(conn):
         log.info(
@@ -479,21 +485,40 @@ async def _retire_runs_for_merged_prs(
     return retired
 
 
-async def _clear_stale_merged_wait(conn: aiosqlite.Connection, *, issue_id: str) -> None:
+async def _retire_stale_waits_for_merged_prs(conn: aiosqlite.Connection) -> int:
+    """Clear every operator wait left behind on an issue whose PR is merged.
+
+    `_retire_runs_for_merged_prs` only clears a wait alongside a run it just
+    retired, so a wait parked on a run that is already `failed`/`interrupted`
+    (not `running`/`needs_approval`) — e.g. an `implement_failed` wait — is
+    never reached even though its issue is just as finished. That is exactly
+    the residue SYM-231's acceptance criteria call out (SYM-226/227/228/218):
+    this sweep iterates waits directly so it self-heals regardless of run
+    status.
+    """
+    cleared = 0
+    for wait in await db.operator_waits.list_all(conn):
+        if await _clear_stale_merged_wait(conn, issue_id=wait.issue_id):
+            cleared += 1
+    return cleared
+
+
+async def _clear_stale_merged_wait(conn: aiosqlite.Connection, *, issue_id: str) -> bool:
     wait = await db.operator_waits.get(conn, issue_id)
     if wait is None:
-        return
+        return False
     merged_pr = await db.issue_prs.get_for_issue(conn, issue_id=issue_id)
     if merged_pr is None or merged_pr.merged_at is None:
-        return
+        return False
     if _parse_rfc3339(wait.created_at) > _parse_rfc3339(merged_pr.merged_at):
-        return
+        return False
     log.info(
         "reconcile: issue=%s operator wait %r predates its merged PR — clearing",
         issue_id,
         wait.kind,
     )
     await db.operator_waits.delete(conn, issue_id, wait.run_id)
+    return True
 
 
 async def _collapse_duplicate_live_runs(

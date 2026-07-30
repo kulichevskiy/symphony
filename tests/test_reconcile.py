@@ -1195,3 +1195,64 @@ async def test_reconcile_leaves_wait_created_after_merge_alone(tmp_path: Path) -
         assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_clears_stale_wait_on_already_failed_run_for_merged_pr(
+    tmp_path: Path,
+) -> None:
+    """SYM-231 acceptance criterion 3: the issue's own example rows (SYM-226/
+    227/228/218) are an `implement_failed` wait sitting on a `failed` — not
+    `running`/`needs_approval` — implement run of an issue whose PR is merged.
+    `_retire_runs_for_merged_prs` only clears a wait alongside a run it
+    retires, and `list_unretired_for_merged_prs` never selects a `failed` run,
+    so this residue needs its own sweep to self-heal at startup."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    merged_at = "2026-05-10T11:00:00+00:00"
+    try:
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-40", title="t", team_key="ENG")
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.issue_prs.update_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            merged_at=merged_at,
+        )
+        await db.runs.create(
+            conn,
+            id="implement-failed",
+            issue_id="iss-1",
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-05-10T09:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="implement-failed",
+            kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="symphony",
+            created_at="2026-05-10T09:01:00+00:00",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        assert await reconcile(conn, linear) == 1
+
+        run = (await db.runs.history_for_issue(conn, "iss-1"))[0]
+        assert run.status == "failed"
+        assert await db.operator_waits.get(conn, "iss-1") is None
+    finally:
+        await conn.close()
