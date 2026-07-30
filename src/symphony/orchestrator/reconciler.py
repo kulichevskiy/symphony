@@ -292,6 +292,20 @@ def _parse_rfc3339(s: str) -> datetime:
     return datetime.fromisoformat(s)
 
 
+def _wait_generation_eligible(
+    wait: db.operator_waits.OperatorWait | None, started_at_max: str | None
+) -> bool:
+    """Does `wait` belong to the generation that went terminal (or is there no wait)?
+
+    A wait created after `started_at_max` belongs to a later cycle (e.g. a
+    fresh merge park the issue re-entered post-Done) and must survive
+    together with the run it is parked on (SYM-231 review).
+    """
+    return wait is None or started_at_max is None or (
+        _parse_rfc3339(wait.created_at) <= _parse_rfc3339(started_at_max)
+    )
+
+
 def _run_is_retirable(run: db.runs.Run, *, started_at_max: str | None) -> bool:
     """Would `_supersede_finished_issue_runs` actually touch this run?
 
@@ -546,8 +560,15 @@ class Reconciler:
             # wait, a `pr.error` observation) — without checking that clearing
             # would actually change something, this fires every tick even after
             # the wait is gone and every run is already retired (SYM-231).
+            #
+            # A wait created after `terminal_started_at_max` belongs to a later
+            # cycle and `_apply_linear_terminal_clear` will refuse to delete it
+            # (SYM-231 review) — counting it here anyway would spend a budget
+            # slot and post a comment every tick for a clear that never
+            # actually happens, forever. Only count it if there is nothing else
+            # (an older retirable run) to clear either.
             terminal_would_clear = linear_drift in _TERMINAL_LINEAR_DRIFTS and (
-                wait is not None
+                (wait is not None and _wait_generation_eligible(wait, terminal_started_at_max))
                 or await self._has_retirable_runs(issue_id, started_at_max=terminal_started_at_max)
             )
             # A wait's own binding can opt out of reconcile even though some other
@@ -1445,9 +1466,7 @@ class Reconciler:
         can pick a comment that only mentions the wait when one was cleared.
         """
         canceled = drift_kind == DRIFT_LINEAR_CANCELED
-        wait_eligible = wait is None or started_at_max is None or (
-            _parse_rfc3339(wait.created_at) <= _parse_rfc3339(started_at_max)
-        )
+        wait_eligible = _wait_generation_eligible(wait, started_at_max)
         if wait is not None and not wait_eligible:
             return False
         wait_cleared = wait is not None

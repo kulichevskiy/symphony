@@ -582,19 +582,23 @@ async def _retire_runs_for_merged_prs(
             run.stage,
             run.status,
         )
-        await db.runs.update_status(
-            conn,
-            run.id,
-            db.runs.SUPERSEDED_STATUS,
-            # A run that already ended (e.g. a `needs_approval` merge run parked
-            # with its genuine end timestamp) keeps it — `update_status`'s
-            # COALESCE would otherwise overwrite real duration/attribution audit
-            # data with the reconcile time, mirroring reconciler.py's
-            # `_supersede_finished_issue_runs`.
-            ended_at=None if run.ended_at is not None else now,
-            kind="pr_merged",
-            detail="PR merged outside Symphony; superseding parked run",
-        )
+        if run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES and run.ended_at is not None:
+            # Already terminal with its own recorded reason (e.g. a parked
+            # `needs_approval` merge run's genuine `awaiting_human_merge`) —
+            # flip status only. `update_status` would overwrite that real
+            # `termination_kind`/`detail` with this sweep's generic
+            # "pr_merged" even though nothing new happened to the run,
+            # mirroring reconciler.py's `_supersede_run`.
+            await db.runs.supersede_preserving_termination(conn, run.id)
+        else:
+            await db.runs.update_status(
+                conn,
+                run.id,
+                db.runs.SUPERSEDED_STATUS,
+                ended_at=now,
+                kind="pr_merged",
+                detail="PR merged outside Symphony; superseding parked run",
+            )
         retired += 1
         if run.issue_id not in cleared_wait_issues:
             cleared_wait_issues.add(run.issue_id)
@@ -663,7 +667,39 @@ async def _clear_stale_merged_wait(
         wait.kind,
     )
     await db.operator_waits.delete(conn, issue_id, wait.run_id)
+    merged_pr = await db.issue_prs.get_for_issue(conn, issue_id=issue_id)
+    await _retire_terminal_non_success_runs_for_merged_issue(
+        conn,
+        issue_id=issue_id,
+        merged_at=merged_pr.merged_at if merged_pr is not None else None,
+    )
     return True
+
+
+async def _retire_terminal_non_success_runs_for_merged_issue(
+    conn: aiosqlite.Connection, *, issue_id: str, merged_at: str | None
+) -> None:
+    """Retire the issue's runs still parked at `failed`/`interrupted`/
+    `needs_approval` once its stale wait clears.
+
+    `_retire_runs_for_merged_prs` only reaches rows `list_unretired_for_merged_prs`
+    selects; a wait parked on a run that is already `failed` (e.g. an
+    `implement_failed` wait, SYM-226/227/228/218) is not among them, so without
+    this the issue's board state goes from HALTED to FAILED-forever instead of
+    self-healing once the wait is gone. Bounded by `merged_at` like that other
+    sweep, so a run from a later cycle (the issue reopened after the merge)
+    is left alone. `supersede_preserving_termination` keeps each run's own
+    recorded reason (mirrors `reconciler.py::_supersede_finished_issue_runs`).
+    """
+    merged_at_parsed = _parse_rfc3339(merged_at) if merged_at is not None else None
+    for run in await db.runs.history_for_issue(conn, issue_id):
+        if run.status not in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
+            continue
+        if merged_at_parsed is not None:
+            started_at = _parse_rfc3339(run.started_at)
+            if started_at is not None and started_at > merged_at_parsed:
+                continue
+        await db.runs.supersede_preserving_termination(conn, run.id)
 
 
 async def _collapse_duplicate_live_runs(

@@ -573,8 +573,15 @@ async def list_unretired_for_merged_prs(conn: aiosqlite.Connection) -> list[Run]
     retired these rows, so they keep showing a finished issue as active — the
     residue SYM-231 sweeps at startup. Two guards keep live work out:
 
-    * only runs started at or before the merge — anything later is a new cycle;
-    * only issues with no PR row still open — an open PR means work in flight.
+    * only issues with no PR row still open — an open PR means work in flight;
+    * for a `running` row, only one started at or before the merge — a later
+      one is a new cycle's dead-pid run and must take the `$retry` path
+      instead of being swept here.
+
+    A `needs_approval` row has no such bound: once its PR is merged and no
+    other PR is open, nothing can ever act on it regardless of when it
+    started — Symphony can park a merge wait after the PR was already merged
+    externally (SYM-231 review), and that shape must still self-heal.
 
     The caller must still skip runs whose pid is alive (a live subprocess is not
     bookkeeping residue).
@@ -591,7 +598,7 @@ async def list_unretired_for_merged_prs(conn: aiosqlite.Connection) -> list[Run]
               SELECT 1 FROM issue_prs p
               WHERE p.issue_id = r.issue_id
                 AND p.merged_at IS NOT NULL
-                AND r.started_at <= p.merged_at
+                AND (r.status = ? OR r.started_at <= p.merged_at)
           )
           AND NOT EXISTS (
               SELECT 1 FROM issue_prs o
@@ -600,7 +607,7 @@ async def list_unretired_for_merged_prs(conn: aiosqlite.Connection) -> list[Run]
           )
         ORDER BY r.started_at ASC, r.id ASC
         """,
-        (*LIVE_STATUSES, NEEDS_APPROVAL_STATUS),
+        (*LIVE_STATUSES, NEEDS_APPROVAL_STATUS, NEEDS_APPROVAL_STATUS),
     )
     rows = await cur.fetchall()
     return [_row_to_run(r) for r in rows]

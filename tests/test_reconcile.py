@@ -1034,7 +1034,11 @@ async def test_reconcile_retires_stale_runs_for_merged_pr(tmp_path: Path) -> Non
             pid=None,
             started_at="2026-05-10T10:00:00+00:00",
         )
-        # Post-merge run: a later generation, not residue of the merged PR.
+        # Parked *after* the merge (SYM-114/SYM-231 review): Symphony can park a
+        # needs_approval wait after the PR was already merged externally. With
+        # no operator wait and no PR left open, nothing can ever revisit this
+        # row, so it must self-heal too rather than surviving because it
+        # happens to have started after the merge timestamp.
         await db.runs.create(
             conn,
             id="post-merge",
@@ -1071,7 +1075,7 @@ async def test_reconcile_retires_stale_runs_for_merged_pr(tmp_path: Path) -> Non
         linear = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
 
-        assert await reconcile(conn, linear) == 1
+        assert await reconcile(conn, linear) == 2
 
         runs = {}
         for issue_id in ("iss-merged", "iss-open", "iss-live"):
@@ -1081,7 +1085,7 @@ async def test_reconcile_retires_stale_runs_for_merged_pr(tmp_path: Path) -> Non
         await conn.close()
 
     assert runs["stale-merge"] == (db.runs.SUPERSEDED_STATUS, "pr_merged")
-    assert runs["post-merge"][0] == "needs_approval"
+    assert runs["post-merge"] == (db.runs.SUPERSEDED_STATUS, "pr_merged")
     assert runs["open-pr-merge"][0] == "needs_approval"
     assert runs["live-run"][0] == "running"
 
@@ -1089,11 +1093,11 @@ async def test_reconcile_retires_stale_runs_for_merged_pr(tmp_path: Path) -> Non
 @pytest.mark.asyncio
 async def test_reconcile_retire_for_merged_pr_preserves_ended_at(tmp_path: Path) -> None:
     """SYM-231 review: a parked `needs_approval` merge run already carries its
-    genuine end timestamp (set when `poll/_merge.py` parked it). Retiring it at
-    startup must not clobber that with the reconcile time — `update_status`'s
-    `ended_at = COALESCE(?, ended_at)` overwrites unless the caller passes
-    `None` for an already-ended row, mirroring `reconciler.py`'s
-    `_supersede_finished_issue_runs`."""
+    genuine end timestamp and termination reason (set when `poll/_merge.py`
+    parked it). Retiring it at startup must not clobber either with this
+    sweep's generic `pr_merged` reason and the reconcile time — it should
+    flip status only via `supersede_preserving_termination`, mirroring
+    `reconciler.py`'s `_supersede_run`."""
     conn = await db.connect(tmp_path / "s.sqlite")
     merged_at = "2026-05-10T11:00:00+00:00"
     real_ended_at = "2026-05-10T10:30:00+00:00"
@@ -1128,6 +1132,8 @@ async def test_reconcile_retire_for_merged_pr_preserves_ended_at(tmp_path: Path)
             "stale-merge",
             "needs_approval",
             ended_at=real_ended_at,
+            kind="awaiting_human_merge",
+            detail="parked for manual merge",
         )
 
         linear = AsyncMock()
@@ -1139,6 +1145,8 @@ async def test_reconcile_retire_for_merged_pr_preserves_ended_at(tmp_path: Path)
         run = (await db.runs.history_for_issue(conn, "iss-1"))[0]
         assert run.status == db.runs.SUPERSEDED_STATUS
         assert run.ended_at == real_ended_at, f"ended_at clobbered: {run.ended_at}"
+        assert run.termination_kind == "awaiting_human_merge"
+        assert run.termination_detail == "parked for manual merge"
     finally:
         await conn.close()
 
@@ -1349,9 +1357,17 @@ async def test_reconcile_clears_stale_wait_on_already_failed_run_for_merged_pr(
             id="implement-failed",
             issue_id="iss-1",
             stage="implement",
-            status="failed",
+            status="running",
             pid=None,
             started_at="2026-05-10T09:00:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "implement-failed",
+            "failed",
+            ended_at="2026-05-10T09:30:00+00:00",
+            kind="agent_error",
+            detail="agent crashed",
         )
         await db.operator_waits.upsert(
             conn,
@@ -1370,7 +1386,10 @@ async def test_reconcile_clears_stale_wait_on_already_failed_run_for_merged_pr(
         assert await reconcile(conn, linear) == 1
 
         run = (await db.runs.history_for_issue(conn, "iss-1"))[0]
-        assert run.status == "failed"
+        assert run.status == db.runs.SUPERSEDED_STATUS
+        assert run.termination_kind == "agent_error"
+        assert run.termination_detail == "agent crashed"
+        assert run.ended_at == "2026-05-10T09:30:00+00:00"
         assert await db.operator_waits.get(conn, "iss-1") is None
     finally:
         await conn.close()

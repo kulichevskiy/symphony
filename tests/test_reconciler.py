@@ -1542,13 +1542,21 @@ async def test_active_linear_done_leaves_wait_created_after_terminal_transition(
         )
 
         await reconciler.tick()
+        await reconciler.tick()
         wait = await db.operator_waits.get(conn, "iss-1")
         runs = {run.id: run.status for run in await db.runs.history_for_issue(conn, "iss-1")}
+        observations = await _observation_rows(conn)
     finally:
         await conn.close()
 
     assert wait is not None
     assert runs["run-late-merge"] == "needs_approval"
+    # SYM-231 review: an ineligible wait with nothing else to clear must not
+    # spend a budget slot or post a comment — it would otherwise repeat every
+    # tick forever, and against a real tracker each comment bumps the
+    # tracker's `updated_at`, moving `started_at_max` past the wait.
+    assert fake.comments == []
+    assert all(action != "cleared" for _source, _drift, action, _payload in observations)
 
 
 @pytest.mark.asyncio
