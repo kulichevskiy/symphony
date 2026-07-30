@@ -581,6 +581,68 @@ async def test_active_merge_zombie_clears_wait_and_marks_pr_merged(
 
 
 @pytest.mark.asyncio
+async def test_active_merge_zombie_retires_run_started_after_merge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SYM-231 review: a merge zombie's wait can be parked *after* the PR was
+    actually merged externally — Symphony dispatched its own merge attempt
+    before observing the hand-merge, so the run it is parked on started after
+    `merged_at`. `_retire_merged_issue_bookkeeping`'s run sweep is bounded by
+    `merged_at`, so once the wait is deleted (unconditionally, here) nothing
+    else would ever retire that run. The run must retire alongside its wait
+    regardless of the bound."""
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    merged_at = "2026-05-17T10:00:00Z"
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-iss-1",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-17T11:00:00Z",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="run-iss-1",
+            kind=db.operator_waits.KIND_MERGE,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="symphony",
+            created_at="2026-05-17T11:01:00Z",
+        )
+        await _seed_pr(conn)
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "MERGED",
+                    "mergeable": "UNKNOWN",
+                    "mergedAt": merged_at,
+                    "url": "https://github.com/org/repo/pull/42",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        runs = {run.id: run.status for run in await db.runs.history_for_issue(conn, "iss-1")}
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert runs["run-iss-1"] == db.runs.SUPERSEDED_STATUS
+
+
+@pytest.mark.asyncio
 async def test_active_review_cap_zombie_clears_wait_and_marks_pr_merged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1231,10 +1293,11 @@ async def test_active_linear_done_leaves_live_pid_run_running(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The pidless-run widening in `_supersede_finished_issue_runs` (SYM-231)
-    must not touch a run with a live subprocess: retiring a live pid's row is
-    the poll loop's job, not the terminal clear's. Only the pidless `running`
-    row should be superseded here.
+    """`_run_is_retirable` (SYM-231) widens the terminal clear to pidless
+    `running` rows, but only at the `review` stage — there is no pid check at
+    all, so an `implement` row survives purely because its stage is not
+    `review`, not because it happens to carry a live pid here. Only the
+    pidless `review` row should be superseded.
     """
     monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
     conn = await db.connect(tmp_path / "state.sqlite")
@@ -1435,6 +1498,60 @@ async def test_active_linear_done_leaves_run_started_after_terminal_transition(
 
 
 @pytest.mark.asyncio
+async def test_active_linear_done_leaves_wait_created_after_terminal_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SYM-231 review: a park created after the terminal transition (e.g. the
+    issue re-entered a merge cycle after the tracker went Done) must survive
+    together with the run it is parked on. The previous code deleted the wait
+    with no generation bound at all while the run sweep is correctly bounded
+    by `started_at_max` — that combination deletes the wait but leaves its
+    `needs_approval` run behind with nothing left to ever clear it, exactly
+    the SYM-114 residue this issue exists to remove."""
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-late-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-17T11:59:00Z",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="run-late-merge",
+            kind=db.operator_waits.KIND_MERGE,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="symphony",
+            created_at="2026-05-17T11:59:30Z",
+        )
+        fake = _FakeLinear(state_name="Done")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        await reconciler.tick()
+        wait = await db.operator_waits.get(conn, "iss-1")
+        runs = {run.id: run.status for run in await db.runs.history_for_issue(conn, "iss-1")}
+    finally:
+        await conn.close()
+
+    assert wait is not None
+    assert runs["run-late-merge"] == "needs_approval"
+
+
+@pytest.mark.asyncio
 async def test_active_linear_canceled_retires_needs_approval_runs_with_no_wait(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1489,7 +1606,11 @@ async def test_active_linear_done_preserves_ended_at_of_already_ended_run(
     overwrites a real historical end timestamp whenever a non-NULL `ts` is
     passed — the terminal clear must only stamp `ts` on runs that never ended,
     or ordinary Done issues corrupt run duration/attribution audit data for
-    every already-finished run in their history."""
+    every already-finished run in their history. `update_status` also always
+    stamps `termination_kind`/`termination_detail`, so an already-terminal run
+    must skip that call entirely (flip status only) or the sweep rewrites its
+    genuine failure reason (e.g. SYM-218's auth-failure attribution) to the
+    sweep's generic `tracker_done`."""
     monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
     conn = await db.connect(tmp_path / "state.sqlite")
     try:
@@ -1528,6 +1649,8 @@ async def test_active_linear_done_preserves_ended_at_of_already_ended_run(
 
     assert runs["run-iss-1-old-failure"].status == db.runs.SUPERSEDED_STATUS
     assert runs["run-iss-1-old-failure"].ended_at == "2026-05-10T09:30:00Z"
+    assert runs["run-iss-1-old-failure"].termination_kind == "agent_error"
+    assert runs["run-iss-1-old-failure"].termination_detail == "boom"
     assert runs["run-iss-1"].status == db.runs.SUPERSEDED_STATUS
     assert runs["run-iss-1"].ended_at == NOW.isoformat()
 

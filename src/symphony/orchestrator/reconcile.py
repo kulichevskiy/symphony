@@ -9,6 +9,7 @@ belong to runs the orchestrator adopts on the next poll.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -29,10 +30,23 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 
-def _parse_rfc3339(s: str) -> datetime:
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    return datetime.fromisoformat(s)
+def _parse_rfc3339(s: str) -> datetime | None:
+    """Tolerant RFC3339 parse: `None` on malformed or timezone-less input
+    instead of raising, mirroring `db/runs.py::_parse_timestamp`. The startup
+    sweep parses every wait/PR row in the DB (`list_all`), unlike per-issue
+    reconcile ticks whose exceptions `tick()` catches individually — a single
+    bad legacy row (e.g. a manual SQL fixup that wrote a naive timestamp) must
+    not abort daemon boot (SYM-231 review)."""
+    text = s.strip()
+    if text.endswith("Z"):
+        text = f"{text[:-1]}+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 _RETRY_BODY = (
@@ -460,6 +474,51 @@ def _wait_reconcile_opted_out(
     return bool(matched) and not any(binding.reconcile_enabled for binding in matched)
 
 
+def _label_from_binding_key(binding_key: str) -> str | None:
+    try:
+        raw = json.loads(binding_key)
+    except ValueError:
+        return None
+    if not isinstance(raw, list) or len(raw) < 3:
+        return None
+    label = raw[2]
+    return None if label is None else str(label)
+
+
+async def _issue_reconcile_opted_out_via_prs(
+    conn: aiosqlite.Connection, *, issue_id: str, bindings: Sequence[RepoBinding]
+) -> bool:
+    """`_wait_reconcile_opted_out` above only fires when the issue still has a
+    wait — SYM-114's shape (no wait at all) never reaches it, so a
+    `reconcile_enabled=False` repo's residue with no wait was swept on every
+    boot despite the docstring's "left alone entirely" and the live-tick gate
+    this mirrors (`reconciler.py`'s `_matched_bindings` check). Resolves
+    bindings from the issue's own `issue_prs` rows instead of a wait."""
+    cur = await conn.execute("SELECT team_key FROM issues WHERE id = ?", (issue_id,))
+    issue_row = await cur.fetchone()
+    if issue_row is None:
+        return False
+    team_key = str(issue_row["team_key"])
+    cur = await conn.execute(
+        "SELECT github_repo, binding_key FROM issue_prs WHERE issue_id = ?",
+        (issue_id,),
+    )
+    pr_rows = await cur.fetchall()
+    matched: list[RepoBinding] = []
+    for pr_row in pr_rows:
+        github_repo = str(pr_row["github_repo"])
+        label = _label_from_binding_key(str(pr_row["binding_key"]))
+        for binding in bindings:
+            if binding.linear_team_key != team_key:
+                continue
+            if binding.github_repo.casefold() != github_repo.casefold():
+                continue
+            if label is not None and (binding.issue_label or "") != label:
+                continue
+            matched.append(binding)
+    return bool(matched) and not any(binding.reconcile_enabled for binding in matched)
+
+
 async def _retire_runs_for_merged_prs(
     conn: aiosqlite.Connection,
     now: str,
@@ -481,14 +540,23 @@ async def _retire_runs_for_merged_prs(
     though every run is superseded. Only a wait from the merged generation is
     removed (`created_at <= merged_at`, mirroring the live-tick equivalent in
     `reconciler.py`); a wait created after the merge belongs to a later cycle.
+    That decision is computed once per issue via `_stale_merged_wait_is_eligible`
+    *before* touching any of its runs — the reconciler's live-tick path
+    (`_retire_merged_issue_bookkeeping`) refuses to supersede a run while its
+    own wait survives, and this sweep must refuse the same combination or it
+    would strand a live park on a `superseded` run (SYM-231 review).
 
     An issue whose parked wait opted out of reconcile (its own binding has
     `reconcile_enabled=False`) is left alone entirely — both the wait and its
-    runs — mirroring `reconciler.py`'s `_retire_merged_issue_bookkeeping`.
+    runs — mirroring `reconciler.py`'s `_retire_merged_issue_bookkeeping`. An
+    issue with no wait at all (SYM-114's shape) is resolved the same way via
+    its `issue_prs` bindings instead, so a `reconcile_enabled=False` repo's
+    residue is left alone even without a wait to carry the opt-out (SYM-231
+    review; mirrors the live path's `_matched_bindings` gate).
     """
     retired = 0
     cleared_wait_issues: set[str] = set()
-    disabled_issues: set[str] = set()
+    skip_issues: set[str] = set()
     checked_issues: set[str] = set()
     for run in await db.runs.list_unretired_for_merged_prs(conn):
         if run.pid is not None and pid_alive(run.pid):
@@ -496,9 +564,16 @@ async def _retire_runs_for_merged_prs(
         if run.issue_id not in checked_issues:
             checked_issues.add(run.issue_id)
             wait = await db.operator_waits.get(conn, run.issue_id)
-            if wait is not None and _wait_reconcile_opted_out(bindings, wait):
-                disabled_issues.add(run.issue_id)
-        if run.issue_id in disabled_issues:
+            if wait is not None:
+                if not await _stale_merged_wait_is_eligible(
+                    conn, issue_id=run.issue_id, wait=wait, bindings=bindings
+                ):
+                    skip_issues.add(run.issue_id)
+            elif await _issue_reconcile_opted_out_via_prs(
+                conn, issue_id=run.issue_id, bindings=bindings
+            ):
+                skip_issues.add(run.issue_id)
+        if run.issue_id in skip_issues:
             continue
         log.info(
             "reconcile: run=%s issue=%s stage=%s is %s on a merged PR — retiring",
@@ -547,18 +622,40 @@ async def _retire_stale_waits_for_merged_prs(
     return cleared
 
 
+async def _stale_merged_wait_is_eligible(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    wait: db.operator_waits.OperatorWait,
+    bindings: Sequence[RepoBinding],
+) -> bool:
+    """Whether `wait` predates its issue's merged PR and would be cleared by
+    `_clear_stale_merged_wait` below — shared with `_retire_runs_for_merged_prs`
+    so the run sweep never supersedes a run whose own wait survives this same
+    check (SYM-231 review). A malformed/timezone-less timestamp (e.g. a manual
+    SQL fixup row) makes the comparison undecidable, so it is treated like "no
+    merged PR info" rather than raising."""
+    merged_pr = await db.issue_prs.get_for_issue(conn, issue_id=issue_id)
+    if merged_pr is None or merged_pr.merged_at is None:
+        return False
+    wait_created = _parse_rfc3339(wait.created_at)
+    merged_at = _parse_rfc3339(merged_pr.merged_at)
+    if wait_created is None or merged_at is None:
+        return False
+    if wait_created > merged_at:
+        return False
+    return not _wait_reconcile_opted_out(bindings, wait)
+
+
 async def _clear_stale_merged_wait(
     conn: aiosqlite.Connection, *, issue_id: str, bindings: Sequence[RepoBinding]
 ) -> bool:
     wait = await db.operator_waits.get(conn, issue_id)
     if wait is None:
         return False
-    merged_pr = await db.issue_prs.get_for_issue(conn, issue_id=issue_id)
-    if merged_pr is None or merged_pr.merged_at is None:
-        return False
-    if _parse_rfc3339(wait.created_at) > _parse_rfc3339(merged_pr.merged_at):
-        return False
-    if _wait_reconcile_opted_out(bindings, wait):
+    if not await _stale_merged_wait_is_eligible(
+        conn, issue_id=issue_id, wait=wait, bindings=bindings
+    ):
         return False
     log.info(
         "reconcile: issue=%s operator wait %r predates its merged PR — clearing",

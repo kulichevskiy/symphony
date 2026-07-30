@@ -1435,11 +1435,21 @@ class Reconciler:
         `started_at_max` (the tracker's `updated_at` at the terminal transition)
         bounds the run sweep to the generation that finished — a run started
         after the issue went terminal belongs to a new cycle and must survive.
+        A wait created after that same bound belongs to that same later cycle
+        (e.g. a fresh merge park the issue re-entered post-Done) — deleting it
+        while its run survives the bounded sweep would strand the run at
+        `needs_approval` with nothing left to clear it (SYM-231 review), so the
+        wait and its run are only ever retired together.
 
         Returns whether a wait row actually existed to delete, so the caller
         can pick a comment that only mentions the wait when one was cleared.
         """
         canceled = drift_kind == DRIFT_LINEAR_CANCELED
+        wait_eligible = wait is None or started_at_max is None or (
+            _parse_rfc3339(wait.created_at) <= _parse_rfc3339(started_at_max)
+        )
+        if wait is not None and not wait_eligible:
+            return False
         wait_cleared = wait is not None
         if wait is not None:
             await db.operator_waits.delete(
@@ -1491,19 +1501,43 @@ class Reconciler:
         for run in history:
             if not _run_is_retirable(run, started_at_max=started_at_max):
                 continue
-            await db.runs.update_status(
-                self._conn,
-                run.id,
-                db.runs.SUPERSEDED_STATUS,
-                # A run that already ended (e.g. a historical `failed` row) keeps
-                # its real end timestamp — only stamp `ts` on rows that never
-                # ended, or `update_status`'s COALESCE would overwrite genuine
-                # duration/attribution audit data with the reconcile time.
-                ended_at=None if run.ended_at is not None else ts,
-                kind=kind,
-                detail=detail,
-                commit=False,
-            )
+            await self._supersede_run(run, ts=ts, kind=kind, detail=detail)
+
+    async def _supersede_run(
+        self, run: db.runs.Run, *, ts: str, kind: str, detail: str
+    ) -> None:
+        if run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES and run.ended_at is not None:
+            # Already terminal with its own recorded reason (e.g. SYM-218's
+            # auth-failure attribution) — flip status only. `update_status`
+            # would overwrite that genuine `termination_kind`/`detail` with
+            # this sweep's generic tracker_done/tracker_canceled/pr_merged
+            # reason even though nothing new actually happened to the run.
+            await db.runs.supersede_preserving_termination(self._conn, run.id, commit=False)
+            return
+        await db.runs.update_status(
+            self._conn,
+            run.id,
+            db.runs.SUPERSEDED_STATUS,
+            # Reached only for rows with no ended_at yet (e.g. a parked
+            # `needs_approval` merge run) — stamp `ts` as the end time.
+            ended_at=None if run.ended_at is not None else ts,
+            kind=kind,
+            detail=detail,
+            commit=False,
+        )
+
+    async def _retire_wait_run(
+        self, *, issue_id: str, run_id: str, ts: str, kind: str, detail: str
+    ) -> None:
+        """Retire the specific run a just-deleted wait was parked on, with no
+        `started_at_max` bound and regardless of any other guard — once its
+        wait is gone, nothing else will ever retire it."""
+        history = await db.runs.history_for_issue(self._conn, issue_id)
+        for run in history:
+            if run.id != run_id or not _run_is_retirable(run, started_at_max=None):
+                continue
+            await self._supersede_run(run, ts=ts, kind=kind, detail=detail)
+            return
 
     async def _apply_github_clear(
         self,
@@ -1556,6 +1590,20 @@ class Reconciler:
                 commit=False,
             )
             wait_cleared = True
+            # The run this wait was parked on must retire alongside it
+            # regardless of `merged_at`: Symphony can park a merge wait after
+            # the PR was already merged externally (it dispatched its own
+            # merge attempt before observing the hand-merge), so the run can
+            # start *after* `merged_at` and fall outside the bounded sweep
+            # below — once the wait is gone, nothing else will ever retire it
+            # (SYM-231 review).
+            await self._retire_wait_run(
+                issue_id=issue_id,
+                run_id=wait.run_id,
+                ts=ts,
+                kind="pr_merged",
+                detail="PR merged outside Symphony; superseding parked run",
+            )
         elif drift_kind != DRIFT_PR_LOCALLY_MERGED:
             raise RuntimeError(f"unsupported github drift clear: {drift_kind}")
 

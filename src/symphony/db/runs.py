@@ -326,6 +326,23 @@ async def update_status(
         await conn.commit()
 
 
+async def supersede_preserving_termination(
+    conn: aiosqlite.Connection, run_id: str, *, commit: bool = True
+) -> None:
+    """Flip an already-terminal, already-ended run to `superseded` without
+    touching its recorded `termination_kind`/`termination_detail`/`ended_at`.
+
+    `update_status` always overwrites those fields (falling back to "unknown"/
+    "" when not given) — fine for a run that never had its own reason, but for
+    a run that already failed/interrupted on its own (e.g. an auth-failure
+    attribution) that would destroy the original audit trail just because a
+    reconcile sweep is superseding the row afterwards.
+    """
+    await conn.execute("UPDATE runs SET status = ? WHERE id = ?", (SUPERSEDED_STATUS, run_id))
+    if commit:
+        await conn.commit()
+
+
 def _truncate_termination_detail(
     detail: str,
     *,

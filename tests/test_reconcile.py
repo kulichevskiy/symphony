@@ -1258,7 +1258,10 @@ async def test_reconcile_clears_stale_operator_wait_for_merged_pr(tmp_path: Path
 async def test_reconcile_leaves_wait_created_after_merge_alone(tmp_path: Path) -> None:
     """A wait created after the merge belongs to a later cycle (e.g. a fresh
     implement_failed park on a re-dispatched run) and must survive the sweep
-    even though the issue's earlier PR is merged."""
+    even though the issue's earlier PR is merged — and so must the run it is
+    still parked on: `_clear_stale_merged_wait` refuses to delete this wait,
+    so superseding its run out from under it would strand a live park on a
+    `superseded` run (SYM-231 review)."""
     conn = await db.connect(tmp_path / "s.sqlite")
     merged_at = "2026-05-10T11:00:00+00:00"
     try:
@@ -1301,11 +1304,13 @@ async def test_reconcile_leaves_wait_created_after_merge_alone(tmp_path: Path) -
         linear = AsyncMock()
         linear.post_comment = AsyncMock(return_value="cmt-1")
 
-        assert await reconcile(conn, linear) == 1
+        assert await reconcile(conn, linear) == 0
 
         wait = await db.operator_waits.get(conn, "iss-1")
         assert wait is not None
         assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+        run = (await db.runs.history_for_issue(conn, "iss-1"))[0]
+        assert run.status == "needs_approval"
     finally:
         await conn.close()
 
@@ -1372,6 +1377,64 @@ async def test_reconcile_clears_stale_wait_on_already_failed_run_for_merged_pr(
 
 
 @pytest.mark.asyncio
+async def test_reconcile_skips_wait_with_malformed_created_at(tmp_path: Path) -> None:
+    """SYM-231 review: `_retire_stale_waits_for_merged_prs` parses every wait
+    row in the DB via `list_all`, so a single bad legacy row (e.g. one written
+    by a manual SQL cleanup that stored garbage instead of a timestamp) must
+    not raise and abort the whole startup sweep — it should just be skipped,
+    leaving that wait alone rather than propagating the parse error."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    merged_at = "2026-05-10T11:00:00+00:00"
+    try:
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-43", title="t", team_key="ENG")
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.issue_prs.update_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            merged_at=merged_at,
+        )
+        await db.runs.create(
+            conn,
+            id="implement-failed",
+            issue_id="iss-1",
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-05-10T09:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="implement-failed",
+            kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="symphony",
+            created_at="not-a-timestamp",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        assert await reconcile(conn, linear) == 0
+
+        run = (await db.runs.history_for_issue(conn, "iss-1"))[0]
+        assert run.status == "failed"
+        assert await db.operator_waits.get(conn, "iss-1") is not None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_reconcile_leaves_opted_out_binding_wait_and_run_alone(tmp_path: Path) -> None:
     """SYM-231 review: an operator who disabled reconcile for a repo
     (`reconcile_enabled=False`) must not have its parked wait or runs
@@ -1432,5 +1495,63 @@ async def test_reconcile_leaves_opted_out_binding_wait_and_run_alone(tmp_path: P
         run = (await db.runs.history_for_issue(conn, "iss-1"))[0]
         assert run.status == "needs_approval"
         assert await db.operator_waits.get(conn, "iss-1") is not None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_opted_out_binding_residue_alone_with_no_wait(
+    tmp_path: Path,
+) -> None:
+    """SYM-231 review: SYM-114's shape (no operator wait at all) on a
+    `reconcile_enabled=False` repo must be left alone entirely too — the
+    opt-out check above only ever consulted a wait, so residue with no wait
+    at all was swept on every boot despite the docstring's promise. Resolves
+    the binding from the issue's own `issue_prs` row instead."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    merged_at = "2026-05-10T11:00:00+00:00"
+    try:
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-42", title="t", team_key="ENG")
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+            binding_key='["ENG","org/repo","symphony"]',
+        )
+        await db.issue_prs.update_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            merged_at=merged_at,
+        )
+        await db.runs.create(
+            conn,
+            id="stale-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T10:00:00+00:00",
+        )
+
+        binding = RepoBinding(
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="symphony",
+            reconcile_enabled=False,
+            linear_states=LinearStates(ready="Todo"),
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        assert await reconcile(conn, linear, bindings=[binding]) == 0
+
+        run = (await db.runs.history_for_issue(conn, "iss-1"))[0]
+        assert run.status == "needs_approval"
     finally:
         await conn.close()
