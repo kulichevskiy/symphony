@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -382,29 +383,22 @@ def test_classifies_all_drift_kinds() -> None:
 
     assert (
         classify_linear_drift(
-            has_operator_wait=True,
             state_name="Done",
             done_state_names={"Done"},
         )
         == DRIFT_LINEAR_STATE_DONE
     )
+    # A terminal drift is reported regardless of an operator wait — SYM-114's
+    # shape (wait already cleared, `needs_approval` runs left over) still needs
+    # to be retired once the tracker issue goes terminal, and the function no
+    # longer takes a `has_operator_wait` gate.
     assert (
         classify_linear_drift(
-            has_operator_wait=True,
             state_name="Canceled",
             state_type="canceled",
             done_state_names={"Done"},
         )
         == DRIFT_LINEAR_CANCELED
-    )
-    assert (
-        classify_linear_drift(
-            has_operator_wait=False,
-            state_name="Canceled",
-            state_type="canceled",
-            done_state_names={"Done"},
-        )
-        is None
     )
     assert classify_github_drift(has_merge_wait=True, prs=[merged_pr]) == DRIFT_MERGE_ZOMBIE
     assert classify_github_drift(has_merge_wait=True, prs=[closed_pr]) == DRIFT_PR_CLOSED_NO_MERGE
@@ -1168,6 +1162,109 @@ async def test_active_linear_done_clears_wait_and_retires_runs(
         "linear:Done",
     ) in transitions
     assert fake.comments and "done" in fake.comments[0][1].lower()
+
+
+@pytest.mark.asyncio
+async def test_active_linear_done_leaves_live_pid_run_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pidless-run widening in `_supersede_finished_issue_runs` (SYM-231)
+    must not touch a run with a live subprocess: retiring a live pid's row is
+    the poll loop's job, not the terminal clear's. Only the pidless `running`
+    row should be superseded here.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        await db.runs.create(
+            conn,
+            id="run-iss-1-review",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-17T10:30:00Z",
+        )
+        await db.runs.create(
+            conn,
+            id="run-iss-1-implement-live",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=os.getpid(),
+            started_at="2026-05-17T10:40:00Z",
+        )
+        fake = _FakeLinear(state_name="Done")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        runs = {
+            run.id: (run.status, run.termination_kind)
+            for run in await db.runs.history_for_issue(conn, "iss-1")
+        }
+    finally:
+        await conn.close()
+
+    assert wait is None
+    for run_id in ("run-iss-1", "run-iss-1-review"):
+        assert runs[run_id] == (db.runs.SUPERSEDED_STATUS, "tracker_done")
+    assert runs["run-iss-1-implement-live"] == ("running", "")
+
+
+@pytest.mark.asyncio
+async def test_active_linear_done_retires_needs_approval_runs_with_no_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SYM-114's exact shape: the operator wait is already gone, but an open
+    `issue_prs` row still makes the issue a reconcile candidate, and several
+    `merge`/`needs_approval` runs are left behind once the tracker issue goes
+    Done. These must be retired even though there is no wait to clear.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(conn)
+        await db.runs.create(
+            conn,
+            id="run-iss-1-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-17T10:30:00Z",
+        )
+        fake = _FakeLinear(state_name="Done")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        await reconciler.tick()
+        wait = await db.operator_waits.get(conn, "iss-1")
+        runs = {
+            run.id: (run.status, run.termination_kind)
+            for run in await db.runs.history_for_issue(conn, "iss-1")
+        }
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert runs["run-iss-1-merge"] == (db.runs.SUPERSEDED_STATUS, "tracker_done")
 
 
 @pytest.mark.asyncio

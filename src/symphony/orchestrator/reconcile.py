@@ -28,6 +28,13 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
+
+def _parse_rfc3339(s: str) -> datetime:
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
+
+
 _RETRY_BODY = (
     "🔁 **Host restarted — run interrupted**\n\n"
     "The Symphony host was restarted while this run was in flight, so the "
@@ -353,6 +360,12 @@ async def reconcile(
         await _post_reconcile_comment(conn, tracker_for_context, run.issue_id)
         flipped += 1
 
+    # Runs on an already-merged PR before the pidless-review sweep below, so a
+    # pidless review monitor whose PR merged out-of-band is superseded here
+    # instead of falling into `_preserve_pidless_review_retry_path` and minting
+    # a fresh operator wait that nothing will ever retire (SYM-231).
+    flipped += await _retire_runs_for_merged_prs(conn, now, pid_alive)
+
     for run in await db.runs.list_live_review_without_pid(conn):
         log.info(
             "reconcile: run=%s issue=%s has no pid — marking interrupted",
@@ -415,7 +428,6 @@ async def reconcile(
         flipped += 1
 
     flipped += await _collapse_duplicate_live_runs(conn, now, terminate_pid)
-    flipped += await _retire_runs_for_merged_prs(conn, now, pid_alive)
     return flipped
 
 
@@ -433,8 +445,15 @@ async def _retire_runs_for_merged_prs(
     pass. Runs whose process is still alive are left alone; they are live work,
     not bookkeeping. No tracker comment: this is silent residue cleanup, and the
     issue is already Done.
+
+    The issue's `operator_waits` row is retired alongside its runs — otherwise
+    the board stays dirty (`ui/status.py` checks the wait before the run) even
+    though every run is superseded. Only a wait from the merged generation is
+    removed (`created_at <= merged_at`, mirroring the live-tick equivalent in
+    `reconciler.py`); a wait created after the merge belongs to a later cycle.
     """
     retired = 0
+    cleared_wait_issues: set[str] = set()
     for run in await db.runs.list_unretired_for_merged_prs(conn):
         if run.pid is not None and pid_alive(run.pid):
             continue
@@ -454,7 +473,27 @@ async def _retire_runs_for_merged_prs(
             detail="PR merged outside Symphony; superseding parked run",
         )
         retired += 1
+        if run.issue_id not in cleared_wait_issues:
+            cleared_wait_issues.add(run.issue_id)
+            await _clear_stale_merged_wait(conn, issue_id=run.issue_id)
     return retired
+
+
+async def _clear_stale_merged_wait(conn: aiosqlite.Connection, *, issue_id: str) -> None:
+    wait = await db.operator_waits.get(conn, issue_id)
+    if wait is None:
+        return
+    merged_pr = await db.issue_prs.get_for_issue(conn, issue_id=issue_id)
+    if merged_pr is None or merged_pr.merged_at is None:
+        return
+    if _parse_rfc3339(wait.created_at) > _parse_rfc3339(merged_pr.merged_at):
+        return
+    log.info(
+        "reconcile: issue=%s operator wait %r predates its merged PR — clearing",
+        issue_id,
+        wait.kind,
+    )
+    await db.operator_waits.delete(conn, issue_id, wait.run_id)
 
 
 async def _collapse_duplicate_live_runs(

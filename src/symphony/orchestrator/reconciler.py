@@ -263,13 +263,14 @@ def _parse_rfc3339(s: str) -> datetime:
 
 def classify_linear_drift(
     *,
-    has_operator_wait: bool,
     state_name: str | None,
     done_state_names: set[str],
     state_type: str | None = None,
 ) -> str | None:
-    if not has_operator_wait:
-        return None
+    """A terminal tracker state is drift regardless of whether an operator wait
+    is parked on the issue — SYM-114's shape (wait already cleared, several
+    `needs_approval` runs left behind) only has a matching `issue_prs` row, no
+    wait, and still needs its bookkeeping retired once the issue goes Done."""
     if state_type == _CANCELED_STATE_TYPE:
         return DRIFT_LINEAR_CANCELED
     if state_name is not None and state_name in done_state_names:
@@ -475,7 +476,6 @@ class Reconciler:
                 tracker_ctx,
             )
             linear_drift = classify_linear_drift(
-                has_operator_wait=wait is not None,
                 state_name=linear_issue.state_name if linear_issue is not None else None,
                 state_type=linear_issue.state_type if linear_issue is not None else None,
                 done_state_names=done_state_names,
@@ -483,11 +483,21 @@ class Reconciler:
             linear_is_canceled = (
                 linear_issue is not None and linear_issue.state_type == _CANCELED_STATE_TYPE
             )
+            # A wait's own binding can opt out of reconcile even though some other
+            # binding matched via a PR row got us this far (see the `active
+            # and linear_drift == DRIFT_LINEAR_STATE_DONE` branch below); with no
+            # wait at all there is nothing to opt out, so SYM-114's shape (wait
+            # already cleared, `needs_approval` runs left over) is eligible on the
+            # terminal drift alone.
             terminal_wait_eligible = (
                 active
                 and linear_drift in _TERMINAL_LINEAR_DRIFTS
-                and wait is not None
-                and any(binding.reconcile_enabled for binding in self._wait_matched_bindings(wait))
+                and (
+                    wait is None
+                    or any(
+                        binding.reconcile_enabled for binding in self._wait_matched_bindings(wait)
+                    )
+                )
             )
             # Only swallow a GitHub backoff for the terminal clear when it can actually
             # run this tick — if the shared action budget is already spent, the clear
@@ -1332,27 +1342,28 @@ class Reconciler:
         state_name: str,
         ts: str,
     ) -> None:
-        """Clear a parked wait for an issue the tracker says is finished.
+        """Clear a parked wait (if any) for an issue the tracker says is finished.
 
         Terminal means canceled *or* done (SYM-231): either way the issue never
-        re-enters a polled lane, so nothing else will ever retire its rows.
-        Deletes the operator wait (which records its own removal transition),
-        retires every leftover run for the issue — not just the one the wait was
-        parked on — so an earlier failed attempt (e.g. a failed retry that failed
-        again) does not re-surface in the "Needs attention" lane once the wait is
-        gone, and notes the external state change for the audit timeline. All
-        writes stay in the caller's transaction (``commit=False``) so a later
-        failure rolls the whole clear back.
+        re-enters a polled lane, so nothing else will ever retire its rows. SYM-114's
+        shape (wait already gone, several `needs_approval` runs left behind) reaches
+        this with `wait is None` — there is nothing to delete, but the runs still
+        need retiring. When a wait exists, deletes it (which records its own removal
+        transition); either way retires every leftover run for the issue — not just
+        the one the wait was parked on — so an earlier failed attempt (e.g. a failed
+        retry that failed again) does not re-surface in the "Needs attention" lane,
+        and notes the external state change for the audit timeline. All writes stay
+        in the caller's transaction (``commit=False``) so a later failure rolls the
+        whole clear back.
         """
-        if wait is None:
-            raise RuntimeError("cannot clear terminal drift without an operator wait")
         canceled = drift_kind == DRIFT_LINEAR_CANCELED
-        await db.operator_waits.delete(
-            self._conn,
-            issue_id,
-            wait.run_id,
-            commit=False,
-        )
+        if wait is not None:
+            await db.operator_waits.delete(
+                self._conn,
+                issue_id,
+                wait.run_id,
+                commit=False,
+            )
         await self._supersede_finished_issue_runs(
             issue_id=issue_id,
             ts=ts,
