@@ -13,6 +13,7 @@ from click.testing import CliRunner
 from symphony import db
 from symphony.agent.claude_models import fetch_claude_effort_capabilities
 from symphony.agent.codex_catalog import CodexCatalog
+from symphony.agent.codex_models import DEFAULT_CODEX_MODEL
 from symphony.cli import main
 
 
@@ -663,8 +664,8 @@ def test_preflight_validates_default_codex_model_and_effort(tmp_path: Path, monk
 
     async def _catalog(**_kwargs: Any) -> CodexCatalog:
         return CodexCatalog(
-            models=("gpt-5.1-codex",),
-            efforts_by_model={"gpt-5.1-codex": ("low", "high")},
+            models=(DEFAULT_CODEX_MODEL,),
+            efforts_by_model={DEFAULT_CODEX_MODEL: ("low", "high")},
         )
 
     monkeypatch.setattr("symphony.cli.codex_catalog_client.get", _catalog)
@@ -676,7 +677,7 @@ def test_preflight_validates_default_codex_model_and_effort(tmp_path: Path, monk
 
     assert result.exit_code == 1, result.output
     assert (
-        "effort 'ultra' not supported by codex model 'gpt-5.1-codex'; "
+        f"effort 'ultra' not supported by codex model {DEFAULT_CODEX_MODEL!r}; "
         "supported: low, high" in result.output
     )
 
