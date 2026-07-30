@@ -56,11 +56,11 @@ const config: ConfigView = {
 
 const OPTIONS: ConfigOptions = {
   agent_families: ["claude", "codex"],
-  codex_models: ["gpt-5.1-codex", "gpt-5.6-sol"],
+  codex_models: ["gpt-5.5", "gpt-5.6-sol"],
   claude_aliases: ["haiku", "opus", "sonnet"],
-  codex_efforts: ["high", "low", "medium", "minimal"],
+  codex_efforts: ["high", "low", "max", "medium", "ultra", "xhigh"],
   codex_efforts_by_model: {
-    "gpt-5.1-codex": ["minimal", "low", "medium", "high"],
+    "gpt-5.5": ["low", "medium", "high", "xhigh"],
     "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
   },
   claude_efforts: ["high", "low", "max", "medium", "xhigh"],
@@ -686,7 +686,7 @@ describe("BindingForm", () => {
             project_key: "ENG",
             github_repo: "org/repo",
             states: { ready: "Todo" },
-            roles: { implement: { agent: "codex", model: "gpt-5.1-codex" } },
+            roles: { implement: { agent: "codex", model: "gpt-5.6-sol" } },
           },
         })}
         options={OPTIONS}
@@ -699,7 +699,7 @@ describe("BindingForm", () => {
     ).toBe("codex");
     expect(
       (screen.getByLabelText("binding implement model") as HTMLSelectElement).value,
-    ).toBe("gpt-5.1-codex");
+    ).toBe("gpt-5.6-sol");
     // A role left unset stays at inherit.
     expect(
       (screen.getByLabelText("binding review_find agent") as HTMLSelectElement).value,
@@ -905,8 +905,8 @@ describe("BindingsPanel", () => {
 
   it("threads globalRoles down into the binding's role matrix editor", () => {
     // implement's agent cell is left inherited on the binding; only the
-    // global matrix pins it to codex. The binding form must still see that
-    // to hide fix's dead model cell (SYM-191 review).
+    // global matrix pins it to codex. The binding form must still see that,
+    // or its inherited rows offer the wrong family's models.
     render(
       <BindingsPanel
         bindings={[]}
@@ -916,7 +916,8 @@ describe("BindingsPanel", () => {
       />,
     );
     fireEvent.click(screen.getByText("New binding"));
-    expect(screen.queryByLabelText("binding fix model")).toBeNull();
+    const model = screen.getByLabelText("binding implement model") as HTMLSelectElement;
+    expect([...model.options].map((o) => o.value)).toEqual(["", ...OPTIONS.codex_models]);
   });
 });
 
@@ -1004,219 +1005,128 @@ describe("RoleMatrixEditor", () => {
     expect(roles.implement).toEqual({ agent: "codex" });
   });
 
-  it("keeps fix/accept's hidden agent cell locked to implement's (builder-agent sync)", () => {
-    // `_synthesize_legacy_role_fields` only bridges the legacy
-    // `binding.agent` field (still read by completion parsing, activity, and
-    // cost attribution) back onto the daemon's other builder readers when
-    // implement/fix/accept all resolve to the same family — so switching
-    // implement's agent here must carry fix/accept along, even though their
-    // own agent cell is hidden.
+  it("edits only the touched row — no cell is mirrored onto another role", () => {
+    // Every role's agent/model/effort now reaches its own dispatched command,
+    // so nothing needs bridging through a sibling row: picking codex for
+    // `implement` must leave `fix`/`accept` inherited rather than silently
+    // pinning them (the pre-SYM-191-cleanup behavior).
     let roles: RolesMatrix = {};
-    const { rerender } = render(
-      <RoleMatrixEditor
-        scope="binding"
-        roles={roles}
-        options={OPTIONS}
-        onChange={(next) => {
-          roles = next;
-        }}
-      />,
-    );
-    fireEvent.change(screen.getByLabelText("binding implement agent"), {
-      target: { value: "codex" },
-    });
-    expect(roles.fix).toEqual({ agent: "codex" });
-    expect(roles.accept).toEqual({ agent: "codex" });
-
-    rerender(
-      <RoleMatrixEditor
-        scope="binding"
-        roles={roles}
-        options={OPTIONS}
-        onChange={(next) => {
-          roles = next;
-        }}
-      />,
-    );
-    fireEvent.change(screen.getByLabelText("binding implement agent"), {
-      target: { value: "" },
-    });
-    expect(roles.fix).toBeUndefined();
-    expect(roles.accept).toBeUndefined();
-  });
-
-  it("mirrors implement's codex model onto fix/accept's hidden model cell", () => {
-    // `_synthesize_legacy_role_fields` only derives the legacy `codex_model`
-    // that a codex-resolved fix/accept actually dispatch with when
-    // impl.model == fix.model == acc.model; picking a non-default codex
-    // model on implement must carry it onto fix/accept too, or their
-    // dispatch silently keeps the stale/default model (SYM-191 review).
-    let roles: RolesMatrix = {};
-    const { rerender } = render(
-      <RoleMatrixEditor
-        scope="binding"
-        roles={roles}
-        options={OPTIONS}
-        onChange={(next) => {
-          roles = next;
-        }}
-      />,
-    );
-    // Step 1: pick Codex as the implementer (mirrors fix/accept's agent, per
-    // the existing builder-agent sync).
-    fireEvent.change(screen.getByLabelText("binding implement agent"), {
-      target: { value: "codex" },
-    });
-    rerender(
-      <RoleMatrixEditor
-        scope="binding"
-        roles={roles}
-        options={OPTIONS}
-        onChange={(next) => {
-          roles = next;
-        }}
-      />,
-    );
-    // Step 2: pick a non-default Codex model.
-    fireEvent.change(screen.getByLabelText("binding implement model"), {
-      target: { value: "gpt-5.1-codex" },
-    });
-    expect(roles.implement).toEqual({ agent: "codex", model: "gpt-5.1-codex" });
-    expect(roles.fix).toEqual({ agent: "codex", model: "gpt-5.1-codex" });
-    expect(roles.accept).toEqual({ agent: "codex", model: "gpt-5.1-codex" });
-
-    // A stale fix/accept model (e.g. loaded from before this sync existed)
-    // is corrected, not just filled in when absent.
-    roles = {
-      implement: { agent: "codex", model: "gpt-5.1-codex" },
-      fix: { agent: "codex", model: "stale-model" },
-      accept: { agent: "codex", model: "stale-model" },
-    };
-    rerender(
-      <RoleMatrixEditor
-        scope="binding"
-        roles={roles}
-        options={OPTIONS}
-        onChange={(next) => {
-          roles = next;
-        }}
-      />,
-    );
-    fireEvent.change(screen.getByLabelText("binding implement model"), {
-      target: { value: "gpt-5.1-codex" },
-    });
-    expect(roles.fix).toEqual({ agent: "codex", model: "gpt-5.1-codex" });
-    expect(roles.accept).toEqual({ agent: "codex", model: "gpt-5.1-codex" });
-  });
-
-  it("hides fix's model cell once its (propagated) agent resolves to codex", () => {
-    let roles: RolesMatrix = {
-      implement: { agent: "claude" },
-      fix: { agent: "claude", model: "sonnet" },
-    };
-    const { rerender } = render(
-      <RoleMatrixEditor
-        scope="binding"
-        roles={roles}
-        options={OPTIONS}
-        onChange={(next) => {
-          roles = next;
-        }}
-      />,
-    );
-    expect(screen.getByLabelText("binding fix model")).toBeTruthy();
-
-    fireEvent.change(screen.getByLabelText("binding implement agent"), {
-      target: { value: "codex" },
-    });
-    // Switching families also strands fix's stale claude model.
-    expect(roles.fix).toEqual({ agent: "codex" });
-    rerender(
-      <RoleMatrixEditor
-        scope="binding"
-        roles={roles}
-        options={OPTIONS}
-        onChange={(next) => {
-          roles = next;
-        }}
-      />,
-    );
-    expect(screen.queryByLabelText("binding fix model")).toBeNull();
-  });
-
-  it("hides fix's model cell when the binding leaves agent inherited and the global matrix resolves it to codex", () => {
     render(
       <RoleMatrixEditor
         scope="binding"
-        roles={{ fix: { model: "sonnet" } }}
-        globalRoles={{ implement: { agent: "codex" } }}
+        roles={roles}
+        options={OPTIONS}
+        onChange={(next) => {
+          roles = next;
+        }}
+      />,
+    );
+    fireEvent.change(screen.getByLabelText("binding implement agent"), {
+      target: { value: "codex" },
+    });
+    expect(roles).toEqual({ implement: { agent: "codex" } });
+  });
+
+  it("offers the resolved family's models for an inherited agent cell", () => {
+    // `review_find` defaults to the opposite of the resolved `implement`
+    // family (`resolved_reviewer_agent`), `review_verify` to implement's own
+    // — so with implement pinned to codex, the two review rows offer
+    // different families even though both agent cells are inherited.
+    render(
+      <RoleMatrixEditor
+        scope="binding"
+        roles={{ implement: { agent: "codex" } }}
         options={OPTIONS}
         onChange={() => {}}
       />,
     );
-    expect(screen.queryByLabelText("binding fix model")).toBeNull();
+    const modelOpts = (role: string) =>
+      [
+        ...(screen.getByLabelText(`binding ${role} model`) as HTMLSelectElement).options,
+      ].map((o) => o.value);
+    expect(modelOpts("review_find")).toEqual(["", ...OPTIONS.claude_aliases]);
+    expect(modelOpts("review_verify")).toEqual(["", ...OPTIONS.codex_models]);
+    // Builder roles fall back to the binding's legacy `agent`, always the
+    // "claude" default for a DB-managed binding.
+    expect(modelOpts("fix")).toEqual(["", ...OPTIONS.claude_aliases]);
+    expect(modelOpts("accept")).toEqual(["", ...OPTIONS.claude_aliases]);
   });
 
-  it("hides review_verify's model cell when its own agent is inherited, regardless of the global implementer", () => {
-    // review_verify's inherited default does NOT mirror implement (server's
-    // `resolved_reviewer_agent()` fallback reads only the binding's legacy
-    // `agent`/`reviewer_agent` fields, always defaults for a DB-managed
-    // binding) — it's always the fixed "codex", so the model cell stays
-    // hidden here even though the global matrix pins `implement` to `claude`
-    // (SYM-191 review).
+  it("names the family an inherited agent cell resolves to", () => {
     render(
       <RoleMatrixEditor
         scope="binding"
-        roles={{ review_verify: { model: "opus" } }}
-        globalRoles={{ implement: { agent: "claude" } }}
+        roles={{ implement: { agent: "codex" } }}
         options={OPTIONS}
         onChange={() => {}}
       />,
     );
-    expect(screen.queryByLabelText("binding review_verify model")).toBeNull();
+    const inheritLabel = (role: string) =>
+      (screen.getByLabelText(`binding ${role} agent`) as HTMLSelectElement).options[0]
+        .textContent;
+    expect(inheritLabel("review_verify")).toBe("inherit (codex)");
+    expect(inheritLabel("review_find")).toBe("inherit (claude)");
+    // A pinned cell still describes what picking inherit would land on, not
+    // the pin itself.
+    expect(inheritLabel("implement")).toBe("inherit (claude)");
   });
 
-  it("does not treat review_verify's inherited default as implement-opposite when the global matrix pins only implement", () => {
-    // An imported or API-created global matrix pinning only
-    // `implement.agent: codex` and leaving `review_verify.agent` inherited
-    // must NOT flip review_verify's effective family to "claude" (the
-    // implement-opposite) — the server's fallback for an inherited
-    // review_verify ignores the matrix's `implement` cell entirely, so it
-    // stays "codex" regardless (SYM-191 review).
+  it("names the value a model/effort cell inherits from the global matrix", () => {
     render(
       <RoleMatrixEditor
         scope="binding"
         roles={{}}
-        globalRoles={{ implement: { agent: "codex" } }}
+        globalRoles={{ implement: { model: "opus", effort: "high" } }}
         options={OPTIONS}
         onChange={() => {}}
       />,
     );
-    expect(screen.queryByLabelText("binding review_verify model")).toBeNull();
+    const first = (label: string) =>
+      (screen.getByLabelText(label) as HTMLSelectElement).options[0].textContent;
+    expect(first("binding implement model")).toBe("inherit (opus)");
+    expect(first("binding implement effort")).toBe("inherit (high)");
   });
 
-  it("shows review_verify's model cell for a claude (or inherited) agent", () => {
+  it("does not advertise an inherited value from the other family", () => {
+    // The server drops a global cell's model/effort when the binding pins a
+    // different agent (`resolved_role`'s family boundary), so hinting the
+    // Claude model here would lie about what the row resolves to.
     render(
       <RoleMatrixEditor
         scope="binding"
-        roles={{ review_verify: { agent: "claude", model: "opus" } }}
+        roles={{ implement: { agent: "codex" } }}
+        globalRoles={{ implement: { agent: "claude", model: "opus" } }}
         options={OPTIONS}
         onChange={() => {}}
       />,
     );
-    expect(screen.getByLabelText("binding review_verify model")).toBeTruthy();
+    expect(
+      (screen.getByLabelText("binding implement model") as HTMLSelectElement).options[0]
+        .textContent,
+    ).toBe("inherit");
   });
 
-  it("hides review_verify's model cell once its own agent is set to codex", () => {
+  it("offers a role's effort options for the model it inherits", () => {
+    // The binding pins no model; the global matrix's gpt-5.5 (per OPTIONS,
+    // no max/ultra) is what the row runs with, so its efforts are what the
+    // cell may offer.
     render(
       <RoleMatrixEditor
         scope="binding"
-        roles={{ review_verify: { agent: "codex" } }}
+        roles={{ implement: { agent: "codex" } }}
+        globalRoles={{ implement: { agent: "codex", model: "gpt-5.5" } }}
         options={OPTIONS}
         onChange={() => {}}
       />,
     );
-    expect(screen.queryByLabelText("binding review_verify model")).toBeNull();
+    const effort = screen.getByLabelText("binding implement effort") as HTMLSelectElement;
+    expect([...effort.options].map((o) => o.value)).toEqual([
+      "",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
   });
 
   it("drops an effort the new model doesn't support when the model changes", () => {
@@ -1293,17 +1203,17 @@ describe("RoleMatrixEditor", () => {
     expect(model.disabled).toBe(false);
   });
 
-  it("offers the union of both families' models when the agent is inherited", () => {
+  it("offers the resolved family's models when the agent is inherited", () => {
+    // An inherited `implement` resolves to the binding's legacy `agent`
+    // default (claude), so offering codex models here would let the operator
+    // save a pair the server's family check rejects.
     render(
       <RoleMatrixEditor scope="binding" roles={{}} options={OPTIONS} onChange={() => {}} />,
     );
     const model = screen.getByLabelText("binding implement model") as HTMLSelectElement;
     expect(model.value).toBe("");
     expect(model.disabled).toBe(false);
-    expect([...model.options].map((o) => o.value)).toEqual([
-      "",
-      ...[...OPTIONS.claude_aliases, ...OPTIONS.codex_models].sort(),
-    ]);
+    expect([...model.options].map((o) => o.value)).toEqual(["", ...OPTIONS.claude_aliases]);
   });
 
   it("renders a stored model not in the current family list instead of blanking the select", () => {
@@ -1322,58 +1232,37 @@ describe("RoleMatrixEditor", () => {
     expect([...model.options].map((o) => o.value)).toContain("claude-opus-4-20250514");
   });
 
-  it("hides the effort control for roles whose effort the runtime never reads", () => {
+  it("exposes agent, model and effort for every role", () => {
+    // All 15 cells reach their role's dispatched command (see the
+    // `RoleMatrixEditor` header comment), so none is hidden or read-only.
     render(
       <RoleMatrixEditor scope="binding" roles={{}} options={OPTIONS} onChange={() => {}} />,
     );
-    expect(screen.getByLabelText("binding implement effort")).toBeTruthy();
-    for (const role of ["review_find", "review_verify", "fix", "accept"]) {
-      expect(screen.queryByLabelText(`binding ${role} effort`)).toBeNull();
+    for (const role of ["implement", "review_find", "review_verify", "fix", "accept"]) {
+      for (const field of ["agent", "model", "effort"]) {
+        const cell = screen.getByLabelText(`binding ${role} ${field}`) as HTMLSelectElement;
+        expect(cell.disabled).toBe(false);
+      }
     }
+    expect(screen.queryByText("not used")).toBeNull();
   });
 
-  it("hides review_verify's model cell when its agent inherits Codex from a default Claude implementer", () => {
-    // With everything inherited, review_verify's fixed fallback (Codex —
-    // see `effectiveAgent`) applies regardless of what `implement` resolves
-    // to — a Codex-resolved verifier reads its model from the legacy
-    // `binding.codex_model`, never this cell, so it must stay hidden even
-    // though the cell's own `agent` is `""` rather than `"codex"`
-    // (SYM-191 review).
-    render(
-      <RoleMatrixEditor scope="binding" roles={{}} options={OPTIONS} onChange={() => {}} />,
-    );
-    expect(screen.getByLabelText("binding review_verify agent")).toBeTruthy();
-    expect(screen.queryByLabelText("binding review_verify model")).toBeNull();
-    expect(screen.getByLabelText("binding review_find agent")).toBeTruthy();
-    expect(screen.getByLabelText("binding review_find model")).toBeTruthy();
-  });
-
-  it("shows review_verify's model cell once its own agent is pinned to claude", () => {
+  it("edits any role's effort independently", () => {
+    let roles: RolesMatrix = {};
     render(
       <RoleMatrixEditor
         scope="binding"
-        roles={{ review_verify: { agent: "claude" } }}
+        roles={roles}
         options={OPTIONS}
-        onChange={() => {}}
+        onChange={(next) => {
+          roles = next;
+        }}
       />,
     );
-    expect(screen.getByLabelText("binding review_verify model")).toBeTruthy();
-  });
-
-  it("shows fix's live model cell but hides its agent (dispatch CLI stays the legacy binding.agent)", () => {
-    render(
-      <RoleMatrixEditor scope="binding" roles={{}} options={OPTIONS} onChange={() => {}} />,
-    );
-    expect(screen.queryByLabelText("binding fix agent")).toBeNull();
-    expect(screen.getByLabelText("binding fix model")).toBeTruthy();
-  });
-
-  it("hides accept's agent+model controls (dispatch never resolves them)", () => {
-    render(
-      <RoleMatrixEditor scope="binding" roles={{}} options={OPTIONS} onChange={() => {}} />,
-    );
-    expect(screen.queryByLabelText("binding accept agent")).toBeNull();
-    expect(screen.queryByLabelText("binding accept model")).toBeNull();
+    fireEvent.change(screen.getByLabelText("binding accept effort"), {
+      target: { value: "low" },
+    });
+    expect(roles).toEqual({ accept: { effort: "low" } });
   });
 });
 

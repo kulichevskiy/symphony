@@ -12,8 +12,10 @@ class CodexModelPricing:
     output_usd_per_million_tokens: float
 
 
-DEFAULT_CODEX_MODEL = "gpt-5.1-codex"
+DEFAULT_CODEX_MODEL = "gpt-5.6-sol"
 
+# Pricing keeps retired models (`gpt-5.1-*`, …) so historical `runs`/
+# `run_model_usage` rows still price; the *catalog* below must not offer them.
 CODEX_MODEL_PRICING_USD_PER_MILLION_TOKENS: dict[str, CodexModelPricing] = {
     "gpt-5.6-sol": CodexModelPricing(
         input_usd_per_million_tokens=5.0,
@@ -49,13 +51,15 @@ CODEX_MODEL_PRICING_USD_PER_MILLION_TOKENS: dict[str, CodexModelPricing] = {
 
 SUPPORTED_CODEX_MODELS = frozenset(CODEX_MODEL_PRICING_USD_PER_MILLION_TOKENS)
 
+# Offline fallback for `codex_catalog` (no credential / discovery failure).
+# Retired models are omitted deliberately: the UI builds its model dropdown
+# from the catalog, and a pin the live `model/list` no longer entitles fails
+# the run at spawn time.
 STATIC_CODEX_EFFORTS_BY_MODEL: dict[str, tuple[str, ...]] = {
     "gpt-5.6-sol": ("low", "medium", "high", "xhigh", "max", "ultra"),
     "gpt-5.6-terra": ("low", "medium", "high", "xhigh", "max", "ultra"),
     "gpt-5.6-luna": ("low", "medium", "high", "xhigh", "max"),
     "gpt-5.5": ("low", "medium", "high", "xhigh"),
-    "gpt-5.1-codex": ("minimal", "low", "medium", "high"),
-    "gpt-5.1-codex-max": ("minimal", "low", "medium", "high"),
 }
 SUPPORTED_CODEX_EFFORTS = frozenset(
     effort for efforts in STATIC_CODEX_EFFORTS_BY_MODEL.values() for effort in efforts

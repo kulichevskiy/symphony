@@ -11,6 +11,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from symphony.agent.codex_models import DEFAULT_CODEX_MODEL
 from symphony.config import (
     AcceptanceConfig,
     Config,
@@ -192,7 +193,7 @@ def test_repo_runner_defaults_to_local(tmp_path: Path, monkeypatch) -> None:  # 
     raw = f"repos:\n  - linear_team_key: ENG\n    github_repo: org/repo\n{_BINDING_STATES}"
     cfg = Config.model_validate(yaml.safe_load(raw))
     assert cfg.repos[0].runner == "local"
-    assert cfg.repos[0].codex_model == "gpt-5.1-codex"
+    assert cfg.repos[0].codex_model == DEFAULT_CODEX_MODEL
 
 
 def test_acceptance_config_defaults() -> None:
@@ -955,7 +956,7 @@ def test_roles_agent_override_is_a_family_inheritance_boundary() -> None:
 @pytest.mark.parametrize(
     ("default_agent", "binding_agent", "global_model", "expected_model"),
     [
-        ("claude", "codex", "sonnet", "gpt-5.1-codex"),
+        ("claude", "codex", "sonnet", DEFAULT_CODEX_MODEL),
         ("codex", "claude", "gpt-5.6-sol", None),
     ],
 )
