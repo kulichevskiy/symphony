@@ -4,6 +4,7 @@ post a Linear comment telling the user to `$retry`."""
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -374,6 +375,80 @@ async def test_reconcile_ignores_stale_issue_pr_for_pidless_review_retry(
         assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
 
         linear.post_comment.assert_awaited_once()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_supersedes_pidless_review_on_merged_pr_without_minting_wait(
+    tmp_path: Path,
+) -> None:
+    """SYM-231: a pidless review monitor whose own PR merged out-of-band must be
+    superseded by the merged-PR sweep, not re-parked by
+    `_preserve_pidless_review_retry_path` — the pidless-review sweep runs after
+    the merged-PR sweep specifically so this row is gone by the time it looks,
+    and re-manufacturing a `review_failed` wait here is exactly the residue
+    SYM-231 exists to remove.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    merged_at = "2026-05-10T02:00:00+00:00"
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-review",
+            identifier="ENG-8",
+            title="t",
+            team_key="ENG",
+        )
+        await db.review_state.begin_review(
+            conn,
+            "iss-review",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            github_repo="org/repo",
+            issue_label="backend",
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-review",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.issue_prs.update_merged(
+            conn,
+            issue_id="iss-review",
+            github_repo="org/repo",
+            pr_number=42,
+            merged_at=merged_at,
+        )
+        await db.runs.create(
+            conn,
+            id="pidless-review",
+            issue_id="iss-review",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:30:00+00:00",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        flipped = await reconcile(conn, linear)
+        assert flipped == 1
+
+        cur = await conn.execute(
+            "SELECT status, termination_kind FROM runs WHERE id=?", ("pidless-review",)
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        assert row[0] == db.runs.SUPERSEDED_STATUS
+        assert row["termination_kind"] == "pr_merged"
+
+        assert await db.operator_waits.get(conn, "iss-review") is None
+        linear.post_comment.assert_not_awaited()
     finally:
         await conn.close()
 
@@ -907,5 +982,676 @@ async def test_reconcile_no_live_runs_is_a_noop(tmp_path: Path) -> None:
         flipped = await reconcile(conn, linear)
         assert flipped == 0
         linear.post_comment.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_retires_stale_runs_for_merged_pr(tmp_path: Path) -> None:
+    """SYM-231 startup sweep: an issue whose PR is merged (typically by hand,
+    outside Symphony) must not keep runs at `running`/`needs_approval` — those
+    show the finished issue as active forever. Pre-fix residue self-heals on the
+    next boot instead of needing a manual SQL pass."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    merged_at = "2026-05-10T11:00:00+00:00"
+    try:
+        for issue_id, identifier in (
+            ("iss-merged", "ENG-20"),
+            ("iss-open", "ENG-21"),
+            ("iss-live", "ENG-22"),
+        ):
+            await db.issues.upsert(
+                conn, id=issue_id, identifier=identifier, title="t", team_key="ENG"
+            )
+
+        async def _seed_pr(issue_id: str, repo: str, pr_number: int, merged: str | None) -> None:
+            await db.issue_prs.upsert(
+                conn,
+                issue_id=issue_id,
+                github_repo=repo,
+                pr_number=pr_number,
+                pr_url=f"https://github.com/{repo}/pull/{pr_number}",
+                created_at="2026-05-10T00:00:00+00:00",
+            )
+            if merged is not None:
+                assert await db.issue_prs.update_merged(
+                    conn,
+                    issue_id=issue_id,
+                    github_repo=repo,
+                    pr_number=pr_number,
+                    merged_at=merged,
+                )
+
+        # Residue: parked merge run + orphaned pidless review monitor, both from
+        # before the merge.
+        await _seed_pr("iss-merged", "org/repo", 42, merged_at)
+        await db.runs.create(
+            conn,
+            id="stale-merge",
+            issue_id="iss-merged",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T10:00:00+00:00",
+        )
+        # Parked *after* the merge (SYM-114/SYM-231 review): Symphony can park a
+        # needs_approval wait after the PR was already merged externally. With
+        # no operator wait and no PR left open, nothing can ever revisit this
+        # row, so it must self-heal too rather than surviving because it
+        # happens to have started after the merge timestamp.
+        await db.runs.create(
+            conn,
+            id="post-merge",
+            issue_id="iss-merged",
+            stage="implement",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T12:00:00+00:00",
+        )
+        # Another PR still open for the issue: work is in flight, leave it alone.
+        await _seed_pr("iss-open", "org/repo", 43, merged_at)
+        await _seed_pr("iss-open", "org/other", 44, None)
+        await db.runs.create(
+            conn,
+            id="open-pr-merge",
+            issue_id="iss-open",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T10:00:00+00:00",
+        )
+        # Live process on a merged issue: not bookkeeping residue, don't touch.
+        await _seed_pr("iss-live", "org/repo", 45, merged_at)
+        await db.runs.create(
+            conn,
+            id="live-run",
+            issue_id="iss-live",
+            stage="implement",
+            status="running",
+            pid=os.getpid(),
+            started_at="2026-05-10T10:00:00+00:00",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        assert await reconcile(conn, linear) == 2
+
+        runs = {}
+        for issue_id in ("iss-merged", "iss-open", "iss-live"):
+            for run in await db.runs.history_for_issue(conn, issue_id):
+                runs[run.id] = (run.status, run.termination_kind)
+    finally:
+        await conn.close()
+
+    assert runs["stale-merge"] == (db.runs.SUPERSEDED_STATUS, "pr_merged")
+    assert runs["post-merge"] == (db.runs.SUPERSEDED_STATUS, "pr_merged")
+    assert runs["open-pr-merge"][0] == "needs_approval"
+    assert runs["live-run"][0] == "running"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_retire_for_merged_pr_preserves_ended_at(tmp_path: Path) -> None:
+    """SYM-231 review: a parked `needs_approval` merge run already carries its
+    genuine end timestamp and termination reason (set when `poll/_merge.py`
+    parked it). Retiring it at startup must not clobber either with this
+    sweep's generic `pr_merged` reason and the reconcile time — it should
+    flip status only via `supersede_preserving_termination`, mirroring
+    `reconciler.py`'s `_supersede_run`."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    merged_at = "2026-05-10T11:00:00+00:00"
+    real_ended_at = "2026-05-10T10:30:00+00:00"
+    try:
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-50", title="t", team_key="ENG")
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.issue_prs.update_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            merged_at=merged_at,
+        )
+        await db.runs.create(
+            conn,
+            id="stale-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T10:00:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "stale-merge",
+            "needs_approval",
+            ended_at=real_ended_at,
+            kind="awaiting_human_merge",
+            detail="parked for manual merge",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        now = datetime.fromisoformat("2026-06-01T00:00:00+00:00")
+        assert await reconcile(conn, linear, clock=lambda: now) == 1
+
+        run = (await db.runs.history_for_issue(conn, "iss-1"))[0]
+        assert run.status == db.runs.SUPERSEDED_STATUS
+        assert run.ended_at == real_ended_at, f"ended_at clobbered: {run.ended_at}"
+        assert run.termination_kind == "awaiting_human_merge"
+        assert run.termination_detail == "parked for manual merge"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_supersedes_dead_pid_run_on_merged_pr_instead_of_interrupting(
+    tmp_path: Path,
+) -> None:
+    """SYM-231 review: the dead-pid sweep used to run before the merged-PR
+    retirement sweep, so a `running` row whose pid died on an issue whose PR
+    is already merged got flipped to `interrupted`/`orphaned` (and a `$retry`
+    comment posted on a finished issue) before the merged-PR sweep ever saw
+    it — `list_unretired_for_merged_prs` only selects `running`/`needs_approval`
+    rows, so the now-`interrupted` row falls through both sweeps and
+    `ui/status.py` renders the issue FAILED forever with no open PR to explain
+    it. The merged-PR sweep must run first."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    merged_at = "2026-05-10T11:00:00+00:00"
+    try:
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-51", title="t", team_key="ENG")
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.issue_prs.update_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            merged_at=merged_at,
+        )
+        dead_pid = 999_999
+        await db.runs.create(
+            conn,
+            id="dead-pid-run",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=dead_pid,
+            started_at="2026-05-10T10:00:00+00:00",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        assert await reconcile(conn, linear) == 1
+
+        run = (await db.runs.history_for_issue(conn, "iss-1"))[0]
+        assert run.status == db.runs.SUPERSEDED_STATUS
+        assert run.termination_kind == "pr_merged"
+        linear.post_comment.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_clears_stale_operator_wait_for_merged_pr(tmp_path: Path) -> None:
+    """SYM-231 acceptance criterion 1: retiring the run is not enough — the
+    issue's `operator_waits` row must go too, or `ui/status.py` (which checks
+    the wait before the run) still renders the finished issue as active."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    merged_at = "2026-05-10T11:00:00+00:00"
+    try:
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-30", title="t", team_key="ENG")
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.issue_prs.update_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            merged_at=merged_at,
+        )
+        await db.runs.create(
+            conn,
+            id="stale-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T10:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="stale-merge",
+            kind=db.operator_waits.KIND_MERGE,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="symphony",
+            created_at="2026-05-10T10:01:00+00:00",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        assert await reconcile(conn, linear) == 1
+
+        run = await db.runs.history_for_issue(conn, "iss-1")
+        assert run[0].status == db.runs.SUPERSEDED_STATUS
+        assert await db.operator_waits.get(conn, "iss-1") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_wait_created_after_merge_alone(tmp_path: Path) -> None:
+    """A wait created after the merge belongs to a later cycle (e.g. a fresh
+    implement_failed park on a re-dispatched run) and must survive the sweep
+    even though the issue's earlier PR is merged — and so must the run it is
+    still parked on: `_clear_stale_merged_wait` refuses to delete this wait,
+    so superseding its run out from under it would strand a live park on a
+    `superseded` run (SYM-231 review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    merged_at = "2026-05-10T11:00:00+00:00"
+    try:
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-31", title="t", team_key="ENG")
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.issue_prs.update_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            merged_at=merged_at,
+        )
+        await db.runs.create(
+            conn,
+            id="stale-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T10:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="stale-merge",
+            kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="symphony",
+            created_at="2026-05-10T12:00:00+00:00",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        assert await reconcile(conn, linear) == 0
+
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+        run = (await db.runs.history_for_issue(conn, "iss-1"))[0]
+        assert run.status == "needs_approval"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_clears_stale_wait_on_already_failed_run_for_merged_pr(
+    tmp_path: Path,
+) -> None:
+    """SYM-231 acceptance criterion 3: the issue's own example rows (SYM-226/
+    227/228/218) are an `implement_failed` wait sitting on a `failed` — not
+    `running`/`needs_approval` — implement run of an issue whose PR is merged.
+    `_retire_runs_for_merged_prs` only clears a wait alongside a run it
+    retires, and `list_unretired_for_merged_prs` never selects a `failed` run,
+    so this residue needs its own sweep to self-heal at startup."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    merged_at = "2026-05-10T11:00:00+00:00"
+    try:
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-40", title="t", team_key="ENG")
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.issue_prs.update_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            merged_at=merged_at,
+        )
+        await db.runs.create(
+            conn,
+            id="implement-failed",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T09:00:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "implement-failed",
+            "failed",
+            ended_at="2026-05-10T09:30:00+00:00",
+            kind="agent_error",
+            detail="agent crashed",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="implement-failed",
+            kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="symphony",
+            created_at="2026-05-10T09:01:00+00:00",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        assert await reconcile(conn, linear) == 1
+
+        run = (await db.runs.history_for_issue(conn, "iss-1"))[0]
+        assert run.status == db.runs.SUPERSEDED_STATUS
+        assert run.termination_kind == "agent_error"
+        assert run.termination_detail == "agent crashed"
+        assert run.ended_at == "2026-05-10T09:30:00+00:00"
+        assert await db.operator_waits.get(conn, "iss-1") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_skips_wait_with_malformed_created_at(tmp_path: Path) -> None:
+    """SYM-231 review: `_retire_stale_waits_for_merged_prs` parses every wait
+    row in the DB via `list_all`, so a single bad legacy row (e.g. one written
+    by a manual SQL cleanup that stored garbage instead of a timestamp) must
+    not raise and abort the whole startup sweep — it should just be skipped,
+    leaving that wait alone rather than propagating the parse error."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    merged_at = "2026-05-10T11:00:00+00:00"
+    try:
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-43", title="t", team_key="ENG")
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.issue_prs.update_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            merged_at=merged_at,
+        )
+        await db.runs.create(
+            conn,
+            id="implement-failed",
+            issue_id="iss-1",
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-05-10T09:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="implement-failed",
+            kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="symphony",
+            created_at="not-a-timestamp",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        assert await reconcile(conn, linear) == 0
+
+        run = (await db.runs.history_for_issue(conn, "iss-1"))[0]
+        assert run.status == "failed"
+        assert await db.operator_waits.get(conn, "iss-1") is not None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_opted_out_binding_wait_and_run_alone(tmp_path: Path) -> None:
+    """SYM-231 review: an operator who disabled reconcile for a repo
+    (`reconcile_enabled=False`) must not have its parked wait or runs
+    retired on every boot, mirroring `reconciler.py`'s live-path opt-out
+    guard (`_retire_merged_issue_bookkeeping`)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    merged_at = "2026-05-10T11:00:00+00:00"
+    try:
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-41", title="t", team_key="ENG")
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.issue_prs.update_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            merged_at=merged_at,
+        )
+        await db.runs.create(
+            conn,
+            id="stale-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T10:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="stale-merge",
+            kind=db.operator_waits.KIND_MERGE,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="symphony",
+            created_at="2026-05-10T10:01:00+00:00",
+        )
+
+        binding = RepoBinding(
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="symphony",
+            reconcile_enabled=False,
+            linear_states=LinearStates(ready="Todo"),
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        assert await reconcile(conn, linear, bindings=[binding]) == 0
+
+        run = (await db.runs.history_for_issue(conn, "iss-1"))[0]
+        assert run.status == "needs_approval"
+        assert await db.operator_waits.get(conn, "iss-1") is not None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_sibling_repo_wait_alone_even_when_enabled(tmp_path: Path) -> None:
+    """SYM-231 review: unlike the opted-out case above, `org/repo`'s binding
+    here has `reconcile_enabled=True` — the only thing that should protect its
+    wait and run is that the merged PR belongs to a different repo
+    (`org/other`) and `org/repo` has no `issue_prs` row of its own.
+    `_stale_merged_wait_is_eligible` used to look up the issue's merged PR via
+    `get_for_issue`, which returns whichever PR row sorts first regardless of
+    repo — so `org/other`'s merge would delete `org/repo`'s wait and supersede
+    its run even though `org/repo`'s own work is untouched. Covers both boot
+    sweeps: `_retire_runs_for_merged_prs` (the `needs_approval` run) and
+    `_retire_stale_waits_for_merged_prs` (the wait itself)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    merged_at = "2026-05-10T11:00:00+00:00"
+    try:
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-44", title="t", team_key="ENG")
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/other",
+            pr_number=99,
+            pr_url="https://github.com/org/other/pull/99",
+            created_at="2026-05-10T00:00:00+00:00",
+            binding_key='["ENG","org/other","frontend"]',
+        )
+        await db.issue_prs.update_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/other",
+            pr_number=99,
+            merged_at=merged_at,
+        )
+        await db.runs.create(
+            conn,
+            id="stale-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T10:00:00+00:00",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="stale-merge",
+            kind=db.operator_waits.KIND_MERGE,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="symphony",
+            created_at="2026-05-10T10:01:00+00:00",
+        )
+
+        bindings = [
+            RepoBinding(
+                linear_team_key="ENG",
+                github_repo="org/repo",
+                issue_label="symphony",
+                reconcile_enabled=True,
+                linear_states=LinearStates(ready="Todo"),
+            ),
+            RepoBinding(
+                linear_team_key="ENG",
+                github_repo="org/other",
+                issue_label="frontend",
+                reconcile_enabled=True,
+                linear_states=LinearStates(ready="Todo"),
+            ),
+        ]
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        assert await reconcile(conn, linear, bindings=bindings) == 0
+
+        run = (await db.runs.history_for_issue(conn, "iss-1"))[0]
+        assert run.status == "needs_approval"
+        assert await db.operator_waits.get(conn, "iss-1") is not None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_leaves_opted_out_binding_residue_alone_with_no_wait(
+    tmp_path: Path,
+) -> None:
+    """SYM-231 review: SYM-114's shape (no operator wait at all) on a
+    `reconcile_enabled=False` repo must be left alone entirely too — the
+    opt-out check above only ever consulted a wait, so residue with no wait
+    at all was swept on every boot despite the docstring's promise. Resolves
+    the binding from the issue's own `issue_prs` row instead."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    merged_at = "2026-05-10T11:00:00+00:00"
+    try:
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-42", title="t", team_key="ENG")
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+            binding_key='["ENG","org/repo","symphony"]',
+        )
+        await db.issue_prs.update_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            merged_at=merged_at,
+        )
+        await db.runs.create(
+            conn,
+            id="stale-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T10:00:00+00:00",
+        )
+
+        binding = RepoBinding(
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="symphony",
+            reconcile_enabled=False,
+            linear_states=LinearStates(ready="Todo"),
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        assert await reconcile(conn, linear, bindings=[binding]) == 0
+
+        run = (await db.runs.history_for_issue(conn, "iss-1"))[0]
+        assert run.status == "needs_approval"
     finally:
         await conn.close()

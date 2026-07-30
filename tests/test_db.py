@@ -633,6 +633,93 @@ async def test_issue_prs_tracks_merge_candidates(tmp_path: Path) -> None:
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_list_unretired_for_merged_prs_includes_needs_approval_parked_after_merge(
+    tmp_path: Path,
+) -> None:
+    """SYM-231 review: Symphony can park a merge wait *after* the PR was
+    already merged externally (SYM-114's shape). A `needs_approval` row has
+    no merge candidacy to protect and no operator wait or open PR left to
+    ever revisit it, so it must not be excluded just because it started after
+    `merged_at` — unlike a `running` row, which keeps that bound so a later
+    generation's dead-pid run still takes the `$retry` path."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.issue_prs.update_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            merged_at="2026-05-10T11:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="merge-after-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T11:05:00+00:00",
+        )
+
+        unretired = await db.runs.list_unretired_for_merged_prs(conn)
+    finally:
+        await conn.close()
+
+    assert [run.id for run in unretired] == ["merge-after-merge"]
+
+
+@pytest.mark.asyncio
+async def test_list_unretired_for_merged_prs_keeps_bound_for_running_rows(
+    tmp_path: Path,
+) -> None:
+    """A `running` row started after the merge is a later generation's
+    dead-pid run, not residue of the merged PR — it must still take the
+    `$retry` interrupted-orphan path instead of being superseded here."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(conn, id="iss-1", identifier="ENG-1", title="t", team_key="ENG")
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:00:00+00:00",
+        )
+        await db.issue_prs.update_merged(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            merged_at="2026-05-10T11:00:00+00:00",
+        )
+        await db.runs.create(
+            conn,
+            id="running-after-merge",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T11:05:00+00:00",
+        )
+
+        unretired = await db.runs.list_unretired_for_merged_prs(conn)
+    finally:
+        await conn.close()
+
+    assert unretired == []
+
+
 async def _seed_orphaned_merge_needs_approval(
     conn: aiosqlite.Connection,
     *,

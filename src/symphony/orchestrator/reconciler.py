@@ -50,6 +50,10 @@ DRIFT_LINEAR_CANCELED = "linear_state_canceled"
 DRIFT_PR_LOCALLY_MERGED = "pr_locally_merged"
 DRIFT_ORPHAN_PR_OPEN = "orphan_pr_open"
 
+# Tracker states that finish an issue for good. Both retire its bookkeeping the
+# same way; only the audit `termination_kind` and the posted comment differ.
+_TERMINAL_LINEAR_DRIFTS = (DRIFT_LINEAR_CANCELED, DRIFT_LINEAR_STATE_DONE)
+
 
 def _is_merge_like_wait(wait: db.operator_waits.OperatorWait | None) -> bool:
     """A review-cap park is awaiting the same `$approve`-to-merge decision as a
@@ -83,6 +87,58 @@ _CANCELED_CLEAR_BODY_PR_OPEN = (
     "operator wait and the associated run state. A linked pull request is "
     "still open and was left untouched by this clear — close or merge it "
     "separately if needed.\n"
+)
+
+# Used instead of _CANCELED_CLEAR_BODY(_PR_OPEN) when there was no wait row to
+# delete — no wait was cleared, so the comment must not claim one was.
+_CANCELED_CLEAR_BODY_NO_WAIT = (
+    "🧹 **Auto-cleared — issue canceled**\n\n"
+    "This issue is canceled in the tracker, so Symphony retired its associated "
+    "run state. The dashboard lane empties on its own; no action needed.\n"
+)
+
+_CANCELED_CLEAR_BODY_NO_WAIT_PR_OPEN = (
+    "🧹 **Auto-cleared — issue canceled**\n\n"
+    "This issue is canceled in the tracker, so Symphony retired its associated "
+    "run state. A linked pull request is still open and was left untouched by "
+    "this clear — close or merge it separately if needed.\n"
+)
+
+# `Done` is terminal for the same reason `canceled` is: the issue will never
+# re-enter a polled active lane, so nothing else can ever clear its parked wait
+# (SYM-231). Hand-finishing an issue — merging its PR outside Symphony, or just
+# dragging the card to Done — is routine, and each time it used to leave a wait
+# plus a `running`/`needs_approval` run behind, showing the issue as active for
+# good.
+_DONE_CLEAR_BODY = (
+    "🧹 **Auto-cleared — issue done**\n\n"
+    "This issue is Done in the tracker, so Symphony cleared its parked operator "
+    "wait and retired the leftover run state. The dashboard lane empties on its "
+    "own; no action needed.\n"
+)
+
+_DONE_CLEAR_BODY_PR_OPEN = (
+    "🧹 **Auto-cleared — issue done**\n\n"
+    "This issue is Done in the tracker, so Symphony cleared its parked operator "
+    "wait and retired the leftover run state. A linked pull request is still "
+    "open and was left untouched by this clear — close or merge it separately "
+    "if needed.\n"
+)
+
+# Used instead of _DONE_CLEAR_BODY(_PR_OPEN) when there was no wait row to
+# delete (SYM-114's shape, or just a Done issue with an old `failed` run in
+# history) — no wait was cleared, so the comment must not claim one was.
+_DONE_CLEAR_BODY_NO_WAIT = (
+    "🧹 **Auto-cleared — issue done**\n\n"
+    "This issue is Done in the tracker, so Symphony retired its leftover run "
+    "state. The dashboard lane empties on its own; no action needed.\n"
+)
+
+_DONE_CLEAR_BODY_NO_WAIT_PR_OPEN = (
+    "🧹 **Auto-cleared — issue done**\n\n"
+    "This issue is Done in the tracker, so Symphony retired its leftover run "
+    "state. A linked pull request is still open and was left untouched by "
+    "this clear — close or merge it separately if needed.\n"
 )
 
 ACTION_OBSERVED = "observed"
@@ -236,15 +292,58 @@ def _parse_rfc3339(s: str) -> datetime:
     return datetime.fromisoformat(s)
 
 
+def _wait_generation_eligible(
+    wait: db.operator_waits.OperatorWait | None, started_at_max: str | None
+) -> bool:
+    """Does `wait` belong to the generation that went terminal (or is there no wait)?
+
+    A wait created after `started_at_max` belongs to a later cycle (e.g. a
+    fresh merge park the issue re-entered post-Done) and must survive
+    together with the run it is parked on (SYM-231 review).
+    """
+    return wait is None or started_at_max is None or (
+        _parse_rfc3339(wait.created_at) <= _parse_rfc3339(started_at_max)
+    )
+
+
+def _run_is_retirable(
+    run: db.runs.Run, *, started_at_max: str | None, has_open_prs: bool = False
+) -> bool:
+    """Would `_supersede_finished_issue_runs` actually touch this run?
+
+    A `failed`/`interrupted`/`needs_approval` row is always residue. A pidless
+    `running` row only counts for the `review` stage — merge/review_fix/
+    acceptance stages create pidless `running` rows for genuinely in-process
+    work (see `poll/_merge.py`, `poll/_base.py`, `poll/_acceptance.py`), so
+    widening this to any stage would retire live work, not residue. A pidless
+    `review` row with an open PR is the resurrected review-monitor's own row —
+    that path owns it and will keep rewriting it, so touching it here would
+    recreate the very residue this sweep exists to remove.
+    """
+    if started_at_max is not None and _parse_rfc3339(run.started_at) > _parse_rfc3339(
+        started_at_max
+    ):
+        return False
+    if run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
+        return True
+    return (
+        run.status in db.runs.LIVE_STATUSES
+        and run.pid is None
+        and run.stage == "review"
+        and not has_open_prs
+    )
+
+
 def classify_linear_drift(
     *,
-    has_operator_wait: bool,
     state_name: str | None,
     done_state_names: set[str],
     state_type: str | None = None,
 ) -> str | None:
-    if not has_operator_wait:
-        return None
+    """A terminal tracker state is drift regardless of whether an operator wait
+    is parked on the issue — SYM-114's shape (wait already cleared, several
+    `needs_approval` runs left behind) only has a matching `issue_prs` row, no
+    wait, and still needs its bookkeeping retired once the issue goes Done."""
     if state_type == _CANCELED_STATE_TYPE:
         return DRIFT_LINEAR_CANCELED
     if state_name is not None and state_name in done_state_names:
@@ -450,7 +549,6 @@ class Reconciler:
                 tracker_ctx,
             )
             linear_drift = classify_linear_drift(
-                has_operator_wait=wait is not None,
                 state_name=linear_issue.state_name if linear_issue is not None else None,
                 state_type=linear_issue.state_type if linear_issue is not None else None,
                 done_state_names=done_state_names,
@@ -458,35 +556,75 @@ class Reconciler:
             linear_is_canceled = (
                 linear_issue is not None and linear_issue.state_type == _CANCELED_STATE_TYPE
             )
-            cancel_wait_eligible = (
-                active
-                and linear_drift == DRIFT_LINEAR_CANCELED
-                and wait is not None
-                and any(binding.reconcile_enabled for binding in self._wait_matched_bindings(wait))
+            # `linear_issue.updated_at` is the tracker's own state-change
+            # timestamp, so it bounds the run sweep to the generation that went
+            # terminal — a run started after the transition belongs to a new
+            # cycle (SYM-231).
+            terminal_started_at_max = (
+                linear_issue.updated_at
+                if linear_issue is not None and linear_issue.updated_at
+                else None
             )
-            # Only swallow a GitHub backoff for the cancel clear when it can actually
+            # A terminal tracker state stays a reconcile candidate forever (an
+            # unmerged `issue_prs` row, a closed-unmerged PR with no merge-like
+            # wait, a `pr.error` observation) — without checking that clearing
+            # would actually change something, this fires every tick even after
+            # the wait is gone and every run is already retired (SYM-231).
+            #
+            # A wait created after `terminal_started_at_max` belongs to a later
+            # cycle and `_apply_linear_terminal_clear` refuses to delete it,
+            # returning `False` outright regardless of any older retirable run
+            # (SYM-231 review) — mirror that hard precondition here, or this
+            # spends a budget slot and posts a comment every tick for a clear
+            # that never actually happens.
+            if wait is not None and not _wait_generation_eligible(wait, terminal_started_at_max):
+                terminal_would_clear = False
+            else:
+                terminal_would_clear = linear_drift in _TERMINAL_LINEAR_DRIFTS and (
+                    wait is not None
+                    or await self._has_retirable_runs(
+                        issue_id, started_at_max=terminal_started_at_max
+                    )
+                )
+            # A wait's own binding can opt out of reconcile even though some other
+            # binding matched via a PR row got us this far (see the `active
+            # and linear_drift == DRIFT_LINEAR_STATE_DONE` branch below); with no
+            # wait at all there is nothing to opt out, so SYM-114's shape (wait
+            # already cleared, `needs_approval` runs left over) is eligible on the
+            # terminal drift alone.
+            terminal_wait_eligible = (
+                active
+                and terminal_would_clear
+                and (
+                    wait is None
+                    or any(
+                        binding.reconcile_enabled for binding in self._wait_matched_bindings(wait)
+                    )
+                )
+            )
+            # Only swallow a GitHub backoff for the terminal clear when it can actually
             # run this tick — if the shared action budget is already spent, the clear
             # is deferred anyway, so re-raising here (instead of masking the error)
             # lets `tick()` enter backoff instead of hammering a rate-limited GitHub.
-            cancel_clearing = cancel_wait_eligible and (
+            terminal_clearing = terminal_wait_eligible and (
                 action_budget_remaining is None or action_budget_remaining > 0
             )
             try:
                 github_prs, github_payload = await self._github_payload(prs)
             except _BackoffRequested:
-                if not cancel_clearing:
+                if not terminal_clearing:
                     raise
-                # The Linear cancellation is already confirmed — don't let a
+                # The terminal tracker state is already confirmed — don't let a
                 # transient GitHub 429/5xx gate clearing the parked wait. Treat
                 # GitHub as unobserved this tick; any ride-along PR cleanup
                 # happens on a later tick once GitHub recovers.
                 github_prs, github_payload = [], {"error": "github unavailable; deferred"}
-            # Canceled always wins over orphan-PR adoption (see below), so skip the
-            # GitHub head-branch probe entirely rather than spend the call only to
-            # discard its result.
+            # A terminal tracker state always wins over orphan-PR adoption (see
+            # below), so skip the GitHub head-branch probe entirely rather than
+            # spend the call only to discard its result.
             orphans = (
                 []
-                if linear_drift == DRIFT_LINEAR_CANCELED
+                if linear_drift in _TERMINAL_LINEAR_DRIFTS
                 else await self._orphan_open_prs(
                     issue_row=issue_row,
                     wait=wait,
@@ -521,20 +659,25 @@ class Reconciler:
         remaining = action_budget_remaining
         actions_taken = 0
         actions_deferred = 0
-        post_cancel_comment = False
+        post_terminal_comment = False
+        terminal_wait_cleared = False
 
         linear_action = _passive_action_for(linear_drift)
-        if active and linear_drift == DRIFT_LINEAR_STATE_DONE:
+        if terminal_wait_eligible:
             if remaining is None or remaining > 0:
-                linear_action = ACTION_NOTED
+                linear_action = ACTION_CLEARED
                 actions_taken += 1
                 if remaining is not None:
                     remaining -= 1
             else:
                 actions_deferred += 1
-        elif cancel_wait_eligible:
+        elif active and linear_drift == DRIFT_LINEAR_STATE_DONE and wait is not None:
+            # The wait's own binding opted out of reconcile, so we may not touch
+            # its rows — record the external completion in the timeline only.
+            # (`wait is not None` excludes the "nothing left to retire" case,
+            # which must stay silent rather than re-noting every tick.)
             if remaining is None or remaining > 0:
-                linear_action = ACTION_CLEARED
+                linear_action = ACTION_NOTED
                 actions_taken += 1
                 if remaining is not None:
                     remaining -= 1
@@ -556,9 +699,9 @@ class Reconciler:
             else:
                 actions_deferred += 1
         elif active and github_clearable and linear_action == ACTION_CLEARED:
-            # Same wait, same cancel event: the PR cleanup rides along with the
-            # cancel-clear's budget slot instead of needing its own. Otherwise a
-            # cancel-clear that spends the tick's last slot would delete the wait
+            # Same wait, same terminal event: the PR cleanup rides along with the
+            # terminal clear's budget slot instead of needing its own. Otherwise a
+            # terminal clear that spends the tick's last slot would delete the wait
             # here and strand the closed/merged PR row forever — `_github_clearable`
             # requires the wait to still exist, and it won't on the next tick.
             github_action = ACTION_CLEARED
@@ -611,22 +754,25 @@ class Reconciler:
                 )
             if (
                 linear_action == ACTION_CLEARED
-                and linear_drift == DRIFT_LINEAR_CANCELED
+                and linear_drift in _TERMINAL_LINEAR_DRIFTS
                 and linear_issue is not None
             ):
-                await self._apply_linear_canceled_clear(
+                terminal_wait_cleared = await self._apply_linear_terminal_clear(
                     issue_id=issue_id,
                     wait=wait,
+                    drift_kind=linear_drift,
                     state_name=linear_issue.state_name,
                     ts=observed_at,
+                    started_at_max=terminal_started_at_max,
                 )
-                post_cancel_comment = True
+                post_terminal_comment = True
             if github_action == ACTION_CLEARED:
                 await self._apply_github_clear(
                     issue_id=issue_id,
                     wait=wait,
                     drift_kind=github_drift,
                     github_prs=drift_prs,
+                    ts=observed_at,
                 )
             elif github_action == ACTION_ADOPTED:
                 post_commit_review_request = await self._adopt_orphan_prs(
@@ -659,17 +805,21 @@ class Reconciler:
                     e,
                 )
 
-        if post_cancel_comment:
+        if post_terminal_comment:
             # `github_action == ACTION_CLEARED` only proves the single drifted PR
             # the tick handled got cleared — with multiple linked PR rows, another
             # one can still be open. Re-check the actual remaining rows rather than
             # inferring "none open" from that one action.
             pr_remains_open = bool(await self._open_prs(issue_id))
-            body = _CANCELED_CLEAR_BODY_PR_OPEN if pr_remains_open else _CANCELED_CLEAR_BODY
+            body = _terminal_clear_body(
+                drift_kind=linear_drift,
+                pr_remains_open=pr_remains_open,
+                wait_cleared=terminal_wait_cleared,
+            )
             try:
                 await self.tracker(tracker_ctx).post_comment(tracker_issue_id, body)
             except LinearError as e:
-                log.warning("could not post canceled auto-clear comment on %s: %s", issue_id, e)
+                log.warning("could not post terminal auto-clear comment on %s: %s", issue_id, e)
 
         return _ReconcileIssueResult(
             observations=2,
@@ -1294,67 +1444,141 @@ class Reconciler:
             ts=ts,
         )
 
-    async def _apply_linear_canceled_clear(
+    async def _apply_linear_terminal_clear(
         self,
         *,
         issue_id: str,
         wait: db.operator_waits.OperatorWait | None,
+        drift_kind: str,
         state_name: str,
         ts: str,
-    ) -> None:
-        """Clear a parked wait for an issue that is canceled in the tracker.
+        started_at_max: str | None,
+    ) -> bool:
+        """Clear a parked wait (if any) for an issue the tracker says is finished.
 
-        Deletes the operator wait (which records its own removal transition),
-        supersedes every terminal-non-success run for the issue — not just the
-        one the wait was parked on — so an earlier failed attempt (e.g. a
-        failed retry that failed again) does not re-surface in the "Needs
-        attention" lane once the wait is gone, and notes the external
-        cancellation for the audit timeline. All writes stay in the caller's
-        transaction (``commit=False``) so a later failure rolls the whole clear
-        back.
+        Terminal means canceled *or* done (SYM-231): either way the issue never
+        re-enters a polled lane, so nothing else will ever retire its rows. SYM-114's
+        shape (wait already gone, several `needs_approval` runs left behind) reaches
+        this with `wait is None` — there is nothing to delete, but the runs still
+        need retiring. When a wait exists, deletes it (which records its own removal
+        transition); either way retires every leftover run for the issue — not just
+        the one the wait was parked on — so an earlier failed attempt (e.g. a failed
+        retry that failed again) does not re-surface in the "Needs attention" lane,
+        and notes the external state change for the audit timeline. All writes stay
+        in the caller's transaction (``commit=False``) so a later failure rolls the
+        whole clear back.
+
+        `started_at_max` (the tracker's `updated_at` at the terminal transition)
+        bounds the run sweep to the generation that finished — a run started
+        after the issue went terminal belongs to a new cycle and must survive.
+        A wait created after that same bound belongs to that same later cycle
+        (e.g. a fresh merge park the issue re-entered post-Done) — deleting it
+        while its run survives the bounded sweep would strand the run at
+        `needs_approval` with nothing left to clear it (SYM-231 review), so the
+        wait and its run are only ever retired together.
+
+        Returns whether a wait row actually existed to delete, so the caller
+        can pick a comment that only mentions the wait when one was cleared.
         """
-        if wait is None:
-            raise RuntimeError("cannot clear canceled drift without an operator wait")
-        await db.operator_waits.delete(
-            self._conn,
-            issue_id,
-            wait.run_id,
-            commit=False,
+        canceled = drift_kind == DRIFT_LINEAR_CANCELED
+        wait_eligible = _wait_generation_eligible(wait, started_at_max)
+        if wait is not None and not wait_eligible:
+            return False
+        wait_cleared = wait is not None
+        if wait is not None:
+            await db.operator_waits.delete(
+                self._conn,
+                issue_id,
+                wait.run_id,
+                commit=False,
+            )
+        await self._supersede_finished_issue_runs(
+            issue_id=issue_id,
+            ts=ts,
+            kind="tracker_canceled" if canceled else "tracker_done",
+            detail=(
+                "Tracker issue canceled; superseding parked run"
+                if canceled
+                else "Tracker issue done; superseding parked run"
+            ),
+            started_at_max=started_at_max,
         )
-        await self._supersede_canceled_runs(issue_id=issue_id, ts=ts)
         await self._note_external_state_change(
             issue_id=issue_id,
             source=SOURCE_LINEAR,
             state_name=state_name,
             ts=ts,
         )
+        return wait_cleared
 
-    async def _supersede_canceled_runs(self, *, issue_id: str, ts: str) -> None:
+    async def _has_retirable_runs(self, issue_id: str, *, started_at_max: str | None) -> bool:
+        history = await db.runs.history_for_issue(self._conn, issue_id)
+        has_open_prs = bool(await self._open_prs(issue_id))
+        return any(
+            _run_is_retirable(run, started_at_max=started_at_max, has_open_prs=has_open_prs)
+            for run in history
+        )
+
+    async def _supersede_finished_issue_runs(
+        self,
+        *,
+        issue_id: str,
+        ts: str,
+        kind: str,
+        detail: str,
+        started_at_max: str | None = None,
+    ) -> None:
+        """Retire the leftover runs of an issue that is finished.
+
+        `started_at_max` bounds the sweep to runs of the generation that got
+        finished (used by the merged-PR path and the tracker-terminal path:
+        anything started after the merge/state-change belongs to a later cycle
+        and is left alone).
+        """
+        history = await db.runs.history_for_issue(self._conn, issue_id)
+        has_open_prs = bool(await self._open_prs(issue_id))
+        for run in history:
+            if not _run_is_retirable(
+                run, started_at_max=started_at_max, has_open_prs=has_open_prs
+            ):
+                continue
+            await self._supersede_run(run, ts=ts, kind=kind, detail=detail)
+
+    async def _supersede_run(
+        self, run: db.runs.Run, *, ts: str, kind: str, detail: str
+    ) -> None:
+        if run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES and run.ended_at is not None:
+            # Already terminal with its own recorded reason (e.g. SYM-218's
+            # auth-failure attribution) — flip status only. `update_status`
+            # would overwrite that genuine `termination_kind`/`detail` with
+            # this sweep's generic tracker_done/tracker_canceled/pr_merged
+            # reason even though nothing new actually happened to the run.
+            await db.runs.supersede_preserving_termination(self._conn, run.id, commit=False)
+            return
+        await db.runs.update_status(
+            self._conn,
+            run.id,
+            db.runs.SUPERSEDED_STATUS,
+            # Reached only for rows with no ended_at yet (e.g. a parked
+            # `needs_approval` merge run) — stamp `ts` as the end time.
+            ended_at=None if run.ended_at is not None else ts,
+            kind=kind,
+            detail=detail,
+            commit=False,
+        )
+
+    async def _retire_wait_run(
+        self, *, issue_id: str, run_id: str, ts: str, kind: str, detail: str
+    ) -> None:
+        """Retire the specific run a just-deleted wait was parked on, with no
+        `started_at_max` bound and regardless of any other guard — once its
+        wait is gone, nothing else will ever retire it."""
         history = await db.runs.history_for_issue(self._conn, issue_id)
         for run in history:
-            if run.status in db.runs.TERMINAL_NON_SUCCESS_STATUSES:
-                target_status = db.runs.SUPERSEDED_STATUS
-            elif run.stage == "review" and run.status in db.runs.LIVE_STATUSES:
-                # A review monitor left "running" while a deliver_failed wait
-                # suppressed its polling would otherwise sit live until the next
-                # unrelated review-poll tick notices the wait is gone — retire
-                # it here so the cancel-clear leaves a consistent audit trail
-                # immediately instead of depending on that side effect. Use
-                # SUPERSEDED_STATUS (not "completed") so the kind/detail below
-                # actually persist instead of being cleared by the
-                # SUCCESS_STATUSES path in `update_status`.
-                target_status = db.runs.SUPERSEDED_STATUS
-            else:
+            if run.id != run_id or not _run_is_retirable(run, started_at_max=None):
                 continue
-            await db.runs.update_status(
-                self._conn,
-                run.id,
-                target_status,
-                ended_at=ts,
-                kind="tracker_canceled",
-                detail="Tracker issue canceled; superseding parked run",
-                commit=False,
-            )
+            await self._supersede_run(run, ts=ts, kind=kind, detail=detail)
+            return
 
     async def _apply_github_clear(
         self,
@@ -1363,6 +1587,7 @@ class Reconciler:
         wait: db.operator_waits.OperatorWait | None,
         drift_kind: str | None,
         github_prs: list[GithubPrObservation],
+        ts: str,
     ) -> None:
         if drift_kind == DRIFT_PR_CLOSED_NO_MERGE:
             closed_prs = _closed_unmerged_prs(github_prs)
@@ -1395,6 +1620,7 @@ class Reconciler:
         if not merged_prs:
             raise RuntimeError("cannot clear merged PR drift without github.mergedAt")
 
+        wait_cleared = False
         if drift_kind == DRIFT_MERGE_ZOMBIE:
             if wait is None:
                 raise RuntimeError("cannot clear merge zombie without an operator wait")
@@ -1404,9 +1630,25 @@ class Reconciler:
                 wait.run_id,
                 commit=False,
             )
+            wait_cleared = True
+            # The run this wait was parked on must retire alongside it
+            # regardless of `merged_at`: Symphony can park a merge wait after
+            # the PR was already merged externally (it dispatched its own
+            # merge attempt before observing the hand-merge), so the run can
+            # start *after* `merged_at` and fall outside the bounded sweep
+            # below — once the wait is gone, nothing else will ever retire it
+            # (SYM-231 review).
+            await self._retire_wait_run(
+                issue_id=issue_id,
+                run_id=wait.run_id,
+                ts=ts,
+                kind="pr_merged",
+                detail="PR merged outside Symphony; superseding parked run",
+            )
         elif drift_kind != DRIFT_PR_LOCALLY_MERGED:
             raise RuntimeError(f"unsupported github drift clear: {drift_kind}")
 
+        merged_at = max(pr.merged_at for pr in merged_prs if pr.merged_at is not None)
         for pr in merged_prs:
             if pr.merged_at is None:
                 continue
@@ -1422,6 +1664,68 @@ class Reconciler:
                 raise RuntimeError(
                     f"could not update merged_at for {pr.github_repo}#{pr.pr_number}"
                 )
+        await self._retire_merged_issue_bookkeeping(
+            issue_id=issue_id,
+            wait=None if wait_cleared else wait,
+            merged_prs=merged_prs,
+            merged_at=merged_at,
+            ts=ts,
+        )
+
+    async def _retire_merged_issue_bookkeeping(
+        self,
+        *,
+        issue_id: str,
+        wait: db.operator_waits.OperatorWait | None,
+        merged_prs: list[GithubPrObservation],
+        merged_at: str,
+        ts: str,
+    ) -> None:
+        """Retire the bookkeeping of an issue whose PR was merged out-of-band.
+
+        A hand-merged PR finishes the issue without Symphony's merge path ever
+        running, so nothing retires the wait and the parked/live runs it left —
+        the issue shows as active forever (SYM-231). Guards keep this off live
+        state: another still-open PR row means work is in flight; only runs/
+        waits from the merged generation are retired (anything created after
+        the merge belongs to a later cycle); the wait's own binding must not
+        have opted out of reconcile — mirroring the terminal-clear path, a
+        sibling repo's PR merging must not delete a wait bound to a
+        `reconcile_enabled=False` repo that has no PR row of its own to trip the
+        open-PR guard above; and on a multi-binding issue, the merged PR must
+        belong to the *wait's own* repo — otherwise repo B's merge would delete
+        repo A's wait (and supersede repo A's runs) even though repo A's PR is
+        untouched.
+        """
+        if await self._open_prs(issue_id):
+            return
+        merged_ts = _parse_rfc3339(merged_at)
+        wait_eligible = (
+            wait is not None
+            and _parse_rfc3339(wait.created_at) <= merged_ts
+            and any(binding.reconcile_enabled for binding in self._wait_matched_bindings(wait))
+            and any(pr.github_repo.casefold() == wait.github_repo.casefold() for pr in merged_prs)
+        )
+        if wait_eligible:
+            assert wait is not None
+            await db.operator_waits.delete(
+                self._conn,
+                issue_id,
+                wait.run_id,
+                commit=False,
+            )
+        elif wait is not None:
+            # The wait survives (opted-out binding or a later generation) — it
+            # is still parked on wait.run_id, so retiring the issue's runs here
+            # would supersede the very run the surviving wait depends on.
+            return
+        await self._supersede_finished_issue_runs(
+            issue_id=issue_id,
+            ts=ts,
+            kind="pr_merged",
+            detail="PR merged outside Symphony; superseding parked run",
+            started_at_max=merged_at,
+        )
 
 
 def _optional_str(value: object) -> str | None:
@@ -1456,6 +1760,20 @@ def _binding_storage_key(binding: RepoBinding) -> str:
         ),
         separators=(",", ":"),
     )
+
+
+def _terminal_clear_body(
+    *, drift_kind: str | None, pr_remains_open: bool, wait_cleared: bool
+) -> str:
+    if drift_kind == DRIFT_LINEAR_CANCELED:
+        if wait_cleared:
+            return _CANCELED_CLEAR_BODY_PR_OPEN if pr_remains_open else _CANCELED_CLEAR_BODY
+        if pr_remains_open:
+            return _CANCELED_CLEAR_BODY_NO_WAIT_PR_OPEN
+        return _CANCELED_CLEAR_BODY_NO_WAIT
+    if wait_cleared:
+        return _DONE_CLEAR_BODY_PR_OPEN if pr_remains_open else _DONE_CLEAR_BODY
+    return _DONE_CLEAR_BODY_NO_WAIT_PR_OPEN if pr_remains_open else _DONE_CLEAR_BODY_NO_WAIT
 
 
 def _passive_action_for(drift_kind: str | None) -> str:
