@@ -909,3 +909,103 @@ async def test_reconcile_no_live_runs_is_a_noop(tmp_path: Path) -> None:
         linear.post_comment.assert_not_awaited()
     finally:
         await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_reconcile_retires_stale_runs_for_merged_pr(tmp_path: Path) -> None:
+    """SYM-231 startup sweep: an issue whose PR is merged (typically by hand,
+    outside Symphony) must not keep runs at `running`/`needs_approval` — those
+    show the finished issue as active forever. Pre-fix residue self-heals on the
+    next boot instead of needing a manual SQL pass."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    merged_at = "2026-05-10T11:00:00+00:00"
+    try:
+        for issue_id, identifier in (
+            ("iss-merged", "ENG-20"),
+            ("iss-open", "ENG-21"),
+            ("iss-live", "ENG-22"),
+        ):
+            await db.issues.upsert(
+                conn, id=issue_id, identifier=identifier, title="t", team_key="ENG"
+            )
+
+        async def _seed_pr(issue_id: str, repo: str, pr_number: int, merged: str | None) -> None:
+            await db.issue_prs.upsert(
+                conn,
+                issue_id=issue_id,
+                github_repo=repo,
+                pr_number=pr_number,
+                pr_url=f"https://github.com/{repo}/pull/{pr_number}",
+                created_at="2026-05-10T00:00:00+00:00",
+            )
+            if merged is not None:
+                assert await db.issue_prs.update_merged(
+                    conn,
+                    issue_id=issue_id,
+                    github_repo=repo,
+                    pr_number=pr_number,
+                    merged_at=merged,
+                )
+
+        # Residue: parked merge run + orphaned pidless review monitor, both from
+        # before the merge.
+        await _seed_pr("iss-merged", "org/repo", 42, merged_at)
+        await db.runs.create(
+            conn,
+            id="stale-merge",
+            issue_id="iss-merged",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T10:00:00+00:00",
+        )
+        # Post-merge run: a later generation, not residue of the merged PR.
+        await db.runs.create(
+            conn,
+            id="post-merge",
+            issue_id="iss-merged",
+            stage="implement",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T12:00:00+00:00",
+        )
+        # Another PR still open for the issue: work is in flight, leave it alone.
+        await _seed_pr("iss-open", "org/repo", 43, merged_at)
+        await _seed_pr("iss-open", "org/other", 44, None)
+        await db.runs.create(
+            conn,
+            id="open-pr-merge",
+            issue_id="iss-open",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-10T10:00:00+00:00",
+        )
+        # Live process on a merged issue: not bookkeeping residue, don't touch.
+        await _seed_pr("iss-live", "org/repo", 45, merged_at)
+        await db.runs.create(
+            conn,
+            id="live-run",
+            issue_id="iss-live",
+            stage="implement",
+            status="running",
+            pid=os.getpid(),
+            started_at="2026-05-10T10:00:00+00:00",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        assert await reconcile(conn, linear) == 1
+
+        runs = {}
+        for issue_id in ("iss-merged", "iss-open", "iss-live"):
+            for run in await db.runs.history_for_issue(conn, issue_id):
+                runs[run.id] = (run.status, run.termination_kind)
+    finally:
+        await conn.close()
+
+    assert runs["stale-merge"] == (db.runs.SUPERSEDED_STATUS, "pr_merged")
+    assert runs["post-merge"][0] == "needs_approval"
+    assert runs["open-pr-merge"][0] == "needs_approval"
+    assert runs["live-run"][0] == "running"

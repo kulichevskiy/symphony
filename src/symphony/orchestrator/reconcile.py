@@ -415,7 +415,46 @@ async def reconcile(
         flipped += 1
 
     flipped += await _collapse_duplicate_live_runs(conn, now, terminate_pid)
+    flipped += await _retire_runs_for_merged_prs(conn, now, pid_alive)
     return flipped
+
+
+async def _retire_runs_for_merged_prs(
+    conn: aiosqlite.Connection,
+    now: str,
+    pid_alive: Callable[[int], bool],
+) -> int:
+    """Retire runs left at `running`/`needs_approval` on an already-merged PR.
+
+    The issue is finished — the PR was merged, usually by hand outside Symphony,
+    so the merge path that would have closed these rows never ran and the board
+    shows the issue as active forever (SYM-231). Sweeping at startup means
+    residue that predates the fix self-heals instead of needing a manual SQL
+    pass. Runs whose process is still alive are left alone; they are live work,
+    not bookkeeping. No tracker comment: this is silent residue cleanup, and the
+    issue is already Done.
+    """
+    retired = 0
+    for run in await db.runs.list_unretired_for_merged_prs(conn):
+        if run.pid is not None and pid_alive(run.pid):
+            continue
+        log.info(
+            "reconcile: run=%s issue=%s stage=%s is %s on a merged PR — retiring",
+            run.id,
+            run.issue_id,
+            run.stage,
+            run.status,
+        )
+        await db.runs.update_status(
+            conn,
+            run.id,
+            db.runs.SUPERSEDED_STATUS,
+            ended_at=now,
+            kind="pr_merged",
+            detail="PR merged outside Symphony; superseding parked run",
+        )
+        retired += 1
+    return retired
 
 
 async def _collapse_duplicate_live_runs(
