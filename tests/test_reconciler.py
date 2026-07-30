@@ -981,11 +981,13 @@ async def test_external_merge_leaves_opted_out_sibling_wait_alone(
         assert await reconciler.tick() == 2
         wait = await db.operator_waits.get(conn, "iss-1")
         merged = await _merged_at(conn, github_repo="org/other")
+        runs = {run.id: run.status for run in await db.runs.history_for_issue(conn, "iss-1")}
     finally:
         await conn.close()
 
     assert merged == merged_at
     assert wait is not None
+    assert runs["run-iss-1"] == "failed"
 
 
 @pytest.mark.asyncio
@@ -1325,6 +1327,8 @@ async def test_active_linear_done_retires_needs_approval_runs_with_no_wait(
 
     assert wait is None
     assert runs["run-iss-1-merge"] == (db.runs.SUPERSEDED_STATUS, "tracker_done")
+    assert len(fake.comments) == 1
+    assert "operator wait" not in fake.comments[0][1]
 
 
 @pytest.mark.asyncio

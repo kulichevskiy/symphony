@@ -337,9 +337,25 @@ async def reconcile(
     """
     bindings = bindings or ()
     tracker_for_context = _tracker_resolver(tracker_or_resolver)
-    rows = await db.runs.list_live_with_pid(conn)
     flipped = 0
     now = (clock() if clock is not None else datetime.now(UTC)).isoformat()  # noqa: clock
+
+    # Runs on an already-merged PR before the dead-pid sweep below, so a
+    # `running` row whose pid died on an issue whose PR merged out-of-band is
+    # superseded here instead of falling into the dead-pid loop and flipping
+    # to interrupted/orphaned first — after which `list_unretired_for_merged_prs`
+    # (which only selects running/needs_approval) can no longer see it (SYM-231).
+    # `_retire_runs_for_merged_prs` already skips runs whose pid is alive, so
+    # running it first does not touch live work.
+    flipped += await _retire_runs_for_merged_prs(conn, now, pid_alive, bindings)
+    # A wait can outlive every run it was ever paired with (e.g. an
+    # `implement_failed` wait parked on a run that is already `failed`, not
+    # `running`/`needs_approval`) — `_retire_runs_for_merged_prs` above only
+    # reaches a wait alongside a run it retires, so this residue needs its own
+    # sweep independent of run status (SYM-231 acceptance criterion 3).
+    flipped += await _retire_stale_waits_for_merged_prs(conn, bindings)
+
+    rows = await db.runs.list_live_with_pid(conn)
     for run in rows:
         if run.pid is None or pid_alive(run.pid):
             continue
@@ -359,18 +375,6 @@ async def reconcile(
         )
         await _post_reconcile_comment(conn, tracker_for_context, run.issue_id)
         flipped += 1
-
-    # Runs on an already-merged PR before the pidless-review sweep below, so a
-    # pidless review monitor whose PR merged out-of-band is superseded here
-    # instead of falling into `_preserve_pidless_review_retry_path` and minting
-    # a fresh operator wait that nothing will ever retire (SYM-231).
-    flipped += await _retire_runs_for_merged_prs(conn, now, pid_alive)
-    # A wait can outlive every run it was ever paired with (e.g. an
-    # `implement_failed` wait parked on a run that is already `failed`, not
-    # `running`/`needs_approval`) — `_retire_runs_for_merged_prs` above only
-    # reaches a wait alongside a run it retires, so this residue needs its own
-    # sweep independent of run status (SYM-231 acceptance criterion 3).
-    flipped += await _retire_stale_waits_for_merged_prs(conn)
 
     for run in await db.runs.list_live_review_without_pid(conn):
         log.info(
@@ -437,10 +441,30 @@ async def reconcile(
     return flipped
 
 
+def _wait_reconcile_opted_out(
+    bindings: Sequence[RepoBinding], wait: db.operator_waits.OperatorWait
+) -> bool:
+    """True when a binding matching the wait's key (mirroring `reconciler.py`'s
+    `_wait_matched_bindings`) exists and every match has opted out of reconcile.
+    A wait matching no configured binding at all is *not* treated as opted
+    out — without binding info there is nothing to opt out of."""
+    matched = [
+        binding
+        for binding in bindings
+        if binding.linear_team_key == wait.linear_team_key
+        and binding.github_repo == wait.github_repo
+        and (binding.issue_label or "") == wait.issue_label
+        and binding.tracker_provider == wait.tracker_provider
+        and binding.tracker_site == wait.tracker_site
+    ]
+    return bool(matched) and not any(binding.reconcile_enabled for binding in matched)
+
+
 async def _retire_runs_for_merged_prs(
     conn: aiosqlite.Connection,
     now: str,
     pid_alive: Callable[[int], bool],
+    bindings: Sequence[RepoBinding],
 ) -> int:
     """Retire runs left at `running`/`needs_approval` on an already-merged PR.
 
@@ -457,11 +481,24 @@ async def _retire_runs_for_merged_prs(
     though every run is superseded. Only a wait from the merged generation is
     removed (`created_at <= merged_at`, mirroring the live-tick equivalent in
     `reconciler.py`); a wait created after the merge belongs to a later cycle.
+
+    An issue whose parked wait opted out of reconcile (its own binding has
+    `reconcile_enabled=False`) is left alone entirely — both the wait and its
+    runs — mirroring `reconciler.py`'s `_retire_merged_issue_bookkeeping`.
     """
     retired = 0
     cleared_wait_issues: set[str] = set()
+    disabled_issues: set[str] = set()
+    checked_issues: set[str] = set()
     for run in await db.runs.list_unretired_for_merged_prs(conn):
         if run.pid is not None and pid_alive(run.pid):
+            continue
+        if run.issue_id not in checked_issues:
+            checked_issues.add(run.issue_id)
+            wait = await db.operator_waits.get(conn, run.issue_id)
+            if wait is not None and _wait_reconcile_opted_out(bindings, wait):
+                disabled_issues.add(run.issue_id)
+        if run.issue_id in disabled_issues:
             continue
         log.info(
             "reconcile: run=%s issue=%s stage=%s is %s on a merged PR — retiring",
@@ -474,18 +511,25 @@ async def _retire_runs_for_merged_prs(
             conn,
             run.id,
             db.runs.SUPERSEDED_STATUS,
-            ended_at=now,
+            # A run that already ended (e.g. a `needs_approval` merge run parked
+            # with its genuine end timestamp) keeps it — `update_status`'s
+            # COALESCE would otherwise overwrite real duration/attribution audit
+            # data with the reconcile time, mirroring reconciler.py's
+            # `_supersede_finished_issue_runs`.
+            ended_at=None if run.ended_at is not None else now,
             kind="pr_merged",
             detail="PR merged outside Symphony; superseding parked run",
         )
         retired += 1
         if run.issue_id not in cleared_wait_issues:
             cleared_wait_issues.add(run.issue_id)
-            await _clear_stale_merged_wait(conn, issue_id=run.issue_id)
+            await _clear_stale_merged_wait(conn, issue_id=run.issue_id, bindings=bindings)
     return retired
 
 
-async def _retire_stale_waits_for_merged_prs(conn: aiosqlite.Connection) -> int:
+async def _retire_stale_waits_for_merged_prs(
+    conn: aiosqlite.Connection, bindings: Sequence[RepoBinding]
+) -> int:
     """Clear every operator wait left behind on an issue whose PR is merged.
 
     `_retire_runs_for_merged_prs` only clears a wait alongside a run it just
@@ -498,12 +542,14 @@ async def _retire_stale_waits_for_merged_prs(conn: aiosqlite.Connection) -> int:
     """
     cleared = 0
     for wait in await db.operator_waits.list_all(conn):
-        if await _clear_stale_merged_wait(conn, issue_id=wait.issue_id):
+        if await _clear_stale_merged_wait(conn, issue_id=wait.issue_id, bindings=bindings):
             cleared += 1
     return cleared
 
 
-async def _clear_stale_merged_wait(conn: aiosqlite.Connection, *, issue_id: str) -> bool:
+async def _clear_stale_merged_wait(
+    conn: aiosqlite.Connection, *, issue_id: str, bindings: Sequence[RepoBinding]
+) -> bool:
     wait = await db.operator_waits.get(conn, issue_id)
     if wait is None:
         return False
@@ -511,6 +557,8 @@ async def _clear_stale_merged_wait(conn: aiosqlite.Connection, *, issue_id: str)
     if merged_pr is None or merged_pr.merged_at is None:
         return False
     if _parse_rfc3339(wait.created_at) > _parse_rfc3339(merged_pr.merged_at):
+        return False
+    if _wait_reconcile_opted_out(bindings, wait):
         return False
     log.info(
         "reconcile: issue=%s operator wait %r predates its merged PR — clearing",

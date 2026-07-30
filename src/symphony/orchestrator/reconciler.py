@@ -89,6 +89,21 @@ _CANCELED_CLEAR_BODY_PR_OPEN = (
     "separately if needed.\n"
 )
 
+# Used instead of _CANCELED_CLEAR_BODY(_PR_OPEN) when there was no wait row to
+# delete — no wait was cleared, so the comment must not claim one was.
+_CANCELED_CLEAR_BODY_NO_WAIT = (
+    "🧹 **Auto-cleared — issue canceled**\n\n"
+    "This issue is canceled in the tracker, so Symphony retired its associated "
+    "run state. The dashboard lane empties on its own; no action needed.\n"
+)
+
+_CANCELED_CLEAR_BODY_NO_WAIT_PR_OPEN = (
+    "🧹 **Auto-cleared — issue canceled**\n\n"
+    "This issue is canceled in the tracker, so Symphony retired its associated "
+    "run state. A linked pull request is still open and was left untouched by "
+    "this clear — close or merge it separately if needed.\n"
+)
+
 # `Done` is terminal for the same reason `canceled` is: the issue will never
 # re-enter a polled active lane, so nothing else can ever clear its parked wait
 # (SYM-231). Hand-finishing an issue — merging its PR outside Symphony, or just
@@ -108,6 +123,22 @@ _DONE_CLEAR_BODY_PR_OPEN = (
     "wait and retired the leftover run state. A linked pull request is still "
     "open and was left untouched by this clear — close or merge it separately "
     "if needed.\n"
+)
+
+# Used instead of _DONE_CLEAR_BODY(_PR_OPEN) when there was no wait row to
+# delete (SYM-114's shape, or just a Done issue with an old `failed` run in
+# history) — no wait was cleared, so the comment must not claim one was.
+_DONE_CLEAR_BODY_NO_WAIT = (
+    "🧹 **Auto-cleared — issue done**\n\n"
+    "This issue is Done in the tracker, so Symphony retired its leftover run "
+    "state. The dashboard lane empties on its own; no action needed.\n"
+)
+
+_DONE_CLEAR_BODY_NO_WAIT_PR_OPEN = (
+    "🧹 **Auto-cleared — issue done**\n\n"
+    "This issue is Done in the tracker, so Symphony retired its leftover run "
+    "state. A linked pull request is still open and was left untouched by "
+    "this clear — close or merge it separately if needed.\n"
 )
 
 ACTION_OBSERVED = "observed"
@@ -593,6 +624,7 @@ class Reconciler:
         actions_taken = 0
         actions_deferred = 0
         post_terminal_comment = False
+        terminal_wait_cleared = False
 
         linear_action = _passive_action_for(linear_drift)
         if terminal_wait_eligible:
@@ -689,7 +721,7 @@ class Reconciler:
                 and linear_drift in _TERMINAL_LINEAR_DRIFTS
                 and linear_issue is not None
             ):
-                await self._apply_linear_terminal_clear(
+                terminal_wait_cleared = await self._apply_linear_terminal_clear(
                     issue_id=issue_id,
                     wait=wait,
                     drift_kind=linear_drift,
@@ -743,7 +775,11 @@ class Reconciler:
             # one can still be open. Re-check the actual remaining rows rather than
             # inferring "none open" from that one action.
             pr_remains_open = bool(await self._open_prs(issue_id))
-            body = _terminal_clear_body(drift_kind=linear_drift, pr_remains_open=pr_remains_open)
+            body = _terminal_clear_body(
+                drift_kind=linear_drift,
+                pr_remains_open=pr_remains_open,
+                wait_cleared=terminal_wait_cleared,
+            )
             try:
                 await self.tracker(tracker_ctx).post_comment(tracker_issue_id, body)
             except LinearError as e:
@@ -1381,7 +1417,7 @@ class Reconciler:
         state_name: str,
         ts: str,
         started_at_max: str | None,
-    ) -> None:
+    ) -> bool:
         """Clear a parked wait (if any) for an issue the tracker says is finished.
 
         Terminal means canceled *or* done (SYM-231): either way the issue never
@@ -1399,8 +1435,12 @@ class Reconciler:
         `started_at_max` (the tracker's `updated_at` at the terminal transition)
         bounds the run sweep to the generation that finished — a run started
         after the issue went terminal belongs to a new cycle and must survive.
+
+        Returns whether a wait row actually existed to delete, so the caller
+        can pick a comment that only mentions the wait when one was cleared.
         """
         canceled = drift_kind == DRIFT_LINEAR_CANCELED
+        wait_cleared = wait is not None
         if wait is not None:
             await db.operator_waits.delete(
                 self._conn,
@@ -1425,6 +1465,7 @@ class Reconciler:
             state_name=state_name,
             ts=ts,
         )
+        return wait_cleared
 
     async def _has_retirable_runs(self, issue_id: str, *, started_at_max: str | None) -> bool:
         history = await db.runs.history_for_issue(self._conn, issue_id)
@@ -1565,17 +1606,24 @@ class Reconciler:
         if await self._open_prs(issue_id):
             return
         merged_ts = _parse_rfc3339(merged_at)
-        if (
+        wait_eligible = (
             wait is not None
             and _parse_rfc3339(wait.created_at) <= merged_ts
             and any(binding.reconcile_enabled for binding in self._wait_matched_bindings(wait))
-        ):
+        )
+        if wait_eligible:
+            assert wait is not None
             await db.operator_waits.delete(
                 self._conn,
                 issue_id,
                 wait.run_id,
                 commit=False,
             )
+        elif wait is not None:
+            # The wait survives (opted-out binding or a later generation) — it
+            # is still parked on wait.run_id, so retiring the issue's runs here
+            # would supersede the very run the surviving wait depends on.
+            return
         await self._supersede_finished_issue_runs(
             issue_id=issue_id,
             ts=ts,
@@ -1619,10 +1667,18 @@ def _binding_storage_key(binding: RepoBinding) -> str:
     )
 
 
-def _terminal_clear_body(*, drift_kind: str | None, pr_remains_open: bool) -> str:
+def _terminal_clear_body(
+    *, drift_kind: str | None, pr_remains_open: bool, wait_cleared: bool
+) -> str:
     if drift_kind == DRIFT_LINEAR_CANCELED:
-        return _CANCELED_CLEAR_BODY_PR_OPEN if pr_remains_open else _CANCELED_CLEAR_BODY
-    return _DONE_CLEAR_BODY_PR_OPEN if pr_remains_open else _DONE_CLEAR_BODY
+        if wait_cleared:
+            return _CANCELED_CLEAR_BODY_PR_OPEN if pr_remains_open else _CANCELED_CLEAR_BODY
+        if pr_remains_open:
+            return _CANCELED_CLEAR_BODY_NO_WAIT_PR_OPEN
+        return _CANCELED_CLEAR_BODY_NO_WAIT
+    if wait_cleared:
+        return _DONE_CLEAR_BODY_PR_OPEN if pr_remains_open else _DONE_CLEAR_BODY
+    return _DONE_CLEAR_BODY_NO_WAIT_PR_OPEN if pr_remains_open else _DONE_CLEAR_BODY_NO_WAIT
 
 
 def _passive_action_for(drift_kind: str | None) -> str:
