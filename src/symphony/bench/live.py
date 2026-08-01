@@ -41,7 +41,7 @@ _TRIAL_DIRECTORY_RE = re.compile(r"(?:SMOKE|[AB][1-9][0-9]*)\Z")
 class GitHubProvisioner(Protocol):
     async def create_repository(self, *, name: str, source: Path) -> GitHubRepository: ...
 
-    async def review_metrics(self, *, repository_slug: str) -> dict[str, int]: ...
+    async def review_metrics(self, *, repository_slug: str, cwd: Path) -> dict[str, int]: ...
 
 
 class LinearProvisioner(Protocol):
@@ -229,7 +229,9 @@ class LiveTrialExecutor:
                     standards_prompt=frozen.standards_prompt,
                 )
             )
-            metrics.update(await github.review_metrics(repository_slug=repository.slug))
+            metrics.update(
+                await github.review_metrics(repository_slug=repository.slug, cwd=trial_root)
+            )
         except asyncio.CancelledError:
             outcome = await self._bounded_partial_outcome(
                 repository=repository,

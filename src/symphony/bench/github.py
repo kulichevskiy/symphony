@@ -168,7 +168,7 @@ class GitHubSandbox:
                 raise
         return GitHubRepository(slug=slug, url=f"https://github.com/{slug}")
 
-    async def review_metrics(self, *, repository_slug: str) -> dict[str, int]:
+    async def review_metrics(self, *, repository_slug: str, cwd: Path) -> dict[str, int]:
         """Count actual remote Codex findings; keep rounds as a separate DB metric."""
         comments: list[tuple[object, bool]] = []
         for endpoint, inline in (
@@ -177,7 +177,7 @@ class GitHubSandbox:
         ):
             raw = await self._commands.run(
                 ["gh", "api", "--paginate", "--slurp", endpoint],
-                cwd=Path.cwd(),
+                cwd=cwd,
                 env={"GH_TOKEN": self._token},
             )
             try:

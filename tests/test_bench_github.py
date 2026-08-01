@@ -159,7 +159,9 @@ async def test_review_metrics_count_codex_comments_by_priority(tmp_path: Path) -
     )
     sandbox = GitHubSandbox(owner="kulichevskiy", token="token", commands=commands)
 
-    metrics = await sandbox.review_metrics(repository_slug="kulichevskiy/trial")
+    metrics = await sandbox.review_metrics(repository_slug="kulichevskiy/trial", cwd=tmp_path)
+
+    assert all(call[1] == tmp_path for call in commands.calls)
 
     assert metrics == {
         "remote_review_comments": 5,

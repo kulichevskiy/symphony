@@ -62,6 +62,27 @@ def test_parse_junit_report_supports_single_suite(tmp_path: Path) -> None:
     assert parse_junit_report(report)["hidden_checks_passed"] == 2
 
 
+def test_parse_junit_report_sums_pytest_suites_when_parent_has_no_counts(
+    tmp_path: Path,
+) -> None:
+    report = tmp_path / "report.xml"
+    report.write_text(
+        """<testsuites name="pytest tests">
+        <testsuite name="hidden-a" tests="3" failures="1" errors="0" skipped="0" />
+        <testsuite name="hidden-b" tests="2" failures="0" errors="1" skipped="0" />
+        </testsuites>""",
+        encoding="utf-8",
+    )
+
+    assert parse_junit_report(report) == {
+        "hidden_checks_total": 5,
+        "hidden_checks_passed": 3,
+        "hidden_checks_failed": 1,
+        "hidden_checks_errors": 1,
+        "hidden_checks_skipped": 0,
+    }
+
+
 @pytest.mark.asyncio
 async def test_grader_injects_collectable_hidden_name_then_removes_it(tmp_path: Path) -> None:
     commands = GraderCommands()

@@ -19,8 +19,9 @@ class FakeGitHub:
             slug=f"kulichevskiy/{name}", url=f"https://github.com/kulichevskiy/{name}"
         )
 
-    async def review_metrics(self, *, repository_slug: str) -> dict[str, int]:
+    async def review_metrics(self, *, repository_slug: str, cwd: Path) -> dict[str, int]:
         assert repository_slug.startswith("kulichevskiy/")
+        assert cwd.name in {"SMOKE", "A1", "B1"}
         return {"remote_review_comments": 2, "remote_review_p1": 1, "remote_review_p2": 1}
 
 

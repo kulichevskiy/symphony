@@ -26,10 +26,11 @@ def parse_junit_report(path: Path) -> dict[str, int]:
     root = ElementTree.parse(path).getroot()
     if root.tag not in {"testsuite", "testsuites"}:
         raise RuntimeError(f"unexpected JUnit root {root.tag!r}")
-    total = int(root.attrib.get("tests", 0))
-    failures = int(root.attrib.get("failures", 0))
-    errors = int(root.attrib.get("errors", 0))
-    skipped = int(root.attrib.get("skipped", 0))
+    suites = [root] if root.tag == "testsuite" else root.findall("testsuite")
+    total = sum(int(suite.attrib.get("tests", 0)) for suite in suites)
+    failures = sum(int(suite.attrib.get("failures", 0)) for suite in suites)
+    errors = sum(int(suite.attrib.get("errors", 0)) for suite in suites)
+    skipped = sum(int(suite.attrib.get("skipped", 0)) for suite in suites)
     return {
         "hidden_checks_total": total,
         "hidden_checks_passed": max(0, total - failures - errors - skipped),
