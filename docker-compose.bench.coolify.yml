@@ -89,6 +89,8 @@ services:
   caddy:
     image: caddy:2
     restart: unless-stopped
+    labels:
+      - "traefik.docker.network=coolify"
     extra_hosts:
       - "connections:127.0.0.1"
     environment:

@@ -32,6 +32,7 @@ def test_bench_compose_separates_control_executor_and_public_network() -> None:
     assert services["connections"]["network_mode"] == "service:caddy"
     assert "networks" not in services["connections"]
     assert services["caddy"]["networks"] == ["coolify", "control"]
+    assert services["caddy"]["labels"] == ["traefik.docker.network=coolify"]
     assert services["caddy"]["extra_hosts"] == ["connections:127.0.0.1"]
     assert services["caddy"]["environment"] == {
         "SERVICE_FQDN_CADDY": "${SERVICE_FQDN_CADDY}"
