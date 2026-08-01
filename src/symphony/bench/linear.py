@@ -30,6 +30,21 @@ mutation BenchRelation($input: IssueRelationCreateInput!) {
 }
 """
 
+_CAMPAIGN_ISSUES = """
+query BenchCampaignIssues($teamId: ID!, $titlePrefix: String!) {
+  issues(
+    first: 50
+    filter: {team: {id: {eq: $teamId}}, title: {startsWith: $titlePrefix}}
+  ) { nodes { id identifier url title } }
+}
+"""
+
+_ISSUE_RELATIONS = """
+query BenchIssueRelations($id: String!) {
+  issue(id: $id) { relations { nodes { type relatedIssue { id } } } }
+}
+"""
+
 _ISSUE_STATE = """
 query BenchIssueState($id: String!) {
   issue(id: $id) { id identifier state { name type } }
@@ -136,6 +151,28 @@ class LinearSandbox:
             raise LinearSandboxError("BENCH team has no Todo state")
 
         issue_by_key = self._issues.setdefault(label, {})
+        expected_titles = {f"[{label}] {ticket.title}": ticket.key for ticket in campaign.tickets}
+        existing_data = await self._query(
+            _CAMPAIGN_ISSUES,
+            {"teamId": team_id, "titlePrefix": f"[{label}]"},
+            retry_transient=True,
+        )
+        existing_nodes = (existing_data.get("issues") or {}).get("nodes") or []
+        seen_keys: set[str] = set()
+        for issue in existing_nodes:
+            if not isinstance(issue, dict):
+                continue
+            key = expected_titles.get(str(issue.get("title", "")))
+            if key is None:
+                continue
+            if key in seen_keys:
+                raise LinearSandboxError(f"duplicate benchmark issue for {label}: {key}")
+            seen_keys.add(key)
+            issue_by_key[key] = {
+                "id": str(issue["id"]),
+                "identifier": str(issue["identifier"]),
+                "url": str(issue["url"]),
+            }
         for ticket in campaign.tickets:
             if ticket.key in issue_by_key:
                 continue
@@ -166,6 +203,23 @@ class LinearSandbox:
             for blocker_key in ticket.blocked_by:
                 relation_key = (issue_by_key[blocker_key]["id"], issue_by_key[ticket.key]["id"])
                 if relation_key in self._relations:
+                    continue
+                relation_data = await self._query(
+                    _ISSUE_RELATIONS,
+                    {"id": relation_key[0]},
+                    retry_transient=True,
+                )
+                relation_issue = relation_data.get("issue") or {}
+                relation_nodes = (relation_issue.get("relations") or {}).get("nodes") or []
+                already_exists = any(
+                    isinstance(relation, dict)
+                    and relation.get("type") == "blocks"
+                    and isinstance(relation.get("relatedIssue"), dict)
+                    and str(relation["relatedIssue"].get("id")) == relation_key[1]
+                    for relation in relation_nodes
+                )
+                if already_exists:
+                    self._relations.add(relation_key)
                     continue
                 self._successful(
                     await self._query(

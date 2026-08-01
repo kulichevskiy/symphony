@@ -20,9 +20,15 @@ from .app import create_bench_app
 from .connection_sync import sync_connections as _sync_connections
 from .eventdesk import harness_version
 from .executor import RemoteCommands, create_executor_app
+from .harness import snapshot_harness
 from .live import LiveBenchConfig, LiveTrialExecutor
 from .models import ExperimentReport
 from .report import render_markdown
+from .reviewer import cleanup_stale_reviewer_credentials
+
+_BENCH_BINDING_OVERRIDES = frozenset(
+    {"allow_auto_merge", "auto_merge", "local_review", "remote_review"}
+)
 
 
 class _BenchSecrets(BaseSettings):
@@ -31,6 +37,24 @@ class _BenchSecrets(BaseSettings):
     api_token: str = Field(default="", validation_alias="SYMPHONY_BENCH_TOKEN")
     encryption_key: str = Field(default="", validation_alias="SYMPHONY_ENCRYPTION_KEY")
     executor_token: str = Field(default="", validation_alias="SYMPHONY_BENCH_EXECUTOR_TOKEN")
+    github_owner: str = Field(
+        default="kulichevskiy", validation_alias="SYMPHONY_BENCH_GITHUB_OWNER"
+    )
+    linear_team_id: str = Field(
+        default="492bfef9-26d3-4469-9407-8bc1858ef9ef",
+        validation_alias="SYMPHONY_BENCH_LINEAR_TEAM_ID",
+    )
+    linear_label_id: str = Field(
+        default="b4b92569-f904-4a3f-bef1-ad22fa4851c7",
+        validation_alias="SYMPHONY_BENCH_LINEAR_LABEL_ID",
+    )
+    linear_label_name: str = Field(
+        default="symphony-bench", validation_alias="SYMPHONY_BENCH_LINEAR_LABEL_NAME"
+    )
+    symphony_repository: str = Field(
+        default="https://github.com/kulichevskiy/symphony.git",
+        validation_alias="SYMPHONY_BENCH_REPOSITORY",
+    )
 
 
 @click.group()
@@ -239,6 +263,10 @@ async def _seed(
     binding_overrides = raw.get("binding", {})
     if not all(isinstance(value, dict) for value in (roles, knobs, binding_overrides)):
         raise click.ClickException("invalid profile: roles, knobs, and binding must be objects")
+    unsafe_binding_keys = set(binding_overrides) - _BENCH_BINDING_OVERRIDES
+    if unsafe_binding_keys:
+        joined = ", ".join(sorted(unsafe_binding_keys))
+        raise click.ClickException(f"invalid profile binding override(s): {joined}")
 
     label = issue_label or github_repo.rsplit("/", 1)[-1]
     payload: dict[str, Any] = {
@@ -415,26 +443,22 @@ async def _snapshot(db_path: Path) -> dict[str, object]:
     envvar="SYMPHONY_BENCH_PROFILE",
 )
 @click.option("--api-token", envvar="SYMPHONY_BENCH_TOKEN")
-@click.option("--github-owner", envvar="SYMPHONY_BENCH_GITHUB_OWNER", default="kulichevskiy")
+@click.option("--github-owner", envvar="SYMPHONY_BENCH_GITHUB_OWNER")
 @click.option(
     "--linear-team-id",
     envvar="SYMPHONY_BENCH_LINEAR_TEAM_ID",
-    default="492bfef9-26d3-4469-9407-8bc1858ef9ef",
 )
 @click.option(
     "--linear-label-id",
     envvar="SYMPHONY_BENCH_LINEAR_LABEL_ID",
-    default="b4b92569-f904-4a3f-bef1-ad22fa4851c7",
 )
 @click.option(
     "--linear-label-name",
     envvar="SYMPHONY_BENCH_LINEAR_LABEL_NAME",
-    default="symphony-bench",
 )
 @click.option(
     "--symphony-repository",
     envvar="SYMPHONY_BENCH_REPOSITORY",
-    default="https://github.com/kulichevskiy/symphony.git",
 )
 @click.option("--encryption-key", envvar="SYMPHONY_ENCRYPTION_KEY")
 @click.option(
@@ -451,11 +475,11 @@ def serve(
     root: Path,
     profile_path: Path | None,
     api_token: str | None,
-    github_owner: str,
-    linear_team_id: str,
-    linear_label_id: str,
-    linear_label_name: str,
-    symphony_repository: str,
+    github_owner: str | None,
+    linear_team_id: str | None,
+    linear_label_id: str | None,
+    linear_label_name: str | None,
+    symphony_repository: str | None,
     encryption_key: str | None,
     executor_url: str,
     executor_token: str | None,
@@ -469,6 +493,11 @@ def serve(
     api_token = api_token or mounted.api_token
     encryption_key = encryption_key or mounted.encryption_key
     executor_token = executor_token or mounted.executor_token
+    github_owner = github_owner or mounted.github_owner
+    linear_team_id = linear_team_id or mounted.linear_team_id
+    linear_label_id = linear_label_id or mounted.linear_label_id
+    linear_label_name = linear_label_name or mounted.linear_label_name
+    symphony_repository = symphony_repository or mounted.symphony_repository
     if not api_token:
         raise click.ClickException("SYMPHONY_BENCH_TOKEN is required")
     if not encryption_key:
@@ -546,6 +575,11 @@ def _serve_with_profile(
         token=executor_token,
         timeout_seconds=wall_time_cap_seconds,
     )
+
+    async def recover_execution() -> None:
+        await commands.cancel_all()
+        await asyncio.to_thread(cleanup_stale_reviewer_credentials, root)
+
     executor = LiveTrialExecutor(
         config=LiveBenchConfig(
             root=root,
@@ -557,9 +591,14 @@ def _serve_with_profile(
             symphony_repository=symphony_repository,
             encryption_key=encryption_key,
             wall_time_cap_seconds=wall_time_cap_seconds,
+            require_harness_snapshot=True,
         ),
         commands=commands,
     )
+
+    async def prepare_harness(experiment_id: str) -> str:
+        return await asyncio.to_thread(snapshot_harness, root / experiment_id / "_harness")
+
     app = create_bench_app(
         db_path=db_path,
         api_token=api_token,
@@ -567,7 +606,8 @@ def _serve_with_profile(
         default_profile=default_profile,
         resolve_revision=executor.resolve_revision,
         harness_version=harness_version(),
-        recover_execution=commands.cancel_all,
+        prepare_harness=prepare_harness,
+        recover_execution=recover_execution,
     )
     uvicorn_module.run(app, host=host, port=port)
 

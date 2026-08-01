@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shutil
+from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ from .connection_sync import snapshot_connections, sync_connections
 from .eventdesk import Campaign, eventdesk_campaign, materialize_eventdesk
 from .github import Commands, GitHubRepository, GitHubSandbox, SubprocessCommands
 from .grader import EventDeskGrader
+from .harness import FrozenHarness, load_harness
 from .linear import LinearCampaign, LinearIssueState, LinearSandbox
 from .models import (
     Trial,
@@ -30,6 +32,13 @@ from .models import (
 from .reviewer import CodexFinalReviewer
 
 T = TypeVar("T")
+
+_LOCAL_REVIEW_MARKERS = (
+    "<<<VERDICT:APPROVED>>>",
+    "<<<VERDICT:CHANGES_REQUESTED>>>",
+)
+_LOCAL_FINDING_RE = re.compile(r"(?m)^[ \t]{0,3}[-*][ \t]+(.+)$")
+_LOCAL_SEVERITY_RE = re.compile(r"^\*{0,2}\[(Critical|Major|Minor)\]", re.IGNORECASE)
 
 
 class GitHubProvisioner(Protocol):
@@ -58,11 +67,19 @@ class ProductGrader(Protocol):
         repository_slug: str,
         destination: Path,
         github_token: str,
+        hidden_test: Path | None = None,
+        checks: dict[str, list[str]] | None = None,
     ) -> dict[str, object]: ...
 
 
 class ProductReviewer(Protocol):
-    async def review(self, *, checkout: Path) -> dict[str, object]: ...
+    async def review(
+        self,
+        *,
+        checkout: Path,
+        spec_prompt: str | None = None,
+        standards_prompt: str | None = None,
+    ) -> dict[str, object]: ...
 
 
 @dataclass(frozen=True)
@@ -82,6 +99,7 @@ class LiveBenchConfig:
     receipt_timeout_seconds: float = 30
     provision_attempts: int = 3
     provision_retry_seconds: float = 5
+    require_harness_snapshot: bool = False
 
 
 class LiveTrialExecutor:
@@ -142,6 +160,7 @@ class LiveTrialExecutor:
         linear: LinearProvisioner | None = None
         owns_linear = False
         try:
+            frozen = self._load_trial_harness(trial)
             credentials = self._credentials or await self._resolve_credentials()
             if not credentials.github_token:
                 raise RuntimeError("bench GitHub connection is missing; reconnect and retry")
@@ -149,7 +168,12 @@ class LiveTrialExecutor:
                 raise RuntimeError("bench Linear connection is missing; reconnect and retry")
 
             await asyncio.to_thread(trial_root.mkdir, parents=True, exist_ok=False)
-            await asyncio.to_thread(materialize_eventdesk, eventdesk_root)
+            campaign_definition = eventdesk_campaign()
+            if frozen is None:
+                await asyncio.to_thread(materialize_eventdesk, eventdesk_root)
+            else:
+                await asyncio.to_thread(shutil.copytree, frozen.root / "eventdesk", eventdesk_root)
+                campaign_definition = frozen.campaign
             github = self._github or GitHubSandbox(
                 owner=self._config.github_owner,
                 token=credentials.github_token,
@@ -169,7 +193,7 @@ class LiveTrialExecutor:
                     team_id=self._config.linear_team_id,
                     label=trial_name,
                     repo_url=repository.url,
-                    campaign=eventdesk_campaign(),
+                    campaign=campaign_definition,
                 )
             )
             connections_db = trial_root / "connections.sqlite"
@@ -197,9 +221,17 @@ class LiveTrialExecutor:
                     repository_slug=repository.slug,
                     destination=trial_root,
                     github_token=credentials.github_token,
+                    hidden_test=frozen.hidden_test if frozen is not None else None,
+                    checks=frozen.regression_commands if frozen is not None else None,
                 )
             )
-            metrics.update(await self._reviewer.review(checkout=trial_root / "final"))
+            metrics.update(
+                await self._reviewer.review(
+                    checkout=trial_root / "final",
+                    spec_prompt=frozen.spec_prompt if frozen is not None else None,
+                    standards_prompt=frozen.standards_prompt if frozen is not None else None,
+                )
+            )
             metrics.update(await github.review_metrics(repository_slug=repository.slug))
         except asyncio.CancelledError:
             outcome = await self._bounded_partial_outcome(
@@ -238,6 +270,14 @@ class LiveTrialExecutor:
             issue_urls=list(campaign.issue_urls),
             metrics=metrics,
         )
+
+    def _load_trial_harness(self, trial: Trial) -> FrozenHarness | None:
+        snapshot = self._config.root / trial.experiment_id / "_harness"
+        if snapshot.exists():
+            return load_harness(snapshot)
+        if self._config.require_harness_snapshot:
+            raise RuntimeError(f"experiment harness snapshot is missing: {snapshot}")
+        return None
 
     async def _partial_outcome(
         self,
@@ -477,20 +517,27 @@ class LiveTrialExecutor:
                 if elapsed >= self._config.wall_time_cap_seconds:
                     raise RuntimeError("bench wall-time safety cap exceeded")
                 await sync_connections(candidate_db, self._config.control_db)
-                metrics = await self._candidate_snapshot(candidate_root, candidate_db)
-                token_total = metrics.get("effective_tokens")
-                launch_total = metrics.get("agent_launches")
-                if not isinstance(token_total, (int, float)) or not isinstance(launch_total, int):
-                    raise RuntimeError("candidate bench snapshot is missing safety metrics")
-                if float(token_total) > self._config.observed_token_cap:
-                    raise RuntimeError("bench observed-token safety cap exceeded")
-                if launch_total > self._config.agent_launch_cap:
-                    raise RuntimeError("bench agent-launch safety cap exceeded")
+                metrics = await self._checked_candidate_snapshot(candidate_root, candidate_db)
 
                 states = await linear.issue_states(campaign.issue_ids)
                 if all(state.type == "completed" for state in states):
-                    metrics["completed_tickets"] = len(states)
-                    return metrics
+                    while True:
+                        await sync_connections(candidate_db, self._config.control_db)
+                        metrics = await self._checked_candidate_snapshot(
+                            candidate_root, candidate_db
+                        )
+                        statuses = metrics.get("runs_by_status")
+                        if not isinstance(statuses, dict):
+                            raise RuntimeError("candidate bench snapshot is missing run statuses")
+                        if int(statuses.get("running", 0)) == 0:
+                            metrics["completed_tickets"] = len(states)
+                            return metrics
+                        if (
+                            asyncio.get_running_loop().time() - started
+                            >= self._config.wall_time_cap_seconds
+                        ):
+                            raise RuntimeError("bench wall-time safety cap exceeded")
+                        await asyncio.sleep(self._config.poll_seconds)
                 failed = [
                     state.identifier
                     for state in states
@@ -503,6 +550,20 @@ class LiveTrialExecutor:
             candidate.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await candidate
+
+    async def _checked_candidate_snapshot(
+        self, candidate_root: Path, candidate_db: Path
+    ) -> dict[str, object]:
+        metrics = await self._candidate_snapshot(candidate_root, candidate_db)
+        token_total = metrics.get("effective_tokens")
+        launch_total = metrics.get("agent_launches")
+        if not isinstance(token_total, (int, float)) or not isinstance(launch_total, int):
+            raise RuntimeError("candidate bench snapshot is missing safety metrics")
+        if float(token_total) > self._config.observed_token_cap:
+            raise RuntimeError("bench observed-token safety cap exceeded")
+        if launch_total > self._config.agent_launch_cap:
+            raise RuntimeError("bench agent-launch safety cap exceeded")
+        return metrics
 
     async def _candidate_snapshot(
         self, candidate_root: Path, candidate_db: Path
@@ -528,4 +589,46 @@ class LiveTrialExecutor:
             raise RuntimeError("candidate returned an invalid bench snapshot") from exc
         if not isinstance(parsed, dict):
             raise RuntimeError("candidate returned a non-object bench snapshot")
-        return {str(key): value for key, value in parsed.items()}
+        metrics = {str(key): value for key, value in parsed.items()}
+        metrics.update(
+            await asyncio.to_thread(_local_review_metrics, candidate_root.parent / "logs")
+        )
+        return metrics
+
+
+def _local_review_metrics(log_root: Path) -> dict[str, int]:
+    """Count final local-review verdicts and their explicitly graded findings."""
+    counts = Counter[str]()
+    review_root = log_root / "local_review"
+    if review_root.is_dir():
+        for path in review_root.glob("*/review-*.last.txt"):
+            if "-find.last.txt" in path.name:
+                continue
+            try:
+                message = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            markers = [(message.rfind(marker), marker) for marker in _LOCAL_REVIEW_MARKERS]
+            marker_at, marker = max(markers)
+            if marker_at < 0:
+                counts["unparseable_rounds"] += 1
+                continue
+            counts["rounds"] += 1
+            if marker != "<<<VERDICT:CHANGES_REQUESTED>>>":
+                continue
+            findings_at = message.lower().rfind("## findings", 0, marker_at)
+            body_at = findings_at + len("## findings") if findings_at >= 0 else 0
+            for match in _LOCAL_FINDING_RE.finditer(message[body_at:marker_at]):
+                counts["findings"] += 1
+                severity = _LOCAL_SEVERITY_RE.match(match.group(1).strip())
+                key = severity.group(1).lower() if severity is not None else "unclassified"
+                counts[key] += 1
+    return {
+        "local_review_rounds": counts["rounds"],
+        "local_review_unparseable_rounds": counts["unparseable_rounds"],
+        "local_review_findings": counts["findings"],
+        "local_review_critical": counts["critical"],
+        "local_review_major": counts["major"],
+        "local_review_minor": counts["minor"],
+        "local_review_unclassified": counts["unclassified"],
+    }

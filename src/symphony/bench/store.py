@@ -79,9 +79,15 @@ class ExperimentStore:
             self._ensure_column(conn, "bench_trials", "profile", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(conn, "bench_trials", "system_version", "TEXT NOT NULL DEFAULT ''")
 
-    def create(self, request: ExperimentCreate, *, harness_version: str = "") -> Experiment:
+    def create(
+        self,
+        request: ExperimentCreate,
+        *,
+        harness_version: str = "",
+        experiment_id: str | None = None,
+    ) -> Experiment:
         experiment = Experiment.queued(
-            experiment_id=f"EXP-{uuid4().hex[:12].upper()}",
+            experiment_id=experiment_id or f"EXP-{uuid4().hex[:12].upper()}",
             request=request,
             harness_version=harness_version,
         )

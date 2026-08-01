@@ -52,6 +52,9 @@ def test_local_review_prompt_demands_actionable_findings() -> None:
     prompt = local_review_prompt(issue_title="t", issue_body="b", labels=[], base_branch="main")
     # path:line example present.
     assert "file:line" in prompt or "foo.py:42" in prompt
+    assert "[Critical]" in prompt
+    assert "[Major]" in prompt
+    assert "[Minor]" in prompt
     # Junior-engineer framing forces concrete-edit-only findings.
     assert "junior engineer" in prompt.lower()
 

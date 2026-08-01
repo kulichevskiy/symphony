@@ -17,6 +17,19 @@ from .eventdesk import eventdesk_campaign
 from .github import Commands
 
 
+def cleanup_stale_reviewer_credentials(root: Path) -> int:
+    """Remove plaintext Codex homes left by an interrupted final review."""
+    removed = 0
+    if not root.exists():
+        return removed
+    for path in root.glob("EXP-*/*/bench-codex-*"):
+        if not path.is_dir():
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        removed += 1
+    return removed
+
+
 class ReviewFinding(BaseModel):
     severity: Literal["Critical", "Major", "Minor"]
     title: str
@@ -69,7 +82,13 @@ class CodexFinalReviewer:
         self._cipher = CredentialCipher(encryption_key)
         self._model = model
 
-    async def review(self, *, checkout: Path) -> dict[str, object]:
+    async def review(
+        self,
+        *,
+        checkout: Path,
+        spec_prompt: str | None = None,
+        standards_prompt: str | None = None,
+    ) -> dict[str, object]:
         conn = await db.connect(self._control_db)
         try:
             resolver = CredentialResolver(conn, self._cipher)
@@ -87,13 +106,13 @@ class CodexFinalReviewer:
                     checkout=checkout,
                     codex_home=codex_home,
                     name="spec",
-                    prompt=_spec_prompt(),
+                    prompt=spec_prompt or _spec_prompt(),
                 )
                 standards = await self._run_one(
                     checkout=checkout,
                     codex_home=codex_home,
                     name="standards",
-                    prompt=_standards_prompt(),
+                    prompt=standards_prompt or _standards_prompt(),
                 )
                 refreshed = read_codex_credential(auth)
                 if refreshed and refreshed != credential:
@@ -174,3 +193,7 @@ network. Report only concrete defects with exact file evidence.
 
 {_OUTPUT_CONTRACT}
 """
+
+
+def final_review_prompts() -> tuple[str, str]:
+    return _spec_prompt(), _standards_prompt()

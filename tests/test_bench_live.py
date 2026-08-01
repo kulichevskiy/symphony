@@ -4,8 +4,9 @@ from pathlib import Path
 import pytest
 
 from symphony.bench.github import GitHubRepository
+from symphony.bench.harness import snapshot_harness
 from symphony.bench.linear import LinearCampaign, LinearIssueState
-from symphony.bench.live import LiveBenchConfig, LiveTrialExecutor
+from symphony.bench.live import LiveBenchConfig, LiveTrialExecutor, _local_review_metrics
 from symphony.bench.models import Trial, TrialExecutionCancelled, TrialExecutionError
 from symphony.credentials import RunCredentials
 
@@ -90,6 +91,35 @@ class FakeCommands:
         return ""
 
 
+class FinalizingCommands(FakeCommands):
+    def __init__(self) -> None:
+        super().__init__()
+        self.snapshots = 0
+
+    async def run(
+        self,
+        argv: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str] | None = None,
+        stdin: str | None = None,
+    ) -> str:
+        if "snapshot" not in argv:
+            return await super().run(argv, cwd=cwd, env=env, stdin=stdin)
+        self.calls.append(tuple(argv))
+        self.environments.append(env or {})
+        self.snapshots += 1
+        if self.snapshots == 1:
+            return (
+                '{"active_agent_seconds":120.0,"agent_launches":6,'
+                '"effective_tokens":1234.0,"runs_by_status":{"running":1}}\n'
+            )
+        return (
+            '{"active_agent_seconds":150.0,"agent_launches":6,'
+            '"effective_tokens":1500.0,"runs_by_status":{"done":1}}\n'
+        )
+
+
 class FakeGrader:
     async def grade(self, **_kwargs: object) -> dict[str, int]:
         return {
@@ -118,6 +148,107 @@ class BlockingGrader:
         self.started.set()
         await asyncio.Event().wait()
         return {}
+
+
+class CapturingGrader(FakeGrader):
+    def __init__(self) -> None:
+        self.kwargs: dict[str, object] = {}
+
+    async def grade(self, **kwargs: object) -> dict[str, int]:
+        self.kwargs = kwargs
+        return await super().grade(**kwargs)
+
+
+class CapturingReviewer(FakeReviewer):
+    def __init__(self) -> None:
+        self.kwargs: dict[str, object] = {}
+
+    async def review(self, **kwargs: object) -> dict[str, object]:
+        self.kwargs = kwargs
+        return await super().review(**kwargs)
+
+
+def test_local_review_metrics_count_final_verdicts_and_severity(tmp_path: Path) -> None:
+    review = tmp_path / "local_review" / "parent"
+    review.mkdir(parents=True)
+    (review / "review-0-find.last.txt").write_text(
+        "## Findings\n- unverified suspicion\n", encoding="utf-8"
+    )
+    (review / "review-0-verify.last.txt").write_text(
+        "## Findings\n"
+        "- [Critical] `a.py:1`: data loss\n"
+        "- **[Major]** `b.py:2`: requirement broken\n"
+        "- [Minor] `c.py:3`: bounded defect\n"
+        "- `d.py:4`: old-format finding\n\n"
+        "<<<VERDICT:CHANGES_REQUESTED>>>\n",
+        encoding="utf-8",
+    )
+    (review / "review-1-verify.last.txt").write_text(
+        "Tried the edge cases.\n<<<VERDICT:APPROVED>>>\n", encoding="utf-8"
+    )
+    (review / "review-2-verify.last.txt").write_text("no marker", encoding="utf-8")
+
+    assert _local_review_metrics(tmp_path) == {
+        "local_review_rounds": 2,
+        "local_review_unparseable_rounds": 1,
+        "local_review_findings": 4,
+        "local_review_critical": 1,
+        "local_review_major": 1,
+        "local_review_minor": 1,
+        "local_review_unclassified": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_live_trial_uses_the_experiment_harness_snapshot(tmp_path: Path) -> None:
+    root = tmp_path / "runs"
+    snapshot_harness(root / "EXP-FROZEN" / "_harness")
+    grader = CapturingGrader()
+    reviewer = CapturingReviewer()
+    executor = LiveTrialExecutor(
+        config=LiveBenchConfig(
+            root=root,
+            control_db=tmp_path / "control.sqlite",
+            github_owner="kulichevskiy",
+            linear_team_id="team-id",
+            symphony_repository="https://github.com/kulichevskiy/symphony.git",
+            encryption_key="key",
+            poll_seconds=0,
+            require_harness_snapshot=True,
+        ),
+        commands=FakeCommands(),
+        credentials=RunCredentials(github_token="gh", linear_token="lin"),
+        github=FakeGitHub(),
+        linear=FakeLinear(),
+        grader=grader,
+        reviewer=reviewer,
+    )
+
+    await executor(Trial(experiment_id="EXP-FROZEN", candidate="A", repetition=1, revision="sha"))
+
+    assert grader.kwargs["hidden_test"] == root / "EXP-FROZEN" / "_harness/hidden_test.py"
+    assert isinstance(grader.kwargs["checks"], dict)
+    assert "SPEC reviewer" in str(reviewer.kwargs["spec_prompt"])
+    assert "STANDARDS reviewer" in str(reviewer.kwargs["standards_prompt"])
+
+
+def test_live_trial_requires_snapshot_in_production_mode(tmp_path: Path) -> None:
+    executor = LiveTrialExecutor(
+        config=LiveBenchConfig(
+            root=tmp_path,
+            control_db=tmp_path / "control.sqlite",
+            github_owner="kulichevskiy",
+            linear_team_id="team-id",
+            symphony_repository="repo",
+            encryption_key="key",
+            require_harness_snapshot=True,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="snapshot is missing"):
+        executor._load_trial_harness(  # noqa: SLF001
+            Trial(experiment_id="EXP-MISSING", candidate="A", repetition=1, revision="sha")
+        )
 
 
 @pytest.mark.asyncio
@@ -207,6 +338,36 @@ async def test_live_trial_keeps_one_candidate_daemon_across_status_polls(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_live_trial_waits_for_final_run_before_capturing_metrics(tmp_path: Path) -> None:
+    commands = FinalizingCommands()
+    executor = LiveTrialExecutor(
+        config=LiveBenchConfig(
+            root=tmp_path / "runs",
+            control_db=tmp_path / "control.sqlite",
+            github_owner="kulichevskiy",
+            linear_team_id="team-id",
+            symphony_repository="https://github.com/kulichevskiy/symphony.git",
+            encryption_key="key",
+            poll_seconds=0,
+        ),
+        commands=commands,
+        credentials=RunCredentials(github_token="gh", linear_token="Bearer lin"),
+        github=FakeGitHub(),
+        linear=FakeLinear(),
+        grader=FakeGrader(),
+        reviewer=FakeReviewer(),
+    )
+
+    outcome = await executor(
+        Trial(experiment_id="EXP-FINAL", candidate="A", repetition=1, revision="sha")
+    )
+
+    assert commands.snapshots == 2
+    assert outcome.metrics["effective_tokens"] == 1500.0
+    assert outcome.metrics["active_agent_seconds"] == 150.0
+
+
+@pytest.mark.asyncio
 async def test_live_trial_resolves_moving_ref_to_full_sha(tmp_path: Path) -> None:
     commands = FakeCommands()
     executor = LiveTrialExecutor(
@@ -244,7 +405,7 @@ async def test_live_trial_wall_cap_covers_grading_and_keeps_receipts(
             symphony_repository="https://github.com/kulichevskiy/symphony.git",
             encryption_key="key",
             poll_seconds=0,
-            wall_time_cap_seconds=0.01,
+            wall_time_cap_seconds=5,
         ),
         commands=FakeCommands(),
         credentials=RunCredentials(github_token="gh", linear_token="lin"),

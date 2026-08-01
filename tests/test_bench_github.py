@@ -115,14 +115,20 @@ async def test_review_metrics_count_codex_comments_by_priority(tmp_path: Path) -
                     [
                         {
                             "user": {"login": "chatgpt-codex-connector[bot]"},
-                            "body": "[P1] Race allows overbooking",
+                            "body": (
+                                "**<sub><sub>![P1 Badge](https://img.shields.io/badge/"
+                                "P1-orange?style=flat)</sub></sub> Race allows overbooking"
+                            ),
                         },
                         {"user": {"login": "human"}, "body": "[P0] Ignore me"},
                     ],
                     [
                         {
                             "user": {"login": "chatgpt-codex-connector[bot]"},
-                            "body": "[P2] Missing validation",
+                            "body": (
+                                "**<sub><sub>![P2 Badge](https://img.shields.io/badge/"
+                                "P2-yellow?style=flat)</sub></sub> Missing validation"
+                            ),
                         }
                     ],
                 ]

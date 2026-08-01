@@ -262,31 +262,21 @@ unknown booking, and restart persistence. Keep the complete suite green.
     )
 
 
-def harness_version() -> str:
+def harness_version(root: Path | None = None) -> str:
     """Stable identity of the campaign, seed application, and hidden grader."""
     package = files("symphony.bench")
     payload = b""
-    with as_file(package) as seed_root:
+    with as_file(package) as packaged_root:
+        seed_root = root or packaged_root
         ignored = {".ruff_cache", "__pycache__", "node_modules", "dist"}
         harness_files = sorted(
             path
             for path in seed_root.rglob("*")
             if path.is_file()
-            and path.suffix
-            in {
-                ".py",
-                ".json",
-                ".md",
-                ".toml",
-                ".lock",
-                ".yml",
-                ".yaml",
-                ".tsx",
-                ".ts",
-                ".css",
-                ".html",
-            }
             and not ignored.intersection(path.relative_to(seed_root).parts)
+            and path.suffix not in {".pyc", ".pyo"}
+            and path.name != ".DS_Store"
+            and path.name != ".version"
         )
         for path in harness_files:
             payload += str(path.relative_to(seed_root)).encode() + b"\0" + path.read_bytes()

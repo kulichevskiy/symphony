@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
+from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 
@@ -26,6 +27,7 @@ def create_bench_app(
     default_profile: dict[str, object] | None = None,
     resolve_revision: Callable[[str], Awaitable[str]] | None = None,
     harness_version: str = "",
+    prepare_harness: Callable[[str], Awaitable[str]] | None = None,
     recover_execution: Callable[[], Awaitable[None]] | None = None,
 ) -> FastAPI:
     if not api_token:
@@ -114,7 +116,21 @@ def create_bench_app(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                     detail=f"candidate revision could not be pinned: {exc}",
                 ) from exc
-        return store.create(request.model_copy(update=updates), harness_version=harness_version)
+        experiment_id = f"EXP-{uuid4().hex[:12].upper()}"
+        pinned_harness = harness_version
+        if prepare_harness is not None:
+            try:
+                pinned_harness = await prepare_harness(experiment_id)
+            except Exception as exc:  # noqa: BLE001 - provider error becomes API failure
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"harness snapshot failed: {exc}",
+                ) from exc
+        return store.create(
+            request.model_copy(update=updates),
+            harness_version=pinned_harness,
+            experiment_id=experiment_id,
+        )
 
     @app.get("/experiments/{experiment_id}", response_model=Experiment, dependencies=auth)
     def get_experiment(experiment_id: str) -> Experiment:

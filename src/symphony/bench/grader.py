@@ -9,6 +9,18 @@ from xml.etree import ElementTree
 from .github import CommandError, Commands
 
 
+def regression_commands() -> dict[str, list[str]]:
+    return {
+        "backend_tests": ["uv", "run", "--frozen", "--no-sync", "pytest", "-q"],
+        "ruff": ["uv", "run", "--frozen", "--no-sync", "ruff", "check", "."],
+        "mypy": ["uv", "run", "--frozen", "--no-sync", "mypy", "eventdesk"],
+        "frontend_install": ["npm", "ci"],
+        "frontend_tests": ["npm", "test", "--", "--run"],
+        "frontend_build": ["npm", "run", "build"],
+        "frontend_audit": ["npm", "audit", "--audit-level=high"],
+    }
+
+
 def parse_junit_report(path: Path) -> dict[str, int]:
     """Turn pytest's stable JUnit summary into comparable scalar metrics."""
     root = ElementTree.parse(path).getroot()
@@ -39,6 +51,8 @@ class EventDeskGrader:
         repository_slug: str,
         destination: Path,
         github_token: str,
+        hidden_test: Path | None = None,
+        checks: dict[str, list[str]] | None = None,
     ) -> dict[str, object]:
         checkout = destination / "final"
         env = {"GH_TOKEN": github_token}
@@ -49,7 +63,9 @@ class EventDeskGrader:
         )
         await self._commands.run(["uv", "sync", "--locked"], cwd=checkout)
         report = destination / "hidden-junit.xml"
-        hidden = files("symphony.bench.assets").joinpath("hidden/test_eventdesk_hidden.py")
+        hidden = hidden_test or files("symphony.bench.assets").joinpath(
+            "hidden/test_eventdesk_hidden.py"
+        )
         with as_file(hidden) as hidden_path:
             injected_hidden = checkout / "bench_hidden_test.py"
             await asyncio.to_thread(shutil.copyfile, hidden_path, injected_hidden)
@@ -76,17 +92,8 @@ class EventDeskGrader:
             finally:
                 await asyncio.to_thread(injected_hidden.unlink, missing_ok=True)
         metrics: dict[str, object] = {**parse_junit_report(report)}
-        regression_commands = {
-            "backend_tests": ["uv", "run", "--frozen", "--no-sync", "pytest", "-q"],
-            "ruff": ["uv", "run", "--frozen", "--no-sync", "ruff", "check", "."],
-            "mypy": ["uv", "run", "--frozen", "--no-sync", "mypy", "eventdesk"],
-            "frontend_install": ["npm", "ci"],
-            "frontend_tests": ["npm", "test", "--", "--run"],
-            "frontend_build": ["npm", "run", "build"],
-            "frontend_audit": ["npm", "audit", "--audit-level=high"],
-        }
         results: dict[str, str] = {}
-        for name, argv in regression_commands.items():
+        for name, argv in (checks or regression_commands()).items():
             cwd = checkout / "frontend" if name.startswith("frontend_") else checkout
             try:
                 await self._commands.run(argv, cwd=cwd)

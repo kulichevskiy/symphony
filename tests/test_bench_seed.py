@@ -96,6 +96,40 @@ def test_bench_seed_builds_candidate_db_from_profile(tmp_path: Path) -> None:
     assert json.loads(knobs)["global_max_concurrent"] == 1
 
 
+def test_bench_seed_rejects_profile_routing_overrides(tmp_path: Path) -> None:
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(
+        json.dumps(
+            {
+                "binding": {
+                    "github_repo": "kulichevskiy/production",
+                    "issue_title_prefix": "",
+                    "webhook_enabled": True,
+                }
+            }
+        )
+    )
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "bench",
+            "seed",
+            "--db",
+            str(tmp_path / "candidate.sqlite"),
+            "--profile",
+            str(profile_path),
+            "--linear-team",
+            "BENCH",
+            "--github-repo",
+            "kulichevskiy/EXP-1-A1",
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "github_repo, issue_title_prefix, webhook_enabled" in result.output
+
+
 def test_bench_seed_copies_encrypted_control_connections(tmp_path: Path) -> None:
     control_path = tmp_path / "control.sqlite"
     candidate_path = tmp_path / "candidate.sqlite"

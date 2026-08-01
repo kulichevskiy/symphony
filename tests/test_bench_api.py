@@ -48,10 +48,15 @@ def test_submit_and_read_experiment_survives_restart(tmp_path: Path) -> None:
 
 def test_submit_pins_revision_profile_and_harness_version(tmp_path: Path) -> None:
     seen: list[str] = []
+    prepared: list[str] = []
 
     async def resolve(revision: str) -> str:
         seen.append(revision)
         return "a" * 40
+
+    async def prepare(experiment_id: str) -> str:
+        prepared.append(experiment_id)
+        return "snapshotted-harness"
 
     app = create_bench_app(
         db_path=tmp_path / "bench.sqlite",
@@ -59,6 +64,7 @@ def test_submit_pins_revision_profile_and_harness_version(tmp_path: Path) -> Non
         default_profile={"binding": {"local_review": True}},
         resolve_revision=resolve,
         harness_version="harness-v1",
+        prepare_harness=prepare,
     )
     with TestClient(app) as client:
         response = client.post(
@@ -75,7 +81,8 @@ def test_submit_pins_revision_profile_and_harness_version(tmp_path: Path) -> Non
     assert body["candidate_a_profile"] == {"binding": {"local_review": True}}
     assert body["candidate_b_profile"] == body["candidate_a_profile"]
     assert body["system_version_a"] == body["system_version_b"]
-    assert body["harness_version"] == "harness-v1"
+    assert prepared == [body["id"]]
+    assert body["harness_version"] == "snapshotted-harness"
 
 
 @pytest.mark.asyncio

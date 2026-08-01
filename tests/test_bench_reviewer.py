@@ -2,7 +2,11 @@ import json
 
 import pytest
 
-from symphony.bench.reviewer import parse_review, review_metrics
+from symphony.bench.reviewer import (
+    cleanup_stale_reviewer_credentials,
+    parse_review,
+    review_metrics,
+)
 
 
 def test_parse_review_accepts_fenced_json() -> None:
@@ -46,3 +50,15 @@ def test_review_metrics_keeps_spec_and_standards_separate() -> None:
 def test_parse_review_rejects_invalid_contract(payload: str) -> None:
     with pytest.raises(RuntimeError):
         parse_review(payload)
+
+
+def test_cleanup_stale_reviewer_credentials_removes_interrupted_auth(tmp_path) -> None:
+    stale = tmp_path / "EXP-1" / "A1" / "bench-codex-stale"
+    stale.mkdir(parents=True)
+    (stale / "auth.json").write_text("plaintext credential")
+    keep = tmp_path / "EXP-1" / "A1" / "candidate-profile.json"
+    keep.write_text("{}")
+
+    assert cleanup_stale_reviewer_credentials(tmp_path) == 1
+    assert not stale.exists()
+    assert keep.exists()

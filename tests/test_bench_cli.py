@@ -2,6 +2,7 @@ import httpx
 import respx
 from click.testing import CliRunner
 
+from symphony.bench.cli import _BenchSecrets
 from symphony.cli import main
 
 
@@ -45,3 +46,29 @@ def test_verify_submit_calls_bench_and_prints_experiment_id() -> None:
     assert route.calls[0].request.content == (
         b'{"candidate_a":"same-sha","candidate_b":"same-sha","repetitions":3}'
     )
+
+
+def test_bench_settings_load_routing_from_mounted_env(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            (
+                "SYMPHONY_BENCH_GITHUB_OWNER=other-owner",
+                "SYMPHONY_BENCH_LINEAR_TEAM_ID=other-team",
+                "SYMPHONY_BENCH_LINEAR_LABEL_ID=other-label",
+                "SYMPHONY_BENCH_LINEAR_LABEL_NAME=other-name",
+                "SYMPHONY_BENCH_REPOSITORY=https://github.com/other/symphony.git",
+            )
+        )
+    )
+
+    settings = _BenchSecrets()
+
+    assert settings.github_owner == "other-owner"
+    assert settings.linear_team_id == "other-team"
+    assert settings.linear_label_id == "other-label"
+    assert settings.linear_label_name == "other-name"
+    assert settings.symphony_repository == "https://github.com/other/symphony.git"

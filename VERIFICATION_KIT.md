@@ -6,7 +6,9 @@ application and six sequential, complete Linear tickets.
 
 ## What one experiment does
 
-1. Resolve each requested Git ref to a full commit SHA and snapshot both profiles and the harness.
+1. Resolve each requested Git ref to a full commit SHA and snapshot both profiles and every harness
+   input: EventDesk seed, ticket campaign, hidden test, regression commands, and final-review
+   prompts. The experiment stores a checksum of that snapshot.
 2. Queue one smoke trial, then `A1, B1, A2, B2, A3, B3`.
 3. For each trial, create a private `kulichevskiy/EXP-…` repository from the same EventDesk seed.
 4. Create six uniquely titled BENCH issues with blocking relations and the stable benchmark label.
@@ -18,11 +20,16 @@ application and six sequential, complete Linear tickets.
 7. Clone final `main`; run hidden product checks, all documented regression checks, and independent
    read-only Spec and Standards reviews.
 8. Store raw receipts and render A/B means for completion, quality, time, tokens, agent launches,
-   remote review rounds, and remote Codex findings by severity.
+   local-review rounds/findings (`Critical`, `Major`, `Minor`), remote-review rounds, and remote
+   Codex comments by P0–P3 severity. Repeated findings/comments remain counted: rounds expose
+   convergence cost, while `unclassified`/`unparseable` expose broken reviewer output instead of
+   silently dropping it.
 
 Only one experiment runs at a time. Submitted experiments remain queued. A worker restart cancels
 active executor commands and marks the interrupted experiment failed instead of silently resuming a
 partly mutated trial. Trial repositories and Linear issues are retained for inspection.
+If a deploy changes the code that executes a queued harness snapshot, that queued experiment fails
+with an explicit resubmit message; it never runs old inputs through a different, unrecorded engine.
 
 ## Coolify deployment
 

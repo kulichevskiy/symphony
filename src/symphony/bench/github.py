@@ -202,7 +202,7 @@ class GitHubSandbox:
             body = raw_comment.get("body")
             if not isinstance(body, str):
                 continue
-            match = re.search(r"\[P([0-3])\]", body, re.I)
+            match = re.search(r"\[P([0-3])(?:\s+Badge)?\]", body, re.I)
             if match is not None:
                 counts[int(match.group(1))] += 1
         return {
