@@ -11,7 +11,7 @@ COPY frontend/ ./
 RUN pnpm build
 
 # --- Stage 2: runtime image with the full agent toolchain -----------------
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-bookworm AS runtime
 
 # uv, from the official static binary image.
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
@@ -85,3 +85,13 @@ RUN git config --global credential."https://github.com".helper "!gh auth git-cre
 # set in the compose `environment:` block.
 ENTRYPOINT ["uv", "run", "--frozen", "--no-sync", "--no-dev", "symphony"]
 CMD []
+
+# Candidate execution gets the full Symphony runtime but never the private
+# grader plaintext. The control image injects that file only after agents stop.
+FROM runtime AS bench-executor
+USER root
+RUN rm -rf /app/src/symphony/bench/assets/hidden
+USER symphony
+
+# Keep the ordinary image and the bench control plane feature-complete.
+FROM runtime AS production

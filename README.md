@@ -255,6 +255,9 @@ the first deploy, log in and connect the four providers on the UI Connections
 page, then point the Linear/GitHub webhooks and the Auth0
 callback/logout/origin URLs at the new domain.
 
+The isolated live E2E benchmark is a separate Coolify application. See
+[Verification kit](VERIFICATION_KIT.md) for its lifecycle, secrets, and A–A commands.
+
 ---
 
 ## Using it

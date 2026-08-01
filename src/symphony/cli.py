@@ -1334,8 +1334,12 @@ def _default_dry_run_runner() -> Runner:  # noqa: F821 — forward ref
 
 
 from .agent.runner import Runner  # noqa: E402 — placed here to match factory
+from .bench.cli import bench, verify  # noqa: E402 — Click command registration
 
 _DRY_RUN_RUNNER_FACTORY: Callable[[], Runner] = _default_dry_run_runner
+
+main.add_command(verify)
+main.add_command(bench)
 
 
 @main.command()

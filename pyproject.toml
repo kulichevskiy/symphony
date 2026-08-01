@@ -58,6 +58,7 @@ select = ["E", "F", "I", "B", "UP", "ASYNC"]
 strict = true
 python_version = "3.12"
 files = ["src/symphony", "tests/harness/fakes.py", "tests/test_github_client_protocol.py"]
+exclude = ["src/symphony/bench/assets/"]
 
 [[tool.mypy.overrides]]
 # harness.py is pulled in transitively via tests/harness/__init__.py; it uses

@@ -1,0 +1,40 @@
+{
+  "roles": {
+    "implement": {
+      "agent": "codex",
+      "model": "gpt-5.6-sol",
+      "effort": "high"
+    },
+    "review_find": {
+      "agent": "codex",
+      "model": "gpt-5.6-sol",
+      "effort": "medium"
+    },
+    "review_verify": {
+      "agent": "codex",
+      "model": "gpt-5.6-sol",
+      "effort": "high"
+    },
+    "fix": {
+      "agent": "codex",
+      "model": "gpt-5.6-sol",
+      "effort": "medium"
+    },
+    "accept": {
+      "agent": "codex",
+      "model": "gpt-5.6-sol",
+      "effort": "low"
+    }
+  },
+  "knobs": {
+    "global_max_concurrent": 1,
+    "review_iteration_cap": 12,
+    "local_review_iteration_cap": 3
+  },
+  "binding": {
+    "local_review": true,
+    "remote_review": true,
+    "auto_merge": true,
+    "allow_auto_merge": true
+  }
+}
