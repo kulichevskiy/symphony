@@ -4,6 +4,7 @@ import httpx
 import pytest
 import respx
 
+from symphony.bench import linear as linear_module
 from symphony.bench.eventdesk import eventdesk_campaign
 from symphony.bench.linear import LinearSandbox
 
@@ -70,3 +71,34 @@ async def test_linear_sandbox_creates_labeled_campaign_and_real_dependency_chain
         {"issueId": "issue-5", "relatedIssueId": "issue-6", "type": "blocks"},
     ]
     assert all("issueLabelCreate" not in call["query"] for call in calls)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_issue_states_retries_transient_linear_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(linear_module, "_RETRY_BACKOFF_SECONDS", 0, raising=False)
+    route = respx.post("https://api.linear.app/graphql").mock(
+        side_effect=[
+            httpx.Response(503),
+            httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "issue": {
+                            "id": "issue-1",
+                            "identifier": "BENCH-1",
+                            "state": {"name": "In Progress", "type": "started"},
+                        }
+                    }
+                },
+            ),
+        ]
+    )
+
+    async with LinearSandbox("Bearer token", routing_label_id="label-id") as sandbox:
+        states = await sandbox.issue_states(("issue-1",))
+
+    assert states[0].identifier == "BENCH-1"
+    assert route.call_count == 2

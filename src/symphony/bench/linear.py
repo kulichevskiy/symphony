@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any
 
@@ -8,6 +9,8 @@ import httpx
 from .eventdesk import Campaign
 
 _ENDPOINT = "https://api.linear.app/graphql"
+_TRANSIENT_QUERY_ATTEMPTS = 5
+_RETRY_BACKOFF_SECONDS = 1.0
 
 _TEAM = """
 query BenchTeam($id: String!) {
@@ -73,14 +76,34 @@ class LinearSandbox:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def _query(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
-        try:
-            response = await self._client.post(
-                _ENDPOINT, json={"query": query, "variables": variables}
-            )
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            raise LinearSandboxError(f"Linear request failed: {exc}") from exc
+    async def _query(
+        self,
+        query: str,
+        variables: dict[str, Any],
+        *,
+        retry_transient: bool = False,
+    ) -> dict[str, Any]:
+        attempts = _TRANSIENT_QUERY_ATTEMPTS if retry_transient else 1
+        for attempt in range(attempts):
+            try:
+                response = await self._client.post(
+                    _ENDPOINT, json={"query": query, "variables": variables}
+                )
+                response.raise_for_status()
+                break
+            except httpx.HTTPStatusError as exc:
+                transient = exc.response.status_code == 429 or exc.response.status_code >= 500
+                if transient and attempt + 1 < attempts:
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS * 2**attempt)
+                    continue
+                raise LinearSandboxError(f"Linear request failed: {exc}") from exc
+            except httpx.RequestError as exc:
+                if attempt + 1 < attempts:
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS * 2**attempt)
+                    continue
+                raise LinearSandboxError(f"Linear request failed: {exc}") from exc
+        else:  # pragma: no cover - every final failure raises above
+            raise AssertionError("unreachable")
         body = response.json()
         errors = body.get("errors")
         if errors:
@@ -105,7 +128,7 @@ class LinearSandbox:
         repo_url: str,
         campaign: Campaign,
     ) -> LinearCampaign:
-        team_data = await self._query(_TEAM, {"id": team_id})
+        team_data = await self._query(_TEAM, {"id": team_id}, retry_transient=True)
         team = team_data.get("team")
         if not isinstance(team, dict):
             raise LinearSandboxError(f"Linear team not found: {team_id}")
@@ -171,7 +194,7 @@ class LinearSandbox:
     async def issue_states(self, issue_ids: tuple[str, ...]) -> tuple[LinearIssueState, ...]:
         states: list[LinearIssueState] = []
         for issue_id in issue_ids:
-            data = await self._query(_ISSUE_STATE, {"id": issue_id})
+            data = await self._query(_ISSUE_STATE, {"id": issue_id}, retry_transient=True)
             issue = data.get("issue")
             if not isinstance(issue, dict):
                 raise LinearSandboxError(f"Linear issue not found: {issue_id}")
