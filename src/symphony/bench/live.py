@@ -3,10 +3,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import re
 import shutil
-from collections import Counter
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,11 +18,12 @@ from ..credentials import CredentialResolver, RunCredentials
 from ..crypto import CredentialCipher
 from ..ui.oauth import linear_provider
 from .connection_sync import snapshot_connections, sync_connections
-from .eventdesk import Campaign, eventdesk_campaign, materialize_eventdesk
+from .eventdesk import Campaign
 from .github import Commands, GitHubRepository, GitHubSandbox, SubprocessCommands
 from .grader import EventDeskGrader
 from .harness import FrozenHarness, load_harness
 from .linear import LinearCampaign, LinearIssueState, LinearSandbox
+from .metrics import snapshot_candidate
 from .models import (
     Trial,
     TrialExecutionCancelled,
@@ -32,13 +33,9 @@ from .models import (
 from .reviewer import CodexFinalReviewer
 
 T = TypeVar("T")
-
-_LOCAL_REVIEW_MARKERS = (
-    "<<<VERDICT:APPROVED>>>",
-    "<<<VERDICT:CHANGES_REQUESTED>>>",
-)
-_LOCAL_FINDING_RE = re.compile(r"(?m)^[ \t]{0,3}[-*][ \t]+(.+)$")
-_LOCAL_SEVERITY_RE = re.compile(r"^\*{0,2}\[(Critical|Major|Minor)\]", re.IGNORECASE)
+CandidateSnapshotter = Callable[[Path, Path], Awaitable[dict[str, object]]]
+log = logging.getLogger(__name__)
+_TRIAL_DIRECTORY_RE = re.compile(r"(?:SMOKE|[AB][1-9][0-9]*)\Z")
 
 
 class GitHubProvisioner(Protocol):
@@ -85,6 +82,7 @@ class ProductReviewer(Protocol):
 @dataclass(frozen=True)
 class LiveBenchConfig:
     root: Path
+    private_root: Path
     control_db: Path
     github_owner: str
     linear_team_id: str
@@ -99,7 +97,6 @@ class LiveBenchConfig:
     receipt_timeout_seconds: float = 30
     provision_attempts: int = 3
     provision_retry_seconds: float = 5
-    require_harness_snapshot: bool = False
 
 
 class LiveTrialExecutor:
@@ -113,6 +110,7 @@ class LiveTrialExecutor:
         linear: LinearProvisioner | None = None,
         grader: ProductGrader | None = None,
         reviewer: ProductReviewer | None = None,
+        candidate_snapshotter: CandidateSnapshotter = snapshot_candidate,
     ) -> None:
         self._config = config
         self._commands = commands or SubprocessCommands()
@@ -125,6 +123,7 @@ class LiveTrialExecutor:
             control_db=config.control_db,
             encryption_key=config.encryption_key,
         )
+        self._candidate_snapshotter = candidate_snapshotter
 
     async def __call__(self, trial: Trial) -> TrialOutcome:
         cancelled_outcome: asyncio.Future[TrialOutcome] = asyncio.get_running_loop().create_future()
@@ -148,6 +147,9 @@ class LiveTrialExecutor:
     async def _execute_trial(
         self, trial: Trial, cancelled_outcome: asyncio.Future[TrialOutcome]
     ) -> TrialOutcome:
+        await asyncio.to_thread(
+            _archive_shared_trials, self._config.root, self._config.private_root
+        )
         started = asyncio.get_running_loop().time()
         suffix = "SMOKE" if trial.candidate == "S" else f"{trial.candidate}{trial.repetition}"
         trial_name = f"{trial.experiment_id}-{suffix}"
@@ -168,12 +170,7 @@ class LiveTrialExecutor:
                 raise RuntimeError("bench Linear connection is missing; reconnect and retry")
 
             await asyncio.to_thread(trial_root.mkdir, parents=True, exist_ok=False)
-            campaign_definition = eventdesk_campaign()
-            if frozen is None:
-                await asyncio.to_thread(materialize_eventdesk, eventdesk_root)
-            else:
-                await asyncio.to_thread(shutil.copytree, frozen.root / "eventdesk", eventdesk_root)
-                campaign_definition = frozen.campaign
+            await asyncio.to_thread(shutil.copytree, frozen.root / "eventdesk", eventdesk_root)
             github = self._github or GitHubSandbox(
                 owner=self._config.github_owner,
                 token=credentials.github_token,
@@ -193,7 +190,7 @@ class LiveTrialExecutor:
                     team_id=self._config.linear_team_id,
                     label=trial_name,
                     repo_url=repository.url,
-                    campaign=campaign_definition,
+                    campaign=frozen.campaign,
                 )
             )
             connections_db = trial_root / "connections.sqlite"
@@ -221,15 +218,15 @@ class LiveTrialExecutor:
                     repository_slug=repository.slug,
                     destination=trial_root,
                     github_token=credentials.github_token,
-                    hidden_test=frozen.hidden_test if frozen is not None else None,
-                    checks=frozen.regression_commands if frozen is not None else None,
+                    hidden_test=frozen.hidden_test,
+                    checks=frozen.regression_commands,
                 )
             )
             metrics.update(
                 await self._reviewer.review(
                     checkout=trial_root / "final",
-                    spec_prompt=frozen.spec_prompt if frozen is not None else None,
-                    standards_prompt=frozen.standards_prompt if frozen is not None else None,
+                    spec_prompt=frozen.spec_prompt,
+                    standards_prompt=frozen.standards_prompt,
                 )
             )
             metrics.update(await github.review_metrics(repository_slug=repository.slug))
@@ -264,6 +261,14 @@ class LiveTrialExecutor:
             if owns_linear:
                 assert isinstance(linear, LinearSandbox)
                 await linear.aclose()
+            try:
+                await asyncio.to_thread(
+                    _archive_trial_receipts,
+                    trial_root,
+                    self._config.private_root / trial.experiment_id / suffix,
+                )
+            except Exception:  # noqa: BLE001 - next trial retries cleanup before dispatch
+                log.exception("could not archive bench receipts from %s", trial_root)
         metrics["wall_seconds"] = asyncio.get_running_loop().time() - started
         return TrialOutcome(
             repository_url=repository.url,
@@ -271,13 +276,11 @@ class LiveTrialExecutor:
             metrics=metrics,
         )
 
-    def _load_trial_harness(self, trial: Trial) -> FrozenHarness | None:
-        snapshot = self._config.root / trial.experiment_id / "_harness"
-        if snapshot.exists():
-            return load_harness(snapshot)
-        if self._config.require_harness_snapshot:
+    def _load_trial_harness(self, trial: Trial) -> FrozenHarness:
+        snapshot = self._config.private_root / trial.experiment_id / "_harness"
+        if not snapshot.exists():
             raise RuntimeError(f"experiment harness snapshot is missing: {snapshot}")
-        return None
+        return load_harness(snapshot)
 
     async def _partial_outcome(
         self,
@@ -568,67 +571,55 @@ class LiveTrialExecutor:
     async def _candidate_snapshot(
         self, candidate_root: Path, candidate_db: Path
     ) -> dict[str, object]:
-        snapshot_raw = await self._commands.run(
-            [
-                "uv",
-                "run",
-                "--frozen",
-                "--no-sync",
-                "--no-dev",
-                "symphony",
-                "bench",
-                "snapshot",
-                "--db",
-                str(candidate_db),
-            ],
-            cwd=candidate_root,
-        )
-        try:
-            parsed = json.loads(snapshot_raw.strip().splitlines()[-1])
-        except (IndexError, json.JSONDecodeError) as exc:
-            raise RuntimeError("candidate returned an invalid bench snapshot") from exc
-        if not isinstance(parsed, dict):
-            raise RuntimeError("candidate returned a non-object bench snapshot")
-        metrics = {str(key): value for key, value in parsed.items()}
-        metrics.update(
-            await asyncio.to_thread(_local_review_metrics, candidate_root.parent / "logs")
-        )
-        return metrics
+        return await self._candidate_snapshotter(candidate_db, candidate_root.parent / "logs")
 
 
-def _local_review_metrics(log_root: Path) -> dict[str, int]:
-    """Count final local-review verdicts and their explicitly graded findings."""
-    counts = Counter[str]()
-    review_root = log_root / "local_review"
-    if review_root.is_dir():
-        for path in review_root.glob("*/review-*.last.txt"):
-            if "-find.last.txt" in path.name:
+def _archive_shared_trials(root: Path, private_root: Path) -> None:
+    """Remove every prior solution from the executor-visible volume before dispatch."""
+    if not root.exists():
+        return
+    for experiment_root in root.glob("EXP-*"):
+        if not experiment_root.is_dir():
+            continue
+        legacy_harness = experiment_root / "_harness"
+        if legacy_harness.is_dir():
+            private_harness = private_root / experiment_root.name / "_harness"
+            if not private_harness.exists():
+                shutil.copytree(legacy_harness, private_harness)
+            shutil.rmtree(legacy_harness)
+        for trial_root in experiment_root.iterdir():
+            if trial_root.is_dir() and _TRIAL_DIRECTORY_RE.fullmatch(trial_root.name):
+                _archive_trial_receipts(
+                    trial_root, private_root / experiment_root.name / trial_root.name
+                )
+        with contextlib.suppress(OSError):
+            experiment_root.rmdir()
+
+
+def _archive_trial_receipts(trial_root: Path, destination: Path) -> None:
+    """Keep audit receipts privately; discard candidate-readable source and hidden artifacts."""
+    if not trial_root.exists():
+        return
+    destination.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    for pattern in (
+        "candidate-profile.json",
+        "candidate.sqlite*",
+        "connections.sqlite*",
+        "hidden-junit.xml",
+        "final-*-review.json",
+    ):
+        for source in trial_root.glob(pattern):
+            if not source.is_file():
                 continue
-            try:
-                message = path.read_text(encoding="utf-8")
-            except OSError:
-                continue
-            markers = [(message.rfind(marker), marker) for marker in _LOCAL_REVIEW_MARKERS]
-            marker_at, marker = max(markers)
-            if marker_at < 0:
-                counts["unparseable_rounds"] += 1
-                continue
-            counts["rounds"] += 1
-            if marker != "<<<VERDICT:CHANGES_REQUESTED>>>":
-                continue
-            findings_at = message.lower().rfind("## findings", 0, marker_at)
-            body_at = findings_at + len("## findings") if findings_at >= 0 else 0
-            for match in _LOCAL_FINDING_RE.finditer(message[body_at:marker_at]):
-                counts["findings"] += 1
-                severity = _LOCAL_SEVERITY_RE.match(match.group(1).strip())
-                key = severity.group(1).lower() if severity is not None else "unclassified"
-                counts[key] += 1
-    return {
-        "local_review_rounds": counts["rounds"],
-        "local_review_unparseable_rounds": counts["unparseable_rounds"],
-        "local_review_findings": counts["findings"],
-        "local_review_critical": counts["critical"],
-        "local_review_major": counts["major"],
-        "local_review_minor": counts["minor"],
-        "local_review_unclassified": counts["unclassified"],
-    }
+            shutil.copy2(source, destination / source.name)
+            copied.append(source.name)
+    logs = trial_root / "logs"
+    if logs.is_dir():
+        shutil.copytree(logs, destination / "logs", dirs_exist_ok=True)
+        copied.append("logs/")
+    (destination / "receipt-manifest.json").write_text(
+        json.dumps({"copied": sorted(copied)}, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    shutil.rmtree(trial_root)

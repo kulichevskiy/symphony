@@ -29,6 +29,7 @@ services:
     environment:
       SYMPHONY_BENCH_DB_PATH: /data/db/bench-control.sqlite
       SYMPHONY_BENCH_ROOT: /data/bench
+      SYMPHONY_BENCH_PRIVATE_ROOT: /data/db/bench-private
       SYMPHONY_BENCH_EXECUTOR_URL: http://executor:8090
       SYMPHONY_BENCH_EXECUTOR_TOKEN: ${SYMPHONY_BENCH_EXECUTOR_TOKEN:?required}
     networks:

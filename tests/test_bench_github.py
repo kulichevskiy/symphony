@@ -120,6 +120,14 @@ async def test_review_metrics_count_codex_comments_by_priority(tmp_path: Path) -
                                 "P1-orange?style=flat)</sub></sub> Race allows overbooking"
                             ),
                         },
+                        {
+                            "user": {"login": "chatgpt-codex-connector[bot]"},
+                            "body": "Malformed inline finding without a priority",
+                        },
+                        {
+                            "user": {"login": "chatgpt-codex-connector[bot]"},
+                            "body": None,
+                        },
                         {"user": {"login": "human"}, "body": "[P0] Ignore me"},
                     ],
                     [
@@ -154,7 +162,9 @@ async def test_review_metrics_count_codex_comments_by_priority(tmp_path: Path) -
     metrics = await sandbox.review_metrics(repository_slug="kulichevskiy/trial")
 
     assert metrics == {
-        "remote_review_comments": 3,
+        "remote_review_comments": 5,
+        "remote_review_unclassified": 1,
+        "remote_review_unparseable": 1,
         "remote_review_p0": 0,
         "remote_review_p1": 1,
         "remote_review_p2": 2,

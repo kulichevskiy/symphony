@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections import Counter
-from datetime import datetime
 from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Any
@@ -15,13 +13,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .. import db
 from ..config import RepoBinding, binding_natural_key
-from ..tokens import effective_tokens
 from .app import create_bench_app
 from .connection_sync import sync_connections as _sync_connections
 from .eventdesk import harness_version
 from .executor import RemoteCommands, create_executor_app
 from .harness import snapshot_harness
 from .live import LiveBenchConfig, LiveTrialExecutor
+from .metrics import snapshot_candidate
 from .models import ExperimentReport
 from .report import render_markdown
 from .reviewer import cleanup_stale_reviewer_credentials
@@ -366,58 +364,12 @@ def sync_connections(db_path: Path, control_db: Path) -> None:
     required=True,
 )
 def snapshot(db_path: Path) -> None:
-    """Emit stable metrics without exposing the candidate's DB schema to the worker."""
+    """Emit metrics with the harness-owned, read-only measurement engine."""
     click.echo(json.dumps(asyncio.run(_snapshot(db_path)), separators=(",", ":")))
 
 
 async def _snapshot(db_path: Path) -> dict[str, object]:
-    conn = await db.connect(db_path)
-    try:
-        cursor = await conn.execute(
-            """
-            SELECT stage, status, started_at, ended_at, input_tokens, output_tokens,
-                   cache_write_tokens, cache_read_tokens
-            FROM runs
-            ORDER BY started_at, id
-            """
-        )
-        rows = await cursor.fetchall()
-        review_cursor = await conn.execute(
-            """
-            SELECT COUNT(*) AS total
-            FROM state_transitions
-            WHERE table_name = 'review_state'
-              AND field = 'codex_review_requested_at'
-              AND COALESCE(new_value, '') <> ''
-            """
-        )
-        review_row = await review_cursor.fetchone()
-    finally:
-        await conn.close()
-    statuses = Counter(str(row["status"]) for row in rows)
-    active_seconds = 0.0
-    for row in rows:
-        if row["stage"] == "review" or row["ended_at"] is None:
-            continue
-        started = datetime.fromisoformat(str(row["started_at"]))
-        ended = datetime.fromisoformat(str(row["ended_at"]))
-        active_seconds += max(0.0, (ended - started).total_seconds())
-    tokens = sum(
-        effective_tokens(
-            int(row["input_tokens"]),
-            int(row["output_tokens"]),
-            int(row["cache_write_tokens"]),
-            int(row["cache_read_tokens"]),
-        )
-        for row in rows
-    )
-    return {
-        "active_agent_seconds": active_seconds,
-        "agent_launches": sum(1 for row in rows if row["stage"] != "review"),
-        "effective_tokens": tokens,
-        "remote_review_rounds": int(review_row["total"]) if review_row is not None else 0,
-        "runs_by_status": dict(sorted(statuses.items())),
-    }
+    return await snapshot_candidate(db_path)
 
 
 @bench.command("serve")
@@ -434,6 +386,13 @@ async def _snapshot(db_path: Path) -> dict[str, object]:
     type=click.Path(path_type=Path),
     envvar="SYMPHONY_BENCH_ROOT",
     default="/data/bench",
+    show_default=True,
+)
+@click.option(
+    "--private-root",
+    type=click.Path(path_type=Path),
+    envvar="SYMPHONY_BENCH_PRIVATE_ROOT",
+    default="/data/db/bench-private",
     show_default=True,
 )
 @click.option(
@@ -473,6 +432,7 @@ async def _snapshot(db_path: Path) -> dict[str, object]:
 def serve(
     db_path: Path,
     root: Path,
+    private_root: Path,
     profile_path: Path | None,
     api_token: str | None,
     github_owner: str | None,
@@ -506,30 +466,13 @@ def serve(
         raise click.ClickException("SYMPHONY_BENCH_EXECUTOR_TOKEN is required")
     asyncio.run(_initialize_control_db(db_path))
     packaged_profile = files("symphony.bench.assets").joinpath("profiles/current.json")
-    if profile_path is not None:
-        _serve_with_profile(
-            profile_path,
-            db_path=db_path,
-            root=root,
-            api_token=api_token,
-            github_owner=github_owner,
-            linear_team_id=linear_team_id,
-            linear_label_id=linear_label_id,
-            linear_label_name=linear_label_name,
-            symphony_repository=symphony_repository,
-            encryption_key=encryption_key,
-            executor_url=executor_url,
-            executor_token=executor_token,
-            host=host,
-            port=port,
-            uvicorn_module=uvicorn,
-        )
-        return
-    with as_file(packaged_profile) as resolved_profile:
+
+    def run_with_profile(resolved_profile: Path) -> None:
         _serve_with_profile(
             resolved_profile,
             db_path=db_path,
             root=root,
+            private_root=private_root,
             api_token=api_token,
             github_owner=github_owner,
             linear_team_id=linear_team_id,
@@ -543,6 +486,12 @@ def serve(
             port=port,
             uvicorn_module=uvicorn,
         )
+
+    if profile_path is not None:
+        run_with_profile(profile_path)
+        return
+    with as_file(packaged_profile) as resolved_profile:
+        run_with_profile(resolved_profile)
 
 
 async def _initialize_control_db(path: Path) -> None:
@@ -555,6 +504,7 @@ def _serve_with_profile(
     *,
     db_path: Path,
     root: Path,
+    private_root: Path,
     api_token: str,
     github_owner: str,
     linear_team_id: str,
@@ -583,6 +533,7 @@ def _serve_with_profile(
     executor = LiveTrialExecutor(
         config=LiveBenchConfig(
             root=root,
+            private_root=private_root,
             control_db=db_path,
             github_owner=github_owner,
             linear_team_id=linear_team_id,
@@ -591,13 +542,12 @@ def _serve_with_profile(
             symphony_repository=symphony_repository,
             encryption_key=encryption_key,
             wall_time_cap_seconds=wall_time_cap_seconds,
-            require_harness_snapshot=True,
         ),
         commands=commands,
     )
 
     async def prepare_harness(experiment_id: str) -> str:
-        return await asyncio.to_thread(snapshot_harness, root / experiment_id / "_harness")
+        return await asyncio.to_thread(snapshot_harness, private_root / experiment_id / "_harness")
 
     app = create_bench_app(
         db_path=db_path,

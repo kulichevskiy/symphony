@@ -25,6 +25,12 @@ application and six sequential, complete Linear tickets.
    convergence cost, while `unclassified`/`unparseable` expose broken reviewer output instead of
    silently dropping it.
 
+The worker, not the candidate revision, reads the candidate SQLite database in read-only mode and
+calculates comparable metrics. Harness snapshots, hidden tests, and archived receipts live under
+the worker-only private root. The executor sees only the active trial; before another candidate is
+started, logs/databases are copied to the private archive and the prior solution checkout is
+removed. Final repositories remain available on GitHub for inspection.
+
 Only one experiment runs at a time. Submitted experiments remain queued. A worker restart cancels
 active executor commands and marks the interrupted experiment failed instead of silently resuming a
 partly mutated trial. Trial repositories and Linear issues are retained for inspection.
@@ -40,6 +46,10 @@ The bench is a separate Coolify application with four long-running services and 
 - `executor`: candidate processes and graders on an isolated network and run volume;
 - `connections`: the existing authenticated Connections UI, with no repository binding;
 - `caddy`: the only public service.
+
+`worker` mounts both `/data/bench` and `/data/db`; `executor` mounts only `/data/bench`.
+`SYMPHONY_BENCH_PRIVATE_ROOT` defaults to `/data/db/bench-private`, so hidden grader inputs and
+prior-trial receipts are never mounted into the candidate executor.
 
 Install a fresh [bench.env.example](bench.env.example) as `/opt/symphony-bench/.env` on the
 Coolify host. It must be readable by container uid 1000 and must not reuse production's encryption

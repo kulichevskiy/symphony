@@ -33,6 +33,8 @@ _SUMMARY_METRICS = (
     "local_review_unparseable_rounds",
     "remote_review_rounds",
     "remote_review_comments",
+    "remote_review_unclassified",
+    "remote_review_unparseable",
     "remote_review_p0",
     "remote_review_p1",
     "remote_review_p2",

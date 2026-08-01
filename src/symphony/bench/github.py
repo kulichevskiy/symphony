@@ -170,10 +170,10 @@ class GitHubSandbox:
 
     async def review_metrics(self, *, repository_slug: str) -> dict[str, int]:
         """Count actual remote Codex findings; keep rounds as a separate DB metric."""
-        comments: list[object] = []
-        for endpoint in (
-            f"repos/{repository_slug}/pulls/comments?per_page=100",
-            f"repos/{repository_slug}/issues/comments?per_page=100",
+        comments: list[tuple[object, bool]] = []
+        for endpoint, inline in (
+            (f"repos/{repository_slug}/pulls/comments?per_page=100", True),
+            (f"repos/{repository_slug}/issues/comments?per_page=100", False),
         ):
             raw = await self._commands.run(
                 ["gh", "api", "--paginate", "--slurp", endpoint],
@@ -189,11 +189,15 @@ class GitHubSandbox:
             for batch in page:
                 if not isinstance(batch, list):
                     raise RuntimeError("GitHub returned an invalid review comment page")
-                comments.extend(batch)
+                comments.extend((comment, inline) for comment in batch)
 
         counts = {priority: 0 for priority in range(4)}
-        for raw_comment in comments:
+        unclassified = 0
+        unparseable = 0
+        for raw_comment, inline in comments:
             if not isinstance(raw_comment, dict):
+                if inline:
+                    unparseable += 1
                 continue
             raw_user = raw_comment.get("user")
             login = raw_user.get("login", "") if isinstance(raw_user, dict) else ""
@@ -201,11 +205,17 @@ class GitHubSandbox:
                 continue
             body = raw_comment.get("body")
             if not isinstance(body, str):
+                if inline:
+                    unparseable += 1
                 continue
             match = re.search(r"\[P([0-3])(?:\s+Badge)?\]", body, re.I)
             if match is not None:
                 counts[int(match.group(1))] += 1
+            elif inline:
+                unclassified += 1
         return {
-            "remote_review_comments": sum(counts.values()),
+            "remote_review_comments": sum(counts.values()) + unclassified + unparseable,
+            "remote_review_unclassified": unclassified,
+            "remote_review_unparseable": unparseable,
             **{f"remote_review_p{priority}": counts[priority] for priority in range(4)},
         }
