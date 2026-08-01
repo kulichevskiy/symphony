@@ -411,8 +411,8 @@ def test_parse_local_review_output_changes_requested_extracts_findings() -> None
     message = (
         "Reviewed.\n\n"
         "## Findings\n"
-        "- `a.py:42` swallows the wrong exception.\n"
-        "- Missing test for the empty-input case.\n\n"
+        "- [Major] `a.py:42` swallows the wrong exception.\n"
+        "- [Minor] `tests/test_a.py:7` misses the empty-input case.\n\n"
         f"{VERDICT_CHANGES_REQUESTED_MARKER}\n"
     )
     stdout = _codex_jsonl_with_final_message(message)
@@ -424,8 +424,37 @@ def test_parse_local_review_output_changes_requested_extracts_findings() -> None
     assert verdict.findings_signature.startswith("local_review_findings:")
 
 
+def test_parse_local_review_output_rejects_unclassified_findings() -> None:
+    message = (
+        "## Findings\n"
+        "- `a.py:42` swallows the wrong exception.\n\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}\n"
+    )
+    stdout = _codex_jsonl_with_final_message(message)
+
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc123")
+
+    assert verdict.kind == LocalVerdictKind.UNPARSEABLE
+    assert verdict.findings == ""
+    assert verdict.raw_message == message
+
+
+def test_parse_local_review_output_rejects_partly_unclassified_findings() -> None:
+    message = (
+        "## Findings\n"
+        "- [Major] `a.py:42` swallows the wrong exception.\n"
+        "- `b.py:7` also loses the error.\n\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}\n"
+    )
+    stdout = _codex_jsonl_with_final_message(message)
+
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc123")
+
+    assert verdict.kind == LocalVerdictKind.UNPARSEABLE
+
+
 def test_changes_requested_signature_changes_with_head_sha() -> None:
-    message = f"## Findings\n- bug\n\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+    message = f"## Findings\n- [Major] bug\n\n{VERDICT_CHANGES_REQUESTED_MARKER}"
     stdout = _codex_jsonl_with_final_message(message)
     v_a = parse_local_review_output(agent="codex", stdout=stdout, head_sha="aaa")
     v_b = parse_local_review_output(agent="codex", stdout=stdout, head_sha="bbb")
@@ -437,14 +466,14 @@ def test_changes_requested_signature_changes_with_findings() -> None:
     a = parse_local_review_output(
         agent="codex",
         stdout=_codex_jsonl_with_final_message(
-            f"## Findings\n- one\n\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+            f"## Findings\n- [Major] one\n\n{VERDICT_CHANGES_REQUESTED_MARKER}"
         ),
         head_sha=head,
     )
     b = parse_local_review_output(
         agent="codex",
         stdout=_codex_jsonl_with_final_message(
-            f"## Findings\n- two\n\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+            f"## Findings\n- [Minor] two\n\n{VERDICT_CHANGES_REQUESTED_MARKER}"
         ),
         head_sha=head,
     )
@@ -484,7 +513,10 @@ def test_parse_local_review_uses_last_marker_if_quoted_earlier() -> None:
 def test_parse_local_review_findings_falls_back_when_no_heading() -> None:
     # If the agent forgets the `## Findings` heading, we still feed the
     # body before the marker into the next fix-run prompt.
-    message = f"The new function ignores the timeout argument.\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+    message = (
+        "- [Major] The new function ignores the timeout argument.\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+    )
     stdout = _codex_jsonl_with_final_message(message)
     verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc")
     assert verdict.kind == LocalVerdictKind.CHANGES_REQUESTED

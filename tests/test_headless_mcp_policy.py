@@ -387,7 +387,7 @@ class _FixerSpecCapturingRunner:
     async def _reviewer_changes_requested(self):
         message = (
             "## Findings\n\n"
-            "- file.py:1 — schema drift; regenerate types.\n\n"
+            "- [Major] file.py:1 — schema drift; regenerate types.\n\n"
             f"{VERDICT_CHANGES_REQUESTED_MARKER}"
         )
         yield RunnerEvent(kind="started", pid=1)

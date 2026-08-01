@@ -858,6 +858,8 @@ _VERDICT_LINE_RE = re.compile(
     rf"{re.escape(VERDICT_CHANGES_REQUESTED_MARKER)})"
 )
 _FINDINGS_HEADING_RE = re.compile(r"(?im)^\s*#{1,6}\s*findings\b\s*$")
+_FINDING_BULLET_RE = re.compile(r"(?m)^[-*+]\s+(.+)$")
+_SEVERITY_PREFIX_RE = re.compile(r"^\[(?:Critical|Major|Minor)\]\s+")
 
 
 def extract_last_agent_message(
@@ -969,6 +971,9 @@ def _classify_message(*, message: str, head_sha: str) -> LocalVerdict:
             raw_message=message,
         )
     findings = _extract_findings(message=message, verdict_index=matches[-1].start())
+    bullets = _FINDING_BULLET_RE.findall(findings)
+    if not bullets or any(_SEVERITY_PREFIX_RE.match(bullet) is None for bullet in bullets):
+        return LocalVerdict(kind=LocalVerdictKind.UNPARSEABLE, raw_message=message)
     digest = _stable_digest(findings)
     return LocalVerdict(
         kind=LocalVerdictKind.CHANGES_REQUESTED,

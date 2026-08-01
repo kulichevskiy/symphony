@@ -211,7 +211,7 @@ class _FixerScript:
 async def test_loop_total_cost_sums_reviewer_and_fixer() -> None:
     reviewer = _ReviewerScript(
         messages=[
-            f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Major] bug\n{VERDICT_CHANGES_REQUESTED_MARKER}",
             f"good\n{VERDICT_APPROVED_MARKER}",
         ],
         costs=[0.10, 0.05],
