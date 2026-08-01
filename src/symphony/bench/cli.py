@@ -189,6 +189,7 @@ def experiment_report(
 @click.option("--linear-team", required=True)
 @click.option("--github-repo", required=True)
 @click.option("--issue-label")
+@click.option("--issue-title-prefix")
 @click.option(
     "--connections-db",
     type=click.Path(path_type=Path, exists=True, dir_okay=False),
@@ -200,6 +201,7 @@ def seed(
     linear_team: str,
     github_repo: str,
     issue_label: str | None,
+    issue_title_prefix: str | None,
     connections_db: Path | None,
 ) -> None:
     """Create an isolated candidate DB through this revision's own schema."""
@@ -210,6 +212,7 @@ def seed(
             linear_team,
             github_repo,
             issue_label,
+            issue_title_prefix,
             connections_db,
         )
     )
@@ -221,6 +224,7 @@ async def _seed(
     linear_team: str,
     github_repo: str,
     issue_label: str | None,
+    issue_title_prefix: str | None,
     connections_db: Path | None,
 ) -> None:
     try:
@@ -241,6 +245,7 @@ async def _seed(
         "project_key": linear_team,
         "github_repo": github_repo,
         "issue_label": label,
+        "issue_title_prefix": issue_title_prefix,
         "branch_prefix": "symphony",
         "max_concurrent": 1,
         "runner": "local",

@@ -233,6 +233,7 @@ class RepoBinding(BaseModel):
     agent: Literal["claude", "codex"] = "claude"
     codex_model: str = DEFAULT_CODEX_MODEL
     issue_label: str | None = None
+    issue_title_prefix: str | None = None
     branch_prefix: str = "symphony"
     base_branch: str | None = None
     merge_strategy: MergeStrategy = "squash"

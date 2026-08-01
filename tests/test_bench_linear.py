@@ -23,17 +23,6 @@ async def test_linear_sandbox_creates_labeled_campaign_and_real_dependency_chain
                 }
             },
         ),
-        httpx.Response(
-            200,
-            json={
-                "data": {
-                    "issueLabelCreate": {
-                        "success": True,
-                        "issueLabel": {"id": "campaign-label-id", "name": "EXP-1-A1"},
-                    }
-                }
-            },
-        ),
     ]
     responses.extend(
         httpx.Response(
@@ -72,20 +61,12 @@ async def test_linear_sandbox_creates_labeled_campaign_and_real_dependency_chain
 
     assert result.issue_identifiers == tuple(f"BENCH-{index}" for index in range(1, 7))
     calls = [json.loads(call.request.content) for call in route.calls]
-    assert calls[1]["variables"]["input"] == {
-        "teamId": "team-id",
-        "name": "EXP-1-A1",
-        "color": "#5E6AD2",
-    }
-    assert all(
-        call["variables"]["input"]["labelIds"] == ["label-id", "campaign-label-id"]
-        for call in calls[2:8]
-    )
-    assert [call["variables"]["input"] for call in calls[8:]] == [
+    assert all(call["variables"]["input"]["labelIds"] == ["label-id"] for call in calls[1:7])
+    assert [call["variables"]["input"] for call in calls[7:]] == [
         {"issueId": "issue-1", "relatedIssueId": "issue-2", "type": "blocks"},
         {"issueId": "issue-2", "relatedIssueId": "issue-3", "type": "blocks"},
         {"issueId": "issue-3", "relatedIssueId": "issue-4", "type": "blocks"},
         {"issueId": "issue-4", "relatedIssueId": "issue-5", "type": "blocks"},
         {"issueId": "issue-5", "relatedIssueId": "issue-6", "type": "blocks"},
     ]
-    assert "issueLabelCreate" in calls[1]["query"]
+    assert all("issueLabelCreate" not in call["query"] for call in calls)

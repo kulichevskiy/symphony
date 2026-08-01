@@ -158,7 +158,8 @@ async def test_live_trial_provisions_runs_and_returns_traceable_outcome(tmp_path
     )
     assert commands.environments[clone_index]["GH_TOKEN"] == "gh"
     seed_call = next(call for call in commands.calls if "seed" in call)
-    assert seed_call[seed_call.index("--issue-label") + 1] == "EXP-1-A1"
+    assert seed_call[seed_call.index("--issue-label") + 1] == "symphony-bench"
+    assert seed_call[seed_call.index("--issue-title-prefix") + 1] == "[EXP-1-A1]"
     daemon_calls = [
         call for call in commands.calls if call[:2] == ("uv", "run") and call[-1] == "symphony"
     ]
