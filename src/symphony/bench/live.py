@@ -176,6 +176,7 @@ class LiveTrialExecutor:
             await snapshot_connections(self._config.control_db, connections_db)
             await self._prepare_candidate(
                 trial=trial,
+                issue_label=trial_name,
                 candidate_root=candidate_root,
                 trial_root=trial_root,
                 repository=repository,
@@ -370,6 +371,7 @@ class LiveTrialExecutor:
         self,
         *,
         trial: Trial,
+        issue_label: str,
         candidate_root: Path,
         trial_root: Path,
         repository: GitHubRepository,
@@ -417,7 +419,7 @@ class LiveTrialExecutor:
                 "--github-repo",
                 repository.slug,
                 "--issue-label",
-                self._config.linear_label_name,
+                issue_label,
                 "--connections-db",
                 str(connections_db),
             ],

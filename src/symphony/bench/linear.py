@@ -21,6 +21,12 @@ mutation BenchIssue($input: IssueCreateInput!) {
 }
 """
 
+_CREATE_LABEL = """
+mutation BenchLabel($input: IssueLabelCreateInput!) {
+  issueLabelCreate(input: $input) { success issueLabel { id name } }
+}
+"""
+
 _CREATE_RELATION = """
 mutation BenchRelation($input: IssueRelationCreateInput!) {
   issueRelationCreate(input: $input) { success }
@@ -62,6 +68,7 @@ class LinearSandbox:
         self._client = httpx.AsyncClient(headers={"Authorization": authorization}, timeout=timeout)
         self._routing_label_id = routing_label_id
         self._issues: dict[str, dict[str, dict[str, str]]] = {}
+        self._campaign_labels: dict[str, str] = {}
         self._relations: set[tuple[str, str]] = set()
 
     async def __aenter__(self) -> LinearSandbox:
@@ -114,6 +121,27 @@ class LinearSandbox:
         if todo_id is None:
             raise LinearSandboxError("BENCH team has no Todo state")
 
+        campaign_label_id = self._campaign_labels.get(label)
+        if campaign_label_id is None:
+            label_payload = self._successful(
+                await self._query(
+                    _CREATE_LABEL,
+                    {
+                        "input": {
+                            "teamId": team_id,
+                            "name": label,
+                            "color": "#5E6AD2",
+                        }
+                    },
+                ),
+                "issueLabelCreate",
+            )
+            issue_label = label_payload.get("issueLabel")
+            if not isinstance(issue_label, dict) or not issue_label.get("id"):
+                raise LinearSandboxError("Linear issueLabelCreate returned no label")
+            campaign_label_id = str(issue_label["id"])
+            self._campaign_labels[label] = campaign_label_id
+
         issue_by_key = self._issues.setdefault(label, {})
         for ticket in campaign.tickets:
             if ticket.key in issue_by_key:
@@ -126,7 +154,7 @@ class LinearSandbox:
                         "input": {
                             "teamId": team_id,
                             "stateId": todo_id,
-                            "labelIds": [self._routing_label_id],
+                            "labelIds": [self._routing_label_id, campaign_label_id],
                             "title": f"[{label}] {ticket.title}",
                             "description": description,
                         }
