@@ -184,6 +184,9 @@ class LiveTrialExecutor:
             linear = self._linear or LinearSandbox(
                 credentials.linear_token,
                 routing_label_id=self._config.linear_label_id,
+                authorization_resolver=(
+                    self._resolve_linear_authorization if self._credentials is None else None
+                ),
             )
             campaign = await self._retry_provision(
                 lambda: linear.create_campaign(
@@ -411,6 +414,12 @@ class LiveTrialExecutor:
             )
         finally:
             await conn.close()
+
+    async def _resolve_linear_authorization(self) -> str:
+        authorization = (await self._resolve_credentials()).linear_token
+        if not authorization:
+            raise RuntimeError("bench Linear connection is missing; reconnect and retry")
+        return authorization
 
     async def _prepare_candidate(
         self,

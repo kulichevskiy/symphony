@@ -277,3 +277,69 @@ async def test_issue_states_retries_transient_linear_503(
 
     assert states[0].identifier == "BENCH-1"
     assert route.call_count == 2
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_issue_states_refreshes_authorization_once_after_401() -> None:
+    route = respx.post("https://api.linear.app/graphql").mock(
+        side_effect=[
+            httpx.Response(401),
+            httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "issue": {
+                            "id": "issue-1",
+                            "identifier": "BENCH-1",
+                            "state": {"name": "In Progress", "type": "started"},
+                        }
+                    }
+                },
+            ),
+        ]
+    )
+    refreshes = 0
+
+    async def refresh_authorization() -> str:
+        nonlocal refreshes
+        refreshes += 1
+        return "Bearer fresh"
+
+    async with LinearSandbox(
+        "Bearer stale",
+        routing_label_id="label-id",
+        authorization_resolver=refresh_authorization,
+    ) as sandbox:
+        states = await sandbox.issue_states(("issue-1",))
+
+    assert states[0].identifier == "BENCH-1"
+    assert refreshes == 1
+    assert route.call_count == 2
+    assert route.calls[0].request.headers["Authorization"] == "Bearer stale"
+    assert route.calls[1].request.headers["Authorization"] == "Bearer fresh"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_issue_states_does_not_loop_when_refreshed_authorization_is_rejected() -> None:
+    route = respx.post("https://api.linear.app/graphql").mock(
+        side_effect=[httpx.Response(401), httpx.Response(401)]
+    )
+    refreshes = 0
+
+    async def refresh_authorization() -> str:
+        nonlocal refreshes
+        refreshes += 1
+        return "Bearer fresh"
+
+    async with LinearSandbox(
+        "Bearer stale",
+        routing_label_id="label-id",
+        authorization_resolver=refresh_authorization,
+    ) as sandbox:
+        with pytest.raises(linear_module.LinearSandboxError, match="401 Unauthorized"):
+            await sandbox.issue_states(("issue-1",))
+
+    assert refreshes == 1
+    assert route.call_count == 2

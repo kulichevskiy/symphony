@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -72,10 +73,18 @@ class LinearIssueState:
 
 
 class LinearSandbox:
-    def __init__(self, authorization: str, *, routing_label_id: str, timeout: float = 30) -> None:
+    def __init__(
+        self,
+        authorization: str,
+        *,
+        routing_label_id: str,
+        authorization_resolver: Callable[[], Awaitable[str]] | None = None,
+        timeout: float = 30,
+    ) -> None:
         if not routing_label_id:
             raise ValueError("routing_label_id must not be empty")
         self._client = httpx.AsyncClient(headers={"Authorization": authorization}, timeout=timeout)
+        self._authorization_resolver = authorization_resolver
         self._routing_label_id = routing_label_id
         self._issues: dict[str, dict[str, dict[str, str]]] = {}
         self._relations: set[tuple[str, str]] = set()
@@ -97,7 +106,9 @@ class LinearSandbox:
         retry_transient: bool = False,
     ) -> dict[str, Any]:
         attempts = _TRANSIENT_QUERY_ATTEMPTS if retry_transient else 1
-        for attempt in range(attempts):
+        attempt = 0
+        authorization_refresh_attempted = False
+        while attempt < attempts:
             try:
                 response = await self._client.post(
                     _ENDPOINT, json={"query": query, "variables": variables}
@@ -105,14 +116,26 @@ class LinearSandbox:
                 response.raise_for_status()
                 break
             except httpx.HTTPStatusError as exc:
+                if (
+                    exc.response.status_code == 401
+                    and self._authorization_resolver is not None
+                    and not authorization_refresh_attempted
+                ):
+                    authorization_refresh_attempted = True
+                    authorization = await self._authorization_resolver()
+                    if authorization:
+                        self._client.headers["Authorization"] = authorization
+                        continue
                 transient = exc.response.status_code == 429 or exc.response.status_code >= 500
-                if transient and attempt + 1 < attempts:
-                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS * 2**attempt)
+                attempt += 1
+                if transient and attempt < attempts:
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS * 2 ** (attempt - 1))
                     continue
                 raise LinearSandboxError(f"Linear request failed: {exc}") from exc
             except httpx.RequestError as exc:
-                if attempt + 1 < attempts:
-                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS * 2**attempt)
+                attempt += 1
+                if attempt < attempts:
+                    await asyncio.sleep(_RETRY_BACKOFF_SECONDS * 2 ** (attempt - 1))
                     continue
                 raise LinearSandboxError(f"Linear request failed: {exc}") from exc
         else:  # pragma: no cover - every final failure raises above
