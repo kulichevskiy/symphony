@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for command in curl jq git; do
+for command in curl jq git ssh; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 2
@@ -13,34 +13,10 @@ done
 
 if [[ -z "${COOLIFY_API_BASE:-}" ]]; then
   coolify_ssh_host="${COOLIFY_SSH_HOST:-prod_eng@esh-kulichevskiy-2.adjust.dev}"
-  coolify_tunnel_port="${COOLIFY_TUNNEL_PORT:-18080}"
-  api_base="http://127.0.0.1:$coolify_tunnel_port/api/v1"
-  ssh -o BatchMode=yes -o ExitOnForwardFailure=yes -N \
-    -L "127.0.0.1:$coolify_tunnel_port:127.0.0.1:8000" \
-    "$coolify_ssh_host" &
-  tunnel_pid=$!
-  cleanup() {
-    kill "$tunnel_pid" 2>/dev/null || true
-    wait "$tunnel_pid" 2>/dev/null || true
-  }
-  trap cleanup EXIT
-  tunnel_ready=false
-  for _ in $(seq 1 20); do
-    if curl --fail --silent "$api_base/health" >/dev/null; then
-      tunnel_ready=true
-      break
-    fi
-    sleep 0.25
-  done
-  if ! kill -0 "$tunnel_pid" 2>/dev/null; then
-    echo "Coolify SSH tunnel failed" >&2
-    exit 2
-  fi
-  if [[ "$tunnel_ready" != "true" ]]; then
-    echo "Coolify API did not become ready through the SSH tunnel" >&2
-    exit 2
-  fi
+  api_transport=ssh
+  api_base="http://127.0.0.1:8000/api/v1"
 else
+  api_transport=direct
   api_base="$COOLIFY_API_BASE"
   if [[ "$api_base" == http://* && "$api_base" != http://127.0.0.1:* ]]; then
     echo "refusing to send COOLIFY_API_TOKEN over non-loopback HTTP" >&2
@@ -49,13 +25,46 @@ else
 fi
 project_name="${COOLIFY_BENCH_PROJECT:-Symphony Bench}"
 application_name="${COOLIFY_BENCH_APPLICATION:-symphony-bench}"
-repository="${COOLIFY_BENCH_REPOSITORY:-https://github.com/kulichevskiy/symphony}"
+repository="${COOLIFY_BENCH_REPOSITORY:-kulichevskiy/symphony}"
 branch="${COOLIFY_BENCH_BRANCH:-$(git branch --show-current)}"
 
 api() {
   method="$1"
   path="$2"
   body="${3:-}"
+  if [[ "$api_transport" == "ssh" ]]; then
+    jq -n \
+      --arg method "$method" \
+      --arg url "$api_base$path" \
+      --arg token "$COOLIFY_API_TOKEN" \
+      --arg body "$body" \
+      '{method: $method, url: $url, token: $token, body: $body}' \
+      | ssh -o BatchMode=yes "$coolify_ssh_host" "python3 -c '
+import json
+import sys
+import urllib.error
+import urllib.request
+
+payload = json.load(sys.stdin)
+data = payload[\"body\"].encode() if payload[\"body\"] else None
+request = urllib.request.Request(
+    payload[\"url\"],
+    data=data,
+    method=payload[\"method\"],
+    headers={
+        \"Authorization\": \"Bearer \" + payload[\"token\"],
+        \"Content-Type\": \"application/json\",
+    },
+)
+try:
+    with urllib.request.urlopen(request, timeout=60) as response:
+        sys.stdout.buffer.write(response.read())
+except urllib.error.HTTPError as error:
+    sys.stderr.buffer.write(error.read())
+    raise SystemExit(22)
+'"
+    return
+  fi
   args=(
     --fail-with-body --silent --show-error
     --request "$method"
@@ -68,6 +77,8 @@ api() {
   fi
   curl "${args[@]}" "$api_base$path"
 }
+
+api GET /health >/dev/null
 
 projects="$(api GET /projects)"
 project_uuid="$(jq -r --arg name "$project_name" '.[] | select(.name == $name) | .uuid' <<<"$projects" | head -1)"
@@ -116,7 +127,8 @@ if [[ -z "$application_uuid" ]]; then
   application_uuid="$(api POST /applications/public "$(jq '. + {instant_deploy: false}' <<<"$common")" | jq -r .uuid)"
   echo "created Coolify application $application_name ($application_uuid)"
 else
-  api PATCH "/applications/$application_uuid" "$common" >/dev/null
+  update="$(jq 'del(.project_uuid, .server_uuid, .environment_name, .autogenerate_domain)' <<<"$common")"
+  api PATCH "/applications/$application_uuid" "$update" >/dev/null
   echo "updated Coolify application $application_name ($application_uuid)"
 fi
 

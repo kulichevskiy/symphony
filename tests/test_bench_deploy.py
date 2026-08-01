@@ -15,6 +15,7 @@ def test_bench_compose_separates_control_executor_and_public_network() -> None:
     assert services["executor"]["networks"] == ["execution"]
     assert services["connections"]["networks"] == ["connections"]
     assert services["caddy"]["networks"] == ["coolify", "control", "connections"]
+    assert services["caddy"]["environment"] == ["SERVICE_FQDN_CADDY"]
     assert "coolify" not in services["executor"]["networks"]
     assert services["executor"]["volumes"] == ["bench_runs:/data/bench"]
     assert all(".env" not in volume for volume in services["executor"]["volumes"])
@@ -28,3 +29,14 @@ def test_caddy_exposes_only_control_api_and_connections_ui() -> None:
     assert "reverse_proxy worker:8080" in caddy
     assert "reverse_proxy connections:8787" in caddy
     assert "executor" not in caddy
+
+
+def test_deploy_uses_ssh_stdin_when_coolify_api_is_local_only() -> None:
+    script = (ROOT / "scripts/deploy-bench-coolify.sh").read_text()
+
+    assert "urllib.request" in script
+    assert "json.load(sys.stdin)" in script
+    assert 'api_transport=ssh' in script
+    assert 'COOLIFY_BENCH_REPOSITORY:-kulichevskiy/symphony' in script
+    assert ' -L ' not in script
+    assert "del(.project_uuid, .server_uuid, .environment_name, .autogenerate_domain)" in script

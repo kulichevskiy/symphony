@@ -77,6 +77,8 @@ services:
   caddy:
     image: caddy:2
     restart: unless-stopped
+    environment:
+      - SERVICE_FQDN_CADDY
     expose:
       - "80"
     networks:

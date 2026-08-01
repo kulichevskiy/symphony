@@ -45,9 +45,9 @@ export COOLIFY_PREPARE_ONLY=1
 scripts/deploy-bench-coolify.sh
 ```
 
-The script reaches Coolify's local API through the configured SSH host; it never sends the bearer
-token over public HTTP. Add the printed origin to Auth0 and to the GitHub and Linear OAuth callback
-allowlists, finish `/opt/symphony-bench/.env`, then deploy:
+The script sends API requests through the configured SSH host to Coolify's loopback API; it never
+sends the bearer token over public HTTP. Add the printed origin to Auth0 and to the GitHub and Linear
+OAuth callback allowlists, finish `/opt/symphony-bench/.env`, then deploy:
 
 ```bash
 unset COOLIFY_PREPARE_ONLY
