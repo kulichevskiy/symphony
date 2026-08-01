@@ -188,6 +188,7 @@ def experiment_report(
 )
 @click.option("--linear-team", required=True)
 @click.option("--github-repo", required=True)
+@click.option("--issue-label")
 @click.option(
     "--connections-db",
     type=click.Path(path_type=Path, exists=True, dir_okay=False),
@@ -198,10 +199,20 @@ def seed(
     profile_path: Path,
     linear_team: str,
     github_repo: str,
+    issue_label: str | None,
     connections_db: Path | None,
 ) -> None:
     """Create an isolated candidate DB through this revision's own schema."""
-    asyncio.run(_seed(db_path, profile_path, linear_team, github_repo, connections_db))
+    asyncio.run(
+        _seed(
+            db_path,
+            profile_path,
+            linear_team,
+            github_repo,
+            issue_label,
+            connections_db,
+        )
+    )
 
 
 async def _seed(
@@ -209,6 +220,7 @@ async def _seed(
     profile_path: Path,
     linear_team: str,
     github_repo: str,
+    issue_label: str | None,
     connections_db: Path | None,
 ) -> None:
     try:
@@ -224,7 +236,7 @@ async def _seed(
     if not all(isinstance(value, dict) for value in (roles, knobs, binding_overrides)):
         raise click.ClickException("invalid profile: roles, knobs, and binding must be objects")
 
-    label = github_repo.rsplit("/", 1)[-1]
+    label = issue_label or github_repo.rsplit("/", 1)[-1]
     payload: dict[str, Any] = {
         "project_key": linear_team,
         "github_repo": github_repo,
@@ -404,6 +416,16 @@ async def _snapshot(db_path: Path) -> dict[str, object]:
     default="492bfef9-26d3-4469-9407-8bc1858ef9ef",
 )
 @click.option(
+    "--linear-label-id",
+    envvar="SYMPHONY_BENCH_LINEAR_LABEL_ID",
+    default="b4b92569-f904-4a3f-bef1-ad22fa4851c7",
+)
+@click.option(
+    "--linear-label-name",
+    envvar="SYMPHONY_BENCH_LINEAR_LABEL_NAME",
+    default="symphony-bench",
+)
+@click.option(
     "--symphony-repository",
     envvar="SYMPHONY_BENCH_REPOSITORY",
     default="https://github.com/kulichevskiy/symphony.git",
@@ -425,6 +447,8 @@ def serve(
     api_token: str | None,
     github_owner: str,
     linear_team_id: str,
+    linear_label_id: str,
+    linear_label_name: str,
     symphony_repository: str,
     encryption_key: str | None,
     executor_url: str,
@@ -455,6 +479,8 @@ def serve(
             api_token=api_token,
             github_owner=github_owner,
             linear_team_id=linear_team_id,
+            linear_label_id=linear_label_id,
+            linear_label_name=linear_label_name,
             symphony_repository=symphony_repository,
             encryption_key=encryption_key,
             executor_url=executor_url,
@@ -472,6 +498,8 @@ def serve(
             api_token=api_token,
             github_owner=github_owner,
             linear_team_id=linear_team_id,
+            linear_label_id=linear_label_id,
+            linear_label_name=linear_label_name,
             symphony_repository=symphony_repository,
             encryption_key=encryption_key,
             executor_url=executor_url,
@@ -495,6 +523,8 @@ def _serve_with_profile(
     api_token: str,
     github_owner: str,
     linear_team_id: str,
+    linear_label_id: str,
+    linear_label_name: str,
     symphony_repository: str,
     encryption_key: str,
     executor_url: str,
@@ -515,6 +545,8 @@ def _serve_with_profile(
             control_db=db_path,
             github_owner=github_owner,
             linear_team_id=linear_team_id,
+            linear_label_id=linear_label_id,
+            linear_label_name=linear_label_name,
             symphony_repository=symphony_repository,
             encryption_key=encryption_key,
         ),

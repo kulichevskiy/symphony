@@ -70,6 +70,8 @@ def test_bench_seed_builds_candidate_db_from_profile(tmp_path: Path) -> None:
             "BENCH",
             "--github-repo",
             "kulichevskiy/EXP-1-A1",
+            "--issue-label",
+            "symphony-bench",
         ],
     )
 
@@ -79,7 +81,7 @@ def test_bench_seed_builds_candidate_db_from_profile(tmp_path: Path) -> None:
         roles, knobs = conn.execute("SELECT roles, knobs FROM config_globals").fetchone()
     assert payload["project_key"] == "BENCH"
     assert payload["github_repo"] == "kulichevskiy/EXP-1-A1"
-    assert payload["issue_label"] == "EXP-1-A1"
+    assert payload["issue_label"] == "symphony-bench"
     assert payload["local_review"] is True
     assert payload["remote_review"] is True
     assert payload["verify_cmd"] == (

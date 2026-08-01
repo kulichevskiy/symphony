@@ -130,7 +130,8 @@ async def test_live_trial_provisions_runs_and_returns_traceable_outcome(tmp_path
         index for index, call in enumerate(commands.calls) if call[:2] == ("git", "clone")
     )
     assert commands.environments[clone_index]["GH_TOKEN"] == "gh"
-    assert any("seed" in call for call in commands.calls)
+    seed_call = next(call for call in commands.calls if "seed" in call)
+    assert seed_call[seed_call.index("--issue-label") + 1] == "symphony-bench"
     assert any(call[-1] == "--once" for call in commands.calls)
 
 

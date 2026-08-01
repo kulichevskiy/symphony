@@ -73,6 +73,8 @@ class LiveBenchConfig:
     linear_team_id: str
     symphony_repository: str
     encryption_key: str
+    linear_label_id: str = "b4b92569-f904-4a3f-bef1-ad22fa4851c7"
+    linear_label_name: str = "symphony-bench"
     poll_seconds: float = 20
     wall_time_cap_seconds: float = 8 * 60 * 60
     observed_token_cap: float = 300_000_000
@@ -159,7 +161,10 @@ class LiveTrialExecutor:
             )
 
             owns_linear = self._linear is None
-            linear = self._linear or LinearSandbox(credentials.linear_token)
+            linear = self._linear or LinearSandbox(
+                credentials.linear_token,
+                routing_label_id=self._config.linear_label_id,
+            )
             campaign = await self._retry_provision(
                 lambda: linear.create_campaign(
                     team_id=self._config.linear_team_id,
@@ -412,6 +417,8 @@ class LiveTrialExecutor:
                 "BENCH",
                 "--github-repo",
                 repository.slug,
+                "--issue-label",
+                self._config.linear_label_name,
                 "--connections-db",
                 str(connections_db),
             ],

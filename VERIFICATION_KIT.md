@@ -9,7 +9,8 @@ application and six sequential, complete Linear tickets.
 1. Resolve each requested Git ref to a full commit SHA and snapshot both profiles and the harness.
 2. Queue one smoke trial, then `A1, B1, A2, B2, A3, B3`.
 3. For each trial, create a private `kulichevskiy/EXP-…` repository from the same EventDesk seed.
-4. Create six BENCH issues with blocking relations and a unique label bound to that repository.
+4. Create six uniquely titled BENCH issues with blocking relations and the stable routing label
+   bound to that trial repository inside the isolated candidate DB.
 5. Run that candidate's own `bench seed`, then repeatedly run its normal `symphony --once` flow.
 6. Wait for all six issues to finish through implementation, local review, GitHub CI, remote Codex
    review, and merge. Stop on Needs Input or a safety cap.
@@ -24,8 +25,9 @@ partly mutated trial. Trial repositories and Linear issues are retained for insp
 
 ## Coolify deployment
 
-The bench is a separate four-service Coolify application:
+The bench is a separate Coolify application with four long-running services and one init job:
 
+- `init`: one-shot ownership setup for the shared named volumes;
 - `worker`: control API, queue, SQLite state, OAuth snapshot/write-back;
 - `executor`: candidate processes and graders on an isolated network and run volume;
 - `connections`: the existing authenticated Connections UI, with no repository binding;
@@ -55,9 +57,11 @@ scripts/deploy-bench-coolify.sh
 ```
 
 Open the generated domain, sign in, and connect GitHub, Linear, Codex, and every agent provider used
-by the selected profile. The GitHub credential needs permission to create private repositories,
-configure branch protection, and read/write PRs. The Linear credential needs issue, label, state,
-and relation access to the BENCH team.
+by the selected profile. The GitHub credential needs permission to create private repositories and
+read/write PRs; the kit also configures branch protection when the plan supports it. The Linear
+credential needs issue, state, and relation access to the BENCH team. Pre-create the stable
+`symphony-bench` team label once and
+set its id/name in the bench environment; trials do not need label-management permission.
 
 GitHub Free does not expose branch protection for private personal repositories. In that exact
 plan-limited case the kit keeps the repository private and relies on Symphony's own green-CI and

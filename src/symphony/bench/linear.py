@@ -15,12 +15,6 @@ query BenchTeam($id: String!) {
 }
 """
 
-_CREATE_LABEL = """
-mutation BenchLabel($input: IssueLabelCreateInput!) {
-  issueLabelCreate(input: $input) { success issueLabel { id } }
-}
-"""
-
 _CREATE_ISSUE = """
 mutation BenchIssue($input: IssueCreateInput!) {
   issueCreate(input: $input) { success issue { id identifier url } }
@@ -60,9 +54,13 @@ class LinearIssueState:
 
 
 class LinearSandbox:
-    def __init__(self, authorization: str, *, timeout: float = 30) -> None:
+    def __init__(
+        self, authorization: str, *, routing_label_id: str, timeout: float = 30
+    ) -> None:
+        if not routing_label_id:
+            raise ValueError("routing_label_id must not be empty")
         self._client = httpx.AsyncClient(headers={"Authorization": authorization}, timeout=timeout)
-        self._label_ids: dict[str, str] = {}
+        self._routing_label_id = routing_label_id
         self._issues: dict[str, dict[str, dict[str, str]]] = {}
         self._relations: set[tuple[str, str]] = set()
 
@@ -116,25 +114,6 @@ class LinearSandbox:
         if todo_id is None:
             raise LinearSandboxError("BENCH team has no Todo state")
 
-        label_id = self._label_ids.get(label)
-        if label_id is None:
-            label_payload = self._successful(
-                await self._query(
-                    _CREATE_LABEL,
-                    {
-                        "input": {
-                            "name": label,
-                            "description": f"Symphony benchmark trial {label}",
-                            "color": "#5E6AD2",
-                            "teamId": team_id,
-                        }
-                    },
-                ),
-                "issueLabelCreate",
-            )
-            label_id = str(label_payload["issueLabel"]["id"])
-            self._label_ids[label] = label_id
-
         issue_by_key = self._issues.setdefault(label, {})
         for ticket in campaign.tickets:
             if ticket.key in issue_by_key:
@@ -147,7 +126,7 @@ class LinearSandbox:
                         "input": {
                             "teamId": team_id,
                             "stateId": todo_id,
-                            "labelIds": [label_id],
+                            "labelIds": [self._routing_label_id],
                             "title": f"[{label}] {ticket.title}",
                             "description": description,
                         }
