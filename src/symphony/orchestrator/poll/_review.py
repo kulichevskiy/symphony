@@ -173,6 +173,11 @@ def _local_review_infra_failed(result: LoopResult | None) -> bool:
 def _local_review_permits_remote(result: LoopResult | None) -> bool:
     return result is not None and result.outcome in {
         LoopOutcome.APPROVED,
+        # EXHAUSTED means the final findings were successfully fixed, but the
+        # cap left no iteration for one more local verdict.  A configured
+        # remote reviewer is the next independent gate; parking here would
+        # skip it and require a human merely to continue the review pipeline.
+        LoopOutcome.EXHAUSTED,
     }
 
 

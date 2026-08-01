@@ -722,7 +722,7 @@ async def test_deliver_failed_reject_interrupts_live_review_monitor(
 
 
 @pytest.mark.asyncio
-async def test_hybrid_strategy_local_non_convergence_skips_remote_review(
+async def test_hybrid_strategy_local_exhaustion_continues_to_remote_review(
     tmp_path: Path,
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
@@ -811,21 +811,17 @@ async def test_hybrid_strategy_local_non_convergence_skips_remote_review(
             for c in gh.pr_comment.await_args_list
             if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body")) == "@codex review"
         ]
-        assert codex_calls == []
+        assert len(codex_calls) == 1
         move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
-        assert "state-na" in move_targets
-        assert "state-review" not in move_targets
+        assert "state-na" not in move_targets
+        assert "state-review" in move_targets
 
         history = await db.runs.history_for_issue(conn, "iss-1")
         review_rows = [h for h in history if h.stage == "review"]
         assert len(review_rows) == 1
-        assert review_rows[0].status == "needs_approval"
-        assert "src/auth.py:12 missing token validation" in (review_rows[0].termination_detail)
-        wait = await db.operator_waits.get(conn, "iss-1")
-        assert wait is not None
-        assert wait.run_id == review_rows[0].id
-        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
-        assert review_rows[0].id in orch._operator_wait_run_ids  # noqa: SLF001
+        assert review_rows[0].status == "running"
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        assert review_rows[0].id not in orch._operator_wait_run_ids  # noqa: SLF001
     finally:
         await conn.close()
 

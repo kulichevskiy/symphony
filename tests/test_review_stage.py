@@ -47,6 +47,25 @@ from symphony.pipeline.review_classifier import Verdict, VerdictKind
 from ._workspace_helpers import advance_head
 
 
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (LoopOutcome.APPROVED, True),
+        (LoopOutcome.EXHAUSTED, True),
+        (LoopOutcome.STUCK_LOOP, False),
+        (LoopOutcome.REVIEWER_FAILED, False),
+        (LoopOutcome.FIX_RUN_FAILED, False),
+    ],
+)
+def test_local_review_remote_handoff_policy(
+    outcome: LoopOutcome,
+    expected: bool,
+) -> None:
+    result = LoopResult(outcome=outcome, iterations=1, verdicts=())
+
+    assert review_module._local_review_permits_remote(result) is expected  # noqa: SLF001
+
+
 def test_codex_lgtm_reaction_carries_reviewed_commit_sha() -> None:
     """The "Reviewed commit: <sha>" line is threaded onto the reaction so the
     classifier can reject the approval once HEAD moves past that commit."""

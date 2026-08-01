@@ -1414,11 +1414,11 @@ class _LifecycleMixin(_OrchestratorBase):
                 )
             return run_id
 
-        # 6. Start the Review stage. A local loop is a hard pre-PR gate:
-        #    true/true runs remote review after local APPROVED, or after an
-        #    operator explicitly bypasses the local gate with $skip-local-review.
-        #    Other local terminals are parked below instead of falling through
-        #    to the GitHub bot.
+        # 6. Start the Review stage. A local loop is a hard pre-PR gate except
+        #    when it exhausts immediately after a successful final fix: in
+        #    hybrid mode the independent remote reviewer becomes the next
+        #    verdict instead of parking for a human just to continue. Stuck or
+        #    failed local terminals remain parked below.
         local_review_blocks_remote = (
             binding.resolved_local_review()
             and not _local_review_permits_remote(local_review_result)
@@ -1431,7 +1431,14 @@ class _LifecycleMixin(_OrchestratorBase):
             pr_url=pr_url,
             post_codex_review=post_codex_review,
         )
-        if binding.resolved_local_review() and _local_review_needs_approval(local_review_result):
+        if (
+            binding.resolved_local_review()
+            and _local_review_needs_approval(local_review_result)
+            and not (
+                binding.resolved_remote_review()
+                and _local_review_permits_remote(local_review_result)
+            )
+        ):
             await self._park_local_only_review_needs_approval(
                 run=review_run,
                 binding=binding,
