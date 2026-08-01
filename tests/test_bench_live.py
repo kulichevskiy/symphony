@@ -37,10 +37,30 @@ class FakeLinear:
         )
 
 
+class CompletingLinear(FakeLinear):
+    def __init__(self) -> None:
+        self.polls = 0
+
+    async def issue_states(self, issue_ids: tuple[str, ...]) -> tuple[LinearIssueState, ...]:
+        self.polls += 1
+        completed = self.polls >= 2
+        return tuple(
+            LinearIssueState(
+                id=issue_id,
+                identifier=issue_id,
+                name="Done" if completed else "In Progress",
+                type="completed" if completed else "started",
+            )
+            for issue_id in issue_ids
+        )
+
+
 class FakeCommands:
     def __init__(self) -> None:
         self.calls: list[tuple[str, ...]] = []
         self.environments: list[dict[str, str]] = []
+        self.daemon_started = asyncio.Event()
+        self.daemon_cancelled = False
 
     async def run(
         self,
@@ -53,6 +73,13 @@ class FakeCommands:
         del cwd, stdin
         self.calls.append(tuple(argv))
         self.environments.append(env or {})
+        if argv[:2] == ["uv", "run"] and argv[-1] == "symphony":
+            self.daemon_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.daemon_cancelled = True
+                raise
         if "snapshot" in argv:
             return (
                 '{"active_agent_seconds":120.0,"agent_launches":6,'
@@ -132,7 +159,47 @@ async def test_live_trial_provisions_runs_and_returns_traceable_outcome(tmp_path
     assert commands.environments[clone_index]["GH_TOKEN"] == "gh"
     seed_call = next(call for call in commands.calls if "seed" in call)
     assert seed_call[seed_call.index("--issue-label") + 1] == "symphony-bench"
-    assert any(call[-1] == "--once" for call in commands.calls)
+    daemon_calls = [
+        call for call in commands.calls if call[:2] == ("uv", "run") and call[-1] == "symphony"
+    ]
+    assert len(daemon_calls) == 1
+    assert not any("--once" in call for call in commands.calls)
+    assert commands.daemon_cancelled
+
+
+@pytest.mark.asyncio
+async def test_live_trial_keeps_one_candidate_daemon_across_status_polls(tmp_path: Path) -> None:
+    commands = FakeCommands()
+    linear = CompletingLinear()
+    executor = LiveTrialExecutor(
+        config=LiveBenchConfig(
+            root=tmp_path / "runs",
+            control_db=tmp_path / "control.sqlite",
+            github_owner="kulichevskiy",
+            linear_team_id="team-id",
+            symphony_repository="https://github.com/kulichevskiy/symphony.git",
+            encryption_key="key",
+            poll_seconds=0,
+        ),
+        commands=commands,
+        credentials=RunCredentials(github_token="gh", linear_token="Bearer lin"),
+        github=FakeGitHub(),
+        linear=linear,
+        grader=FakeGrader(),
+        reviewer=FakeReviewer(),
+    )
+
+    await executor(Trial(experiment_id="EXP-DAEMON", candidate="A", repetition=1, revision="sha"))
+
+    assert linear.polls == 2
+    assert len(
+        [
+            call
+            for call in commands.calls
+            if call[:2] == ("uv", "run") and call[-1] == "symphony"
+        ]
+    ) == 1
+    assert commands.daemon_cancelled
 
 
 @pytest.mark.asyncio

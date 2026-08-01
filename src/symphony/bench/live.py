@@ -79,7 +79,6 @@ class LiveBenchConfig:
     wall_time_cap_seconds: float = 8 * 60 * 60
     observed_token_cap: float = 300_000_000
     agent_launch_cap: int = 120
-    command_timeout_seconds: float = 2 * 60 * 60
     receipt_timeout_seconds: float = 30
     provision_attempts: int = 3
     provision_retry_seconds: float = 5
@@ -450,52 +449,56 @@ class LiveTrialExecutor:
             "SYMPHONY_WORKSPACE_ROOT": str(trial_root / "workspaces"),
             "SYMPHONY_ENCRYPTION_KEY": self._config.encryption_key,
         }
-        while True:
-            elapsed = asyncio.get_running_loop().time() - started
-            if elapsed >= self._config.wall_time_cap_seconds:
-                raise RuntimeError("bench wall-time safety cap exceeded")
-            await asyncio.wait_for(
-                self._commands.run(
-                    [
-                        "uv",
-                        "run",
-                        "--frozen",
-                        "--no-sync",
-                        "--no-dev",
-                        "symphony",
-                        "--once",
-                    ],
-                    cwd=candidate_root,
-                    env=candidate_env,
-                ),
-                timeout=min(
-                    self._config.command_timeout_seconds,
-                    self._config.wall_time_cap_seconds - elapsed,
-                ),
+        candidate = asyncio.create_task(
+            self._commands.run(
+                [
+                    "uv",
+                    "run",
+                    "--frozen",
+                    "--no-sync",
+                    "--no-dev",
+                    "symphony",
+                ],
+                cwd=candidate_root,
+                env=candidate_env,
             )
-            await sync_connections(candidate_db, self._config.control_db)
-            metrics = await self._candidate_snapshot(candidate_root, candidate_db)
-            token_total = metrics.get("effective_tokens")
-            launch_total = metrics.get("agent_launches")
-            if not isinstance(token_total, (int, float)) or not isinstance(launch_total, int):
-                raise RuntimeError("candidate bench snapshot is missing safety metrics")
-            if float(token_total) > self._config.observed_token_cap:
-                raise RuntimeError("bench observed-token safety cap exceeded")
-            if launch_total > self._config.agent_launch_cap:
-                raise RuntimeError("bench agent-launch safety cap exceeded")
+        )
+        try:
+            while True:
+                await asyncio.sleep(0)
+                if candidate.done():
+                    candidate.result()
+                    raise RuntimeError("candidate Symphony exited before campaign completed")
+                elapsed = asyncio.get_running_loop().time() - started
+                if elapsed >= self._config.wall_time_cap_seconds:
+                    raise RuntimeError("bench wall-time safety cap exceeded")
+                await sync_connections(candidate_db, self._config.control_db)
+                metrics = await self._candidate_snapshot(candidate_root, candidate_db)
+                token_total = metrics.get("effective_tokens")
+                launch_total = metrics.get("agent_launches")
+                if not isinstance(token_total, (int, float)) or not isinstance(launch_total, int):
+                    raise RuntimeError("candidate bench snapshot is missing safety metrics")
+                if float(token_total) > self._config.observed_token_cap:
+                    raise RuntimeError("bench observed-token safety cap exceeded")
+                if launch_total > self._config.agent_launch_cap:
+                    raise RuntimeError("bench agent-launch safety cap exceeded")
 
-            states = await linear.issue_states(campaign.issue_ids)
-            if all(state.type == "completed" for state in states):
-                metrics["completed_tickets"] = len(states)
-                return metrics
-            failed = [
-                state.identifier
-                for state in states
-                if state.type == "canceled" or state.name == "Needs Input"
-            ]
-            if failed:
-                raise RuntimeError(f"candidate trial stopped on {', '.join(failed)}")
-            await asyncio.sleep(self._config.poll_seconds)
+                states = await linear.issue_states(campaign.issue_ids)
+                if all(state.type == "completed" for state in states):
+                    metrics["completed_tickets"] = len(states)
+                    return metrics
+                failed = [
+                    state.identifier
+                    for state in states
+                    if state.type == "canceled" or state.name == "Needs Input"
+                ]
+                if failed:
+                    raise RuntimeError(f"candidate trial stopped on {', '.join(failed)}")
+                await asyncio.sleep(self._config.poll_seconds)
+        finally:
+            candidate.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await candidate
 
     async def _candidate_snapshot(
         self, candidate_root: Path, candidate_db: Path

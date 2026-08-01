@@ -534,10 +534,11 @@ def _serve_with_profile(
     uvicorn_module: Any,
 ) -> None:
     default_profile = _read_profile(profile)
+    wall_time_cap_seconds = 8 * 60 * 60
     commands = RemoteCommands(
         base_url=executor_url,
         token=executor_token,
-        timeout_seconds=2 * 60 * 60,
+        timeout_seconds=wall_time_cap_seconds,
     )
     executor = LiveTrialExecutor(
         config=LiveBenchConfig(
@@ -549,6 +550,7 @@ def _serve_with_profile(
             linear_label_name=linear_label_name,
             symphony_repository=symphony_repository,
             encryption_key=encryption_key,
+            wall_time_cap_seconds=wall_time_cap_seconds,
         ),
         commands=commands,
     )
