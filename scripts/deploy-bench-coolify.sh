@@ -80,6 +80,22 @@ except urllib.error.HTTPError as error:
 
 api GET /health >/dev/null
 
+application_domain() {
+  application_uuid="$1"
+  envs="$(api GET "/applications/$application_uuid/envs")"
+  service_fqdn="$(jq -r '[.[] | select(.key == "SERVICE_FQDN_CADDY") | .value | select(contains("caddy-"))][0] // empty' <<<"$envs")"
+  if [[ -n "$service_fqdn" ]]; then
+    if [[ "$service_fqdn" == http://* || "$service_fqdn" == https://* ]]; then
+      echo "$service_fqdn"
+    else
+      echo "http://$service_fqdn"
+    fi
+    return
+  fi
+  application="$(api GET "/applications/$application_uuid")"
+  jq -r '.fqdn // .domains // "domain pending"' <<<"$application"
+}
+
 projects="$(api GET /projects)"
 project_uuid="$(jq -r --arg name "$project_name" '.[] | select(.name == $name) | .uuid' <<<"$projects" | head -1)"
 if [[ -z "$project_uuid" ]]; then
@@ -143,8 +159,7 @@ else
   api POST "/applications/$application_uuid/envs" "$executor_env" >/dev/null
 fi
 
-application="$(api GET "/applications/$application_uuid")"
-domain="$(jq -r '.fqdn // .domains // "domain pending"' <<<"$application")"
+domain="$(application_domain "$application_uuid")"
 if [[ "${COOLIFY_PREPARE_ONLY:-0}" == "1" ]]; then
   echo "prepared: $domain"
   exit 0
@@ -159,8 +174,7 @@ for _ in $(seq 1 180); do
   status="$(jq -r .status <<<"$state")"
   case "$status" in
     finished)
-      application="$(api GET "/applications/$application_uuid")"
-      echo "deployed: $(jq -r '.fqdn // .domains // "domain pending"' <<<"$application")"
+      echo "deployed: $(application_domain "$application_uuid")"
       exit 0
       ;;
     failed|cancelled|cancelled-by-user)

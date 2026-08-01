@@ -60,6 +60,8 @@ services:
     restart: unless-stopped
     depends_on:
       - worker
+      - caddy
+    network_mode: "service:caddy"
     environment:
       SYMPHONY_REQUIRE_AUTH0: "1"
       SYMPHONY_DB_PATH: /data/db/bench-control.sqlite
@@ -71,9 +73,6 @@ services:
       - connection_logs:/data/connections-logs
       - connection_workspaces:/data/connections-workspaces
       - gh_auth:/home/symphony/.config/gh
-    networks:
-      - connections
-
   caddy:
     image: caddy:2
     restart: unless-stopped
@@ -84,7 +83,6 @@ services:
     networks:
       - coolify
       - control
-      - connections
     volumes:
       - type: bind
         source: ./Caddyfile.bench.coolify
@@ -103,7 +101,7 @@ services:
                   reverse_proxy worker:8080
               }
               handle {
-                  reverse_proxy connections:8787
+                  reverse_proxy 127.0.0.1:8787
               }
           }
       - caddy_data:/data
@@ -115,7 +113,6 @@ networks:
   control:
     internal: true
   execution:
-  connections:
 
 volumes:
   bench_db:
