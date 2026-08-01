@@ -11,7 +11,7 @@ application and six sequential, complete Linear tickets.
 3. For each trial, create a private `kulichevskiy/EXP-…` repository from the same EventDesk seed.
 4. Create six uniquely titled BENCH issues with blocking relations and the stable routing label
    bound to that trial repository inside the isolated candidate DB.
-5. Run that candidate's own `bench seed`, then keep one normal `symphony` daemon alive for the whole trial while the harness polls status and safety metrics.
+5. Run that candidate's own `bench seed` with GitHub webhooks disabled, then keep one normal `symphony` daemon alive for the whole trial while the harness polls status and safety metrics.
 6. Wait for all six issues to finish through implementation, local review, GitHub CI, remote Codex
    review, and merge. Stop on Needs Input or a safety cap.
 7. Clone final `main`; run hidden product checks, all documented regression checks, and independent

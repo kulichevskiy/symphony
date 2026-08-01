@@ -84,6 +84,7 @@ def test_bench_seed_builds_candidate_db_from_profile(tmp_path: Path) -> None:
     assert payload["issue_label"] == "symphony-bench"
     assert payload["local_review"] is True
     assert payload["remote_review"] is True
+    assert payload["webhook_enabled"] is False
     assert payload["verify_cmd"] == (
         "uv run pytest && uv run ruff check . && uv run mypy eventdesk "
         "&& cd frontend && npm ci && npm test -- --run && npm run build"

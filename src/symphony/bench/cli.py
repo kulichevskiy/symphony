@@ -244,6 +244,7 @@ async def _seed(
         "branch_prefix": "symphony",
         "max_concurrent": 1,
         "runner": "local",
+        "webhook_enabled": False,
         "verify_cmd": (
             "uv run pytest && uv run ruff check . && uv run mypy eventdesk "
             "&& cd frontend && npm ci && npm test -- --run && npm run build"
