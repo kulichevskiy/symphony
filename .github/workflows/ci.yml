@@ -18,3 +18,10 @@ jobs:
       - run: uv run ruff format --check
       - run: uv run mypy
       - run: uv run pytest -q
+
+  bench-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build isolated bench executor
+        run: docker build --target bench-executor --tag symphony-bench-executor:test .
