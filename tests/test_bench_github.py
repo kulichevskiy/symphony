@@ -103,9 +103,7 @@ async def test_github_sandbox_allows_plan_limited_private_repo(tmp_path: Path) -
     result = await sandbox.create_repository(name="EXP-1-A1", source=tmp_path)
 
     assert result.slug == "kulichevskiy/EXP-1-A1"
-    assert any(
-        any("branches/main/protection" in arg for arg in call[0]) for call in commands.calls
-    )
+    assert any(any("branches/main/protection" in arg for arg in call[0]) for call in commands.calls)
 
 
 @pytest.mark.asyncio

@@ -193,13 +193,16 @@ async def test_live_trial_keeps_one_candidate_daemon_across_status_polls(tmp_pat
     await executor(Trial(experiment_id="EXP-DAEMON", candidate="A", repetition=1, revision="sha"))
 
     assert linear.polls == 2
-    assert len(
-        [
-            call
-            for call in commands.calls
-            if call[:2] == ("uv", "run") and call[-1] == "symphony"
-        ]
-    ) == 1
+    assert (
+        len(
+            [
+                call
+                for call in commands.calls
+                if call[:2] == ("uv", "run") and call[-1] == "symphony"
+            ]
+        )
+        == 1
+    )
     assert commands.daemon_cancelled
 
 

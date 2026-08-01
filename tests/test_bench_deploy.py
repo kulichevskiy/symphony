@@ -34,9 +34,7 @@ def test_bench_compose_separates_control_executor_and_public_network() -> None:
     assert services["caddy"]["networks"] == ["coolify", "control"]
     assert services["caddy"]["labels"] == ["traefik.docker.network=coolify"]
     assert services["caddy"]["extra_hosts"] == ["connections:127.0.0.1"]
-    assert services["caddy"]["environment"] == {
-        "SERVICE_FQDN_CADDY": "${SERVICE_FQDN_CADDY}"
-    }
+    assert services["caddy"]["environment"] == {"SERVICE_FQDN_CADDY": "${SERVICE_FQDN_CADDY}"}
     assert "coolify" not in services["executor"]["networks"]
     assert services["executor"]["volumes"] == ["bench_runs:/data/bench"]
     assert all(".env" not in volume for volume in services["executor"]["volumes"])
@@ -57,9 +55,9 @@ def test_deploy_uses_ssh_stdin_when_coolify_api_is_local_only() -> None:
 
     assert "urllib.request" in script
     assert "json.load(sys.stdin)" in script
-    assert 'api_transport=ssh' in script
-    assert 'COOLIFY_BENCH_REPOSITORY:-kulichevskiy/symphony' in script
-    assert ' -L ' not in script
+    assert "api_transport=ssh" in script
+    assert "COOLIFY_BENCH_REPOSITORY:-kulichevskiy/symphony" in script
+    assert " -L " not in script
     assert "del(.project_uuid, .server_uuid, .environment_name, .autogenerate_domain)" in script
     assert 'select(contains("caddy-"))' in script
     assert 'echo "http://$service_fqdn"' in script

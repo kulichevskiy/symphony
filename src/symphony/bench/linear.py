@@ -57,9 +57,7 @@ class LinearIssueState:
 
 
 class LinearSandbox:
-    def __init__(
-        self, authorization: str, *, routing_label_id: str, timeout: float = 30
-    ) -> None:
+    def __init__(self, authorization: str, *, routing_label_id: str, timeout: float = 30) -> None:
         if not routing_label_id:
             raise ValueError("routing_label_id must not be empty")
         self._client = httpx.AsyncClient(headers={"Authorization": authorization}, timeout=timeout)
