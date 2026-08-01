@@ -120,6 +120,14 @@ class RemoteCommands:
             with contextlib.suppress(CommandError):
                 await self.cancel_all()
             raise
+        except httpx.HTTPStatusError as exc:
+            try:
+                body = exc.response.json()
+            except ValueError:
+                body = None
+            detail = body.get("detail") if isinstance(body, dict) else None
+            message = detail if isinstance(detail, str) and detail else str(exc)
+            raise CommandError(f"remote command failed: {message}") from exc
         except httpx.HTTPError as exc:
             raise CommandError(f"remote command failed: {exc}") from exc
         body = response.json()

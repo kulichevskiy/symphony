@@ -7,6 +7,7 @@ import respx
 from fastapi.testclient import TestClient
 
 from symphony.bench.executor import RemoteCommands, create_executor_app
+from symphony.bench.github import CommandError
 
 
 class FakeCommands:
@@ -94,6 +95,23 @@ async def test_remote_commands_forwards_without_exposing_token_in_payload(tmp_pa
     request = route.calls[0].request
     assert request.headers["Authorization"] == "Bearer executor-secret"
     assert b"executor-secret" not in request.content
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_remote_commands_preserves_executor_error_detail(tmp_path: Path) -> None:
+    respx.post("http://executor:8090/commands").mock(
+        return_value=httpx.Response(
+            422,
+            json={"detail": "gh api repos/kulichevskiy/missing exited 1: HTTP 404"},
+        )
+    )
+    commands = RemoteCommands(
+        base_url="http://executor:8090", token="executor-secret", timeout_seconds=60
+    )
+
+    with pytest.raises(CommandError, match="HTTP 404"):
+        await commands.run(["gh", "api", "repos/kulichevskiy/missing"], cwd=tmp_path)
 
 
 @pytest.mark.asyncio
