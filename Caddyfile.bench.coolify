@@ -10,6 +10,6 @@
         reverse_proxy worker:8080
     }
     handle {
-        reverse_proxy 127.0.0.1:8787
+        reverse_proxy connections:8787
     }
 }
