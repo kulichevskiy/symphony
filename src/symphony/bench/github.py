@@ -145,20 +145,27 @@ class GitHubSandbox:
             },
             separators=(",", ":"),
         )
-        await self._commands.run(
-            [
-                "gh",
-                "api",
-                "--method",
-                "PUT",
-                f"repos/{slug}/branches/main/protection",
-                "--input",
-                "-",
-            ],
-            cwd=source,
-            env=token_env,
-            stdin=protection,
-        )
+        try:
+            await self._commands.run(
+                [
+                    "gh",
+                    "api",
+                    "--method",
+                    "PUT",
+                    f"repos/{slug}/branches/main/protection",
+                    "--input",
+                    "-",
+                ],
+                cwd=source,
+                env=token_env,
+                stdin=protection,
+            )
+        except CommandError as exc:
+            if not (
+                "HTTP 403" in str(exc)
+                and "Upgrade to GitHub Pro or make this repository public" in str(exc)
+            ):
+                raise
         return GitHubRepository(slug=slug, url=f"https://github.com/{slug}")
 
     async def review_metrics(self, *, repository_slug: str) -> dict[str, int]:

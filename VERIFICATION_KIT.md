@@ -59,6 +59,10 @@ by the selected profile. The GitHub credential needs permission to create privat
 configure branch protection, and read/write PRs. The Linear credential needs issue, label, state,
 and relation access to the BENCH team.
 
+GitHub Free does not expose branch protection for private personal repositories. In that exact
+plan-limited case the kit keeps the repository private and relies on Symphony's own green-CI and
+remote-review merge gates; other branch-protection failures remain fatal.
+
 ## A–A validation
 
 Submit the same current revision and default profile on both sides:

@@ -25,6 +25,24 @@ class RecordingCommands:
         return self.responses.get(argv[-1], "")
 
 
+class FreePrivateRepositoryCommands(RecordingCommands):
+    async def run(
+        self,
+        argv: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str] | None = None,
+        stdin: str | None = None,
+    ) -> str:
+        result = await super().run(argv, cwd=cwd, env=env, stdin=stdin)
+        if any("branches/main/protection" in arg for arg in argv):
+            raise CommandError(
+                "Upgrade to GitHub Pro or make this repository public to enable this "
+                "feature. (HTTP 403)"
+            )
+        return result
+
+
 @pytest.mark.asyncio
 async def test_github_sandbox_creates_private_protected_repo(tmp_path: Path) -> None:
     commands = RecordingCommands()
@@ -75,6 +93,19 @@ async def test_github_sandbox_creates_private_protected_repo(tmp_path: Path) -> 
     assert protection[2] == {"GH_TOKEN": "github-token"}
     assert '"backend"' in (protection[3] or "")
     assert '"frontend"' in (protection[3] or "")
+
+
+@pytest.mark.asyncio
+async def test_github_sandbox_allows_plan_limited_private_repo(tmp_path: Path) -> None:
+    commands = FreePrivateRepositoryCommands()
+    sandbox = GitHubSandbox(owner="kulichevskiy", token="github-token", commands=commands)
+
+    result = await sandbox.create_repository(name="EXP-1-A1", source=tmp_path)
+
+    assert result.slug == "kulichevskiy/EXP-1-A1"
+    assert any(
+        any("branches/main/protection" in arg for arg in call[0]) for call in commands.calls
+    )
 
 
 @pytest.mark.asyncio
