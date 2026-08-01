@@ -15,7 +15,9 @@ def test_bench_compose_separates_control_executor_and_public_network() -> None:
     assert services["executor"]["networks"] == ["execution"]
     assert services["connections"]["networks"] == ["connections"]
     assert services["caddy"]["networks"] == ["coolify", "control", "connections"]
-    assert services["caddy"]["environment"] == ["SERVICE_FQDN_CADDY"]
+    assert services["caddy"]["environment"] == {
+        "SERVICE_FQDN_CADDY": "${SERVICE_FQDN_CADDY}"
+    }
     assert "coolify" not in services["executor"]["networks"]
     assert services["executor"]["volumes"] == ["bench_runs:/data/bench"]
     assert all(".env" not in volume for volume in services["executor"]["volumes"])
