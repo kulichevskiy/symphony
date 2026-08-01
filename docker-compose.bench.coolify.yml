@@ -4,6 +4,14 @@
 # mounted here.
 
 services:
+  init:
+    image: alpine:3.22
+    restart: "no"
+    command: ["sh", "-c", "chown -R 1000:1000 /data/db /data/bench"]
+    volumes:
+      - bench_db:/data/db
+      - bench_runs:/data/bench
+
   worker:
     build:
       context: .
@@ -12,6 +20,8 @@ services:
     restart: unless-stopped
     command: ["bench", "serve"]
     depends_on:
+      init:
+        condition: service_completed_successfully
       caddy:
         condition: service_started
       executor:
@@ -39,6 +49,9 @@ services:
     image: symphony-bench-executor
     restart: unless-stopped
     command: ["bench", "executor"]
+    depends_on:
+      init:
+        condition: service_completed_successfully
     environment:
       SYMPHONY_BENCH_ROOT: /data/bench
       SYMPHONY_BENCH_EXECUTOR_TOKEN: ${SYMPHONY_BENCH_EXECUTOR_TOKEN:?required}

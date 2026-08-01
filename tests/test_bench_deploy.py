@@ -9,6 +9,22 @@ def test_bench_compose_separates_control_executor_and_public_network() -> None:
     compose = yaml.safe_load((ROOT / "docker-compose.bench.coolify.yml").read_text())
     services = compose["services"]
 
+    assert services["init"]["image"] == "alpine:3.22"
+    assert services["init"]["command"] == [
+        "sh",
+        "-c",
+        "chown -R 1000:1000 /data/db /data/bench",
+    ]
+    assert set(services["init"]["volumes"]) == {
+        "bench_db:/data/db",
+        "bench_runs:/data/bench",
+    }
+    assert services["worker"]["depends_on"]["init"]["condition"] == (
+        "service_completed_successfully"
+    )
+    assert services["executor"]["depends_on"]["init"]["condition"] == (
+        "service_completed_successfully"
+    )
     assert services["worker"]["build"]["target"] == "runtime"
     assert services["executor"]["build"]["target"] == "bench-executor"
     assert set(services["worker"]["networks"]) == {"control", "execution"}
