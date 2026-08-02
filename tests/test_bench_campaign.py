@@ -7,6 +7,7 @@ from symphony.bench.campaign import (
     feedback_inbox_campaign,
     harness_version,
     materialize_feedback_inbox,
+    materialize_feedback_inbox_reference,
 )
 from symphony.bench.harness import load_harness, snapshot_harness
 
@@ -49,6 +50,23 @@ def test_materialize_feedback_inbox_creates_runnable_full_stack_seed(tmp_path: P
     workflow = (destination / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert "uv run mypy feedback_inbox" in workflow
     assert "mypy eventdesk" not in workflow
+
+
+def test_materialize_private_reference_makes_read_only_source_directories_writable(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "controls"
+    nested = source / "feedback_inbox"
+    nested.mkdir(parents=True)
+    (nested / "main.py").write_text("# reference\n", encoding="utf-8")
+    nested.chmod(0o555)
+    source.chmod(0o555)
+    destination = tmp_path / "reference"
+
+    materialize_feedback_inbox_reference(source, destination)
+
+    (destination / ".venv").mkdir()
+    (destination / "feedback_inbox/generated.py").write_text("# generated\n", encoding="utf-8")
 
 
 def test_harness_version_is_stable_content_hash() -> None:

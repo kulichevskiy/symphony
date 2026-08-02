@@ -62,6 +62,9 @@ def materialize_feedback_inbox_reference(source: Path, destination: Path) -> Non
             "*.tsbuildinfo",
         ),
     )
+    destination.chmod(destination.stat().st_mode | 0o700)
+    for directory in (path for path in destination.rglob("*") if path.is_dir()):
+        directory.chmod(directory.stat().st_mode | 0o700)
 
 
 def _ticket(key: str, title: str, body: str, *, blocked_by: tuple[str, ...] = ()) -> CampaignTicket:
