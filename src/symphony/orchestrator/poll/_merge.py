@@ -1901,11 +1901,23 @@ class _MergeMixin(_OrchestratorBase):
                 )
             return True
 
-    async def _reconcile_merged_issues_linear_state(self) -> int:
+    async def _reconcile_pending_merged_issues_linear_state(self) -> int:
+        issue_ids = frozenset(self._merged_linear_state_recheck_issue_ids)
+        if not issue_ids:
+            return 0
+        corrected = await self._reconcile_merged_issues_linear_state(issue_ids=issue_ids)
+        self._merged_linear_state_recheck_issue_ids.difference_update(issue_ids)
+        return corrected
+
+    async def _reconcile_merged_issues_linear_state(
+        self, *, issue_ids: set[str] | frozenset[str] | None = None
+    ) -> int:
         since = self._now() - timedelta(hours=MERGED_LINEAR_STATE_RECONCILE_LOOKBACK_HOURS)
         recent_merged = await db.issue_prs.list_recent_merged(self._conn, since=since)
         corrected = 0
         for pr in recent_merged:
+            if issue_ids is not None and pr.issue_id not in issue_ids:
+                continue
             binding = self._binding_for_pr(pr)
             if binding is None:
                 log.warning(
@@ -3446,6 +3458,7 @@ class _MergeMixin(_OrchestratorBase):
             merged_at=ended_at,
         )
         await db.runs.update_status(self._conn, run_id, "done", ended_at=ended_at)
+        self._merged_linear_state_recheck_issue_ids.add(storage_issue_id)
         await self._clear_operator_wait(storage_issue_id, run_id)
         await self._notify_attention(
             event=EVENT_PR_MERGED,

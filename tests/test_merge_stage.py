@@ -551,6 +551,65 @@ async def test_reconcile_merged_issue_linear_drift_moves_back_to_done(
 
 
 @pytest.mark.asyncio
+async def test_completed_merge_rechecks_its_linear_state_on_next_poll(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await db.issues.upsert(
+            conn,
+            id="iss-1",
+            identifier="ENG-1",
+            title="Add auth",
+            team_key="ENG",
+        )
+        await db.runs.create(
+            conn,
+            id="merge-run",
+            issue_id="iss-1",
+            stage="merge",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T00:02:00+00:00",
+        )
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-10T00:01:00+00:00",
+        )
+        linear = AsyncMock()
+        linear.move_issue = AsyncMock(return_value=None)
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        orch = Orchestrator(
+            Config(repos=[_binding()]),
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=MagicMock(),
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await orch._mark_merge_done(  # noqa: SLF001
+            binding=orch.config.repos[0],
+            issue=_issue(),
+            pr_url="https://github.com/org/repo/pull/42",
+            run_id="merge-run",
+        )
+        linear.move_issue.reset_mock()
+
+        assert await orch._reconcile_pending_merged_issues_linear_state() == 1  # noqa: SLF001
+        linear.lookup_issue.assert_awaited_once_with("iss-1")
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-done")
+        assert orch._merged_linear_state_recheck_issue_ids == set()  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_reconcile_merged_issue_linear_drift_dedupes_comment(
     tmp_path: Path,
 ) -> None:

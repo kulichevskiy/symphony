@@ -303,7 +303,11 @@ class _OrchestratorBase:
             self, *, reason: str = "manual"
         ) -> int: ...
 
-        async def _reconcile_merged_issues_linear_state(self) -> int: ...
+        async def _reconcile_merged_issues_linear_state(
+            self, *, issue_ids: set[str] | frozenset[str] | None = None
+        ) -> int: ...
+
+        async def _reconcile_pending_merged_issues_linear_state(self) -> int: ...
 
         async def _reconcile_orphaned_merge_runs(self, *, reason: str = "manual") -> int: ...
 
@@ -417,6 +421,7 @@ class _OrchestratorBase:
     _review_no_signal_rearm_heads: set[tuple[str, str]]
     _parked_manual_merge_revival_issue_ids: set[str]
     _merged_linear_state_reconcile_ticks: int
+    _merged_linear_state_recheck_issue_ids: set[str]
     _merged_linear_state_drift_comment_keys: set[tuple[str, str]]
     _parked_closed_unmerged_comment_keys: set[tuple[str, str, int]]
     _parked_closed_unmerged_lock: asyncio.Lock
@@ -652,6 +657,7 @@ class _OrchestratorBase:
         self._review_no_signal_rearm_heads: set[tuple[str, str]] = set()
         self._parked_manual_merge_revival_issue_ids: set[str] = set()
         self._merged_linear_state_reconcile_ticks = 0
+        self._merged_linear_state_recheck_issue_ids: set[str] = set()
         self._merged_linear_state_drift_comment_keys: set[tuple[str, str]] = set()
         self._parked_closed_unmerged_comment_keys: set[tuple[str, str, int]] = set()
         self._parked_closed_unmerged_lock = asyncio.Lock()
@@ -1181,6 +1187,15 @@ class _OrchestratorBase:
         except Exception:  # noqa: BLE001 — must not kill the loop
             log.exception("Linear tracker credential refresh failed")
         await self._restore_operator_waits()
+        try:
+            corrected = await self._reconcile_pending_merged_issues_linear_state()
+            if corrected:
+                log.info(
+                    "reconciled %d newly merged Linear issue(s) back to Done",
+                    corrected,
+                )
+        except Exception:  # noqa: BLE001 — must not kill the loop
+            log.exception("newly merged issue Linear state recheck failed")
         self._merged_linear_state_reconcile_ticks += 1
         if (
             self._merged_linear_state_reconcile_ticks % MERGED_LINEAR_STATE_RECONCILE_TICK_INTERVAL
