@@ -197,9 +197,20 @@ def test_local_review_metrics_count_final_verdicts_and_severity(tmp_path: Path) 
         "Tried the edge cases.\n<<<VERDICT:APPROVED>>>\n", encoding="utf-8"
     )
     (review / "review-2-verify.last.txt").write_text("no marker", encoding="utf-8")
+    (review / "review-2-verify-attempt-2.last.txt").write_text(
+        "Recovered.\n<<<VERDICT:APPROVED>>>\n", encoding="utf-8"
+    )
+    for name in (
+        "review-0-find.out.log",
+        "review-0-verify.out.log",
+        "review-2-verify-attempt-2.out.log",
+        "fix-0.out.log",
+    ):
+        (review / name).write_text("transcript", encoding="utf-8")
 
     assert local_review_metrics(tmp_path) == {
-        "local_review_rounds": 2,
+        "local_review_agent_launches": 4,
+        "local_review_rounds": 3,
         "local_review_unparseable_rounds": 1,
         "local_review_findings": 4,
         "local_review_critical": 1,
@@ -327,6 +338,10 @@ async def test_live_trial_provisions_runs_and_returns_traceable_outcome(tmp_path
         index for index, call in enumerate(commands.calls) if call[:2] == ("git", "clone")
     )
     assert commands.environments[clone_index]["GH_TOKEN"] == "gh"
+    checkout_index = next(
+        index for index, call in enumerate(commands.calls) if call[:2] == ("git", "checkout")
+    )
+    assert commands.environments[checkout_index]["GH_TOKEN"] == "gh"
     seed_call = next(call for call in commands.calls if "seed" in call)
     assert seed_call[seed_call.index("--issue-label") + 1] == "symphony-bench"
     assert seed_call[seed_call.index("--issue-title-prefix") + 1] == "[EXP-1-A1]"

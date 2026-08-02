@@ -451,7 +451,9 @@ class LiveTrialExecutor:
             encoding="utf-8",
         )
         await self._commands.run(
-            ["git", "checkout", "--detach", trial.revision], cwd=candidate_root
+            ["git", "checkout", "--detach", trial.revision],
+            cwd=candidate_root,
+            env={"GH_TOKEN": github_token},
         )
         await self._commands.run(["uv", "sync", "--frozen", "--no-dev"], cwd=candidate_root)
         await self._commands.run(

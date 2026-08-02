@@ -24,6 +24,7 @@ _SUMMARY_METRICS = (
     "active_agent_seconds",
     "wall_seconds",
     "agent_launches",
+    "local_review_agent_launches",
     "local_review_rounds",
     "local_review_findings",
     "local_review_critical",
@@ -59,9 +60,17 @@ def _number(value: float | None, *, signed: bool = False) -> str:
 
 def render_markdown(report: ExperimentReport) -> str:
     experiment = report.experiment
-    by_candidate: dict[str, list[TrialRecord]] = defaultdict(list)
+    completed_by_candidate: dict[str, dict[int, TrialRecord]] = defaultdict(dict)
     for trial in report.trials:
-        by_candidate[trial.candidate].append(trial)
+        if trial.candidate in {"A", "B"} and trial.status == "completed":
+            completed_by_candidate[trial.candidate][trial.repetition] = trial
+    matched_repetitions = sorted(
+        set(completed_by_candidate["A"]) & set(completed_by_candidate["B"])
+    )
+    by_candidate = {
+        candidate: [completed_by_candidate[candidate][item] for item in matched_repetitions]
+        for candidate in ("A", "B")
+    }
 
     lines = [
         f"# Symphony bench {experiment.id}",
@@ -71,8 +80,11 @@ def render_markdown(report: ExperimentReport) -> str:
         f"Candidate B: `{experiment.candidate_b}`  ",
         f"System A: `{experiment.system_version_a}`  ",
         f"System B: `{experiment.system_version_b}`  ",
+        f"Executor toolchain: `{experiment.executor_toolchain_version}`  ",
         f"Harness: `{experiment.harness_version}`  ",
         f"Repetitions: {experiment.repetitions}; order: A1, B1, A2, B2 …",
+        "Matched completed repetitions: "
+        + (", ".join(str(item) for item in matched_repetitions) or "none"),
         "",
         "## Aggregate means",
         "",

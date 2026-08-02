@@ -339,6 +339,7 @@ async def run_local_review_session(
     # so confirmed discoveries are not lost (production BENCH-59).
     finder_cache: dict[int, tuple[str, ReviewerOutput, str]] = {}
     verifier_retry_notes: dict[int, str] = {}
+    pass_attempts: dict[str, int] = {}
 
     async def _run_reviewer_pass(
         *,
@@ -362,7 +363,10 @@ async def run_local_review_session(
         the Tier B exec/write surface (verifier only); pass 1 and the
         single-pass fallback stay read-only.
         """
-        last_message_path = last_message_dir / f"{stem}.last.txt"
+        attempt = pass_attempts.get(stem, 0) + 1
+        pass_attempts[stem] = attempt
+        attempt_stem = stem if attempt == 1 else f"{stem}-attempt-{attempt}"
+        last_message_path = last_message_dir / f"{attempt_stem}.last.txt"
         # Clear any previous iteration's leftover so a partial run
         # doesn't smuggle a stale "approved" into the next pass.
         if last_message_path.exists():
@@ -402,7 +406,7 @@ async def run_local_review_session(
         collected = await collect_runner_output(
             runner, spec, usage_handler=estimator.delta, log_path=log_path
         )
-        _persist_runner_transcript(last_message_dir, stem, collected)
+        _persist_runner_transcript(last_message_dir, attempt_stem, collected)
         cost_delta = estimator.total_cost_usd - cost_before
         input_delta = estimator.total_input_tokens - input_before
         output_delta = estimator.total_output_tokens - output_before
@@ -545,8 +549,6 @@ async def run_local_review_session(
                 stdout=finder_out.stdout,
                 last_message_file=finder_out.last_message_file,
             )
-            if finder_out.ok:
-                finder_cache[iteration] = (head_sha, finder_out, pass_one_findings)
         if not finder_out.ok:
             # Propagate the finder failure (with its cost) to the loop;
             # no point paying for a verifier with nothing to verify.
@@ -560,6 +562,8 @@ async def run_local_review_session(
             # findings alongside a stray event still proceeds normally — the
             # finder is instructed not to emit a verdict marker.
             return replace(finder_out, ok=False, error=finder_out.agent_error)
+        if not finder_reused:
+            finder_cache[iteration] = (head_sha, finder_out, pass_one_findings)
         verifier_prompt = local_review_verifier_prompt(
             issue_title=issue_title,
             issue_body=issue_body,

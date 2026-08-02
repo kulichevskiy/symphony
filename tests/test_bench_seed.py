@@ -237,3 +237,66 @@ def test_bench_sync_connections_copies_only_newer_candidate_generation(
     )
     assert repeated.exit_code == 0
     assert repeated.output == "synced 0 connection(s)\n"
+
+
+def test_bench_sync_connections_does_not_undo_a_control_disconnect(
+    tmp_path: Path,
+) -> None:
+    control_path = tmp_path / "control.sqlite"
+    candidate_path = tmp_path / "candidate.sqlite"
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text("{}")
+    asyncio.run(_control_db(control_path))
+    seeded = CliRunner().invoke(
+        main,
+        [
+            "bench",
+            "seed",
+            "--db",
+            str(candidate_path),
+            "--profile",
+            str(profile_path),
+            "--linear-team",
+            "BENCH",
+            "--github-repo",
+            "kulichevskiy/EXP-1-A1",
+            "--connections-db",
+            str(control_path),
+        ],
+    )
+    assert seeded.exit_code == 0, seeded.output
+
+    async def refresh_candidate_then_disconnect_control() -> None:
+        await _replace_connection(candidate_path, "candidate-refreshed-token")
+        conn = await db.connect(control_path)
+        try:
+            await db.oauth_connections.delete(conn, "github")
+        finally:
+            await conn.close()
+
+    asyncio.run(refresh_candidate_then_disconnect_control())
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "bench",
+            "sync-connections",
+            "--db",
+            str(candidate_path),
+            "--control-db",
+            str(control_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert result.output == "synced 0 connection(s)\n"
+    with sqlite3.connect(control_path) as control:
+        assert (
+            control.execute(
+                "SELECT credential FROM oauth_connections WHERE provider = 'github'"
+            ).fetchone()
+            is None
+        )
+        assert control.execute(
+            "SELECT generation FROM oauth_credential_generations WHERE provider = 'github'"
+        ).fetchone() == (1,)

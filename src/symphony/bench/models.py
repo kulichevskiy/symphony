@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 ExperimentStatus = Literal["queued", "running", "completed", "failed"]
 TrialStatus = Literal["running", "completed", "failed"]
+EXECUTOR_TOOLCHAIN_VERSION = "uv=0.12.1;codex=0.146.0;claude-code=2.1.220;node=22"
 
 
 class ExperimentCreate(BaseModel):
@@ -26,6 +27,7 @@ class Experiment(ExperimentCreate):
     created_at: datetime
     system_version_a: str = ""
     system_version_b: str = ""
+    executor_toolchain_version: str = EXECUTOR_TOOLCHAIN_VERSION
     harness_version: str = ""
 
     @classmethod
@@ -36,8 +38,17 @@ class Experiment(ExperimentCreate):
             id=experiment_id,
             status="queued",
             created_at=datetime.now(UTC),
-            system_version_a=system_version(request.candidate_a, request.candidate_a_profile),
-            system_version_b=system_version(request.candidate_b, request.candidate_b_profile),
+            system_version_a=system_version(
+                request.candidate_a,
+                request.candidate_a_profile,
+                EXECUTOR_TOOLCHAIN_VERSION,
+            ),
+            system_version_b=system_version(
+                request.candidate_b,
+                request.candidate_b_profile,
+                EXECUTOR_TOOLCHAIN_VERSION,
+            ),
+            executor_toolchain_version=EXECUTOR_TOOLCHAIN_VERSION,
             harness_version=harness_version,
             **request.model_dump(),
         )
@@ -85,8 +96,18 @@ class ExperimentReport(BaseModel):
     trials: list[TrialRecord]
 
 
-def system_version(revision: str, profile: dict[str, object]) -> str:
+def system_version(
+    revision: str,
+    profile: dict[str, object],
+    executor_toolchain_version: str = EXECUTOR_TOOLCHAIN_VERSION,
+) -> str:
     payload = json.dumps(
-        {"revision": revision, "profile": profile}, separators=(",", ":"), sort_keys=True
+        {
+            "revision": revision,
+            "profile": profile,
+            "executor_toolchain_version": executor_toolchain_version,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
     )
     return hashlib.sha256(payload.encode()).hexdigest()[:16]

@@ -14,7 +14,7 @@ RUN pnpm build
 FROM python:3.12-slim-bookworm AS runtime
 
 # uv, from the official static binary image.
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.12.1 /uv /uvx /usr/local/bin/
 
 # System deps: git + node/npm (for the coding-agent CLIs) + gh (GitHub CLI).
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # The two coding-agent CLIs, on PATH globally.
-RUN npm install -g @anthropic-ai/claude-code @openai/codex
+RUN npm install -g @anthropic-ai/claude-code@2.1.220 @openai/codex@0.146.0
 
 # Corepack shims (pnpm/yarn) so agents + verify_cmd can run repos pinned to
 # pnpm (e.g. `verify_cmd: pnpm build && pnpm test`); node ships corepack.

@@ -16,6 +16,7 @@ _LOCAL_REVIEW_MARKERS = (
 )
 _LOCAL_FINDING_RE = re.compile(r"(?m)^[ \t]{0,3}[-*][ \t]+(.+)$")
 _LOCAL_SEVERITY_RE = re.compile(r"^\*{0,2}\[(Critical|Major|Minor)\]", re.IGNORECASE)
+_LOCAL_FINDER_FILE_RE = re.compile(r"^review-\d+-find(?:-attempt-\d+)?\.last\.txt$")
 
 
 async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dict[str, object]:
@@ -48,9 +49,10 @@ async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dic
         await conn.close()
 
     statuses = Counter(str(row["status"]) for row in rows)
+    nested_stages = {"review", "local_review", "local_review_fix"}
     active_seconds = 0.0
     for row in rows:
-        if row["stage"] == "review" or row["ended_at"] is None:
+        if row["stage"] in nested_stages or row["ended_at"] is None:
             continue
         started = datetime.fromisoformat(str(row["started_at"]))
         ended = datetime.fromisoformat(str(row["ended_at"]))
@@ -64,15 +66,20 @@ async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dic
         )
         for row in rows
     )
+    local_metrics = (
+        await asyncio.to_thread(local_review_metrics, log_root) if log_root is not None else {}
+    )
     metrics: dict[str, object] = {
         "active_agent_seconds": active_seconds,
-        "agent_launches": sum(1 for row in rows if row["stage"] != "review"),
+        "agent_launches": (
+            sum(1 for row in rows if row["stage"] not in nested_stages)
+            + int(local_metrics.get("local_review_agent_launches", 0))
+        ),
         "effective_tokens": tokens,
         "remote_review_rounds": int(review_row["total"]) if review_row is not None else 0,
         "runs_by_status": dict(sorted(statuses.items())),
+        **local_metrics,
     }
-    if log_root is not None:
-        metrics.update(await asyncio.to_thread(local_review_metrics, log_root))
     return metrics
 
 
@@ -81,8 +88,13 @@ def local_review_metrics(log_root: Path | None) -> dict[str, int]:
     counts = Counter[str]()
     review_root = log_root / "local_review" if log_root is not None else None
     if review_root is not None and review_root.is_dir():
+        counts["agent_launches"] = sum(
+            1
+            for pattern in ("*/review-*.out.log", "*/fix-*.out.log")
+            for _path in review_root.glob(pattern)
+        )
         for path in review_root.glob("*/review-*.last.txt"):
-            if "-find.last.txt" in path.name:
+            if _LOCAL_FINDER_FILE_RE.fullmatch(path.name):
                 continue
             try:
                 message = path.read_text(encoding="utf-8")
@@ -104,6 +116,7 @@ def local_review_metrics(log_root: Path | None) -> dict[str, int]:
                 key = severity.group(1).lower() if severity is not None else "unclassified"
                 counts[key] += 1
     return {
+        "local_review_agent_launches": counts["agent_launches"],
         "local_review_rounds": counts["rounds"],
         "local_review_unparseable_rounds": counts["unparseable_rounds"],
         "local_review_findings": counts["findings"],

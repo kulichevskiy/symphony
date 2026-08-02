@@ -62,10 +62,20 @@ async def sync_connections(candidate_path: Path, control_path: Path) -> int:
             await control.execute("BEGIN IMMEDIATE")
             try:
                 current = await control.execute(
-                    "SELECT generation FROM oauth_connections WHERE provider = ?",
+                    """
+                    SELECT generations.generation,
+                           connections.provider IS NOT NULL AS connected
+                    FROM oauth_credential_generations AS generations
+                    LEFT JOIN oauth_connections AS connections
+                      ON connections.provider = generations.provider
+                    WHERE generations.provider = ?
+                    """,
                     (row["provider"],),
                 )
                 current_row = await current.fetchone()
+                if current_row is not None and not bool(current_row["connected"]):
+                    await control.rollback()
+                    continue
                 current_generation = (
                     int(current_row["generation"]) if current_row is not None else 0
                 )

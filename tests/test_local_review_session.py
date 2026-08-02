@@ -1030,6 +1030,50 @@ async def test_two_pass_retry_reuses_finder_and_preserves_incomplete_verifier_no
     assert runner.verify_calls == 2
     retry_prompt = [spec.command[-1] for spec in runner.specs if spec.run_id.endswith("-verify")][1]
     assert "Confirmed SQLite OverflowError" in retry_prompt
+    assert (tmp_path / "last/review-0-verify.out.log").exists()
+    assert (tmp_path / "last/review-0-verify-attempt-2.out.log").exists()
+
+
+@pytest.mark.asyncio
+async def test_two_pass_retry_reruns_an_error_only_finder(tmp_path: Path) -> None:
+    api_error = "The server encountered a temporary problem. Please retry."
+    finder_text = "## Findings\n- [Major] suspicion at foo.py:1"
+    runner = _ScriptedRunner(
+        scripts=[
+            _turn_failed_stream(api_error),
+            _message_stream("codex", finder_text),
+            _message_stream("codex", f"held\n{VERDICT_APPROVED_MARKER}"),
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=500, changed_files=10)
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-finder-retry",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        fixer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        cap=1,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    assert [spec.run_id for spec in runner.specs].count("run-finder-retry-rev-0-find") == 2
+    assert (tmp_path / "last/review-0-find.out.log").exists()
+    assert (tmp_path / "last/review-0-find-attempt-2.out.log").exists()
 
 
 @pytest.mark.asyncio

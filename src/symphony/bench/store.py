@@ -34,6 +34,7 @@ class ExperimentStore:
                     candidate_b_profile TEXT NOT NULL DEFAULT '{}',
                     system_version_a TEXT NOT NULL DEFAULT '',
                     system_version_b TEXT NOT NULL DEFAULT '',
+                    executor_toolchain_version TEXT NOT NULL DEFAULT '',
                     harness_version TEXT NOT NULL DEFAULT '',
                     repetitions INTEGER NOT NULL,
                     created_at TEXT NOT NULL
@@ -74,6 +75,12 @@ class ExperimentStore:
                 conn, "bench_experiments", "system_version_b", "TEXT NOT NULL DEFAULT ''"
             )
             self._ensure_column(
+                conn,
+                "bench_experiments",
+                "executor_toolchain_version",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            self._ensure_column(
                 conn, "bench_experiments", "harness_version", "TEXT NOT NULL DEFAULT ''"
             )
             self._ensure_column(conn, "bench_trials", "profile", "TEXT NOT NULL DEFAULT '{}'")
@@ -97,8 +104,8 @@ class ExperimentStore:
                 INSERT INTO bench_experiments
                     (id, status, candidate_a, candidate_b, candidate_a_profile,
                      candidate_b_profile, system_version_a, system_version_b,
-                     harness_version, repetitions, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     executor_toolchain_version, harness_version, repetitions, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     experiment.id,
@@ -109,6 +116,7 @@ class ExperimentStore:
                     json.dumps(experiment.candidate_b_profile, sort_keys=True),
                     experiment.system_version_a,
                     experiment.system_version_b,
+                    experiment.executor_toolchain_version,
                     experiment.harness_version,
                     experiment.repetitions,
                     experiment.created_at.isoformat(),
@@ -122,7 +130,7 @@ class ExperimentStore:
                 """
                 SELECT id, status, candidate_a, candidate_b, candidate_a_profile,
                        candidate_b_profile, system_version_a, system_version_b,
-                       harness_version, repetitions, created_at
+                       executor_toolchain_version, harness_version, repetitions, created_at
                 FROM bench_experiments WHERE id = ?
                 """,
                 (experiment_id,),
@@ -141,7 +149,7 @@ class ExperimentStore:
                 """
                 SELECT id, status, candidate_a, candidate_b, candidate_a_profile,
                        candidate_b_profile, system_version_a, system_version_b,
-                       harness_version, repetitions, created_at
+                       executor_toolchain_version, harness_version, repetitions, created_at
                 FROM bench_experiments
                 WHERE status = 'queued'
                 ORDER BY created_at, id

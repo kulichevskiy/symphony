@@ -6,10 +6,12 @@ from fastapi.testclient import TestClient
 
 from symphony.bench.app import create_bench_app
 from symphony.bench.models import (
+    EXECUTOR_TOOLCHAIN_VERSION,
     ExperimentCreate,
     Trial,
     TrialExecutionError,
     TrialOutcome,
+    system_version,
 )
 from symphony.bench.runner import ExperimentRunner
 from symphony.bench.store import ExperimentStore
@@ -81,8 +83,15 @@ def test_submit_pins_revision_profile_and_harness_version(tmp_path: Path) -> Non
     assert body["candidate_a_profile"] == {"binding": {"local_review": True}}
     assert body["candidate_b_profile"] == body["candidate_a_profile"]
     assert body["system_version_a"] == body["system_version_b"]
+    assert body["executor_toolchain_version"] == EXECUTOR_TOOLCHAIN_VERSION
     assert prepared == [body["id"]]
     assert body["harness_version"] == "snapshotted-harness"
+
+
+def test_system_version_includes_executor_toolchain_identity() -> None:
+    assert system_version("same-sha", {}, "toolchain-a") != system_version(
+        "same-sha", {}, "toolchain-b"
+    )
 
 
 @pytest.mark.asyncio
