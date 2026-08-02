@@ -129,8 +129,12 @@ async def test_harness_preflight_validates_controls_on_both_lanes_and_persists_r
 
 def test_stale_grader_preflight_cleanup_removes_only_reserved_directories(tmp_path) -> None:
     stale = tmp_path / ".grader-preflight-EXP-OLD"
-    stale.mkdir()
-    (stale / "hidden.py").write_text("secret")
+    readonly = stale / "reference/package"
+    readonly.mkdir(parents=True)
+    (readonly / "hidden.py").write_text("secret")
+    readonly.chmod(0o555)
+    readonly.parent.chmod(0o555)
+    stale.chmod(0o555)
     unrelated = tmp_path / "keep"
     unrelated.mkdir()
 

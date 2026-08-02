@@ -541,6 +541,9 @@ def _cleanup_stale_grader_preflights(root: Path) -> int:
         return removed
     for path in root.glob(".grader-preflight-EXP-*"):
         if path.is_dir():
+            path.chmod(path.stat().st_mode | 0o700)
+            for directory in (item for item in path.rglob("*") if item.is_dir()):
+                directory.chmod(directory.stat().st_mode | 0o700)
             shutil.rmtree(path)
             removed += 1
     return removed
