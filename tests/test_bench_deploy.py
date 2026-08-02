@@ -60,6 +60,9 @@ def test_deploy_uses_ssh_stdin_when_coolify_api_is_local_only() -> None:
     assert 'create_repository="https://github.com/${update_repository}.git"' in script
     assert '--arg repository "$update_repository"' in script
     assert "git_repository: $repository, instant_deploy: false" in script
+    assert "docker_compose_domains" in script
+    assert 'secure_domain="https://${domain#*://}"' in script
+    assert '{name: "caddy", domain: $domain}' in script
     assert " -L " not in script
     assert "del(.project_uuid, .server_uuid, .environment_name, .autogenerate_domain)" in script
     assert 'select(contains("caddy-"))' in script

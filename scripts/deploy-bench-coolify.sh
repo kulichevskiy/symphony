@@ -99,6 +99,16 @@ api GET /health >/dev/null
 
 application_domain() {
   application_uuid="$1"
+  application="$(api GET "/applications/$application_uuid")"
+  compose_domain="$(jq -r '
+    .docker_compose_domains
+    | if type == "string" then (fromjson? // {}) else (. // {}) end
+    | .caddy.domain // empty
+  ' <<<"$application")"
+  if [[ -n "$compose_domain" ]]; then
+    echo "$compose_domain"
+    return
+  fi
   envs="$(api GET "/applications/$application_uuid/envs")"
   service_fqdn="$(jq -r '[.[] | select(.key == "SERVICE_FQDN_CADDY") | .value | select(contains("caddy-"))][0] // empty' <<<"$envs")"
   if [[ -n "$service_fqdn" ]]; then
@@ -109,7 +119,6 @@ application_domain() {
     fi
     return
   fi
-  application="$(api GET "/applications/$application_uuid")"
   jq -r '.fqdn // .domains // "domain pending"' <<<"$application"
 }
 
@@ -179,6 +188,15 @@ else
 fi
 
 domain="$(application_domain "$application_uuid")"
+if [[ "$domain" != "domain pending" ]]; then
+  secure_domain="https://${domain#*://}"
+  if [[ "$domain" != "$secure_domain" ]]; then
+    domain_update="$(jq -n --arg domain "$secure_domain" \
+      '{docker_compose_domains: [{name: "caddy", domain: $domain}]}')"
+    api PATCH "/applications/$application_uuid" "$domain_update" >/dev/null
+    domain="$secure_domain"
+  fi
+fi
 if [[ "${COOLIFY_PREPARE_ONLY:-0}" == "1" ]]; then
   echo "prepared: $domain"
   exit 0
