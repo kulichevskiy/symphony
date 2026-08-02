@@ -998,7 +998,10 @@ class _LifecycleMixin(_OrchestratorBase):
                 parent_run_id=run_id,
                 allow_fixes=allow_fixes,
             )
-            if _local_review_infra_failed(local_review_result):
+            if _local_review_infra_failed(local_review_result) and not (
+                binding.resolved_remote_review()
+                and _local_review_permits_remote(local_review_result)
+            ):
                 # A transient provider API error in the reviewer/fix turn left
                 # the agent's commits intact and did no further work — requeue
                 # with backoff instead of escalating, until the budget is spent.
@@ -1415,10 +1418,9 @@ class _LifecycleMixin(_OrchestratorBase):
             return run_id
 
         # 6. Start the Review stage. A local loop is a hard pre-PR gate except
-        #    when it exhausts immediately after a successful final fix: in
-        #    hybrid mode the independent remote reviewer becomes the next
-        #    verdict instead of parking for a human just to continue. Stuck or
-        #    failed local terminals remain parked below.
+        #    for recoverable non-approval in hybrid mode: EXHAUSTED or a
+        #    reviewer-infrastructure failure hands off to the independent
+        #    remote reviewer. STUCK_LOOP and fixer failures remain blocked.
         local_review_blocks_remote = (
             binding.resolved_local_review()
             and not _local_review_permits_remote(local_review_result)

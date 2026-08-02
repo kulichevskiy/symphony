@@ -883,7 +883,7 @@ async def test_stale_last_message_does_not_smuggle_into_next_iteration(
         head_sha_provider=head_sha,
     )
     # If the stale file had leaked through we'd have gotten APPROVED.
-    assert result.outcome == LoopOutcome.EXHAUSTED
+    assert result.outcome == LoopOutcome.STUCK_LOOP
     assert result.last_verdict is not None
     assert "real-bug" in result.last_verdict.findings
 
@@ -951,6 +951,91 @@ async def test_large_diff_runs_two_passes_with_per_pass_families(
     assert verifier_spec.command[0] == implementer_agent
     # Pass-1 findings are injected into the verifier's prompt.
     assert "suspicion at foo.py:1" in verifier_spec.command[-1]
+
+
+@pytest.mark.asyncio
+async def test_two_pass_retry_reuses_finder_and_preserves_incomplete_verifier_notes(
+    tmp_path: Path,
+) -> None:
+    """A no-verdict verifier retry must not redo pass 1 or lose discoveries.
+
+    Production BENCH-59 confirmed a SQLite overflow, then ended without the
+    required verdict marker. The retry rebuilt its prompt from a new finder
+    run and silently dropped that confirmed defect.
+    """
+
+    class _RetryRunner:
+        def __init__(self) -> None:
+            self.specs: list[RunnerSpec] = []
+            self.find_calls = 0
+            self.verify_calls = 0
+
+        def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+            self.specs.append(spec)
+
+            async def gen() -> AsyncIterator[RunnerEvent]:
+                if spec.run_id.endswith("-find"):
+                    self.find_calls += 1
+                    events = _codex_message_stream(
+                        "## Findings\n- [Major] recursive decoder is slow"
+                    )
+                else:
+                    self.verify_calls += 1
+                    if self.verify_calls == 1:
+                        events = [
+                            *_codex_message_stream(
+                                "Confirmed SQLite OverflowError on oversized event id"
+                            )[:-1],
+                            *_codex_message_stream(
+                                "I ran out of time before emitting a verdict"
+                            ),
+                        ]
+                    else:
+                        events = _codex_message_stream(
+                            f"rechecked prior notes\n{VERDICT_APPROVED_MARKER}"
+                        )
+                for event in events:
+                    yield event
+
+            return gen()
+
+        async def kill(self, run_id: str) -> None:
+            pass
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=500, changed_files=10)
+
+    runner = _RetryRunner()
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-retry-notes",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        fixer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        cap=1,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    assert runner.find_calls == 1
+    assert runner.verify_calls == 2
+    retry_prompt = [
+        spec.command[-1]
+        for spec in runner.specs
+        if spec.run_id.endswith("-verify")
+    ][1]
+    assert "Confirmed SQLite OverflowError" in retry_prompt
 
 
 @pytest.mark.asyncio
@@ -1147,7 +1232,7 @@ async def test_two_pass_finder_401_survives_merge_when_verifier_stalls(
         RunnerEvent(kind="exit", returncode=0),
     ]
     verifier_stall = [RunnerEvent(kind="stall_timeout")]
-    runner = _ScriptedRunner(scripts=[finder_stream, verifier_stall, finder_stream, verifier_stall])
+    runner = _ScriptedRunner(scripts=[finder_stream, verifier_stall, verifier_stall])
 
     async def head_sha(_: Path) -> str:
         return "sha-1"
@@ -1289,6 +1374,10 @@ async def test_two_pass_merged_verdict_is_pass_twos(tmp_path: Path) -> None:
             _message_stream("codex", finder_text),  # pass 1 (reviewer)
             _message_stream("claude", verifier_text),  # pass 2 (implementer)
             _ok_fix_stream(),  # fixer dispatched on CHANGES_REQUESTED
+            _message_stream("codex", finder_text),
+            _message_stream(
+                "claude", f"fixed and rechecked\n{VERDICT_APPROVED_MARKER}"
+            ),
         ]
     )
 
@@ -1316,15 +1405,15 @@ async def test_two_pass_merged_verdict_is_pass_twos(tmp_path: Path) -> None:
         diff_size_provider=diff_size,
     )
 
-    assert result.outcome == LoopOutcome.EXHAUSTED  # cap=1, CHANGES_REQUESTED
-    # First two specs are the reviewer passes; third is the fixer.
+    assert result.outcome == LoopOutcome.APPROVED
+    # First two specs are the reviewer passes; third is the fixer. The final
+    # two specs are the mandatory closure review after the last permitted fix.
     assert runner.specs[0].run_id == "run-merge-rev-0-find"
     assert runner.specs[1].run_id == "run-merge-rev-0-verify"
     assert runner.specs[2].stage == "local_review_fix"
     # Merged verdict is pass-2's, not pass-1's.
-    assert result.last_verdict is not None
-    assert "confirmed bug at foo.py:1" in result.last_verdict.findings
-    assert "suspicion at foo.py:1" not in result.last_verdict.findings
+    assert "confirmed bug at foo.py:1" in result.verdicts[0].findings
+    assert "suspicion at foo.py:1" not in result.verdicts[0].findings
     # The fixer trigger is pass-2's findings.
     assert "confirmed bug at foo.py:1" in runner.specs[2].command[-1]
 
@@ -1566,7 +1655,7 @@ async def test_workspace_scrubbed_after_pass_two_before_fixer(
         workspace_scrubber=scrubber,
     )
 
-    assert result.outcome == LoopOutcome.EXHAUSTED  # cap=1, CHANGES_REQUESTED
+    assert result.outcome == LoopOutcome.STUCK_LOOP
     kinds = [e[0] for e in events]
     assert ("verify_wrote", True) in events
     assert "scrub" in kinds

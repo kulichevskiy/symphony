@@ -810,9 +810,10 @@ class Config(BaseModel):
     repos: list[RepoBinding] = Field(default_factory=list)
 
     review_iteration_cap: int = 12
-    # Local-review converges fast or it doesn't. The right cap is well
-    # below `review_iteration_cap`: more rounds means the in-workspace
-    # reviewer is stuck. Per-binding overrides live on `RepoBinding`.
+    # Maximum local-review fixer turns. A read-only closure review runs after
+    # the final permitted fix, so observed verdict rounds can be cap + 1. Keep
+    # this below `review_iteration_cap`; per-binding overrides live on
+    # `RepoBinding`.
     local_review_iteration_cap: int = Field(default=3, ge=1)
     # Soft per-issue *effective-token* budget. Off by default (`None`): no
     # behavior change. When set, an issue whose cumulative effective tokens

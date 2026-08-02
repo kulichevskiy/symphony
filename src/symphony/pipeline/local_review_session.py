@@ -99,6 +99,52 @@ WorkspaceScrubber = Callable[[Path, str], Awaitable[None]]
 # already uses UUIDs, but if a caller passes something weirder we still
 # want clean derived IDs.
 _RUN_ID_SAFE_RE = re.compile(r"[^a-zA-Z0-9_.\-]")
+_RETRY_NOTES_MAX_CHARS = 16_000
+
+
+def _retryable_agent_notes(
+    *, agent: ReviewerAgent, stdout: str, last_message_file: str | None
+) -> str:
+    """Collect agent prose from an incomplete verifier attempt.
+
+    `extract_last_agent_message` intentionally returns only the terminal
+    message for verdict parsing. Retry context is different: a verifier can
+    prove a defect in an earlier progress message and then terminate without a
+    marker. Preserve only agent-authored prose (never command/tool output) so
+    the retry can re-check those discoveries instead of silently losing them.
+    """
+    messages: list[str] = []
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if agent == "codex" and event.get("type") == "item.completed":
+            item = event.get("item") or {}
+            text = item.get("text") if item.get("type") == "agent_message" else None
+            if isinstance(text, str) and text.strip():
+                messages.append(text.strip())
+        elif agent == "claude":
+            if event.get("type") == "result":
+                text = event.get("result")
+                if isinstance(text, str) and text.strip():
+                    messages.append(text.strip())
+            elif event.get("type") == "assistant":
+                for block in (event.get("message") or {}).get("content") or []:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text")
+                        if isinstance(text, str) and text.strip():
+                            messages.append(text.strip())
+    if last_message_file and last_message_file.strip():
+        messages.append(last_message_file.strip())
+    combined = "\n\n".join(dict.fromkeys(messages))
+    if len(combined) <= _RETRY_NOTES_MAX_CHARS:
+        return combined
+    half = _RETRY_NOTES_MAX_CHARS // 2
+    return combined[:half] + "\n\n[...truncated...]\n\n" + combined[-half:]
 
 
 def _safe_run_id(parent_run_id: str, suffix: str) -> str:
@@ -288,6 +334,11 @@ async def run_local_review_session(
         agent=fixer_role.agent,
         codex_model=fixer_role.codex_model_arg(),
     )
+    # A no-verdict verifier gets one retry. Reuse the successful finder for
+    # that retry and retain verifier-authored notes from the incomplete attempt
+    # so confirmed discoveries are not lost (production BENCH-59).
+    finder_cache: dict[int, tuple[str, ReviewerOutput, str]] = {}
+    verifier_retry_notes: dict[int, str] = {}
 
     async def _run_reviewer_pass(
         *,
@@ -468,32 +519,39 @@ async def run_local_review_session(
         # Pass 1 — finder, resolved from the `review_find` role (defaults to
         # the family opposite `implement`). Lists every suspicion, emits no
         # verdict marker; its findings feed pass 2.
-        finder_out = await _run_reviewer_pass(
-            agent=reviewer_role.agent,
-            codex_model=reviewer_role.codex_model_arg(),
-            claude_model=reviewer_role.claude_model_arg(),
-            effort=reviewer_role.effort,
-            prompt=finder_prompt,
-            stem=f"review-{iteration}-find",
-            run_suffix=f"rev-{iteration}-find",
-            estimator=reviewer_estimator,
-            head_sha=head_sha,
-        )
-        # Finder is unsandboxed: reset before the verifier sees the diff (and
-        # before delivery) so finder edits/commits never leak. Findings are
-        # already captured from the finder's stdout / last-message file.
-        if workspace_scrubber is not None:
-            await workspace_scrubber(workspace_path, head_sha)
+        cached_finder = finder_cache.get(iteration)
+        if cached_finder is not None and cached_finder[0] == head_sha:
+            finder_reused = True
+            _, finder_out, pass_one_findings = cached_finder
+        else:
+            finder_reused = False
+            finder_out = await _run_reviewer_pass(
+                agent=reviewer_role.agent,
+                codex_model=reviewer_role.codex_model_arg(),
+                claude_model=reviewer_role.claude_model_arg(),
+                effort=reviewer_role.effort,
+                prompt=finder_prompt,
+                stem=f"review-{iteration}-find",
+                run_suffix=f"rev-{iteration}-find",
+                estimator=reviewer_estimator,
+                head_sha=head_sha,
+            )
+            # Finder is unsandboxed: reset before the verifier sees the diff
+            # (and before delivery) so finder edits/commits never leak.
+            if workspace_scrubber is not None:
+                await workspace_scrubber(workspace_path, head_sha)
+            pass_one_findings = extract_last_agent_message(
+                agent=reviewer_role.agent,
+                stdout=finder_out.stdout,
+                last_message_file=finder_out.last_message_file,
+            )
+            if finder_out.ok:
+                finder_cache[iteration] = (head_sha, finder_out, pass_one_findings)
         if not finder_out.ok:
             # Propagate the finder failure (with its cost) to the loop;
             # no point paying for a verifier with nothing to verify.
             return finder_out
 
-        pass_one_findings = extract_last_agent_message(
-            agent=reviewer_role.agent,
-            stdout=finder_out.stdout,
-            last_message_file=finder_out.last_message_file,
-        )
         if finder_out.agent_error and not pass_one_findings.strip():
             # Pass 1 exited 0 but emitted only a `turn.failed`/`error` (e.g. an
             # API 4xx) with no findings: surface it as a failure rather than
@@ -508,6 +566,7 @@ async def run_local_review_session(
             labels=labels,
             base_branch=base_branch,
             pass_one_findings=pass_one_findings,
+            previous_attempt_notes=verifier_retry_notes.get(iteration, ""),
         )
         # Pass 2 — adversarial verifier, resolved from the `review_verify`
         # role (defaults to the implementer's family, kept opposite
@@ -571,6 +630,17 @@ async def run_local_review_session(
             head_sha=verifier_out.head_sha,
             last_message_file=verifier_message,
         )
+        if verifier_parsed.kind == LocalVerdictKind.UNPARSEABLE:
+            retry_notes = _retryable_agent_notes(
+                agent=verifier_role.agent,
+                stdout=verifier_out.stdout,
+                last_message_file=verifier_out.last_message_file,
+            )
+            if retry_notes:
+                verifier_retry_notes[iteration] = retry_notes
+        else:
+            finder_cache.pop(iteration, None)
+            verifier_retry_notes.pop(iteration, None)
         merged_healthy_agents = tuple(
             {
                 *(
@@ -601,11 +671,23 @@ async def run_local_review_session(
         return replace(
             verifier_out,
             last_message_file=verifier_message,
-            cost_usd=verifier_out.cost_usd + finder_out.cost_usd,
-            input_tokens=verifier_out.input_tokens + finder_out.input_tokens,
-            output_tokens=(verifier_out.output_tokens + finder_out.output_tokens),
-            cache_write_tokens=(verifier_out.cache_write_tokens + finder_out.cache_write_tokens),
-            cache_read_tokens=(verifier_out.cache_read_tokens + finder_out.cache_read_tokens),
+            cost_usd=(
+                verifier_out.cost_usd + (0.0 if finder_reused else finder_out.cost_usd)
+            ),
+            input_tokens=(
+                verifier_out.input_tokens + (0 if finder_reused else finder_out.input_tokens)
+            ),
+            output_tokens=(
+                verifier_out.output_tokens + (0 if finder_reused else finder_out.output_tokens)
+            ),
+            cache_write_tokens=(
+                verifier_out.cache_write_tokens
+                + (0 if finder_reused else finder_out.cache_write_tokens)
+            ),
+            cache_read_tokens=(
+                verifier_out.cache_read_tokens
+                + (0 if finder_reused else finder_out.cache_read_tokens)
+            ),
             api_error=merged_api_error,
             api_error_agent=merged_api_error_agent,
             extra_api_errors=merged_extra_api_errors,

@@ -53,7 +53,7 @@ from ._workspace_helpers import advance_head
         (LoopOutcome.APPROVED, True),
         (LoopOutcome.EXHAUSTED, True),
         (LoopOutcome.STUCK_LOOP, False),
-        (LoopOutcome.REVIEWER_FAILED, False),
+        (LoopOutcome.REVIEWER_FAILED, True),
         (LoopOutcome.FIX_RUN_FAILED, False),
     ],
 )

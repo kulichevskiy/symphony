@@ -78,6 +78,11 @@ def test_local_review_prompt_is_adversarial_and_lensed() -> None:
     assert "tried to break" in lower
     # 4. Style nits stay explicitly non-blocking.
     assert "nit" in lower and "not blocking" in lower
+    # Security probes stay explicitly authorized, local, and bounded so a
+    # defensive code review is not mistaken for an external attack request.
+    assert "authorized defensive review" in lower
+    assert "isolated local workspace" in lower
+    assert "do not access external targets" in lower
 
 
 def test_local_review_prompt_handles_missing_origin_ref() -> None:

@@ -115,6 +115,62 @@ async def test_fix_then_approve_runs_full_cycle() -> None:
     assert "bug A" in fixer.received[0].findings
 
 
+@pytest.mark.asyncio
+async def test_cap_counts_fix_rounds_and_verifies_the_last_fix() -> None:
+    """A successful final fix must be reviewed before the loop exhausts.
+
+    The cap limits change-driving fixer turns, not read-only verification.
+    Otherwise cap=1 applies a fix and immediately escalates an unverified
+    branch even when the very next review would approve it.
+    """
+    reviewer = _ReviewerScript(
+        messages=[
+            f"## Findings\n- [Major] bug A\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"fixed and verified\n{VERDICT_APPROVED_MARKER}",
+        ],
+        head_shas=["sha-a", "sha-b"],
+    )
+    fixer = _FixerScript()
+
+    result = await run_local_review_loop(
+        reviewer_agent="codex",
+        reviewer=reviewer,
+        fixer=fixer,
+        cap=1,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    assert result.iterations == 2
+    assert reviewer.calls == [0, 1]
+    assert len(fixer.received) == 1
+
+
+@pytest.mark.asyncio
+async def test_fixer_receives_prior_findings_as_regression_obligations() -> None:
+    """A later fix must not silently reintroduce an earlier confirmed bug."""
+    reviewer = _ReviewerScript(
+        messages=[
+            f"## Findings\n- [Critical] CPU exhaustion\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Minor] safe paths rejected\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"clean\n{VERDICT_APPROVED_MARKER}",
+        ],
+        head_shas=["sha-a", "sha-b", "sha-c"],
+    )
+    fixer = _FixerScript()
+
+    result = await run_local_review_loop(
+        reviewer_agent="codex",
+        reviewer=reviewer,
+        fixer=fixer,
+        cap=2,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    assert len(fixer.received) == 2
+    assert "CPU exhaustion" in fixer.received[1].findings
+    assert "safe paths rejected" in fixer.received[1].findings
+
+
 # --- exhaustion --------------------------------------------------------
 
 
@@ -125,8 +181,9 @@ async def test_exhausts_when_cap_hit_with_distinct_findings_each_round() -> None
             f"## Findings\n- [Major] bug 1\n{VERDICT_CHANGES_REQUESTED_MARKER}",
             f"## Findings\n- [Major] bug 2\n{VERDICT_CHANGES_REQUESTED_MARKER}",
             f"## Findings\n- [Major] bug 3\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Major] bug 4\n{VERDICT_CHANGES_REQUESTED_MARKER}",
         ],
-        head_shas=["a", "b", "c"],
+        head_shas=["a", "b", "c", "d"],
     )
     fixer = _FixerScript()
     result = await run_local_review_loop(
@@ -136,12 +193,11 @@ async def test_exhausts_when_cap_hit_with_distinct_findings_each_round() -> None
         cap=3,
     )
     assert result.outcome == LoopOutcome.EXHAUSTED
-    assert result.iterations == 3
-    # Reviewer ran cap times; the fixer also ran cap times so the branch
-    # carries the best-effort fix when an operator picks it up at the
-    # Needs Approval escalation. The unverified-fixed state beats the
-    # known-broken state for handoff.
-    assert len(reviewer.calls) == 3
+    assert result.iterations == 4
+    # The cap limits mutations. The branch carries all three best-effort
+    # fixes, and a fourth read-only review proves the last fix did not close
+    # the remaining findings before escalation.
+    assert len(reviewer.calls) == 4
     assert len(fixer.received) == 3
 
 

@@ -722,8 +722,12 @@ async def test_deliver_failed_reject_interrupts_live_review_monitor(
 
 
 @pytest.mark.asyncio
-async def test_hybrid_strategy_local_exhaustion_continues_to_remote_review(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "local_outcome",
+    [LoopOutcome.EXHAUSTED, LoopOutcome.REVIEWER_FAILED],
+)
+async def test_hybrid_strategy_local_nonapproval_continues_to_remote_review(
+    tmp_path: Path, local_outcome: LoopOutcome
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
@@ -789,7 +793,7 @@ async def test_hybrid_strategy_local_exhaustion_continues_to_remote_review(
         )
         orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
             return_value=LoopResult(
-                outcome=LoopOutcome.EXHAUSTED,
+                outcome=local_outcome,
                 iterations=2,
                 verdicts=(
                     LocalVerdict(

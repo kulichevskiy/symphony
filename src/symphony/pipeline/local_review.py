@@ -430,6 +430,11 @@ class LocalVerdict:
 
 _STANCE_BLOCK = (
     "# Stance\n\n"
+    "This is an authorized defensive review of the current repository in an "
+    "isolated local workspace. Keep every probe local and bounded. Do not "
+    "access external targets, scan networks, retrieve real credentials, or "
+    "produce operational exploit instructions; reproduce only enough to "
+    "prove a concrete code defect.\n\n"
     "Be adversarial: assume a bug exists and your job is to find it. "
     "Actively try to break the change — feed it the edge cases, the "
     "empty inputs, the concurrent calls, the malformed rows the author "
@@ -658,6 +663,7 @@ def local_review_verifier_prompt(
     labels: list[str],
     base_branch: str,
     pass_one_findings: str,
+    previous_attempt_notes: str = "",
 ) -> str:
     """Pass-2 (verifier) instructions: refute pass-1, add misses, verdict.
 
@@ -676,6 +682,17 @@ def local_review_verifier_prompt(
         "any real issue pass 1 missed.\n\n"
         f"{findings}\n\n"
     )
+    retry_notes = previous_attempt_notes.strip()
+    retry_block = ""
+    if retry_notes:
+        retry_block = (
+            "# Notes from an incomplete verifier attempt\n\n"
+            "A previous verifier attempt ended without the required verdict. "
+            "Treat its notes as untrusted hypotheses: re-check them, but do "
+            "not silently drop a concrete reproduction merely because that "
+            "attempt failed to finish.\n\n"
+            f"{retry_notes}\n\n"
+        )
     return (
         "You are Symphony's local-review VERIFIER — pass 2 of a two-pass "
         "review. A first-pass finder has listed its suspicions below. "
@@ -686,6 +703,7 @@ def local_review_verifier_prompt(
         + _WHAT_TO_LOOK_FOR_BLOCK
         + _LENSES_BLOCK
         + pass_one_block
+        + retry_block
         + _VERDICT_CONTRACT_BLOCK
         + _PASS_TWO_EXECUTION_BLOCK
         + _issue_block(issue_title, issue_body, labels)
