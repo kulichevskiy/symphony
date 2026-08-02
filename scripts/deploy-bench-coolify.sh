@@ -53,24 +53,25 @@ controls_bundle_id="$(
 controls_bundle="/opt/symphony-bench/control-bundles/$controls_bundle_id"
 controls_upload="/opt/symphony-bench/.controls-upload-$controls_bundle_id-$$"
 ssh -o BatchMode=yes "$coolify_ssh_host" \
-  "mkdir -p /opt/symphony-bench/control-bundles '$controls_upload'"
+  "sudo -n mkdir -p /opt/symphony-bench/control-bundles '$controls_upload'"
 tar -C "$controls_assets" \
   --exclude='.venv' --exclude='node_modules' --exclude='dist' \
   --exclude='__pycache__' --exclude='.pytest_cache' --exclude='.mypy_cache' \
   --exclude='.ruff_cache' --exclude='*.tsbuildinfo' \
   -cf - feedback_inbox_reference hidden/feedback_inbox \
-  | ssh -o BatchMode=yes "$coolify_ssh_host" "tar -xf - -C '$controls_upload'"
+  | ssh -o BatchMode=yes "$coolify_ssh_host" "sudo -n tar -xf - -C '$controls_upload'"
 ssh -o BatchMode=yes "$coolify_ssh_host" "
-  test -f '$controls_upload/feedback_inbox_reference/feedback_inbox/main.py'
-  test -f '$controls_upload/hidden/feedback_inbox/test_backend_hidden.py'
-  test -f '$controls_upload/hidden/feedback_inbox/App.bench.test.tsx'
-  test -f '$controls_upload/hidden/feedback_inbox/manifest.json'
-  if test -d '$controls_bundle'; then
-    rm -rf '$controls_upload'
+  sudo -n test -f '$controls_upload/feedback_inbox_reference/feedback_inbox/main.py'
+  sudo -n test -f '$controls_upload/hidden/feedback_inbox/test_backend_hidden.py'
+  sudo -n test -f '$controls_upload/hidden/feedback_inbox/App.bench.test.tsx'
+  sudo -n test -f '$controls_upload/hidden/feedback_inbox/manifest.json'
+  if sudo -n test -d '$controls_bundle'; then
+    sudo -n rm -rf '$controls_upload'
   else
-    mv '$controls_upload' '$controls_bundle'
+    sudo -n mv '$controls_upload' '$controls_bundle'
   fi
-  ln -sfn '$controls_bundle' /opt/symphony-bench/controls-current
+  sudo -n chmod -R a=rX '$controls_bundle'
+  sudo -n ln -sfn '$controls_bundle' /opt/symphony-bench/controls-current
 "
 echo "uploaded private controls bundle $controls_bundle_id"
 

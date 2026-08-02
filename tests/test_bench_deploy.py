@@ -109,3 +109,4 @@ def test_deploy_uses_ssh_stdin_when_coolify_api_is_local_only() -> None:
     assert 'echo "http://$service_fqdn"' in script
     assert "uploaded private controls bundle" in script
     assert "/opt/symphony-bench/controls-current" in script
+    assert "sudo -n tar" in script
