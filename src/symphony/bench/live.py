@@ -17,10 +17,10 @@ from ..config import Secrets
 from ..credentials import CredentialResolver, RunCredentials
 from ..crypto import CredentialCipher
 from ..ui.oauth import linear_provider
+from .campaign import Campaign
 from .connection_sync import snapshot_connections, sync_connections
-from .eventdesk import Campaign
 from .github import Commands, GitHubRepository, GitHubSandbox, SubprocessCommands
-from .grader import EventDeskGrader
+from .grader import FeedbackInboxGrader, GraderInfrastructureError, HiddenManifest
 from .harness import FrozenHarness, load_harness
 from .linear import LinearCampaign, LinearIssueState, LinearSandbox
 from .metrics import snapshot_candidate
@@ -35,7 +35,7 @@ from .reviewer import CodexFinalReviewer
 T = TypeVar("T")
 CandidateSnapshotter = Callable[[Path, Path], Awaitable[dict[str, object]]]
 log = logging.getLogger(__name__)
-_TRIAL_DIRECTORY_RE = re.compile(r"(?:SMOKE|[AB][1-9][0-9]*)\Z")
+_TRIAL_DIRECTORY_RE = re.compile(r"[AB][1-9][0-9]*\Z")
 
 
 class GitHubProvisioner(Protocol):
@@ -66,7 +66,9 @@ class ProductGrader(Protocol):
         repository_slug: str,
         destination: Path,
         github_token: str,
-        hidden_test: Path | None = None,
+        backend_hidden_test: Path,
+        frontend_hidden_test: Path,
+        manifest: HiddenManifest,
         checks: dict[str, list[str]] | None = None,
     ) -> dict[str, object]: ...
 
@@ -119,7 +121,7 @@ class LiveTrialExecutor:
         self._credentials = credentials
         self._github = github
         self._linear = linear
-        self._grader = grader or EventDeskGrader(self._commands)
+        self._grader = grader or FeedbackInboxGrader(self._commands)
         self._reviewer = reviewer or CodexFinalReviewer(
             commands=self._commands,
             control_db=config.control_db,
@@ -153,10 +155,10 @@ class LiveTrialExecutor:
             _archive_shared_trials, self._config.root, self._config.private_root
         )
         started = asyncio.get_running_loop().time()
-        suffix = "SMOKE" if trial.candidate == "S" else f"{trial.candidate}{trial.repetition}"
+        suffix = f"{trial.candidate}{trial.repetition}"
         trial_name = f"{trial.experiment_id}-{suffix}"
         trial_root = self._config.root / trial.experiment_id / suffix
-        eventdesk_root = trial_root / "eventdesk"
+        app_root = trial_root / "feedback_inbox"
         candidate_root = trial_root / "symphony"
         repository: GitHubRepository | None = None
         github: GitHubProvisioner | None = None
@@ -174,14 +176,14 @@ class LiveTrialExecutor:
                 raise RuntimeError("bench Linear connection is missing; reconnect and retry")
 
             await asyncio.to_thread(trial_root.mkdir, parents=True, exist_ok=False)
-            await asyncio.to_thread(shutil.copytree, frozen.root / "eventdesk", eventdesk_root)
+            await asyncio.to_thread(shutil.copytree, frozen.root / "feedback_inbox", app_root)
             github = self._github or GitHubSandbox(
                 owner=self._config.github_owner,
                 token=credentials.github_token,
                 commands=self._commands,
             )
             repository = await self._retry_provision(
-                lambda: github.create_repository(name=trial_name, source=eventdesk_root)
+                lambda: github.create_repository(name=trial_name, source=app_root)
             )
 
             owns_linear = self._linear is None
@@ -225,7 +227,9 @@ class LiveTrialExecutor:
                     repository_slug=repository.slug,
                     destination=trial_root,
                     github_token=credentials.github_token,
-                    hidden_test=frozen.hidden_test,
+                    backend_hidden_test=frozen.backend_hidden_test,
+                    frontend_hidden_test=frozen.frontend_hidden_test,
+                    manifest=frozen.hidden_manifest,
                     checks=frozen.regression_commands,
                 )
             )
@@ -252,6 +256,20 @@ class LiveTrialExecutor:
             if not cancelled_outcome.done():
                 cancelled_outcome.set_result(outcome)
             raise
+        except GraderInfrastructureError as exc:
+            outcome = await self._bounded_partial_outcome(
+                repository=repository,
+                campaign=campaign,
+                linear=linear,
+                candidate_root=candidate_root,
+                candidate_db=trial_root / "candidate.sqlite",
+                metrics=metrics,
+                started=started,
+            )
+            raise TrialExecutionError(
+                f"infrastructure_failed: {exc}",
+                outcome=outcome,
+            ) from exc
         except Exception as exc:
             outcome = await self._bounded_partial_outcome(
                 repository=repository,
@@ -505,13 +523,14 @@ class LiveTrialExecutor:
             cwd=candidate_root,
             env={"SYMPHONY_ENCRYPTION_KEY": self._config.encryption_key},
         )
-        # The candidate needs runtime code, not the grader source or its own
-        # Git object database. Remove both before any agent is dispatched.
-        await asyncio.to_thread(
-            shutil.rmtree,
-            candidate_root / "src/symphony/bench/assets/hidden",
-            True,
-        )
+        # The candidate needs runtime code, not grader controls or its own Git
+        # object database. Remove all three before any agent is dispatched.
+        for private_asset in ("hidden", "feedback_inbox_reference"):
+            await asyncio.to_thread(
+                shutil.rmtree,
+                candidate_root / "src/symphony/bench/assets" / private_asset,
+                True,
+            )
         await asyncio.to_thread(shutil.rmtree, candidate_root / ".git", True)
 
     async def _run_until_done(
@@ -640,7 +659,9 @@ def _archive_trial_receipts(trial_root: Path, destination: Path) -> None:
         "candidate-profile.json",
         "candidate.sqlite*",
         "connections.sqlite*",
-        "hidden-junit.xml",
+        "backend-hidden-junit.xml",
+        "frontend-hidden.json",
+        "hidden-feedback.sqlite*",
         "final-*-review.json",
     ):
         for source in trial_root.glob(pattern):

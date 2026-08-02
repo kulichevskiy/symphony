@@ -42,6 +42,10 @@ config.local.yaml
 !.claude/skills/
 .agents/
 
+# Worker-only benchmark controls. Deploy script uploads these outside Git/Coolify build context.
+src/symphony/bench/assets/feedback_inbox_reference/
+src/symphony/bench/assets/hidden/feedback_inbox/
+
 # Symphony runtime state — event log + checked-out worktrees
 .symphony/
 

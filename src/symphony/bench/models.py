@@ -4,13 +4,25 @@ import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
 ExperimentStatus = Literal["queued", "running", "completed", "failed"]
 TrialStatus = Literal["running", "completed", "failed"]
-EXECUTOR_TOOLCHAIN_VERSION = "uv=0.12.1;codex=0.146.0;claude-code=2.1.220;node=22"
+_TOOLCHAIN_RECEIPT = Path("/usr/local/share/symphony-bench-toolchain.txt")
+
+
+def read_executor_toolchain_version(path: Path = _TOOLCHAIN_RECEIPT) -> str:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "unmeasured-local-toolchain"
+    return value or "unmeasured-local-toolchain"
+
+
+EXECUTOR_TOOLCHAIN_VERSION = read_executor_toolchain_version()
 
 
 class ExperimentCreate(BaseModel):
@@ -56,8 +68,8 @@ class Experiment(ExperimentCreate):
 
 class Trial(BaseModel):
     experiment_id: str
-    candidate: Literal["S", "A", "B"]
-    repetition: int = Field(ge=0)
+    candidate: Literal["A", "B"]
+    repetition: int = Field(ge=1)
     revision: str
     profile: dict[str, object] = Field(default_factory=dict)
     system_version: str = ""
@@ -94,6 +106,15 @@ class TrialRecord(Trial):
 class ExperimentReport(BaseModel):
     experiment: Experiment
     trials: list[TrialRecord]
+
+
+class BenchNotification(BaseModel):
+    event_key: str
+    experiment_id: str
+    candidate: Literal["A", "B"]
+    repetition: int
+    markdown: str
+    created_at: datetime
 
 
 def system_version(

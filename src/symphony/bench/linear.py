@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from .eventdesk import Campaign
+from .campaign import Campaign
 
 _ENDPOINT = "https://api.linear.app/graphql"
 _TRANSIENT_QUERY_ATTEMPTS = 5
@@ -68,7 +68,7 @@ query BenchIssueState($id: String!) {
 }
 """
 
-_TRIAL_SUFFIX = re.compile(r"(?:SMOKE|[AB][1-9][0-9]*)\Z")
+_TRIAL_SUFFIX = re.compile(r"[AB][1-9][0-9]*\Z")
 _PROJECT_LOCKS: dict[str, asyncio.Lock] = {}
 
 

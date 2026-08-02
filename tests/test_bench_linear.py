@@ -7,7 +7,7 @@ import pytest
 import respx
 
 from symphony.bench import linear as linear_module
-from symphony.bench.eventdesk import Campaign, CampaignTicket, eventdesk_campaign
+from symphony.bench.campaign import Campaign, CampaignTicket, feedback_inbox_campaign
 from symphony.bench.linear import LinearSandbox
 
 
@@ -35,7 +35,7 @@ async def test_linear_sandbox_creates_labeled_campaign_and_real_dependency_chain
                         "success": True,
                         "project": {
                             "id": "project-id",
-                            "name": "EventDesk V1 · 2026-08-02 · 1",
+                            "name": "Feedback Inbox V1 · 2026-08-02 · 1",
                             "url": "https://linear.app/project-id",
                         },
                     }
@@ -66,9 +66,9 @@ async def test_linear_sandbox_creates_labeled_campaign_and_real_dependency_chain
                 }
             },
         )
-        for index in range(1, 7)
+        for index in range(1, 3)
     )
-    for _ in range(5):
+    for _ in range(1):
         responses.extend(
             (
                 httpx.Response(
@@ -92,25 +92,21 @@ async def test_linear_sandbox_creates_labeled_campaign_and_real_dependency_chain
             team_id="team-id",
             label="EXP-1-A1",
             repo_url="https://github.com/kulichevskiy/EXP-1-A1",
-            campaign=eventdesk_campaign(),
+            campaign=feedback_inbox_campaign(),
         )
 
-    assert result.issue_identifiers == tuple(f"BENCH-{index}" for index in range(1, 7))
+    assert result.issue_identifiers == tuple(f"BENCH-{index}" for index in range(1, 3))
     calls = [json.loads(call.request.content) for call in route.calls]
     issue_calls = [call for call in calls if "mutation BenchIssue" in call["query"]]
     project_calls = [call for call in calls if "mutation BenchProject" in call["query"]]
     relation_calls = [call for call in calls if "mutation BenchRelation" in call["query"]]
     assert all(call["variables"]["input"]["labelIds"] == ["label-id"] for call in issue_calls)
     assert [call["variables"]["input"] for call in project_calls] == [
-        {"name": "EventDesk V1 · 2026-08-02 · 1", "teamIds": ["team-id"]}
+        {"name": "Feedback Inbox V1 · 2026-08-02 · 1", "teamIds": ["team-id"]}
     ]
     assert all(call["variables"]["input"]["projectId"] == "project-id" for call in issue_calls)
     assert [call["variables"]["input"] for call in relation_calls] == [
         {"issueId": "issue-1", "relatedIssueId": "issue-2", "type": "blocks"},
-        {"issueId": "issue-2", "relatedIssueId": "issue-3", "type": "blocks"},
-        {"issueId": "issue-3", "relatedIssueId": "issue-4", "type": "blocks"},
-        {"issueId": "issue-4", "relatedIssueId": "issue-5", "type": "blocks"},
-        {"issueId": "issue-5", "relatedIssueId": "issue-6", "type": "blocks"},
     ]
     assert all("issueLabelCreate" not in call["query"] for call in calls)
 
@@ -118,7 +114,7 @@ async def test_linear_sandbox_creates_labeled_campaign_and_real_dependency_chain
 @pytest.mark.asyncio
 @respx.mock
 async def test_campaign_retry_reconciles_issue_created_before_response_was_lost() -> None:
-    campaign = eventdesk_campaign()
+    campaign = feedback_inbox_campaign()
     first_title = f"[EXP-RETRY] {campaign.tickets[0].title}"
     team = httpx.Response(
         200,
@@ -172,9 +168,9 @@ async def test_campaign_retry_reconciles_issue_created_before_response_was_lost(
                 }
             },
         )
-        for index in range(2, 7)
+        for index in range(2, 3)
     )
-    for _ in range(5):
+    for _ in range(1):
         responses.extend(
             (
                 httpx.Response(200, json={"data": {"issue": {"relations": {"nodes": []}}}}),
@@ -199,14 +195,14 @@ async def test_campaign_retry_reconciles_issue_created_before_response_was_lost(
         )
 
     calls = [json.loads(call.request.content) for call in route.calls]
-    assert result.issue_identifiers == tuple(f"BENCH-{index}" for index in range(1, 7))
-    assert sum("mutation BenchIssue" in call["query"] for call in calls) == 6
+    assert result.issue_identifiers == tuple(f"BENCH-{index}" for index in range(1, 3))
+    assert sum("mutation BenchIssue" in call["query"] for call in calls) == 2
 
 
 @pytest.mark.asyncio
 @respx.mock
 async def test_campaign_retry_reconciles_relation_created_before_response_was_lost() -> None:
-    campaign = eventdesk_campaign()
+    campaign = feedback_inbox_campaign()
     issues = [
         {
             "id": f"issue-{index}",
@@ -270,7 +266,7 @@ async def test_campaign_retry_reconciles_relation_created_before_response_was_lo
             ),
         )
     )
-    for _ in range(4):
+    for _ in range(0):
         responses.extend(
             (
                 httpx.Response(200, json={"data": {"issue": {"relations": {"nodes": []}}}}),
@@ -295,15 +291,15 @@ async def test_campaign_retry_reconciles_relation_created_before_response_was_lo
         )
 
     calls = [json.loads(call.request.content) for call in route.calls]
-    assert len(result.issue_ids) == 6
-    assert sum("mutation BenchRelation" in call["query"] for call in calls) == 5
+    assert len(result.issue_ids) == 2
+    assert sum("mutation BenchRelation" in call["query"] for call in calls) == 1
 
 
 @pytest.mark.asyncio
 @respx.mock
 async def test_campaign_retry_reuses_project_created_before_response_was_lost() -> None:
     campaign = Campaign(
-        name="EventDesk V1",
+        name="Feedback Inbox V1",
         tickets=(CampaignTicket(key="one", title="One", description="Do one"),),
     )
     team = httpx.Response(
@@ -319,7 +315,7 @@ async def test_campaign_retry_reuses_project_created_before_response_was_lost() 
     )
     project = {
         "id": "project-id",
-        "name": "EventDesk V1 · 2026-08-02 · RETRY",
+        "name": "Feedback Inbox V1 · 2026-08-02 · RETRY",
         "url": "https://linear.app/project-id",
     }
     route = respx.post("https://api.linear.app/graphql").mock(
@@ -374,7 +370,7 @@ async def test_campaign_retry_reuses_project_created_before_response_was_lost() 
 @respx.mock
 async def test_parallel_trials_reuse_one_experiment_project() -> None:
     campaign = Campaign(
-        name="EventDesk V1",
+        name="Feedback Inbox V1",
         tickets=(CampaignTicket(key="one", title="One", description="Do one"),),
     )
     project: dict[str, str] | None = None

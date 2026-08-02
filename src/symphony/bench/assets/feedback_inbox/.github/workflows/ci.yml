@@ -17,7 +17,7 @@ jobs:
       - run: uv sync --locked
       - run: uv run pytest
       - run: uv run ruff check .
-      - run: uv run mypy eventdesk
+      - run: uv run mypy feedback_inbox
 
   frontend:
     runs-on: ubuntu-latest

@@ -1,5 +1,5 @@
 [project]
-name = "eventdesk"
+name = "feedback-inbox"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
@@ -21,7 +21,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["eventdesk"]
+packages = ["feedback_inbox"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -36,4 +36,4 @@ select = ["E", "F", "I", "B", "UP"]
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["eventdesk"]
+files = ["feedback_inbox"]

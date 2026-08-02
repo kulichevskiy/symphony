@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import shutil
+import time
 from importlib.resources import as_file, files
 from pathlib import Path
 from typing import Any
@@ -14,10 +16,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from .. import db
 from ..config import RepoBinding, binding_natural_key
 from .app import create_bench_app
+from .campaign import harness_version
 from .connection_sync import sync_connections as _sync_connections
-from .eventdesk import harness_version
 from .executor import RemoteCommands, create_executor_app
-from .harness import snapshot_harness
+from .grader import FeedbackInboxGrader, GraderInfrastructureError
+from .harness import load_harness, snapshot_harness
 from .live import LiveBenchConfig, LiveTrialExecutor
 from .metrics import snapshot_candidate
 from .models import ExperimentReport, Trial, TrialOutcome
@@ -81,7 +84,13 @@ def _connection_options(command: Any) -> Any:
 
 
 def _request(
-    method: str, url: str, token: str, path: str, *, payload: dict[str, object] | None = None
+    method: str,
+    url: str,
+    token: str,
+    path: str,
+    *,
+    payload: dict[str, object] | None = None,
+    timeout_seconds: float = 30,
 ) -> dict[str, Any]:
     try:
         response = httpx.request(
@@ -89,7 +98,7 @@ def _request(
             f"{url.rstrip('/')}{path}",
             headers={"Authorization": f"Bearer {token}"},
             json=payload,
-            timeout=30,
+            timeout=timeout_seconds,
         )
         response.raise_for_status()
     except httpx.HTTPError as exc:
@@ -140,6 +149,7 @@ def submit(
         token,
         "/experiments",
         payload=payload,
+        timeout_seconds=15 * 60,
     )
     click.echo(f"{body['id']} {body['status']}")
 
@@ -277,7 +287,7 @@ async def _seed(
         "runner": "local",
         "webhook_enabled": False,
         "verify_cmd": (
-            "uv run pytest && uv run ruff check . && uv run mypy eventdesk "
+            "uv run pytest && uv run ruff check . && uv run mypy feedback_inbox "
             "&& cd frontend && npm ci && npm test -- --run && npm run build"
         ),
         "states": {
@@ -403,6 +413,13 @@ async def _snapshot(db_path: Path) -> dict[str, object]:
     show_default=True,
 )
 @click.option(
+    "--controls-root",
+    type=click.Path(path_type=Path, exists=True, file_okay=False),
+    envvar="SYMPHONY_BENCH_CONTROLS_ROOT",
+    default="/run/symphony-bench-controls",
+    show_default=True,
+)
+@click.option(
     "--profile",
     "profile_path",
     type=click.Path(path_type=Path, exists=True, dir_okay=False),
@@ -447,6 +464,7 @@ def serve(
     root_a: Path,
     root_b: Path,
     private_root: Path,
+    controls_root: Path,
     profile_path: Path | None,
     api_token: str | None,
     github_owner: str | None,
@@ -489,6 +507,7 @@ def serve(
             root_a=root_a,
             root_b=root_b,
             private_root=private_root,
+            controls_root=controls_root,
             api_token=api_token,
             github_owner=github_owner,
             linear_team_id=linear_team_id,
@@ -516,6 +535,92 @@ async def _initialize_control_db(path: Path) -> None:
     await conn.close()
 
 
+def _cleanup_stale_grader_preflights(root: Path) -> int:
+    removed = 0
+    if not root.exists():
+        return removed
+    for path in root.glob(".grader-preflight-EXP-*"):
+        if path.is_dir():
+            shutil.rmtree(path)
+            removed += 1
+    return removed
+
+
+async def _prepare_harness_with_preflight(
+    experiment_id: str,
+    *,
+    private_root: Path,
+    controls_root: Path,
+    lanes: tuple[tuple[str, Path, RemoteCommands], ...],
+) -> str:
+    started = time.monotonic()
+    snapshot = private_root / experiment_id / "_harness"
+    try:
+        version = await asyncio.to_thread(
+            snapshot_harness, snapshot, controls_root=controls_root
+        )
+        frozen = load_harness(snapshot)
+    except BaseException:
+        await asyncio.to_thread(shutil.rmtree, snapshot, ignore_errors=True)
+        raise
+
+    async def validate_lane(name: str, root: Path, commands: RemoteCommands) -> dict[str, object]:
+        preflight = root / f".grader-preflight-{experiment_id}"
+        await asyncio.to_thread(preflight.mkdir, parents=True, exist_ok=False)
+        try:
+            seed = preflight / "seed"
+            reference = preflight / "reference"
+            await asyncio.to_thread(shutil.copytree, frozen.root / "feedback_inbox", seed)
+            await asyncio.to_thread(shutil.copytree, frozen.reference_root, reference)
+            backend_hidden = preflight / "backend_hidden_test.py"
+            frontend_hidden = preflight / "frontend_hidden_test.tsx"
+            await asyncio.to_thread(
+                shutil.copyfile, frozen.backend_hidden_test, backend_hidden
+            )
+            await asyncio.to_thread(
+                shutil.copyfile, frozen.frontend_hidden_test, frontend_hidden
+            )
+            controls = await FeedbackInboxGrader(commands).validate_controls(
+                seed_root=seed,
+                reference_root=reference,
+                results_root=preflight / "results",
+                backend_hidden_test=backend_hidden,
+                frontend_hidden_test=frontend_hidden,
+                manifest=frozen.hidden_manifest,
+            )
+            return {"lane": name, "status": "passed", "controls": controls}
+        finally:
+            await asyncio.to_thread(shutil.rmtree, preflight, ignore_errors=True)
+
+    results = await asyncio.gather(
+        *(validate_lane(name, root, commands) for name, root, commands in lanes),
+        return_exceptions=True,
+    )
+    failures = [result for result in results if isinstance(result, BaseException)]
+    receipt = {
+        "experiment_id": experiment_id,
+        "harness_version": version,
+        "status": "infrastructure_failed" if failures else "passed",
+        "duration_seconds": round(time.monotonic() - started, 3),
+        "lanes": [
+            {"status": "infrastructure_failed", "error": str(result)}
+            if isinstance(result, BaseException)
+            else result
+            for result in results
+        ],
+    }
+    await asyncio.to_thread(
+        (private_root / experiment_id / "preflight.json").write_text,
+        json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    if failures:
+        detail = "; ".join(str(failure) for failure in failures)
+        await asyncio.to_thread(shutil.rmtree, snapshot, ignore_errors=True)
+        raise GraderInfrastructureError(f"grader preflight failed on a lane: {detail}")
+    return version
+
+
 def _serve_with_profile(
     profile: Path,
     *,
@@ -523,6 +628,7 @@ def _serve_with_profile(
     root_a: Path,
     root_b: Path,
     private_root: Path,
+    controls_root: Path,
     api_token: str,
     github_owner: str,
     linear_team_id: str,
@@ -555,6 +661,8 @@ def _serve_with_profile(
         await asyncio.gather(
             asyncio.to_thread(cleanup_stale_reviewer_credentials, root_a),
             asyncio.to_thread(cleanup_stale_reviewer_credentials, root_b),
+            asyncio.to_thread(_cleanup_stale_grader_preflights, root_a),
+            asyncio.to_thread(_cleanup_stale_grader_preflights, root_b),
         )
 
     def live_executor(root: Path, commands: RemoteCommands) -> LiveTrialExecutor:
@@ -585,7 +693,12 @@ def _serve_with_profile(
         return await executor_a.resolve_revision(revision)
 
     async def prepare_harness(experiment_id: str) -> str:
-        return await asyncio.to_thread(snapshot_harness, private_root / experiment_id / "_harness")
+        return await _prepare_harness_with_preflight(
+            experiment_id,
+            private_root=private_root,
+            controls_root=controls_root,
+            lanes=(("A", root_a, commands_a), ("B", root_b, commands_b)),
+        )
 
     app = create_bench_app(
         db_path=db_path,
@@ -596,6 +709,7 @@ def _serve_with_profile(
         harness_version=harness_version(),
         prepare_harness=prepare_harness,
         recover_execution=recover_execution,
+        reports_root=private_root / "reports",
     )
     uvicorn_module.run(app, host=host, port=port)
 

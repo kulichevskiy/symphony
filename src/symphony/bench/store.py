@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from .models import (
+    BenchNotification,
     Experiment,
     ExperimentCreate,
     ExperimentReport,
@@ -85,6 +86,20 @@ class ExperimentStore:
             )
             self._ensure_column(conn, "bench_trials", "profile", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(conn, "bench_trials", "system_version", "TEXT NOT NULL DEFAULT ''")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS bench_notifications (
+                    event_key TEXT PRIMARY KEY,
+                    experiment_id TEXT NOT NULL,
+                    candidate TEXT NOT NULL,
+                    repetition INTEGER NOT NULL,
+                    markdown TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    acknowledged_at TEXT,
+                    FOREIGN KEY (experiment_id) REFERENCES bench_experiments(id)
+                )
+                """
+            )
 
     def create(
         self,
@@ -168,6 +183,17 @@ class ExperimentStore:
         claimed["status"] = "running"
         return Experiment.model_validate(claimed)
 
+    def has_active(self) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM bench_experiments
+                WHERE status IN ('queued', 'running')
+                LIMIT 1
+                """
+            ).fetchone()
+        return row is not None
+
     def set_status(self, experiment_id: str, status: ExperimentStatus) -> None:
         with self._connect() as conn:
             cursor = conn.execute(
@@ -177,12 +203,23 @@ class ExperimentStore:
         if cursor.rowcount != 1:
             raise KeyError(experiment_id)
 
-    def fail_interrupted(self) -> int:
+    def fail_interrupted(self) -> tuple[list[Trial], list[str]]:
         """Close orphaned running work before this process claims a new experiment."""
         ended_at = datetime.now(UTC).isoformat()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            trials = conn.execute(
+            trial_rows = conn.execute(
+                """
+                SELECT experiment_id, candidate, repetition, revision, profile, system_version
+                FROM bench_trials
+                WHERE status = 'running'
+                ORDER BY started_at, experiment_id, candidate, repetition
+                """
+            ).fetchall()
+            experiment_rows = conn.execute(
+                "SELECT id FROM bench_experiments WHERE status = 'running' ORDER BY created_at, id"
+            ).fetchall()
+            conn.execute(
                 """
                 UPDATE bench_trials
                 SET status = 'failed', ended_at = ?,
@@ -190,11 +227,20 @@ class ExperimentStore:
                 WHERE status = 'running'
                 """,
                 (ended_at,),
-            ).rowcount
-            experiments = conn.execute(
+            )
+            conn.execute(
                 "UPDATE bench_experiments SET status = 'failed' WHERE status = 'running'"
-            ).rowcount
-        return max(trials, experiments)
+            )
+        trials = [
+            Trial.model_validate(
+                {
+                    **dict(row),
+                    "profile": json.loads(row["profile"]),
+                }
+            )
+            for row in trial_rows
+        ]
+        return trials, [str(row["id"]) for row in experiment_rows]
 
     def start_trial(self, trial: Trial) -> None:
         with self._connect() as conn:
@@ -277,6 +323,49 @@ class ExperimentStore:
                 for row in rows
             ],
         )
+
+    def queue_notification(self, trial: Trial, markdown: str) -> None:
+        event_key = f"{trial.experiment_id}:{trial.candidate}{trial.repetition}"
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO bench_notifications (
+                    event_key, experiment_id, candidate, repetition, markdown, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_key,
+                    trial.experiment_id,
+                    trial.candidate,
+                    trial.repetition,
+                    markdown,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+
+    def pending_notifications(self) -> list[BenchNotification]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT event_key, experiment_id, candidate, repetition, markdown, created_at
+                FROM bench_notifications
+                WHERE acknowledged_at IS NULL
+                ORDER BY created_at, event_key
+                """
+            ).fetchall()
+        return [BenchNotification.model_validate(dict(row)) for row in rows]
+
+    def acknowledge_notification(self, event_key: str) -> bool:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE bench_notifications
+                SET acknowledged_at = ?
+                WHERE event_key = ? AND acknowledged_at IS NULL
+                """,
+                (datetime.now(UTC).isoformat(), event_key),
+            )
+        return cursor.rowcount == 1
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._path)

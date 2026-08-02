@@ -37,7 +37,7 @@ async def _seed_run(path: Path) -> None:
         await db.runs.add_usage(
             conn,
             "run-1",
-            cost_usd=0,
+            cost_usd=1.25,
             input_tokens=100,
             output_tokens=50,
             cache_write_tokens=20,
@@ -68,7 +68,12 @@ def test_bench_snapshot_reports_stable_safety_metrics(tmp_path: Path) -> None:
     assert snapshot == {
         "active_agent_seconds": 120.0,
         "agent_launches": 1,
+        "cache_read_tokens": 10,
+        "cache_write_tokens": 20,
+        "cost_usd": 1.25,
         "effective_tokens": 176.0,
+        "input_tokens": 100,
+        "output_tokens": 50,
         "remote_review_rounds": 2,
         "runs_by_status": {"completed": 1},
     }

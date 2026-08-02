@@ -1,19 +1,66 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import re
 import shutil
-from importlib.resources import as_file, files
+from dataclasses import dataclass
 from pathlib import Path
 from xml.etree import ElementTree
 
 from .github import CommandError, Commands
 
 
+class GraderInfrastructureError(RuntimeError):
+    """The hidden checks did not execute reliably enough to score a product."""
+
+
+@dataclass(frozen=True)
+class HiddenManifest:
+    backend_total: int
+    frontend_total: int
+    seed_backend_passed: int
+    seed_frontend_passed: int
+
+
+_FIXED_FEEDBACK_INBOX_MANIFEST = HiddenManifest(
+    backend_total=9,
+    frontend_total=7,
+    seed_backend_passed=1,
+    seed_frontend_passed=1,
+)
+
+
+def load_hidden_manifest(path: Path) -> HiddenManifest:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        manifest = HiddenManifest(
+            backend_total=int(payload["backend_total"]),
+            frontend_total=int(payload["frontend_total"]),
+            seed_backend_passed=int(payload["seed_backend_passed"]),
+            seed_frontend_passed=int(payload["seed_frontend_passed"]),
+        )
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise GraderInfrastructureError(f"invalid hidden-check manifest: {exc}") from exc
+    if (
+        manifest.backend_total < 1
+        or manifest.frontend_total < 1
+        or not 0 <= manifest.seed_backend_passed < manifest.backend_total
+        or not 0 <= manifest.seed_frontend_passed < manifest.frontend_total
+    ):
+        raise GraderInfrastructureError("invalid hidden-check manifest counters")
+    if manifest != _FIXED_FEEDBACK_INBOX_MANIFEST:
+        raise GraderInfrastructureError(
+            "hidden-check manifest does not match the fixed benchmark contract"
+        )
+    return manifest
+
+
 def regression_commands() -> dict[str, list[str]]:
     return {
         "backend_tests": ["uv", "run", "--frozen", "--no-sync", "pytest", "-q"],
         "ruff": ["uv", "run", "--frozen", "--no-sync", "ruff", "check", "."],
-        "mypy": ["uv", "run", "--frozen", "--no-sync", "mypy", "eventdesk"],
+        "mypy": ["uv", "run", "--frozen", "--no-sync", "mypy", "feedback_inbox"],
         "frontend_install": ["npm", "ci"],
         "frontend_tests": ["npm", "test", "--", "--run"],
         "frontend_build": ["npm", "run", "build"],
@@ -31,6 +78,8 @@ def parse_junit_report(path: Path) -> dict[str, int]:
     failures = sum(int(suite.attrib.get("failures", 0)) for suite in suites)
     errors = sum(int(suite.attrib.get("errors", 0)) for suite in suites)
     skipped = sum(int(suite.attrib.get("skipped", 0)) for suite in suites)
+    if min(total, failures, errors, skipped) < 0 or failures + errors + skipped > total:
+        raise GraderInfrastructureError("invalid JUnit test accounting")
     return {
         "hidden_checks_total": total,
         "hidden_checks_passed": max(0, total - failures - errors - skipped),
@@ -40,8 +89,66 @@ def parse_junit_report(path: Path) -> dict[str, int]:
     }
 
 
-class EventDeskGrader:
-    """Clone merged main and run tests never copied into the task repository."""
+def parse_vitest_report(path: Path) -> dict[str, int]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise GraderInfrastructureError(f"invalid Vitest result: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise GraderInfrastructureError("invalid Vitest result: root must be an object")
+    try:
+        total = int(payload["numTotalTests"])
+        passed = int(payload["numPassedTests"])
+        failed = int(payload["numFailedTests"])
+        skipped = int(payload.get("numPendingTests", 0)) + int(payload.get("numTodoTests", 0))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise GraderInfrastructureError(f"invalid Vitest result counters: {exc}") from exc
+    if min(total, passed, failed, skipped) < 0 or passed + failed + skipped != total:
+        raise GraderInfrastructureError("invalid Vitest test accounting")
+    return {
+        "hidden_checks_total": total,
+        "hidden_checks_passed": passed,
+        "hidden_checks_failed": failed,
+        "hidden_checks_errors": max(0, total - passed - failed - skipped),
+        "hidden_checks_skipped": skipped,
+    }
+
+
+def validate_control_result(
+    metrics: dict[str, object], manifest: HiddenManifest, *, control: str
+) -> None:
+    if control not in {"reference", "seed"}:
+        raise ValueError(f"unknown grader control {control!r}")
+    for component, expected_total in (
+        ("backend", manifest.backend_total),
+        ("frontend", manifest.frontend_total),
+    ):
+        total = _metric_int(metrics, f"{component}_hidden_checks_total")
+        if total != expected_total:
+            raise GraderInfrastructureError(
+                f"{control}: expected {expected_total} {component} checks, got {total}"
+            )
+        errors = _metric_int(metrics, f"{component}_hidden_checks_errors")
+        skipped = _metric_int(metrics, f"{component}_hidden_checks_skipped")
+        if errors or skipped:
+            raise GraderInfrastructureError(
+                f"{control}: {component} checks had {errors} errors and {skipped} skipped"
+            )
+        passed = _metric_int(metrics, f"{component}_hidden_checks_passed")
+        expected_passed = (
+            expected_total
+            if control == "reference"
+            else getattr(manifest, f"seed_{component}_passed")
+        )
+        if passed != expected_passed:
+            raise GraderInfrastructureError(
+                f"{control}: expected {expected_passed}/{expected_total} {component} passes, "
+                f"got {passed}/{total}"
+            )
+
+
+class FeedbackInboxGrader:
+    """Clone merged main and run private backend and frontend checks."""
 
     def __init__(self, commands: Commands) -> None:
         self._commands = commands
@@ -52,7 +159,9 @@ class EventDeskGrader:
         repository_slug: str,
         destination: Path,
         github_token: str,
-        hidden_test: Path | None = None,
+        backend_hidden_test: Path,
+        frontend_hidden_test: Path,
+        manifest: HiddenManifest,
         checks: dict[str, list[str]] | None = None,
     ) -> dict[str, object]:
         checkout = destination / "final"
@@ -62,43 +171,18 @@ class EventDeskGrader:
             cwd=destination,
             env=env,
         )
-        await self._commands.run(["uv", "sync", "--locked"], cwd=checkout)
-        report = destination / "hidden-junit.xml"
-        hidden = hidden_test or files("symphony.bench.assets").joinpath(
-            "hidden/test_eventdesk_hidden.py"
+        metrics = await self._run_hidden_checks(
+            checkout=checkout,
+            results_root=destination,
+            backend_hidden_test=backend_hidden_test,
+            frontend_hidden_test=frontend_hidden_test,
+            manifest=manifest,
         )
-        with as_file(hidden) as hidden_path:
-            injected_hidden = checkout / "bench_hidden_test.py"
-            await asyncio.to_thread(shutil.copyfile, hidden_path, injected_hidden)
-            try:
-                try:
-                    await self._commands.run(
-                        [
-                            "uv",
-                            "run",
-                            "--frozen",
-                            "--no-sync",
-                            "pytest",
-                            str(injected_hidden),
-                            "-q",
-                            f"--junitxml={report}",
-                        ],
-                        cwd=checkout,
-                        env={
-                            "EVENTDESK_SESSION_SECRET": "bench-hidden-session-secret",
-                            "PAYMENT_WEBHOOK_SECRET": "hidden-secret",
-                        },
-                    )
-                except CommandError:
-                    # Product failures are data. Pytest still writes JUnit; only a
-                    # missing/invalid report is grader infrastructure failure.
-                    if not report.exists():
-                        raise
-            finally:
-                await asyncio.to_thread(injected_hidden.unlink, missing_ok=True)
-        metrics: dict[str, object] = {**parse_junit_report(report)}
         results: dict[str, str] = {}
         for name, argv in (checks or regression_commands()).items():
+            if name == "frontend_install":
+                results[name] = "passed"
+                continue
             cwd = checkout / "frontend" if name.startswith("frontend_") else checkout
             try:
                 await self._commands.run(argv, cwd=cwd)
@@ -112,3 +196,173 @@ class EventDeskGrader:
             regression_results=results,
         )
         return metrics
+
+    async def validate_controls(
+        self,
+        *,
+        seed_root: Path,
+        reference_root: Path,
+        results_root: Path,
+        backend_hidden_test: Path,
+        frontend_hidden_test: Path,
+        manifest: HiddenManifest,
+    ) -> dict[str, object]:
+        reference = await self._run_hidden_checks(
+            checkout=reference_root,
+            results_root=results_root / "reference",
+            backend_hidden_test=backend_hidden_test,
+            frontend_hidden_test=frontend_hidden_test,
+            manifest=manifest,
+        )
+        validate_control_result(reference, manifest, control="reference")
+        seed = await self._run_hidden_checks(
+            checkout=seed_root,
+            results_root=results_root / "seed",
+            backend_hidden_test=backend_hidden_test,
+            frontend_hidden_test=frontend_hidden_test,
+            manifest=manifest,
+        )
+        validate_control_result(seed, manifest, control="seed")
+        return {"reference": reference, "seed": seed}
+
+    async def _run_hidden_checks(
+        self,
+        *,
+        checkout: Path,
+        results_root: Path,
+        backend_hidden_test: Path,
+        frontend_hidden_test: Path,
+        manifest: HiddenManifest,
+    ) -> dict[str, object]:
+        await asyncio.to_thread(results_root.mkdir, parents=True, exist_ok=True)
+        try:
+            await self._commands.run(["uv", "sync", "--locked"], cwd=checkout)
+        except CommandError as exc:
+            raise GraderInfrastructureError(f"backend dependency install failed: {exc}") from exc
+        backend_report = results_root / "backend-hidden-junit.xml"
+        injected_backend = checkout / "bench_hidden_test.py"
+        if await asyncio.to_thread(injected_backend.exists):
+            raise GraderInfrastructureError(
+                f"reserved hidden-check path already exists: {injected_backend.name}"
+            )
+        await asyncio.to_thread(shutil.copyfile, backend_hidden_test, injected_backend)
+        try:
+            try:
+                await self._commands.run(
+                    [
+                        "uv",
+                        "run",
+                        "--frozen",
+                        "--no-sync",
+                        "pytest",
+                        str(injected_backend),
+                        "-q",
+                        f"--junitxml={backend_report}",
+                    ],
+                    cwd=checkout,
+                    env={
+                        "FEEDBACK_INBOX_DB_PATH": str(results_root / "hidden-feedback.sqlite")
+                    },
+                )
+            except CommandError as exc:
+                if not backend_report.exists():
+                    raise GraderInfrastructureError(
+                        f"backend hidden checks did not produce JUnit: {exc}"
+                    ) from exc
+                if not _is_test_failure_exit(exc):
+                    raise GraderInfrastructureError(
+                        f"backend hidden-check process failed: {exc}"
+                    ) from exc
+        finally:
+            await asyncio.to_thread(injected_backend.unlink, missing_ok=True)
+        try:
+            backend = parse_junit_report(backend_report)
+        except (OSError, ElementTree.ParseError, RuntimeError, ValueError) as exc:
+            raise GraderInfrastructureError(f"invalid backend JUnit: {exc}") from exc
+
+        frontend_root = checkout / "frontend"
+        try:
+            await self._commands.run(["npm", "ci"], cwd=frontend_root)
+        except CommandError as exc:
+            raise GraderInfrastructureError(f"frontend dependency install failed: {exc}") from exc
+        frontend_report = results_root / "frontend-hidden.json"
+        injected_frontend = frontend_root / "src/App.bench.test.tsx"
+        if await asyncio.to_thread(injected_frontend.exists):
+            raise GraderInfrastructureError(
+                f"reserved hidden-check path already exists: {injected_frontend.name}"
+            )
+        await asyncio.to_thread(shutil.copyfile, frontend_hidden_test, injected_frontend)
+        try:
+            try:
+                await self._commands.run(
+                    [
+                        "npm",
+                        "test",
+                        "--",
+                        "--run",
+                        "src/App.bench.test.tsx",
+                        "--reporter=json",
+                        f"--outputFile={frontend_report}",
+                    ],
+                    cwd=frontend_root,
+                )
+            except CommandError as exc:
+                if not frontend_report.exists():
+                    raise GraderInfrastructureError(
+                        f"frontend hidden checks did not produce JSON: {exc}"
+                    ) from exc
+                if not _is_test_failure_exit(exc):
+                    raise GraderInfrastructureError(
+                        f"frontend hidden-check process failed: {exc}"
+                    ) from exc
+        finally:
+            await asyncio.to_thread(injected_frontend.unlink, missing_ok=True)
+        frontend = parse_vitest_report(frontend_report)
+
+        metrics: dict[str, object] = {
+            **{f"backend_{key}": value for key, value in backend.items()},
+            **{f"frontend_{key}": value for key, value in frontend.items()},
+        }
+        _validate_hidden_shape(metrics, manifest)
+        metrics.update(
+            hidden_checks_total=backend["hidden_checks_total"]
+            + frontend["hidden_checks_total"],
+            hidden_checks_passed=backend["hidden_checks_passed"]
+            + frontend["hidden_checks_passed"],
+            hidden_checks_failed=backend["hidden_checks_failed"]
+            + frontend["hidden_checks_failed"],
+            hidden_checks_errors=backend["hidden_checks_errors"]
+            + frontend["hidden_checks_errors"],
+            hidden_checks_skipped=backend["hidden_checks_skipped"]
+            + frontend["hidden_checks_skipped"],
+        )
+        return metrics
+
+
+def _validate_hidden_shape(metrics: dict[str, object], manifest: HiddenManifest) -> None:
+    for component, expected_total in (
+        ("backend", manifest.backend_total),
+        ("frontend", manifest.frontend_total),
+    ):
+        actual_total = _metric_int(metrics, f"{component}_hidden_checks_total")
+        if actual_total != expected_total:
+            raise GraderInfrastructureError(
+                f"expected {expected_total} {component} checks, got {actual_total}"
+            )
+        errors = _metric_int(metrics, f"{component}_hidden_checks_errors")
+        skipped = _metric_int(metrics, f"{component}_hidden_checks_skipped")
+        if errors or skipped:
+            raise GraderInfrastructureError(
+                f"{component} hidden checks had {errors} errors and {skipped} skipped"
+            )
+
+
+def _metric_int(metrics: dict[str, object], key: str) -> int:
+    value = metrics.get(key)
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise GraderInfrastructureError(f"hidden-check metric {key!r} is missing or invalid")
+    return value
+
+
+def _is_test_failure_exit(error: CommandError) -> bool:
+    return re.search(r"\bexited 1:", str(error)) is not None

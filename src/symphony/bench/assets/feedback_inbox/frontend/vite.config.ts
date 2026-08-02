@@ -5,7 +5,7 @@ export default defineConfig({
   plugins: [react()],
   server: {
     proxy: {
-      "/events": "http://localhost:8000",
+      "/feedback": "http://localhost:8000",
     },
   },
   test: {

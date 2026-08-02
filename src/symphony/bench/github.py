@@ -98,7 +98,7 @@ class GitHubSandbox:
         await self._commands.run(["git", "add", "."], cwd=source)
         try:
             await self._commands.run(
-                ["git", "commit", "-m", "Seed EventDesk benchmark"], cwd=source
+                ["git", "commit", "-m", "Seed Feedback Inbox benchmark"], cwd=source
             )
         except CommandError as exc:
             if "nothing to commit" not in str(exc):

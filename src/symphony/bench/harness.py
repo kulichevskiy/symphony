@@ -3,17 +3,17 @@ from __future__ import annotations
 import json
 import shutil
 from dataclasses import asdict, dataclass
-from importlib.resources import as_file, files
 from pathlib import Path
 
-from .eventdesk import (
+from .campaign import (
     Campaign,
     CampaignTicket,
-    eventdesk_campaign,
+    feedback_inbox_campaign,
     harness_version,
-    materialize_eventdesk,
+    materialize_feedback_inbox,
+    materialize_feedback_inbox_reference,
 )
-from .grader import regression_commands
+from .grader import HiddenManifest, load_hidden_manifest, regression_commands
 from .reviewer import final_review_prompts
 
 
@@ -22,20 +22,40 @@ class FrozenHarness:
     root: Path
     version: str
     campaign: Campaign
-    hidden_test: Path
+    backend_hidden_test: Path
+    frontend_hidden_test: Path
+    reference_root: Path
+    hidden_manifest: HiddenManifest
     regression_commands: dict[str, list[str]]
     spec_prompt: str
     standards_prompt: str
 
 
-def snapshot_harness(destination: Path) -> str:
+def snapshot_harness(destination: Path, *, controls_root: Path) -> str:
     """Persist every workload artifact before an experiment becomes queue-visible."""
+    reference_root = controls_root / "feedback_inbox_reference"
+    hidden_root = controls_root / "hidden" / "feedback_inbox"
+    required = (
+        reference_root / "feedback_inbox" / "main.py",
+        hidden_root / "test_backend_hidden.py",
+        hidden_root / "App.bench.test.tsx",
+        hidden_root / "manifest.json",
+    )
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"private benchmark controls are incomplete: {', '.join(missing)}")
     destination.mkdir(parents=True, exist_ok=False)
-    materialize_eventdesk(destination / "eventdesk")
-    hidden = files("symphony.bench.assets").joinpath("hidden/test_eventdesk_hidden.py")
-    with as_file(hidden) as hidden_path:
-        shutil.copyfile(hidden_path, destination / "hidden_test.py")
-    campaign = eventdesk_campaign_payload()
+    materialize_feedback_inbox(destination / "feedback_inbox")
+    materialize_feedback_inbox_reference(
+        reference_root, destination / "feedback_inbox_reference"
+    )
+    for source_name, destination_name in (
+        ("test_backend_hidden.py", "backend_hidden_test.py"),
+        ("App.bench.test.tsx", "frontend_hidden_test.tsx"),
+        ("manifest.json", "hidden_manifest.json"),
+    ):
+        shutil.copyfile(hidden_root / source_name, destination / destination_name)
+    campaign = feedback_inbox_campaign_payload()
     (destination / "campaign.json").write_text(
         json.dumps(campaign, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -89,15 +109,18 @@ def load_harness(snapshot: Path) -> FrozenHarness:
         root=snapshot,
         version=expected,
         campaign=campaign_from_payload(campaign_payload),
-        hidden_test=snapshot / "hidden_test.py",
+        backend_hidden_test=snapshot / "backend_hidden_test.py",
+        frontend_hidden_test=snapshot / "frontend_hidden_test.tsx",
+        reference_root=snapshot / "feedback_inbox_reference",
+        hidden_manifest=load_hidden_manifest(snapshot / "hidden_manifest.json"),
         regression_commands=commands,
         spec_prompt=spec_prompt,
         standards_prompt=standards_prompt,
     )
 
 
-def eventdesk_campaign_payload() -> dict[str, object]:
-    return asdict(eventdesk_campaign())
+def feedback_inbox_campaign_payload() -> dict[str, object]:
+    return asdict(feedback_inbox_campaign())
 
 
 def campaign_from_payload(payload: dict[str, object]) -> Campaign:

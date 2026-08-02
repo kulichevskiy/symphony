@@ -19,6 +19,7 @@ services:
       target: runtime
     image: symphony-bench-control
     restart: unless-stopped
+    stop_grace_period: 90s
     command: ["bench", "serve"]
     depends_on:
       init:
@@ -34,6 +35,7 @@ services:
       SYMPHONY_BENCH_ROOT_A: /data/bench-a
       SYMPHONY_BENCH_ROOT_B: /data/bench-b
       SYMPHONY_BENCH_PRIVATE_ROOT: /data/db/bench-private
+      SYMPHONY_BENCH_CONTROLS_ROOT: /run/symphony-bench-controls
       SYMPHONY_BENCH_EXECUTOR_A_URL: http://bench-a:8090
       SYMPHONY_BENCH_EXECUTOR_B_URL: http://bench-b:8090
       SYMPHONY_BENCH_EXECUTOR_TOKEN: ${SYMPHONY_BENCH_EXECUTOR_TOKEN:?required}
@@ -45,6 +47,7 @@ services:
       - bench_db:/data/db
       - bench_runs_a:/data/bench-a
       - bench_runs_b:/data/bench-b
+      - /opt/symphony-bench/controls-current:/run/symphony-bench-controls:ro
 
   # A and B run concurrently in isolated containers and volumes. Each receives
   # only per-command credentials, has no control DB/.env mount, and cannot reach
@@ -145,6 +148,9 @@ services:
                   reverse_proxy worker:8080
               }
               handle /experiments* {
+                  reverse_proxy worker:8080
+              }
+              handle /notifications* {
                   reverse_proxy worker:8080
               }
               handle {

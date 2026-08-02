@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from collections import defaultdict
+from pathlib import Path
 from statistics import mean
 
 from .models import ExperimentReport, TrialRecord
@@ -20,7 +22,12 @@ _SUMMARY_METRICS = (
     "standards_findings_critical",
     "standards_findings_major",
     "standards_findings_minor",
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
     "effective_tokens",
+    "cost_usd",
     "active_agent_seconds",
     "wall_seconds",
     "agent_launches",
@@ -82,7 +89,7 @@ def render_markdown(report: ExperimentReport) -> str:
         f"System B: `{experiment.system_version_b}`  ",
         f"Executor toolchain: `{experiment.executor_toolchain_version}`  ",
         f"Harness: `{experiment.harness_version}`  ",
-        f"Repetitions: {experiment.repetitions}; order: S0, then A/B pairs in parallel",
+        f"Repetitions: {experiment.repetitions}; order: A/B pairs in parallel",
         "Matched completed repetitions: "
         + (", ".join(str(item) for item in matched_repetitions) or "none"),
         "",
@@ -133,3 +140,61 @@ def render_markdown(report: ExperimentReport) -> str:
                 )
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
+
+
+def render_trial_markdown(report: ExperimentReport, record: TrialRecord) -> str:
+    label = f"{record.candidate}{record.repetition}"
+    lines = [
+        f"# Symphony bench {report.experiment.id} — {label}",
+        "",
+        f"Status: **{record.status}**",
+        f"Revision: `{record.revision}`",
+        f"System version: `{record.system_version}`",
+        f"Started: `{record.started_at.isoformat()}`",
+        f"Ended: `{record.ended_at.isoformat() if record.ended_at else 'running'}`",
+        f"Repository: {record.repository_url or 'unavailable'}",
+        f"Issues: {', '.join(record.issue_urls) if record.issue_urls else 'none'}",
+    ]
+    if record.error:
+        lines.append(f"Error: `{record.error}`")
+    lines.extend(["", "## Metrics", ""])
+    for key in sorted(record.metrics):
+        value = record.metrics[key]
+        rendered = (
+            json.dumps(value, sort_keys=True)
+            if isinstance(value, (dict, list))
+            else str(value)
+        )
+        lines.append(f"- {key}: `{rendered}`")
+    lines.extend(
+        [
+            "",
+            "## Next step",
+            "",
+            "Next step: continue the experiment if healthy; otherwise diagnose this receipt.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def persist_trial_markdown(root: Path, report: ExperimentReport, record: TrialRecord) -> str:
+    body = render_trial_markdown(report, record)
+    directory = root / report.experiment.id
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / f"{record.candidate}{record.repetition}.md"
+    temporary = destination.with_suffix(".md.tmp")
+    temporary.write_text(body, encoding="utf-8")
+    temporary.replace(destination)
+    return body
+
+
+def persist_experiment_markdown(root: Path, report: ExperimentReport) -> str:
+    body = render_markdown(report)
+    directory = root / report.experiment.id
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / "FINAL.md"
+    temporary = destination.with_suffix(".md.tmp")
+    temporary.write_text(body, encoding="utf-8")
+    temporary.replace(destination)
+    return body

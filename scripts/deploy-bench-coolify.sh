@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-for command in curl jq git ssh; do
+for command in curl jq git ssh tar shasum; do
   command -v "$command" >/dev/null || {
     echo "missing required command: $command" >&2
     exit 2
@@ -11,8 +11,9 @@ done
 : "${COOLIFY_API_TOKEN:?Set COOLIFY_API_TOKEN from Coolify Keys & Tokens}"
 : "${SYMPHONY_BENCH_EXECUTOR_TOKEN:?Set the executor token used in bench .env}"
 
+coolify_ssh_host="${COOLIFY_SSH_HOST:-prod_eng@esh-kulichevskiy-2.adjust.dev}"
+
 if [[ -z "${COOLIFY_API_BASE:-}" ]]; then
-  coolify_ssh_host="${COOLIFY_SSH_HOST:-prod_eng@esh-kulichevskiy-2.adjust.dev}"
   api_transport=ssh
   api_base="http://127.0.0.1:8000/api/v1"
 else
@@ -27,6 +28,51 @@ project_name="${COOLIFY_BENCH_PROJECT:-Symphony Bench}"
 application_name="${COOLIFY_BENCH_APPLICATION:-symphony-bench}"
 repository="${COOLIFY_BENCH_REPOSITORY:-kulichevskiy/symphony}"
 branch="${COOLIFY_BENCH_BRANCH:-$(git branch --show-current)}"
+repository_root="$(git rev-parse --show-toplevel)"
+controls_assets="${SYMPHONY_BENCH_CONTROLS_SOURCE:-$repository_root/src/symphony/bench/assets}"
+for control in \
+  feedback_inbox_reference/feedback_inbox/main.py \
+  hidden/feedback_inbox/test_backend_hidden.py \
+  hidden/feedback_inbox/App.bench.test.tsx \
+  hidden/feedback_inbox/manifest.json; do
+  if [[ ! -f "$controls_assets/$control" ]]; then
+    echo "missing private benchmark control: $controls_assets/$control" >&2
+    exit 2
+  fi
+done
+
+controls_bundle_id="$(
+  tar -C "$controls_assets" \
+    --exclude='.venv' --exclude='node_modules' --exclude='dist' \
+    --exclude='__pycache__' --exclude='.pytest_cache' --exclude='.mypy_cache' \
+    --exclude='.ruff_cache' --exclude='*.tsbuildinfo' \
+    -cf - feedback_inbox_reference hidden/feedback_inbox \
+    | shasum -a 256 \
+    | awk '{print substr($1, 1, 16)}'
+)"
+controls_bundle="/opt/symphony-bench/control-bundles/$controls_bundle_id"
+controls_upload="/opt/symphony-bench/.controls-upload-$controls_bundle_id-$$"
+ssh -o BatchMode=yes "$coolify_ssh_host" \
+  "mkdir -p /opt/symphony-bench/control-bundles '$controls_upload'"
+tar -C "$controls_assets" \
+  --exclude='.venv' --exclude='node_modules' --exclude='dist' \
+  --exclude='__pycache__' --exclude='.pytest_cache' --exclude='.mypy_cache' \
+  --exclude='.ruff_cache' --exclude='*.tsbuildinfo' \
+  -cf - feedback_inbox_reference hidden/feedback_inbox \
+  | ssh -o BatchMode=yes "$coolify_ssh_host" "tar -xf - -C '$controls_upload'"
+ssh -o BatchMode=yes "$coolify_ssh_host" "
+  test -f '$controls_upload/feedback_inbox_reference/feedback_inbox/main.py'
+  test -f '$controls_upload/hidden/feedback_inbox/test_backend_hidden.py'
+  test -f '$controls_upload/hidden/feedback_inbox/App.bench.test.tsx'
+  test -f '$controls_upload/hidden/feedback_inbox/manifest.json'
+  if test -d '$controls_bundle'; then
+    rm -rf '$controls_upload'
+  else
+    mv '$controls_upload' '$controls_bundle'
+  fi
+  ln -sfn '$controls_bundle' /opt/symphony-bench/controls-current
+"
+echo "uploaded private controls bundle $controls_bundle_id"
 
 # Coolify's public-create endpoint requires a full URL, while updates to an
 # existing public GitHub application expect the owner/repository slug.

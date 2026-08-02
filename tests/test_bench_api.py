@@ -6,16 +6,25 @@ import pytest
 from fastapi.testclient import TestClient
 
 from symphony.bench.app import create_bench_app
+from symphony.bench.grader import GraderInfrastructureError
 from symphony.bench.models import (
     EXECUTOR_TOOLCHAIN_VERSION,
     ExperimentCreate,
     Trial,
     TrialExecutionError,
     TrialOutcome,
+    read_executor_toolchain_version,
     system_version,
 )
 from symphony.bench.runner import ExperimentRunner
 from symphony.bench.store import ExperimentStore
+
+
+def test_executor_toolchain_version_reads_built_image_receipt(tmp_path: Path) -> None:
+    receipt = tmp_path / "toolchain.txt"
+    receipt.write_text("python=3.12.11;node=v22.18.0\n", encoding="utf-8")
+
+    assert read_executor_toolchain_version(receipt) == "python=3.12.11;node=v22.18.0"
 
 
 def test_submit_and_read_experiment_survives_restart(tmp_path: Path) -> None:
@@ -89,6 +98,62 @@ def test_submit_pins_revision_profile_and_harness_version(tmp_path: Path) -> Non
     assert body["harness_version"] == "snapshotted-harness"
 
 
+def test_submit_rejects_broken_grader_preflight_without_queueing_experiment(
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "bench.sqlite"
+
+    async def prepare(_experiment_id: str) -> str:
+        raise GraderInfrastructureError("reference: expected 9 backend checks, got 0")
+
+    app = create_bench_app(
+        db_path=db_path,
+        api_token="token",
+        prepare_harness=prepare,
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/experiments",
+            headers={"Authorization": "Bearer token"},
+            json={"candidate_a": "sha", "candidate_b": "sha", "repetitions": 1},
+        )
+
+    assert response.status_code == 500
+    assert response.json()["detail"].startswith("infrastructure_failed:")
+    assert ExperimentStore(db_path).claim_next() is None
+
+
+def test_submit_does_not_run_preflight_while_an_experiment_is_active(tmp_path: Path) -> None:
+    prepared: list[str] = []
+
+    async def prepare(experiment_id: str) -> str:
+        prepared.append(experiment_id)
+        return "harness"
+
+    app = create_bench_app(
+        db_path=tmp_path / "bench.sqlite",
+        api_token="token",
+        prepare_harness=prepare,
+    )
+    headers = {"Authorization": "Bearer token"}
+    with TestClient(app) as client:
+        first = client.post(
+            "/experiments",
+            headers=headers,
+            json={"candidate_a": "sha", "candidate_b": "sha", "repetitions": 1},
+        )
+        second = client.post(
+            "/experiments",
+            headers=headers,
+            json={"candidate_a": "sha", "candidate_b": "sha", "repetitions": 1},
+        )
+
+    assert first.status_code == 201
+    assert second.status_code == 409
+    assert second.json()["detail"] == "another experiment is queued or running"
+    assert len(prepared) == 1
+
+
 def test_system_version_includes_executor_toolchain_identity() -> None:
     assert system_version("same-sha", {}, "toolchain-a") != system_version(
         "same-sha", {}, "toolchain-b"
@@ -115,7 +180,6 @@ async def test_runner_interleaves_candidates_and_completes_experiment(tmp_path: 
 
     assert ran == experiment.id
     assert seen == [
-        ("S", 0, "same-sha"),
         ("A", 1, "same-sha"),
         ("B", 1, "same-sha"),
         ("A", 2, "same-sha"),
@@ -139,7 +203,6 @@ async def test_runner_interleaves_candidates_and_completes_experiment(tmp_path: 
         (trial["candidate"], trial["repetition"], trial["status"])
         for trial in report.json()["trials"]
     ] == [
-        ("S", 0, "completed"),
         ("A", 1, "completed"),
         ("B", 1, "completed"),
         ("A", 2, "completed"),
@@ -147,7 +210,7 @@ async def test_runner_interleaves_candidates_and_completes_experiment(tmp_path: 
         ("A", 3, "completed"),
         ("B", 3, "completed"),
     ]
-    assert report.json()["trials"][0]["repository_url"].endswith("/S0")
+    assert report.json()["trials"][0]["repository_url"].endswith("/A1")
     assert report.json()["trials"][0]["metrics"] == {"effective_tokens": 10}
 
 
@@ -159,8 +222,6 @@ async def test_runner_runs_each_candidate_pair_concurrently(tmp_path: Path) -> N
     released: list[int] = []
 
     async def execute(trial: Trial) -> TrialOutcome:
-        if trial.candidate == "S":
-            return TrialOutcome()
         candidates = waiting.setdefault(trial.repetition, set())
         candidates.add(trial.candidate)
         deadline = asyncio.get_running_loop().time() + 1
@@ -178,7 +239,7 @@ async def test_runner_runs_each_candidate_pair_concurrently(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_runner_keeps_counterpart_receipt_when_one_parallel_trial_fails(
+async def test_runner_cancels_sibling_and_keeps_both_failure_receipts(
     tmp_path: Path,
 ) -> None:
     store = ExperimentStore(tmp_path / "bench.sqlite")
@@ -186,12 +247,13 @@ async def test_runner_keeps_counterpart_receipt_when_one_parallel_trial_fails(
 
     async def execute(trial: Trial) -> TrialOutcome:
         if trial.candidate == "A":
+            await asyncio.sleep(0)
             raise TrialExecutionError(
                 "A failed",
                 outcome=TrialOutcome(repository_url="https://github.com/example/A1"),
             )
-        await asyncio.sleep(0)
-        return TrialOutcome(repository_url=f"https://github.com/example/{trial.candidate}1")
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
 
     with pytest.raises(TrialExecutionError, match="A failed"):
         await ExperimentRunner(store=store, execute=execute).run_next()
@@ -200,9 +262,8 @@ async def test_runner_keeps_counterpart_receipt_when_one_parallel_trial_fails(
     assert report is not None
     assert report.experiment.status == "failed"
     assert [(trial.candidate, trial.status) for trial in report.trials] == [
-        ("S", "completed"),
         ("A", "failed"),
-        ("B", "completed"),
+        ("B", "failed"),
     ]
 
 
@@ -233,7 +294,167 @@ def test_app_worker_drains_one_experiment_at_a_time(tmp_path: Path) -> None:
             time.sleep(0.01)
 
     assert current["status"] == "completed"
-    assert seen == ["S0", "A1", "B1"]
+    assert seen == ["A1", "B1"]
+
+
+def test_completed_trial_persists_report_and_notification_until_ack(tmp_path: Path) -> None:
+    db_path = tmp_path / "bench.sqlite"
+    reports_root = tmp_path / "reports"
+    headers = {"Authorization": "Bearer test-token"}
+
+    async def execute(trial: Trial) -> TrialOutcome:
+        return TrialOutcome(
+            repository_url=f"https://github.com/example/{trial.candidate}{trial.repetition}",
+            issue_urls=["https://linear.app/example/BENCH-1"],
+            metrics={
+                "wall_seconds": 12.5,
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_read_tokens": 30,
+                "cache_write_tokens": 0,
+                "effective_tokens": 117,
+                "cost_usd": 1.25,
+                "local_review_rounds": 2,
+                "local_review_major": 1,
+                "remote_review_rounds": 1,
+                "remote_review_p2": 1,
+                "hidden_checks_passed": 7,
+                "hidden_checks_total": 7,
+                "runs_by_status": {"completed": 2},
+            },
+        )
+
+    app = create_bench_app(
+        db_path=db_path,
+        api_token="test-token",
+        execute=execute,
+        reports_root=reports_root,
+        idle_poll_seconds=0.01,
+    )
+    with TestClient(app) as client:
+        submitted = client.post(
+            "/experiments",
+            headers=headers,
+            json={"candidate_a": "sha", "candidate_b": "sha", "repetitions": 1},
+        ).json()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            notifications = client.get("/notifications", headers=headers).json()
+            current = client.get(f"/experiments/{submitted['id']}", headers=headers).json()
+            if len(notifications) == 2 and current["status"] == "completed":
+                break
+            time.sleep(0.01)
+
+    report_path = reports_root / submitted["id"] / "A1.md"
+    assert report_path.exists()
+    final_path = reports_root / submitted["id"] / "FINAL.md"
+    assert final_path.exists()
+    assert "Status: **completed**" in final_path.read_text(encoding="utf-8")
+    assert notifications[0]["event_key"] == f"{submitted['id']}:A1"
+    assert notifications[0]["markdown"] == report_path.read_text(encoding="utf-8")
+    for expected in (
+        "Status: **completed**",
+        "wall_seconds: `12.5`",
+        "input_tokens: `100`",
+        "cost_usd: `1.25`",
+        "local_review_major: `1`",
+        "remote_review_p2: `1`",
+        "hidden_checks_passed: `7`",
+        'runs_by_status: `{"completed": 2}`',
+        "Next step:",
+    ):
+        assert expected in notifications[0]["markdown"]
+
+    with TestClient(
+        create_bench_app(
+            db_path=db_path,
+            api_token="test-token",
+            reports_root=reports_root,
+        )
+    ) as client:
+        pending = client.get("/notifications", headers=headers).json()
+        assert len(pending) == 2
+        acknowledged = client.post(
+            f"/notifications/{pending[0]['event_key']}/ack", headers=headers
+        )
+        assert acknowledged.status_code == 204
+        assert len(client.get("/notifications", headers=headers).json()) == 1
+
+
+def test_failed_pair_persists_both_trial_receipts_and_final_report(tmp_path: Path) -> None:
+    db_path = tmp_path / "bench.sqlite"
+    reports_root = tmp_path / "reports"
+    headers = {"Authorization": "Bearer test-token"}
+
+    async def execute(trial: Trial) -> TrialOutcome:
+        if trial.candidate == "A":
+            raise TrialExecutionError(
+                "candidate failed",
+                outcome=TrialOutcome(metrics={"input_tokens": 10, "wall_seconds": 1}),
+            )
+        return TrialOutcome(metrics={"input_tokens": 20, "wall_seconds": 2})
+
+    app = create_bench_app(
+        db_path=db_path,
+        api_token="test-token",
+        execute=execute,
+        reports_root=reports_root,
+        idle_poll_seconds=0.01,
+    )
+    with TestClient(app) as client:
+        submitted = client.post(
+            "/experiments",
+            headers=headers,
+            json={"candidate_a": "sha", "candidate_b": "sha", "repetitions": 1},
+        ).json()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            current = client.get(f"/experiments/{submitted['id']}", headers=headers).json()
+            if current["status"] == "failed":
+                break
+            time.sleep(0.01)
+
+    directory = reports_root / submitted["id"]
+    assert (directory / "A1.md").exists()
+    assert (directory / "B1.md").exists()
+    assert "candidate failed" in (directory / "A1.md").read_text(encoding="utf-8")
+    assert "Status: **failed**" in (directory / "FINAL.md").read_text(encoding="utf-8")
+
+
+def test_restart_persists_interrupted_trial_and_final_receipts(tmp_path: Path) -> None:
+    db_path = tmp_path / "bench.sqlite"
+    reports_root = tmp_path / "reports"
+    store = ExperimentStore(db_path)
+    experiment = store.create(
+        ExperimentCreate(candidate_a="sha", candidate_b="sha", repetitions=1)
+    )
+    claimed = store.claim_next()
+    assert claimed is not None
+    trial = Trial(
+        experiment_id=experiment.id,
+        candidate="A",
+        repetition=1,
+        revision="sha",
+    )
+    store.start_trial(trial)
+
+    app = create_bench_app(
+        db_path=db_path,
+        api_token="token",
+        reports_root=reports_root,
+    )
+    with TestClient(app) as client:
+        notifications = client.get(
+            "/notifications", headers={"Authorization": "Bearer token"}
+        ).json()
+
+    directory = reports_root / experiment.id
+    assert (directory / "A1.md").exists()
+    assert "bench worker restarted" in (directory / "A1.md").read_text(encoding="utf-8")
+    assert "Status: **failed**" in (directory / "FINAL.md").read_text(encoding="utf-8")
+    assert [notification["event_key"] for notification in notifications] == [
+        f"{experiment.id}:A1"
+    ]
 
 
 def test_app_marks_interrupted_trial_failed_before_claiming_more(tmp_path: Path) -> None:
@@ -244,8 +465,8 @@ def test_app_marks_interrupted_trial_failed_before_claiming_more(tmp_path: Path)
     assert claimed is not None
     trial = Trial(
         experiment_id=experiment.id,
-        candidate="S",
-        repetition=0,
+        candidate="A",
+        repetition=1,
         revision="sha",
     )
     store.start_trial(trial)

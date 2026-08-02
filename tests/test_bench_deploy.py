@@ -50,15 +50,44 @@ def test_bench_compose_separates_control_executor_and_public_network() -> None:
         "http://bench-b:8090"
     )
     assert "bench_db:/data/db" in services["worker"]["volumes"]
+    assert services["worker"]["stop_grace_period"] == "90s"
+    assert (
+        "/opt/symphony-bench/controls-current:/run/symphony-bench-controls:ro"
+        in services["worker"]["volumes"]
+    )
+    assert all(
+        "controls-current" not in item
+        for lane in ("bench-a", "bench-b")
+        for item in services[lane]["volumes"]
+    )
     assert compose["networks"]["control"]["internal"] is True
+
+
+def test_bench_executor_image_excludes_all_private_grader_controls() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text()
+    bench_stage = dockerfile.split("FROM runtime AS bench-executor", 1)[1].split(
+        "FROM runtime AS production", 1
+    )[0]
+
+    assert "/app/src/symphony/bench/assets/hidden" in bench_stage
+    assert "/app/src/symphony/bench/assets/feedback_inbox_reference" in bench_stage
+    dockerignore = (ROOT / ".dockerignore").read_text()
+    assert "src/symphony/bench/assets/feedback_inbox_reference" in dockerignore
+    assert "src/symphony/bench/assets/hidden/feedback_inbox" in dockerignore
+    assert "symphony-bench-toolchain.txt" in dockerfile
+    assert "dpkg-query" in dockerfile
 
 
 def test_caddy_exposes_only_control_api_and_connections_ui() -> None:
     caddy = (ROOT / "Caddyfile.bench.coolify").read_text()
 
     assert "reverse_proxy worker:8080" in caddy
+    assert "handle /notifications*" in caddy
     assert "reverse_proxy connections:8787" in caddy
     assert "executor" not in caddy
+    compose = yaml.safe_load((ROOT / "docker-compose.bench.coolify.yml").read_text())
+    embedded = compose["services"]["caddy"]["volumes"][0]["content"]
+    assert "handle /notifications*" in embedded
 
 
 def test_deploy_uses_ssh_stdin_when_coolify_api_is_local_only() -> None:
@@ -78,3 +107,5 @@ def test_deploy_uses_ssh_stdin_when_coolify_api_is_local_only() -> None:
     assert "del(.project_uuid, .server_uuid, .environment_name, .autogenerate_domain)" in script
     assert 'select(contains("caddy-"))' in script
     assert 'echo "http://$service_fqdn"' in script
+    assert "uploaded private controls bundle" in script
+    assert "/opt/symphony-bench/controls-current" in script

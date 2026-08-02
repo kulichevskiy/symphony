@@ -40,6 +40,21 @@ RUN corepack enable
 RUN command -v claude && command -v codex && command -v gh \
     && command -v git && command -v uv && command -v node
 
+# Record the exact built runtime, including the base/apt layer. Rebuilding the
+# same Git SHA under a changed toolchain must produce a different system version.
+RUN { \
+      python --version 2>&1; \
+      uv --version; \
+      node --version; \
+      npm --version; \
+      git --version; \
+      gh --version | head -n 1; \
+      codex --version; \
+      claude --version; \
+      dpkg-query -W -f='${Package}=${Version}\n' | sort | sha256sum; \
+    } | paste -sd ';' - > /usr/local/share/symphony-bench-toolchain.txt \
+    && test -s /usr/local/share/symphony-bench-toolchain.txt
+
 # Non-root runtime user; ~ is /home/symphony so config's ~/.claude etc. resolve.
 RUN useradd --create-home --shell /bin/bash symphony
 WORKDIR /app
@@ -86,11 +101,12 @@ RUN git config --global credential."https://github.com".helper "!gh auth git-cre
 ENTRYPOINT ["uv", "run", "--frozen", "--no-sync", "--no-dev", "symphony"]
 CMD []
 
-# Candidate execution gets the full Symphony runtime but never the private
-# grader plaintext. The control image injects that file only after agents stop.
+# Candidate execution gets the full Symphony runtime but never the worker-only
+# controls mount. The worker injects hidden files only after candidate agents stop.
 FROM runtime AS bench-executor
 USER root
-RUN rm -rf /app/src/symphony/bench/assets/hidden
+RUN test ! -e /app/src/symphony/bench/assets/hidden/feedback_inbox \
+    && test ! -e /app/src/symphony/bench/assets/feedback_inbox_reference
 USER symphony
 
 # Keep the ordinary image and the bench control plane feature-complete.

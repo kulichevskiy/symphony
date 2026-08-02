@@ -9,9 +9,11 @@ from pathlib import Path
 from typing import Annotated
 from uuid import uuid4
 
-from fastapi import Depends, FastAPI, Header, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
 
-from .models import Experiment, ExperimentCreate, ExperimentReport
+from .grader import GraderInfrastructureError
+from .models import BenchNotification, Experiment, ExperimentCreate, ExperimentReport, Trial
+from .report import persist_experiment_markdown, persist_trial_markdown
 from .runner import ExperimentRunner, TrialExecutor
 from .store import ExperimentStore
 
@@ -29,6 +31,7 @@ def create_bench_app(
     harness_version: str = "",
     prepare_harness: Callable[[str], Awaitable[str]] | None = None,
     recover_execution: Callable[[], Awaitable[None]] | None = None,
+    reports_root: Path | None = None,
 ) -> FastAPI:
     if not api_token:
         raise ValueError("bench API token must not be empty")
@@ -38,13 +41,65 @@ def create_bench_app(
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         if recover_execution is not None:
             await recover_execution()
-        interrupted = store.fail_interrupted()
-        if interrupted:
-            log.error("marked %d interrupted bench run(s) failed on startup", interrupted)
+        interrupted_trials, interrupted_experiments = store.fail_interrupted()
+        if interrupted_experiments:
+            log.error(
+                "marked %d interrupted experiment(s) failed on startup",
+                len(interrupted_experiments),
+            )
+        if reports_root is not None:
+            for trial in interrupted_trials:
+                report = store.report(trial.experiment_id)
+                if report is None:
+                    raise RuntimeError(f"missing interrupted report for {trial.experiment_id}")
+                record = next(
+                    item
+                    for item in report.trials
+                    if item.candidate == trial.candidate
+                    and item.repetition == trial.repetition
+                )
+                markdown = await asyncio.to_thread(
+                    persist_trial_markdown, reports_root, report, record
+                )
+                store.queue_notification(trial, markdown)
+            for experiment_id in interrupted_experiments:
+                report = store.report(experiment_id)
+                if report is None:
+                    raise RuntimeError(f"missing interrupted report for {experiment_id}")
+                await asyncio.to_thread(persist_experiment_markdown, reports_root, report)
         if execute is None:
             yield
             return
-        runner = ExperimentRunner(store=store, execute=execute)
+        async def publish(trial: Trial) -> None:
+            if reports_root is None:
+                return
+            report = store.report(trial.experiment_id)
+            if report is None:
+                raise RuntimeError(f"missing experiment report for {trial.experiment_id}")
+            record = next(
+                item
+                for item in report.trials
+                if item.candidate == trial.candidate and item.repetition == trial.repetition
+            )
+            markdown = await asyncio.to_thread(
+                persist_trial_markdown, reports_root, report, record
+            )
+            store.queue_notification(trial, markdown)
+
+        async def publish_experiment(experiment_id: str) -> None:
+            if reports_root is None:
+                return
+            report = store.report(experiment_id)
+            if report is None:
+                raise RuntimeError(f"missing experiment report for {experiment_id}")
+            await asyncio.to_thread(persist_experiment_markdown, reports_root, report)
+
+        runner = ExperimentRunner(
+            store=store,
+            execute=execute,
+            publish=publish,
+            publish_experiment=publish_experiment,
+        )
 
         async def drain() -> None:
             while True:
@@ -82,18 +137,13 @@ def create_bench_app(
             )
 
     auth = [Depends(require_token)]
+    submission_lock = asyncio.Lock()
 
     @app.get("/health")
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @app.post(
-        "/experiments",
-        response_model=Experiment,
-        status_code=status.HTTP_201_CREATED,
-        dependencies=auth,
-    )
-    async def submit(request: ExperimentCreate) -> Experiment:
+    async def submit_one(request: ExperimentCreate) -> Experiment:
         defaults = default_profile or {}
         updates: dict[str, object] = {}
         if "candidate_a_profile" not in request.model_fields_set:
@@ -121,6 +171,11 @@ def create_bench_app(
         if prepare_harness is not None:
             try:
                 pinned_harness = await prepare_harness(experiment_id)
+            except GraderInfrastructureError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"infrastructure_failed: {exc}",
+                ) from exc
             except Exception as exc:  # noqa: BLE001 - provider error becomes API failure
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -131,6 +186,21 @@ def create_bench_app(
             harness_version=pinned_harness,
             experiment_id=experiment_id,
         )
+
+    @app.post(
+        "/experiments",
+        response_model=Experiment,
+        status_code=status.HTTP_201_CREATED,
+        dependencies=auth,
+    )
+    async def submit(request: ExperimentCreate) -> Experiment:
+        async with submission_lock:
+            if store.has_active():
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="another experiment is queued or running",
+                )
+            return await submit_one(request)
 
     @app.get("/experiments/{experiment_id}", response_model=Experiment, dependencies=auth)
     def get_experiment(experiment_id: str) -> Experiment:
@@ -149,5 +219,19 @@ def create_bench_app(
         if report is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
         return report
+
+    @app.get("/notifications", response_model=list[BenchNotification], dependencies=auth)
+    def get_notifications() -> list[BenchNotification]:
+        return store.pending_notifications()
+
+    @app.post(
+        "/notifications/{event_key}/ack",
+        status_code=status.HTTP_204_NO_CONTENT,
+        dependencies=auth,
+    )
+    def acknowledge_notification(event_key: str) -> Response:
+        if not store.acknowledge_notification(event_key):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     return app

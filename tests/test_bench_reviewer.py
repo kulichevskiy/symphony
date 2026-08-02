@@ -13,7 +13,7 @@ def test_parse_review_accepts_fenced_json() -> None:
     result = parse_review(
         """```json
         {"findings":[
-          {"severity":"Major","title":"Race","evidence":"eventdesk/main.py:80","explanation":"Unsafe"},
+          {"severity":"Major","title":"Race","evidence":"feedback_inbox/main.py:80","explanation":"Unsafe"},
           {"severity":"Minor","title":"Naming","evidence":"frontend/src/App.tsx:12","explanation":"Unclear"}
         ]}
         ```"""
@@ -30,7 +30,7 @@ def test_review_metrics_keeps_spec_and_standards_separate() -> None:
                     {
                         "severity": "Critical",
                         "title": "Broken invariant",
-                        "evidence": "eventdesk/main.py:1",
+                        "evidence": "feedback_inbox/main.py:1",
                         "explanation": "Data loss",
                     }
                 ]

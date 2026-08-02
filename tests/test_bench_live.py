@@ -24,7 +24,7 @@ class FakeGitHub:
 
     async def review_metrics(self, *, repository_slug: str, cwd: Path) -> dict[str, int]:
         assert repository_slug.startswith("kulichevskiy/")
-        assert cwd.name in {"SMOKE", "A1", "B1"}
+        assert cwd.name in {"A1", "B1"}
         return {"remote_review_comments": 2, "remote_review_p1": 1, "remote_review_p2": 1}
 
     async def archive_repository(self, *, repository_slug: str, cwd: Path) -> None:
@@ -41,9 +41,9 @@ class FailingArchiveGitHub(FakeGitHub):
 class FakeLinear:
     async def create_campaign(self, **_kwargs: object) -> LinearCampaign:
         return LinearCampaign(
-            issue_ids=tuple(f"id-{index}" for index in range(6)),
-            issue_identifiers=tuple(f"BENCH-{index}" for index in range(6)),
-            issue_urls=tuple(f"https://linear.app/BENCH-{index}" for index in range(6)),
+            issue_ids=tuple(f"id-{index}" for index in range(2)),
+            issue_identifiers=tuple(f"BENCH-{index}" for index in range(2)),
+            issue_urls=tuple(f"https://linear.app/BENCH-{index}" for index in range(2)),
         )
 
     async def issue_states(self, issue_ids: tuple[str, ...]) -> tuple[LinearIssueState, ...]:
@@ -184,10 +184,14 @@ class CapturingReviewer(FakeReviewer):
         return await super().review(**kwargs)
 
 
-def _frozen_roots(tmp_path: Path, experiment_id: str) -> tuple[Path, Path]:
+def _frozen_roots(
+    tmp_path: Path, experiment_id: str, private_bench_controls: Path
+) -> tuple[Path, Path]:
     root = tmp_path / "runs"
     private_root = tmp_path / "private"
-    snapshot_harness(private_root / experiment_id / "_harness")
+    snapshot_harness(
+        private_root / experiment_id / "_harness", controls_root=private_bench_controls
+    )
     return root, private_root
 
 
@@ -241,6 +245,8 @@ def test_prior_solutions_and_hidden_harness_leave_executor_volume(tmp_path: Path
     (trial / "logs").mkdir()
     (trial / "logs/run.log").write_text("receipt")
     (trial / "candidate.sqlite").write_bytes(b"db")
+    (trial / "backend-hidden-junit.xml").write_text("<testsuite />")
+    (trial / "frontend-hidden.json").write_text("{}")
     legacy_harness = shared / "EXP-OLD" / "_harness"
     legacy_harness.mkdir()
     (legacy_harness / "hidden_test.py").write_text("hidden")
@@ -251,15 +257,21 @@ def test_prior_solutions_and_hidden_harness_leave_executor_volume(tmp_path: Path
     assert not (shared / "EXP-OLD").exists()
     assert (private / "EXP-OLD/A1/logs/run.log").read_text() == "receipt"
     assert (private / "EXP-OLD/A1/candidate.sqlite").read_bytes() == b"db"
+    assert (private / "EXP-OLD/A1/backend-hidden-junit.xml").exists()
+    assert (private / "EXP-OLD/A1/frontend-hidden.json").exists()
     assert not (private / "EXP-OLD/A1/final/solution.py").exists()
     assert (private / "EXP-OLD/_harness/hidden_test.py").read_text() == "hidden"
 
 
 @pytest.mark.asyncio
-async def test_live_trial_uses_the_experiment_harness_snapshot(tmp_path: Path) -> None:
+async def test_live_trial_uses_the_experiment_harness_snapshot(
+    tmp_path: Path, private_bench_controls: Path
+) -> None:
     root = tmp_path / "runs"
     private_root = tmp_path / "private"
-    snapshot_harness(private_root / "EXP-FROZEN" / "_harness")
+    snapshot_harness(
+        private_root / "EXP-FROZEN" / "_harness", controls_root=private_bench_controls
+    )
     grader = CapturingGrader()
     reviewer = CapturingReviewer()
     commands = FakeCommands()
@@ -285,7 +297,13 @@ async def test_live_trial_uses_the_experiment_harness_snapshot(tmp_path: Path) -
 
     await executor(Trial(experiment_id="EXP-FROZEN", candidate="A", repetition=1, revision="sha"))
 
-    assert grader.kwargs["hidden_test"] == (private_root / "EXP-FROZEN" / "_harness/hidden_test.py")
+    assert grader.kwargs["backend_hidden_test"] == (
+        private_root / "EXP-FROZEN" / "_harness/backend_hidden_test.py"
+    )
+    assert grader.kwargs["frontend_hidden_test"] == (
+        private_root / "EXP-FROZEN" / "_harness/frontend_hidden_test.tsx"
+    )
+    assert grader.kwargs["manifest"].backend_total == 9
     assert isinstance(grader.kwargs["checks"], dict)
     assert "SPEC reviewer" in str(reviewer.kwargs["spec_prompt"])
     assert "STANDARDS reviewer" in str(reviewer.kwargs["standards_prompt"])
@@ -312,9 +330,11 @@ def test_live_trial_requires_snapshot(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_live_trial_provisions_runs_and_returns_traceable_outcome(tmp_path: Path) -> None:
+async def test_live_trial_provisions_runs_and_returns_traceable_outcome(
+    tmp_path: Path, private_bench_controls: Path
+) -> None:
     commands = FakeCommands()
-    root, private_root = _frozen_roots(tmp_path, "EXP-1")
+    root, private_root = _frozen_roots(tmp_path, "EXP-1", private_bench_controls)
     github = FakeGitHub()
     executor = LiveTrialExecutor(
         config=LiveBenchConfig(
@@ -341,9 +361,9 @@ async def test_live_trial_provisions_runs_and_returns_traceable_outcome(tmp_path
     )
 
     assert outcome.repository_url == "https://github.com/kulichevskiy/EXP-1-A1"
-    assert len(outcome.issue_urls) == 6
+    assert len(outcome.issue_urls) == 2
     assert outcome.metrics["effective_tokens"] == 1234.0
-    assert outcome.metrics["completed_tickets"] == 6
+    assert outcome.metrics["completed_tickets"] == 2
     assert outcome.metrics["hidden_checks_passed"] == 8
     assert outcome.metrics["remote_review_comments"] == 2
     assert outcome.metrics["spec_findings_major"] == 1
@@ -372,9 +392,11 @@ async def test_live_trial_provisions_runs_and_returns_traceable_outcome(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_live_trial_reports_repository_archive_failure(tmp_path: Path) -> None:
+async def test_live_trial_reports_repository_archive_failure(
+    tmp_path: Path, private_bench_controls: Path
+) -> None:
     commands = FakeCommands()
-    root, private_root = _frozen_roots(tmp_path, "EXP-ARCHIVE")
+    root, private_root = _frozen_roots(tmp_path, "EXP-ARCHIVE", private_bench_controls)
     executor = LiveTrialExecutor(
         config=LiveBenchConfig(
             root=root,
@@ -406,10 +428,12 @@ async def test_live_trial_reports_repository_archive_failure(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_live_trial_keeps_one_candidate_daemon_across_status_polls(tmp_path: Path) -> None:
+async def test_live_trial_keeps_one_candidate_daemon_across_status_polls(
+    tmp_path: Path, private_bench_controls: Path
+) -> None:
     commands = FakeCommands()
     linear = CompletingLinear()
-    root, private_root = _frozen_roots(tmp_path, "EXP-DAEMON")
+    root, private_root = _frozen_roots(tmp_path, "EXP-DAEMON", private_bench_controls)
     executor = LiveTrialExecutor(
         config=LiveBenchConfig(
             root=root,
@@ -447,9 +471,11 @@ async def test_live_trial_keeps_one_candidate_daemon_across_status_polls(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_live_trial_waits_for_final_run_before_capturing_metrics(tmp_path: Path) -> None:
+async def test_live_trial_waits_for_final_run_before_capturing_metrics(
+    tmp_path: Path, private_bench_controls: Path
+) -> None:
     commands = FinalizingCommands()
-    root, private_root = _frozen_roots(tmp_path, "EXP-FINAL")
+    root, private_root = _frozen_roots(tmp_path, "EXP-FINAL", private_bench_controls)
     executor = LiveTrialExecutor(
         config=LiveBenchConfig(
             root=root,
@@ -506,10 +532,10 @@ async def test_live_trial_resolves_moving_ref_to_full_sha(tmp_path: Path) -> Non
 
 @pytest.mark.asyncio
 async def test_live_trial_wall_cap_covers_grading_and_keeps_receipts(
-    tmp_path: Path,
+    tmp_path: Path, private_bench_controls: Path
 ) -> None:
     grader = BlockingGrader()
-    root, private_root = _frozen_roots(tmp_path, "EXP-CAP")
+    root, private_root = _frozen_roots(tmp_path, "EXP-CAP", private_bench_controls)
     commands = FakeCommands()
     executor = LiveTrialExecutor(
         config=LiveBenchConfig(
@@ -537,14 +563,16 @@ async def test_live_trial_wall_cap_covers_grading_and_keeps_receipts(
 
     assert str(raised.value) == "bench wall-time safety cap exceeded"
     assert raised.value.outcome.repository_url.endswith("/EXP-CAP-A1")  # type: ignore[union-attr]
-    assert raised.value.outcome.metrics["completed_tickets"] == 6
+    assert raised.value.outcome.metrics["completed_tickets"] == 2
     assert "wall_seconds" in raised.value.outcome.metrics
 
 
 @pytest.mark.asyncio
-async def test_live_trial_external_cancellation_keeps_partial_outcome(tmp_path: Path) -> None:
+async def test_live_trial_external_cancellation_keeps_partial_outcome(
+    tmp_path: Path, private_bench_controls: Path
+) -> None:
     grader = BlockingGrader()
-    root, private_root = _frozen_roots(tmp_path, "EXP-CANCEL")
+    root, private_root = _frozen_roots(tmp_path, "EXP-CANCEL", private_bench_controls)
     commands = FakeCommands()
     github = FakeGitHub()
     executor = LiveTrialExecutor(
@@ -576,5 +604,5 @@ async def test_live_trial_external_cancellation_keeps_partial_outcome(tmp_path: 
         await task
 
     assert raised.value.outcome.repository_url.endswith("/EXP-CANCEL-A1")  # type: ignore[union-attr]
-    assert raised.value.outcome.metrics["completed_tickets"] == 6
+    assert raised.value.outcome.metrics["completed_tickets"] == 2
     assert github.archived == ["kulichevskiy/EXP-CANCEL-A1"]

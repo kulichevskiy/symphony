@@ -28,7 +28,7 @@ async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dic
         await conn.execute("PRAGMA query_only = ON")
         cursor = await conn.execute(
             """
-            SELECT stage, status, started_at, ended_at, input_tokens, output_tokens,
+            SELECT stage, status, started_at, ended_at, cost_usd, input_tokens, output_tokens,
                    cache_write_tokens, cache_read_tokens
             FROM runs
             ORDER BY started_at, id
@@ -75,6 +75,11 @@ async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dic
             sum(1 for row in rows if row["stage"] not in nested_stages)
             + int(local_metrics.get("local_review_agent_launches", 0))
         ),
+        "input_tokens": sum(int(row["input_tokens"]) for row in rows),
+        "output_tokens": sum(int(row["output_tokens"]) for row in rows),
+        "cache_write_tokens": sum(int(row["cache_write_tokens"]) for row in rows),
+        "cache_read_tokens": sum(int(row["cache_read_tokens"]) for row in rows),
+        "cost_usd": sum(float(row["cost_usd"]) for row in rows),
         "effective_tokens": tokens,
         "remote_review_rounds": int(review_row["total"]) if review_row is not None else 0,
         "runs_by_status": dict(sorted(statuses.items())),

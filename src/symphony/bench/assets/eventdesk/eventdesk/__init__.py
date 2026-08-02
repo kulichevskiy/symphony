@@ -1,1 +1,0 @@
-"""EventDesk application."""
