@@ -28,6 +28,23 @@ application_name="${COOLIFY_BENCH_APPLICATION:-symphony-bench}"
 repository="${COOLIFY_BENCH_REPOSITORY:-kulichevskiy/symphony}"
 branch="${COOLIFY_BENCH_BRANCH:-$(git branch --show-current)}"
 
+# Coolify's public-create endpoint requires a full URL, while updates to an
+# existing public GitHub application expect the owner/repository slug.
+create_repository="$repository"
+update_repository="$repository"
+case "$repository" in
+  https://github.com/*)
+    update_repository="${repository#https://github.com/}"
+    update_repository="${update_repository%.git}"
+    ;;
+  */*)
+    if [[ "$repository" != *"://"* && "$repository" != git@* ]]; then
+      update_repository="${repository%.git}"
+      create_repository="https://github.com/${update_repository}.git"
+    fi
+    ;;
+esac
+
 api() {
   method="$1"
   path="$2"
@@ -120,7 +137,7 @@ application_uuid="$(jq -r --arg name "$application_name" '.[] | select(.name == 
 common="$(jq -n \
   --arg project "$project_uuid" \
   --arg server "$server_uuid" \
-  --arg repository "$repository" \
+  --arg repository "$update_repository" \
   --arg branch "$branch" \
   --arg name "$application_name" \
   '{
@@ -140,7 +157,9 @@ common="$(jq -n \
   }')"
 
 if [[ -z "$application_uuid" ]]; then
-  application_uuid="$(api POST /applications/public "$(jq '. + {instant_deploy: false}' <<<"$common")" | jq -r .uuid)"
+  create="$(jq --arg repository "$create_repository" \
+    '. + {git_repository: $repository, instant_deploy: false}' <<<"$common")"
+  application_uuid="$(api POST /applications/public "$create" | jq -r .uuid)"
   echo "created Coolify application $application_name ($application_uuid)"
 else
   update="$(jq 'del(.project_uuid, .server_uuid, .environment_name, .autogenerate_domain)' <<<"$common")"

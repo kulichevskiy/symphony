@@ -57,6 +57,9 @@ def test_deploy_uses_ssh_stdin_when_coolify_api_is_local_only() -> None:
     assert "json.load(sys.stdin)" in script
     assert "api_transport=ssh" in script
     assert "COOLIFY_BENCH_REPOSITORY:-kulichevskiy/symphony" in script
+    assert 'create_repository="https://github.com/${update_repository}.git"' in script
+    assert '--arg repository "$update_repository"' in script
+    assert "git_repository: $repository, instant_deploy: false" in script
     assert " -L " not in script
     assert "del(.project_uuid, .server_uuid, .environment_name, .autogenerate_domain)" in script
     assert 'select(contains("caddy-"))' in script
