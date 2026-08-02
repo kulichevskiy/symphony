@@ -84,6 +84,10 @@ class EventDeskGrader:
                             f"--junitxml={report}",
                         ],
                         cwd=checkout,
+                        env={
+                            "EVENTDESK_SESSION_SECRET": "bench-hidden-session-secret",
+                            "PAYMENT_WEBHOOK_SECRET": "hidden-secret",
+                        },
                     )
                 except CommandError:
                     # Product failures are data. Pytest still writes JUnit; only a

@@ -8,6 +8,7 @@ from symphony.bench.grader import EventDeskGrader, parse_junit_report
 class GraderCommands:
     def __init__(self) -> None:
         self.hidden_path: Path | None = None
+        self.hidden_env: dict[str, str] | None = None
 
     async def run(
         self,
@@ -17,10 +18,11 @@ class GraderCommands:
         env: dict[str, str] | None = None,
         stdin: str | None = None,
     ) -> str:
-        del env, stdin
+        del stdin
         if argv[:3] == ["gh", "repo", "clone"]:
             (cwd / "final").mkdir()
         if "--junitxml=" in " ".join(argv):
+            self.hidden_env = env
             self.hidden_path = Path(argv[-3])
             assert self.hidden_path.name == "bench_hidden_test.py"
             assert self.hidden_path.exists()
@@ -95,4 +97,8 @@ async def test_grader_injects_collectable_hidden_name_then_removes_it(tmp_path: 
 
     assert metrics["hidden_checks_passed"] == 1
     assert commands.hidden_path is not None
+    assert commands.hidden_env == {
+        "EVENTDESK_SESSION_SECRET": "bench-hidden-session-secret",
+        "PAYMENT_WEBHOOK_SECRET": "hidden-secret",
+    }
     assert not commands.hidden_path.exists()
