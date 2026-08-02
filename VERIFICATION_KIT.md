@@ -31,8 +31,8 @@ operator inbox after the backend finishes.
    run repository regression checks; then run independent read-only Spec and Standards reviews.
 8. Persist `A1.md`, `B1.md`, and so on immediately after each trial. Each receipt contains status,
    duration, raw/cache/effective tokens, cost, local/remote review rounds and findings by severity,
-   regression and hidden-check results, errors, and links. A durable `/notifications` outbox keeps
-   the same Markdown until the chat acknowledges it.
+   regression and hidden-check results, errors, and links. A durable
+   `/experiments/_notifications` outbox keeps the same Markdown until the chat acknowledges it.
 9. Persist `FINAL.md` when the experiment completes or fails. Aggregate only matched completed A/B
    repetitions. Archive every GitHub trial repository after its receipt is collected.
 
@@ -94,4 +94,5 @@ uv run symphony verify report EXP-… --output bench-report.md
 ```
 
 Submit returns an immutable experiment id only after both grader preflights pass. Status, report,
-and notification endpoints require the bearer token.
+and notification endpoints require the bearer token. Use `/experiments/_notifications` through
+the Coolify domain; it stays under the application's stable proxied prefix.

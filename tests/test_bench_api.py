@@ -372,13 +372,14 @@ def test_completed_trial_persists_report_and_notification_until_ack(tmp_path: Pa
             reports_root=reports_root,
         )
     ) as client:
-        pending = client.get("/notifications", headers=headers).json()
+        pending = client.get("/experiments/_notifications", headers=headers).json()
         assert len(pending) == 2
         acknowledged = client.post(
-            f"/notifications/{pending[0]['event_key']}/ack", headers=headers
+            f"/experiments/_notifications/{pending[0]['event_key']}/ack",
+            headers=headers,
         )
         assert acknowledged.status_code == 204
-        assert len(client.get("/notifications", headers=headers).json()) == 1
+        assert len(client.get("/experiments/_notifications", headers=headers).json()) == 1
 
 
 def test_failed_pair_persists_both_trial_receipts_and_final_report(tmp_path: Path) -> None:

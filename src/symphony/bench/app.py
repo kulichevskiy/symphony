@@ -202,6 +202,30 @@ def create_bench_app(
                 )
             return await submit_one(request)
 
+    @app.get(
+        "/experiments/_notifications",
+        response_model=list[BenchNotification],
+        dependencies=auth,
+    )
+    @app.get("/notifications", response_model=list[BenchNotification], dependencies=auth)
+    def get_notifications() -> list[BenchNotification]:
+        return store.pending_notifications()
+
+    @app.post(
+        "/experiments/_notifications/{event_key}/ack",
+        status_code=status.HTTP_204_NO_CONTENT,
+        dependencies=auth,
+    )
+    @app.post(
+        "/notifications/{event_key}/ack",
+        status_code=status.HTTP_204_NO_CONTENT,
+        dependencies=auth,
+    )
+    def acknowledge_notification(event_key: str) -> Response:
+        if not store.acknowledge_notification(event_key):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
     @app.get("/experiments/{experiment_id}", response_model=Experiment, dependencies=auth)
     def get_experiment(experiment_id: str) -> Experiment:
         experiment = store.get(experiment_id)
@@ -219,19 +243,5 @@ def create_bench_app(
         if report is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
         return report
-
-    @app.get("/notifications", response_model=list[BenchNotification], dependencies=auth)
-    def get_notifications() -> list[BenchNotification]:
-        return store.pending_notifications()
-
-    @app.post(
-        "/notifications/{event_key}/ack",
-        status_code=status.HTTP_204_NO_CONTENT,
-        dependencies=auth,
-    )
-    def acknowledge_notification(event_key: str) -> Response:
-        if not store.acknowledge_notification(event_key):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-        return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     return app
