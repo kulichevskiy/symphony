@@ -986,9 +986,7 @@ async def test_two_pass_retry_reuses_finder_and_preserves_incomplete_verifier_no
                             *_codex_message_stream(
                                 "Confirmed SQLite OverflowError on oversized event id"
                             )[:-1],
-                            *_codex_message_stream(
-                                "I ran out of time before emitting a verdict"
-                            ),
+                            *_codex_message_stream("I ran out of time before emitting a verdict"),
                         ]
                     else:
                         events = _codex_message_stream(
@@ -1030,11 +1028,7 @@ async def test_two_pass_retry_reuses_finder_and_preserves_incomplete_verifier_no
     assert result.outcome == LoopOutcome.APPROVED
     assert runner.find_calls == 1
     assert runner.verify_calls == 2
-    retry_prompt = [
-        spec.command[-1]
-        for spec in runner.specs
-        if spec.run_id.endswith("-verify")
-    ][1]
+    retry_prompt = [spec.command[-1] for spec in runner.specs if spec.run_id.endswith("-verify")][1]
     assert "Confirmed SQLite OverflowError" in retry_prompt
 
 
@@ -1375,9 +1369,7 @@ async def test_two_pass_merged_verdict_is_pass_twos(tmp_path: Path) -> None:
             _message_stream("claude", verifier_text),  # pass 2 (implementer)
             _ok_fix_stream(),  # fixer dispatched on CHANGES_REQUESTED
             _message_stream("codex", finder_text),
-            _message_stream(
-                "claude", f"fixed and rechecked\n{VERDICT_APPROVED_MARKER}"
-            ),
+            _message_stream("claude", f"fixed and rechecked\n{VERDICT_APPROVED_MARKER}"),
         ]
     )
 

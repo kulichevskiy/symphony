@@ -671,9 +671,7 @@ async def run_local_review_session(
         return replace(
             verifier_out,
             last_message_file=verifier_message,
-            cost_usd=(
-                verifier_out.cost_usd + (0.0 if finder_reused else finder_out.cost_usd)
-            ),
+            cost_usd=(verifier_out.cost_usd + (0.0 if finder_reused else finder_out.cost_usd)),
             input_tokens=(
                 verifier_out.input_tokens + (0 if finder_reused else finder_out.input_tokens)
             ),
