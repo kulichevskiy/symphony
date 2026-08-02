@@ -43,6 +43,8 @@ class GitHubProvisioner(Protocol):
 
     async def review_metrics(self, *, repository_slug: str, cwd: Path) -> dict[str, int]: ...
 
+    async def archive_repository(self, *, repository_slug: str, cwd: Path) -> None: ...
+
 
 class LinearProvisioner(Protocol):
     async def create_campaign(
@@ -157,10 +159,12 @@ class LiveTrialExecutor:
         eventdesk_root = trial_root / "eventdesk"
         candidate_root = trial_root / "symphony"
         repository: GitHubRepository | None = None
+        github: GitHubProvisioner | None = None
         campaign: LinearCampaign | None = None
         metrics: dict[str, object] = {}
         linear: LinearProvisioner | None = None
         owns_linear = False
+        archive_error: Exception | None = None
         try:
             frozen = self._load_trial_harness(trial)
             credentials = self._credentials or await self._resolve_credentials()
@@ -274,12 +278,29 @@ class LiveTrialExecutor:
                 )
             except Exception:  # noqa: BLE001 - next trial retries cleanup before dispatch
                 log.exception("could not archive bench receipts from %s", trial_root)
+            if repository is not None and github is not None:
+                try:
+                    await self._retry_provision(
+                        lambda: github.archive_repository(
+                            repository_slug=repository.slug,
+                            cwd=self._config.root,
+                        )
+                    )
+                except Exception as exc:  # noqa: BLE001 - reported after a successful trial
+                    archive_error = exc
+                    log.exception("could not archive benchmark repository %s", repository.slug)
         metrics["wall_seconds"] = asyncio.get_running_loop().time() - started
-        return TrialOutcome(
+        outcome = TrialOutcome(
             repository_url=repository.url,
             issue_urls=list(campaign.issue_urls),
             metrics=metrics,
         )
+        if archive_error is not None:
+            raise TrialExecutionError(
+                f"could not archive benchmark repository: {archive_error}",
+                outcome=outcome,
+            )
+        return outcome
 
     def _load_trial_harness(self, trial: Trial) -> FrozenHarness:
         snapshot = self._config.private_root / trial.experiment_id / "_harness"

@@ -82,7 +82,7 @@ def render_markdown(report: ExperimentReport) -> str:
         f"System B: `{experiment.system_version_b}`  ",
         f"Executor toolchain: `{experiment.executor_toolchain_version}`  ",
         f"Harness: `{experiment.harness_version}`  ",
-        f"Repetitions: {experiment.repetitions}; order: A1, B1, A2, B2 …",
+        f"Repetitions: {experiment.repetitions}; order: S0, then A/B pairs in parallel",
         "Matched completed repetitions: "
         + (", ".join(str(item) for item in matched_repetitions) or "none"),
         "",

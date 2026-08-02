@@ -13,31 +13,42 @@ def test_bench_compose_separates_control_executor_and_public_network() -> None:
     assert services["init"]["command"] == [
         "sh",
         "-c",
-        "chown -R 1000:1000 /data/db /data/bench",
+        "chown -R 1000:1000 /data/db /data/bench-a /data/bench-b",
     ]
     assert set(services["init"]["volumes"]) == {
         "bench_db:/data/db",
-        "bench_runs:/data/bench",
+        "bench_runs_a:/data/bench-a",
+        "bench_runs_b:/data/bench-b",
     }
     assert services["worker"]["depends_on"]["init"]["condition"] == (
         "service_completed_successfully"
     )
-    assert services["executor"]["depends_on"]["init"]["condition"] == (
-        "service_completed_successfully"
-    )
     assert services["worker"]["build"]["target"] == "runtime"
-    assert services["executor"]["build"]["target"] == "bench-executor"
     assert set(services["worker"]["networks"]) == {"control", "execution"}
-    assert services["executor"]["networks"] == ["execution"]
+    for lane, volume, root in (
+        ("bench-a", "bench_runs_a", "/data/bench-a"),
+        ("bench-b", "bench_runs_b", "/data/bench-b"),
+    ):
+        assert services[lane]["depends_on"]["init"]["condition"] == (
+            "service_completed_successfully"
+        )
+        assert services[lane]["build"]["target"] == "bench-executor"
+        assert services[lane]["networks"] == ["execution"]
+        assert "coolify" not in services[lane]["networks"]
+        assert services[lane]["volumes"] == [f"{volume}:{root}"]
+        assert all(".env" not in item for item in services[lane]["volumes"])
     assert services["connections"]["network_mode"] == "service:caddy"
     assert "networks" not in services["connections"]
     assert services["caddy"]["networks"] == ["coolify", "control"]
     assert services["caddy"]["labels"] == ["traefik.docker.network=coolify"]
     assert services["caddy"]["extra_hosts"] == ["connections:127.0.0.1"]
     assert services["caddy"]["environment"] == {"SERVICE_FQDN_CADDY": "${SERVICE_FQDN_CADDY}"}
-    assert "coolify" not in services["executor"]["networks"]
-    assert services["executor"]["volumes"] == ["bench_runs:/data/bench"]
-    assert all(".env" not in volume for volume in services["executor"]["volumes"])
+    assert services["worker"]["environment"]["SYMPHONY_BENCH_EXECUTOR_A_URL"] == (
+        "http://bench-a:8090"
+    )
+    assert services["worker"]["environment"]["SYMPHONY_BENCH_EXECUTOR_B_URL"] == (
+        "http://bench-b:8090"
+    )
     assert "bench_db:/data/db" in services["worker"]["volumes"]
     assert compose["networks"]["control"]["internal"] is True
 

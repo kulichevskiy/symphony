@@ -219,3 +219,19 @@ class GitHubSandbox:
             "remote_review_unparseable": unparseable,
             **{f"remote_review_p{priority}": counts[priority] for priority in range(4)},
         }
+
+    async def archive_repository(self, *, repository_slug: str, cwd: Path) -> None:
+        await self._commands.run(
+            [
+                "gh",
+                "api",
+                "--method",
+                "PATCH",
+                f"repos/{repository_slug}",
+                "--input",
+                "-",
+            ],
+            cwd=cwd,
+            env={"GH_TOKEN": self._token},
+            stdin='{"archived":true}',
+        )

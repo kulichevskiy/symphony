@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -22,6 +24,20 @@ query BenchTeam($id: String!) {
 _CREATE_ISSUE = """
 mutation BenchIssue($input: IssueCreateInput!) {
   issueCreate(input: $input) { success issue { id identifier url } }
+}
+"""
+
+_PROJECTS = """
+query BenchProjects($marker: String!) {
+  projects(first: 20, filter: {name: {containsIgnoreCase: $marker}}) {
+    nodes { id name url }
+  }
+}
+"""
+
+_CREATE_PROJECT = """
+mutation BenchProject($input: ProjectCreateInput!) {
+  projectCreate(input: $input) { success project { id name url } }
 }
 """
 
@@ -52,6 +68,9 @@ query BenchIssueState($id: String!) {
 }
 """
 
+_TRIAL_SUFFIX = re.compile(r"(?:SMOKE|[AB][1-9][0-9]*)\Z")
+_PROJECT_LOCKS: dict[str, asyncio.Lock] = {}
+
 
 class LinearSandboxError(RuntimeError):
     pass
@@ -79,15 +98,18 @@ class LinearSandbox:
         *,
         routing_label_id: str,
         authorization_resolver: Callable[[], Awaitable[str]] | None = None,
+        clock: Callable[[], datetime] | None = None,
         timeout: float = 30,
     ) -> None:
         if not routing_label_id:
             raise ValueError("routing_label_id must not be empty")
         self._client = httpx.AsyncClient(headers={"Authorization": authorization}, timeout=timeout)
         self._authorization_resolver = authorization_resolver
+        self._clock = clock
         self._routing_label_id = routing_label_id
         self._issues: dict[str, dict[str, dict[str, str]]] = {}
         self._relations: set[tuple[str, str]] = set()
+        self._projects: dict[str, str] = {}
 
     async def __aenter__(self) -> LinearSandbox:
         return self
@@ -156,6 +178,54 @@ class LinearSandbox:
             raise LinearSandboxError(f"Linear {field} returned success=false")
         return payload
 
+    async def _project_id(self, *, team_id: str, label: str, campaign: Campaign) -> str:
+        experiment_id = _TRIAL_SUFFIX.sub("", label).removesuffix("-")
+        cached = self._projects.get(experiment_id)
+        if cached is not None:
+            return cached
+
+        lock = _PROJECT_LOCKS.setdefault(experiment_id, asyncio.Lock())
+        async with lock:
+            cached = self._projects.get(experiment_id)
+            if cached is not None:
+                return cached
+            return await self._find_or_create_project(
+                team_id=team_id,
+                experiment_id=experiment_id,
+                campaign=campaign,
+            )
+
+    async def _find_or_create_project(
+        self, *, team_id: str, experiment_id: str, campaign: Campaign
+    ) -> str:
+        marker = experiment_id.removeprefix("EXP-")
+        data = await self._query(_PROJECTS, {"marker": marker}, retry_transient=True)
+        nodes = (data.get("projects") or {}).get("nodes") or []
+        matches = [
+            project
+            for project in nodes
+            if isinstance(project, dict) and str(project.get("name", "")).endswith(f" · {marker}")
+        ]
+        if len(matches) > 1:
+            raise LinearSandboxError(f"duplicate Linear projects for {experiment_id}")
+        if matches:
+            project_id = str(matches[0]["id"])
+            self._projects[experiment_id] = project_id
+            return project_id
+
+        now = self._clock() if self._clock is not None else datetime.now(UTC)
+        name = f"{campaign.name} · {now:%Y-%m-%d} · {marker}"
+        payload = self._successful(
+            await self._query(
+                _CREATE_PROJECT,
+                {"input": {"name": name, "teamIds": [team_id]}},
+            ),
+            "projectCreate",
+        )
+        project_id = str(payload["project"]["id"])
+        self._projects[experiment_id] = project_id
+        return project_id
+
     async def create_campaign(
         self,
         *,
@@ -172,6 +242,7 @@ class LinearSandbox:
         todo_id = next((state["id"] for state in states if state.get("name") == "Todo"), None)
         if todo_id is None:
             raise LinearSandboxError("BENCH team has no Todo state")
+        project_id = await self._project_id(team_id=team_id, label=label, campaign=campaign)
 
         issue_by_key = self._issues.setdefault(label, {})
         expected_titles = {f"[{label}] {ticket.title}": ticket.key for ticket in campaign.tickets}
@@ -208,6 +279,7 @@ class LinearSandbox:
                             "teamId": team_id,
                             "stateId": todo_id,
                             "labelIds": [self._routing_label_id],
+                            "projectId": project_id,
                             "title": f"[{label}] {ticket.title}",
                             "description": description,
                         }

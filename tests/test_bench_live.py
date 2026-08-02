@@ -13,6 +13,9 @@ from symphony.credentials import RunCredentials
 
 
 class FakeGitHub:
+    def __init__(self) -> None:
+        self.archived: list[str] = []
+
     async def create_repository(self, *, name: str, source: Path) -> GitHubRepository:
         assert (source / "README.md").exists()
         return GitHubRepository(
@@ -23,6 +26,16 @@ class FakeGitHub:
         assert repository_slug.startswith("kulichevskiy/")
         assert cwd.name in {"SMOKE", "A1", "B1"}
         return {"remote_review_comments": 2, "remote_review_p1": 1, "remote_review_p2": 1}
+
+    async def archive_repository(self, *, repository_slug: str, cwd: Path) -> None:
+        del cwd
+        self.archived.append(repository_slug)
+
+
+class FailingArchiveGitHub(FakeGitHub):
+    async def archive_repository(self, *, repository_slug: str, cwd: Path) -> None:
+        del repository_slug, cwd
+        raise RuntimeError("archive denied")
 
 
 class FakeLinear:
@@ -302,6 +315,7 @@ def test_live_trial_requires_snapshot(tmp_path: Path) -> None:
 async def test_live_trial_provisions_runs_and_returns_traceable_outcome(tmp_path: Path) -> None:
     commands = FakeCommands()
     root, private_root = _frozen_roots(tmp_path, "EXP-1")
+    github = FakeGitHub()
     executor = LiveTrialExecutor(
         config=LiveBenchConfig(
             root=root,
@@ -315,7 +329,7 @@ async def test_live_trial_provisions_runs_and_returns_traceable_outcome(tmp_path
         ),
         commands=commands,
         credentials=RunCredentials(github_token="gh", linear_token="Bearer lin"),
-        github=FakeGitHub(),
+        github=github,
         linear=FakeLinear(),
         grader=FakeGrader(),
         reviewer=FakeReviewer(),
@@ -354,6 +368,41 @@ async def test_live_trial_provisions_runs_and_returns_traceable_outcome(tmp_path
     assert commands.daemon_cancelled
     assert not (root / "EXP-1/A1").exists()
     assert (private_root / "EXP-1/A1/receipt-manifest.json").exists()
+    assert github.archived == ["kulichevskiy/EXP-1-A1"]
+
+
+@pytest.mark.asyncio
+async def test_live_trial_reports_repository_archive_failure(tmp_path: Path) -> None:
+    commands = FakeCommands()
+    root, private_root = _frozen_roots(tmp_path, "EXP-ARCHIVE")
+    executor = LiveTrialExecutor(
+        config=LiveBenchConfig(
+            root=root,
+            private_root=private_root,
+            control_db=tmp_path / "control.sqlite",
+            github_owner="kulichevskiy",
+            linear_team_id="team-id",
+            symphony_repository="https://github.com/kulichevskiy/symphony.git",
+            encryption_key="key",
+            poll_seconds=0,
+            provision_attempts=1,
+        ),
+        commands=commands,
+        credentials=RunCredentials(github_token="gh", linear_token="Bearer lin"),
+        github=FailingArchiveGitHub(),
+        linear=FakeLinear(),
+        grader=FakeGrader(),
+        reviewer=FakeReviewer(),
+        candidate_snapshotter=commands.snapshot,
+    )
+
+    with pytest.raises(TrialExecutionError, match="archive denied") as raised:
+        await executor(
+            Trial(experiment_id="EXP-ARCHIVE", candidate="A", repetition=1, revision="sha")
+        )
+
+    assert raised.value.outcome.repository_url.endswith("/EXP-ARCHIVE-A1")  # type: ignore[union-attr]
+    assert raised.value.outcome.metrics["hidden_checks_passed"] == 8
 
 
 @pytest.mark.asyncio
@@ -497,6 +546,7 @@ async def test_live_trial_external_cancellation_keeps_partial_outcome(tmp_path: 
     grader = BlockingGrader()
     root, private_root = _frozen_roots(tmp_path, "EXP-CANCEL")
     commands = FakeCommands()
+    github = FakeGitHub()
     executor = LiveTrialExecutor(
         config=LiveBenchConfig(
             root=root,
@@ -510,7 +560,7 @@ async def test_live_trial_external_cancellation_keeps_partial_outcome(tmp_path: 
         ),
         commands=commands,
         credentials=RunCredentials(github_token="gh", linear_token="lin"),
-        github=FakeGitHub(),
+        github=github,
         linear=FakeLinear(),
         grader=grader,
         reviewer=FakeReviewer(),
@@ -527,3 +577,4 @@ async def test_live_trial_external_cancellation_keeps_partial_outcome(tmp_path: 
 
     assert raised.value.outcome.repository_url.endswith("/EXP-CANCEL-A1")  # type: ignore[union-attr]
     assert raised.value.outcome.metrics["completed_tickets"] == 6
+    assert github.archived == ["kulichevskiy/EXP-CANCEL-A1"]

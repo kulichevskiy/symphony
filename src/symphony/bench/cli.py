@@ -20,7 +20,7 @@ from .executor import RemoteCommands, create_executor_app
 from .harness import snapshot_harness
 from .live import LiveBenchConfig, LiveTrialExecutor
 from .metrics import snapshot_candidate
-from .models import ExperimentReport
+from .models import ExperimentReport, Trial, TrialOutcome
 from .report import render_markdown
 from .reviewer import cleanup_stale_reviewer_credentials
 
@@ -382,10 +382,17 @@ async def _snapshot(db_path: Path) -> dict[str, object]:
     show_default=True,
 )
 @click.option(
-    "--root",
+    "--root-a",
     type=click.Path(path_type=Path),
-    envvar="SYMPHONY_BENCH_ROOT",
-    default="/data/bench",
+    envvar="SYMPHONY_BENCH_ROOT_A",
+    default="/data/bench/a",
+    show_default=True,
+)
+@click.option(
+    "--root-b",
+    type=click.Path(path_type=Path),
+    envvar="SYMPHONY_BENCH_ROOT_B",
+    default="/data/bench/b",
     show_default=True,
 )
 @click.option(
@@ -421,9 +428,15 @@ async def _snapshot(db_path: Path) -> dict[str, object]:
 )
 @click.option("--encryption-key", envvar="SYMPHONY_ENCRYPTION_KEY")
 @click.option(
-    "--executor-url",
-    envvar="SYMPHONY_BENCH_EXECUTOR_URL",
-    default="http://executor:8090",
+    "--executor-a-url",
+    envvar="SYMPHONY_BENCH_EXECUTOR_A_URL",
+    default="http://bench-a:8090",
+    show_default=True,
+)
+@click.option(
+    "--executor-b-url",
+    envvar="SYMPHONY_BENCH_EXECUTOR_B_URL",
+    default="http://bench-b:8090",
     show_default=True,
 )
 @click.option("--executor-token", envvar="SYMPHONY_BENCH_EXECUTOR_TOKEN")
@@ -431,7 +444,8 @@ async def _snapshot(db_path: Path) -> dict[str, object]:
 @click.option("--port", type=click.IntRange(1, 65535), default=8080, show_default=True)
 def serve(
     db_path: Path,
-    root: Path,
+    root_a: Path,
+    root_b: Path,
     private_root: Path,
     profile_path: Path | None,
     api_token: str | None,
@@ -441,7 +455,8 @@ def serve(
     linear_label_name: str | None,
     symphony_repository: str | None,
     encryption_key: str | None,
-    executor_url: str,
+    executor_a_url: str,
+    executor_b_url: str,
     executor_token: str | None,
     host: str,
     port: int,
@@ -471,7 +486,8 @@ def serve(
         _serve_with_profile(
             resolved_profile,
             db_path=db_path,
-            root=root,
+            root_a=root_a,
+            root_b=root_b,
             private_root=private_root,
             api_token=api_token,
             github_owner=github_owner,
@@ -480,7 +496,8 @@ def serve(
             linear_label_name=linear_label_name,
             symphony_repository=symphony_repository,
             encryption_key=encryption_key,
-            executor_url=executor_url,
+            executor_a_url=executor_a_url,
+            executor_b_url=executor_b_url,
             executor_token=executor_token,
             host=host,
             port=port,
@@ -503,7 +520,8 @@ def _serve_with_profile(
     profile: Path,
     *,
     db_path: Path,
-    root: Path,
+    root_a: Path,
+    root_b: Path,
     private_root: Path,
     api_token: str,
     github_owner: str,
@@ -512,7 +530,8 @@ def _serve_with_profile(
     linear_label_name: str,
     symphony_repository: str,
     encryption_key: str,
-    executor_url: str,
+    executor_a_url: str,
+    executor_b_url: str,
     executor_token: str,
     host: str,
     port: int,
@@ -520,31 +539,50 @@ def _serve_with_profile(
 ) -> None:
     default_profile = _read_profile(profile)
     wall_time_cap_seconds = 8 * 60 * 60
-    commands = RemoteCommands(
-        base_url=executor_url,
+    commands_a = RemoteCommands(
+        base_url=executor_a_url,
+        token=executor_token,
+        timeout_seconds=wall_time_cap_seconds,
+    )
+    commands_b = RemoteCommands(
+        base_url=executor_b_url,
         token=executor_token,
         timeout_seconds=wall_time_cap_seconds,
     )
 
     async def recover_execution() -> None:
-        await commands.cancel_all()
-        await asyncio.to_thread(cleanup_stale_reviewer_credentials, root)
+        await asyncio.gather(commands_a.cancel_all(), commands_b.cancel_all())
+        await asyncio.gather(
+            asyncio.to_thread(cleanup_stale_reviewer_credentials, root_a),
+            asyncio.to_thread(cleanup_stale_reviewer_credentials, root_b),
+        )
 
-    executor = LiveTrialExecutor(
-        config=LiveBenchConfig(
-            root=root,
-            private_root=private_root,
-            control_db=db_path,
-            github_owner=github_owner,
-            linear_team_id=linear_team_id,
-            linear_label_id=linear_label_id,
-            linear_label_name=linear_label_name,
-            symphony_repository=symphony_repository,
-            encryption_key=encryption_key,
-            wall_time_cap_seconds=wall_time_cap_seconds,
-        ),
-        commands=commands,
-    )
+    def live_executor(root: Path, commands: RemoteCommands) -> LiveTrialExecutor:
+        return LiveTrialExecutor(
+            config=LiveBenchConfig(
+                root=root,
+                private_root=private_root,
+                control_db=db_path,
+                github_owner=github_owner,
+                linear_team_id=linear_team_id,
+                linear_label_id=linear_label_id,
+                linear_label_name=linear_label_name,
+                symphony_repository=symphony_repository,
+                encryption_key=encryption_key,
+                wall_time_cap_seconds=wall_time_cap_seconds,
+            ),
+            commands=commands,
+        )
+
+    executor_a = live_executor(root_a, commands_a)
+    executor_b = live_executor(root_b, commands_b)
+
+    async def execute(trial: Trial) -> TrialOutcome:
+        executor = executor_b if trial.candidate == "B" else executor_a
+        return await executor(trial)
+
+    async def resolve_revision(revision: str) -> str:
+        return await executor_a.resolve_revision(revision)
 
     async def prepare_harness(experiment_id: str) -> str:
         return await asyncio.to_thread(snapshot_harness, private_root / experiment_id / "_harness")
@@ -552,9 +590,9 @@ def _serve_with_profile(
     app = create_bench_app(
         db_path=db_path,
         api_token=api_token,
-        execute=executor,
+        execute=execute,
         default_profile=default_profile,
-        resolve_revision=executor.resolve_revision,
+        resolve_revision=resolve_revision,
         harness_version=harness_version(),
         prepare_harness=prepare_harness,
         recover_execution=recover_execution,

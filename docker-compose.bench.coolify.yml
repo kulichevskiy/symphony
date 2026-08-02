@@ -7,10 +7,11 @@ services:
   init:
     image: alpine:3.22
     restart: "no"
-    command: ["sh", "-c", "chown -R 1000:1000 /data/db /data/bench"]
+    command: ["sh", "-c", "chown -R 1000:1000 /data/db /data/bench-a /data/bench-b"]
     volumes:
       - bench_db:/data/db
-      - bench_runs:/data/bench
+      - bench_runs_a:/data/bench-a
+      - bench_runs_b:/data/bench-b
 
   worker:
     build:
@@ -24,13 +25,17 @@ services:
         condition: service_completed_successfully
       caddy:
         condition: service_started
-      executor:
+      bench-a:
+        condition: service_healthy
+      bench-b:
         condition: service_healthy
     environment:
       SYMPHONY_BENCH_DB_PATH: /data/db/bench-control.sqlite
-      SYMPHONY_BENCH_ROOT: /data/bench
+      SYMPHONY_BENCH_ROOT_A: /data/bench-a
+      SYMPHONY_BENCH_ROOT_B: /data/bench-b
       SYMPHONY_BENCH_PRIVATE_ROOT: /data/db/bench-private
-      SYMPHONY_BENCH_EXECUTOR_URL: http://executor:8090
+      SYMPHONY_BENCH_EXECUTOR_A_URL: http://bench-a:8090
+      SYMPHONY_BENCH_EXECUTOR_B_URL: http://bench-b:8090
       SYMPHONY_BENCH_EXECUTOR_TOKEN: ${SYMPHONY_BENCH_EXECUTOR_TOKEN:?required}
     networks:
       - control
@@ -38,23 +43,24 @@ services:
     volumes:
       - /opt/symphony-bench/.env:/app/.env:ro
       - bench_db:/data/db
-      - bench_runs:/data/bench
+      - bench_runs_a:/data/bench-a
+      - bench_runs_b:/data/bench-b
 
-  # Runs candidate Symphony, tests, and final Codex reviews. It receives only
-  # per-command credentials, has no control DB/.env mount, and cannot reach the
-  # shared Coolify network. SYMPHONY_* is scrubbed from every child process.
-  executor:
+  # A and B run concurrently in isolated containers and volumes. Each receives
+  # only per-command credentials, has no control DB/.env mount, and cannot reach
+  # the shared Coolify network. SYMPHONY_* is scrubbed from child processes.
+  bench-a:
     build:
       context: .
       target: bench-executor
-    image: symphony-bench-executor
+    image: symphony-bench-executor-a
     restart: unless-stopped
     command: ["bench", "executor"]
     depends_on:
       init:
         condition: service_completed_successfully
     environment:
-      SYMPHONY_BENCH_ROOT: /data/bench
+      SYMPHONY_BENCH_ROOT: /data/bench-a
       SYMPHONY_BENCH_EXECUTOR_TOKEN: ${SYMPHONY_BENCH_EXECUTOR_TOKEN:?required}
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8090/health"]
@@ -64,7 +70,30 @@ services:
     networks:
       - execution
     volumes:
-      - bench_runs:/data/bench
+      - bench_runs_a:/data/bench-a
+
+  bench-b:
+    build:
+      context: .
+      target: bench-executor
+    image: symphony-bench-executor-b
+    restart: unless-stopped
+    command: ["bench", "executor"]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      SYMPHONY_BENCH_ROOT: /data/bench-b
+      SYMPHONY_BENCH_EXECUTOR_TOKEN: ${SYMPHONY_BENCH_EXECUTOR_TOKEN:?required}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8090/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks:
+      - execution
+    volumes:
+      - bench_runs_b:/data/bench-b
 
   # Reuses Symphony's existing Auth0 + Connections UI. It has no bindings,
   # so it never dispatches work; it only owns OAuth login/callback flows and
@@ -134,7 +163,8 @@ networks:
 
 volumes:
   bench_db:
-  bench_runs:
+  bench_runs_a:
+  bench_runs_b:
   connection_logs:
   connection_workspaces:
   gh_auth:

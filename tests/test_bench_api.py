@@ -1,3 +1,4 @@
+import asyncio
 import time
 from pathlib import Path
 
@@ -148,6 +149,61 @@ async def test_runner_interleaves_candidates_and_completes_experiment(tmp_path: 
     ]
     assert report.json()["trials"][0]["repository_url"].endswith("/S0")
     assert report.json()["trials"][0]["metrics"] == {"effective_tokens": 10}
+
+
+@pytest.mark.asyncio
+async def test_runner_runs_each_candidate_pair_concurrently(tmp_path: Path) -> None:
+    store = ExperimentStore(tmp_path / "bench.sqlite")
+    store.create(ExperimentCreate(candidate_a="a", candidate_b="b", repetitions=2))
+    waiting: dict[int, set[str]] = {}
+    released: list[int] = []
+
+    async def execute(trial: Trial) -> TrialOutcome:
+        if trial.candidate == "S":
+            return TrialOutcome()
+        candidates = waiting.setdefault(trial.repetition, set())
+        candidates.add(trial.candidate)
+        deadline = asyncio.get_running_loop().time() + 1
+        while candidates != {"A", "B"}:
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("candidate pair did not overlap")
+            await asyncio.sleep(0)
+        released.append(trial.repetition)
+        return TrialOutcome()
+
+    await ExperimentRunner(store=store, execute=execute).run_next()
+
+    assert waiting == {1: {"A", "B"}, 2: {"A", "B"}}
+    assert set(released) == {1, 2}
+
+
+@pytest.mark.asyncio
+async def test_runner_keeps_counterpart_receipt_when_one_parallel_trial_fails(
+    tmp_path: Path,
+) -> None:
+    store = ExperimentStore(tmp_path / "bench.sqlite")
+    experiment = store.create(ExperimentCreate(candidate_a="a", candidate_b="b", repetitions=2))
+
+    async def execute(trial: Trial) -> TrialOutcome:
+        if trial.candidate == "A":
+            raise TrialExecutionError(
+                "A failed",
+                outcome=TrialOutcome(repository_url="https://github.com/example/A1"),
+            )
+        await asyncio.sleep(0)
+        return TrialOutcome(repository_url=f"https://github.com/example/{trial.candidate}1")
+
+    with pytest.raises(TrialExecutionError, match="A failed"):
+        await ExperimentRunner(store=store, execute=execute).run_next()
+
+    report = store.report(experiment.id)
+    assert report is not None
+    assert report.experiment.status == "failed"
+    assert [(trial.candidate, trial.status) for trial in report.trials] == [
+        ("S", "completed"),
+        ("A", "failed"),
+        ("B", "completed"),
+    ]
 
 
 def test_app_worker_drains_one_experiment_at_a_time(tmp_path: Path) -> None:

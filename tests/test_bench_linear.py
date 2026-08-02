@@ -1,11 +1,13 @@
+import asyncio
 import json
+from datetime import UTC, datetime
 
 import httpx
 import pytest
 import respx
 
 from symphony.bench import linear as linear_module
-from symphony.bench.eventdesk import eventdesk_campaign
+from symphony.bench.eventdesk import Campaign, CampaignTicket, eventdesk_campaign
 from symphony.bench.linear import LinearSandbox
 
 
@@ -20,6 +22,22 @@ async def test_linear_sandbox_creates_labeled_campaign_and_real_dependency_chain
                     "team": {
                         "id": "team-id",
                         "states": {"nodes": [{"id": "todo-id", "name": "Todo"}]},
+                    }
+                }
+            },
+        ),
+        httpx.Response(200, json={"data": {"projects": {"nodes": []}}}),
+        httpx.Response(
+            200,
+            json={
+                "data": {
+                    "projectCreate": {
+                        "success": True,
+                        "project": {
+                            "id": "project-id",
+                            "name": "EventDesk V1 · 2026-08-02 · 1",
+                            "url": "https://linear.app/project-id",
+                        },
                     }
                 }
             },
@@ -65,7 +83,11 @@ async def test_linear_sandbox_creates_labeled_campaign_and_real_dependency_chain
         )
     route = respx.post("https://api.linear.app/graphql").mock(side_effect=responses)
 
-    async with LinearSandbox("Bearer token", routing_label_id="label-id") as sandbox:
+    async with LinearSandbox(
+        "Bearer token",
+        routing_label_id="label-id",
+        clock=lambda: datetime(2026, 8, 2, tzinfo=UTC),
+    ) as sandbox:
         result = await sandbox.create_campaign(
             team_id="team-id",
             label="EXP-1-A1",
@@ -76,8 +98,13 @@ async def test_linear_sandbox_creates_labeled_campaign_and_real_dependency_chain
     assert result.issue_identifiers == tuple(f"BENCH-{index}" for index in range(1, 7))
     calls = [json.loads(call.request.content) for call in route.calls]
     issue_calls = [call for call in calls if "mutation BenchIssue" in call["query"]]
+    project_calls = [call for call in calls if "mutation BenchProject" in call["query"]]
     relation_calls = [call for call in calls if "mutation BenchRelation" in call["query"]]
     assert all(call["variables"]["input"]["labelIds"] == ["label-id"] for call in issue_calls)
+    assert [call["variables"]["input"] for call in project_calls] == [
+        {"name": "EventDesk V1 · 2026-08-02 · 1", "teamIds": ["team-id"]}
+    ]
+    assert all(call["variables"]["input"]["projectId"] == "project-id" for call in issue_calls)
     assert [call["variables"]["input"] for call in relation_calls] == [
         {"issueId": "issue-1", "relatedIssueId": "issue-2", "type": "blocks"},
         {"issueId": "issue-2", "relatedIssueId": "issue-3", "type": "blocks"},
@@ -112,6 +139,18 @@ async def test_campaign_retry_reconciles_issue_created_before_response_was_lost(
     }
     responses: list[httpx.Response | Exception] = [
         team,
+        httpx.Response(200, json={"data": {"projects": {"nodes": []}}}),
+        httpx.Response(
+            200,
+            json={
+                "data": {
+                    "projectCreate": {
+                        "success": True,
+                        "project": {"id": "project-id", "name": "project", "url": "url"},
+                    }
+                }
+            },
+        ),
         httpx.Response(200, json={"data": {"issues": {"nodes": []}}}),
         httpx.ReadTimeout("response lost"),
         team,
@@ -190,6 +229,18 @@ async def test_campaign_retry_reconciles_relation_created_before_response_was_lo
     )
     responses: list[httpx.Response | Exception] = [
         team,
+        httpx.Response(200, json={"data": {"projects": {"nodes": []}}}),
+        httpx.Response(
+            200,
+            json={
+                "data": {
+                    "projectCreate": {
+                        "success": True,
+                        "project": {"id": "project-id", "name": "project", "url": "url"},
+                    }
+                }
+            },
+        ),
         httpx.Response(200, json={"data": {"issues": {"nodes": []}}}),
     ]
     responses.extend(
@@ -246,6 +297,169 @@ async def test_campaign_retry_reconciles_relation_created_before_response_was_lo
     calls = [json.loads(call.request.content) for call in route.calls]
     assert len(result.issue_ids) == 6
     assert sum("mutation BenchRelation" in call["query"] for call in calls) == 5
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_campaign_retry_reuses_project_created_before_response_was_lost() -> None:
+    campaign = Campaign(
+        name="EventDesk V1",
+        tickets=(CampaignTicket(key="one", title="One", description="Do one"),),
+    )
+    team = httpx.Response(
+        200,
+        json={
+            "data": {
+                "team": {
+                    "id": "team-id",
+                    "states": {"nodes": [{"id": "todo-id", "name": "Todo"}]},
+                }
+            }
+        },
+    )
+    project = {
+        "id": "project-id",
+        "name": "EventDesk V1 · 2026-08-02 · RETRY",
+        "url": "https://linear.app/project-id",
+    }
+    route = respx.post("https://api.linear.app/graphql").mock(
+        side_effect=[
+            team,
+            httpx.Response(200, json={"data": {"projects": {"nodes": []}}}),
+            httpx.ReadTimeout("response lost"),
+            team,
+            httpx.Response(200, json={"data": {"projects": {"nodes": [project]}}}),
+            httpx.Response(200, json={"data": {"issues": {"nodes": []}}}),
+            httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "issueCreate": {
+                            "success": True,
+                            "issue": {
+                                "id": "issue-1",
+                                "identifier": "BENCH-1",
+                                "url": "https://linear.app/BENCH-1",
+                            },
+                        }
+                    }
+                },
+            ),
+        ]
+    )
+
+    async with LinearSandbox("Bearer token", routing_label_id="label-id") as sandbox:
+        with pytest.raises(linear_module.LinearSandboxError):
+            await sandbox.create_campaign(
+                team_id="team-id",
+                label="EXP-RETRY-A1",
+                repo_url="https://github.com/kulichevskiy/EXP-RETRY-A1",
+                campaign=campaign,
+            )
+        result = await sandbox.create_campaign(
+            team_id="team-id",
+            label="EXP-RETRY-A1",
+            repo_url="https://github.com/kulichevskiy/EXP-RETRY-A1",
+            campaign=campaign,
+        )
+
+    calls = [json.loads(call.request.content) for call in route.calls]
+    issue_call = next(call for call in calls if "mutation BenchIssue" in call["query"])
+    assert result.issue_identifiers == ("BENCH-1",)
+    assert issue_call["variables"]["input"]["projectId"] == "project-id"
+    assert sum("mutation BenchProject" in call["query"] for call in calls) == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_parallel_trials_reuse_one_experiment_project() -> None:
+    campaign = Campaign(
+        name="EventDesk V1",
+        tickets=(CampaignTicket(key="one", title="One", description="Do one"),),
+    )
+    project: dict[str, str] | None = None
+    project_creates = 0
+    issue_project_ids: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal project, project_creates
+        payload = json.loads(request.content)
+        query = payload["query"]
+        variables = payload["variables"]
+        if "query BenchTeam" in query:
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "team": {
+                            "id": "team-id",
+                            "states": {"nodes": [{"id": "todo-id", "name": "Todo"}]},
+                        }
+                    }
+                },
+            )
+        if "query BenchProjects" in query:
+            return httpx.Response(
+                200,
+                json={"data": {"projects": {"nodes": [project] if project else []}}},
+            )
+        if "mutation BenchProject" in query:
+            project_creates += 1
+            project = {
+                "id": "project-id",
+                "name": variables["input"]["name"],
+                "url": "https://linear.app/project-id",
+            }
+            return httpx.Response(
+                200,
+                json={"data": {"projectCreate": {"success": True, "project": project}}},
+            )
+        if "query BenchCampaignIssues" in query:
+            return httpx.Response(200, json={"data": {"issues": {"nodes": []}}})
+        if "mutation BenchIssue" in query:
+            issue_project_ids.append(variables["input"]["projectId"])
+            identifier = f"BENCH-{len(issue_project_ids)}"
+            return httpx.Response(
+                200,
+                json={
+                    "data": {
+                        "issueCreate": {
+                            "success": True,
+                            "issue": {
+                                "id": f"issue-{len(issue_project_ids)}",
+                                "identifier": identifier,
+                                "url": f"https://linear.app/{identifier}",
+                            },
+                        }
+                    }
+                },
+            )
+        raise AssertionError(query)
+
+    respx.post("https://api.linear.app/graphql").mock(side_effect=respond)
+    first = LinearSandbox("Bearer token", routing_label_id="label-id")
+    second = LinearSandbox("Bearer token", routing_label_id="label-id")
+    try:
+        await asyncio.gather(
+            first.create_campaign(
+                team_id="team-id",
+                label="EXP-PARALLEL-A1",
+                repo_url="https://github.com/example/a",
+                campaign=campaign,
+            ),
+            second.create_campaign(
+                team_id="team-id",
+                label="EXP-PARALLEL-B1",
+                repo_url="https://github.com/example/b",
+                campaign=campaign,
+            ),
+        )
+    finally:
+        await first.aclose()
+        await second.aclose()
+
+    assert project_creates == 1
+    assert issue_project_ids == ["project-id", "project-id"]
 
 
 @pytest.mark.asyncio

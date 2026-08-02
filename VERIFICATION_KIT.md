@@ -9,7 +9,8 @@ application and six sequential, complete Linear tickets.
 1. Resolve each requested Git ref to a full commit SHA and snapshot both profiles and every harness
    input: EventDesk seed, ticket campaign, hidden test, regression commands, and final-review
    prompts. The experiment stores a checksum of that snapshot.
-2. Queue one smoke trial, then `A1, B1, A2, B2, A3, B3`.
+2. Run one smoke trial, then each isolated pair in parallel: `A1 + B1`, `A2 + B2`,
+   `A3 + B3`.
 3. For each trial, create a private `kulichevskiy/EXP-…` repository from the same EventDesk seed.
 4. Create six uniquely titled BENCH issues with blocking relations and the stable benchmark label.
    Bind the candidate to that label plus the trial-specific title prefix, so stale BENCH issues from
@@ -29,7 +30,8 @@ The worker, not the candidate revision, reads the candidate SQLite database in r
 calculates comparable metrics. Harness snapshots, hidden tests, and archived receipts live under
 the worker-only private root. The executor sees only the active trial; before another candidate is
 started, logs/databases are copied to the private archive and the prior solution checkout is
-removed. Final repositories remain available on GitHub for inspection.
+removed. Each repository is archived on GitHub when its trial ends. It remains readable for audit
+but cannot accumulate later writes.
 
 Only one experiment runs at a time. Submitted experiments remain queued. A worker restart cancels
 active executor commands and marks the interrupted experiment failed instead of silently resuming a
@@ -39,11 +41,12 @@ with an explicit resubmit message; it never runs old inputs through a different,
 
 ## Coolify deployment
 
-The bench is a separate Coolify application with four long-running services and one init job:
+The bench is a separate Coolify application with five long-running services and one init job:
 
 - `init`: one-shot ownership setup for the shared named volumes;
 - `worker`: control API, queue, SQLite state, OAuth snapshot/write-back;
-- `executor`: candidate processes and graders on an isolated network and run volume;
+- `bench-a` and `bench-b`: candidate processes and graders on an isolated network, each with its
+  own run volume;
 - `connections`: the existing authenticated Connections UI, with no repository binding;
 - `caddy`: the only public service.
 

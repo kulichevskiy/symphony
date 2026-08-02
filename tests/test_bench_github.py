@@ -107,6 +107,31 @@ async def test_github_sandbox_allows_plan_limited_private_repo(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_github_sandbox_archives_repository(tmp_path: Path) -> None:
+    commands = RecordingCommands()
+    sandbox = GitHubSandbox(owner="kulichevskiy", token="github-token", commands=commands)
+
+    await sandbox.archive_repository(repository_slug="kulichevskiy/EXP-1-A1", cwd=tmp_path)
+
+    assert commands.calls == [
+        (
+            (
+                "gh",
+                "api",
+                "--method",
+                "PATCH",
+                "repos/kulichevskiy/EXP-1-A1",
+                "--input",
+                "-",
+            ),
+            tmp_path,
+            {"GH_TOKEN": "github-token"},
+            '{"archived":true}',
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_review_metrics_count_codex_comments_by_priority(tmp_path: Path) -> None:
     commands = RecordingCommands(
         responses={
