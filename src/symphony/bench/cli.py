@@ -286,6 +286,7 @@ async def _seed(
         "max_concurrent": 1,
         "runner": "local",
         "webhook_enabled": False,
+        "required_status_checks": ["backend", "frontend"],
         "verify_cmd": (
             "uv run pytest && uv run ruff check . && uv run mypy support_queue "
             "&& cd frontend && npm ci && npm test -- --run && npm run build"

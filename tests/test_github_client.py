@@ -471,6 +471,47 @@ async def test_pr_checks_treats_no_required_checks_reported_as_empty(fake_gh) ->
     assert result.pending is False
 
 
+async def test_pr_checks_uses_configured_contexts_without_branch_protection(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    payload = json.dumps(
+        [
+            {"name": "backend", "state": "SUCCESS", "bucket": "pass", "link": None},
+            {"name": "frontend", "state": "FAILURE", "bucket": "fail", "link": None},
+            {"name": "optional", "state": "FAILURE", "bucket": "fail", "link": None},
+        ]
+    )
+    log = fake_gh({"pr checks": [1, payload]})
+
+    result = await GitHub().pr_checks(
+        17,
+        repo="org/r",
+        required_contexts=("backend", "frontend"),
+    )
+
+    assert [(run.name, run.bucket) for run in result.runs] == [
+        ("backend", "pass"),
+        ("frontend", "fail"),
+    ]
+    assert "--required" not in _calls(log)[0]["argv"]
+
+
+async def test_pr_checks_marks_missing_configured_context_pending(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    payload = json.dumps(
+        [{"name": "backend", "state": "SUCCESS", "bucket": "pass", "link": None}]
+    )
+    fake_gh({"pr checks": [0, payload]})
+
+    result = await GitHub().pr_checks(
+        18,
+        repo="org/r",
+        required_contexts=("backend", "frontend"),
+    )
+
+    assert [(run.name, run.bucket) for run in result.runs] == [
+        ("backend", "pass"),
+        ("frontend", "pending"),
+    ]
+
+
 async def test_check_log_tail_fetches_run_log_from_check_link(fake_gh) -> None:  # type: ignore[no-untyped-def]
     log = fake_gh({"run view": [0, "line 1\nline 2\n"]})
     gh = GitHub()

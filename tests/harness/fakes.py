@@ -667,7 +667,13 @@ class FakeGitHub:
     async def pr_diff(self, pr: int | str, *, repo: str | None = None) -> str:
         return ""
 
-    async def pr_checks(self, pr: int | str, *, repo: str | None = None) -> PRChecks:
+    async def pr_checks(
+        self,
+        pr: int | str,
+        *,
+        repo: str | None = None,
+        required_contexts: tuple[str, ...] = (),
+    ) -> PRChecks:
         sim_pr = self._pr(pr, repo)
         if sim_pr is None:
             raise GitHubError(f"no such PR: {pr}")
@@ -676,18 +682,31 @@ class FakeGitHub:
             # merge, so the rollup's optional checks are filtered out here. This
             # is the seam `get_required_contexts` reads to tell required from
             # optional rollup failures.
-            return PRChecks(
-                runs=[
+            runs = [
                     CheckRun(
                         name=c.name,
                         state=_check_state(c),
                         bucket=_check_bucket(c),
                     )
                     for c in sim_pr.checks
-                    if c.required
+                    if c.required or c.name in required_contexts
                 ]
-            )
+            if required_contexts:
+                present = {run.name for run in runs}
+                runs.extend(
+                    CheckRun(name=name, state="PENDING", bucket="pending")
+                    for name in required_contexts
+                    if name not in present
+                )
+            return PRChecks(runs=runs)
         if sim_pr.checks_passed:
+            if required_contexts:
+                return PRChecks(
+                    runs=[
+                        CheckRun(name=name, state="PENDING", bucket="pending")
+                        for name in required_contexts
+                    ]
+                )
             # Empty runs have identical gate semantics to an all-green required-check
             # list (PRChecks.all_passed is True for empty runs). This models the
             # "no required checks reported" case, not "has checks that all pass" —

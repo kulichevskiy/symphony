@@ -558,21 +558,23 @@ class _MergeMixin(_OrchestratorBase):
         if not failing_rollup_checks:
             return []
 
-        try:
-            required_contexts = await get_required_contexts(
-                binding.github_repo,
-                pr_number,
-                gh=await self._gh_client(),
-                cache=required_context_cache,
-            )
-        except GitHubError as e:
-            log.warning(
-                "could not fetch required status contexts for %s#%d: %s",
-                binding.github_repo,
-                pr_number,
-                e,
-            )
-            return []
+        required_contexts = binding.required_status_checks
+        if not required_contexts:
+            try:
+                required_contexts = await get_required_contexts(
+                    binding.github_repo,
+                    pr_number,
+                    gh=await self._gh_client(),
+                    cache=required_context_cache,
+                )
+            except GitHubError as e:
+                log.warning(
+                    "could not fetch required status contexts for %s#%d: %s",
+                    binding.github_repo,
+                    pr_number,
+                    e,
+                )
+                return []
         required = {context.strip() for context in required_contexts if context.strip()}
         if not required:
             return []
@@ -3176,7 +3178,8 @@ class _MergeMixin(_OrchestratorBase):
             return False, None
 
         premerge_head_sha = str(premerge_view.get("headRefOid") or "")
-        if approved_head_sha and premerge_head_sha != approved_head_sha:
+        head_changed = bool(approved_head_sha and premerge_head_sha != approved_head_sha)
+        if head_changed:
             try:
                 verdict = await self._review_verdict_for_pr(
                     binding=binding,
@@ -3193,19 +3196,50 @@ class _MergeMixin(_OrchestratorBase):
                 )
                 verdict = None
             if verdict is None or verdict.kind is not VerdictKind.APPROVED:
-                reason = f"merge-agent pushed unreviewed HEAD {premerge_head_sha or '(unknown)'}"
                 await self._mark_merge_needs_approval(
                     binding=binding,
                     issue=issue,
                     pr_url=pr_url,
                     run_id=run_id,
-                    reason=reason,
+                    reason=(
+                        f"merge-agent pushed unreviewed HEAD "
+                        f"{premerge_head_sha or '(unknown)'}"
+                    ),
                 )
                 state = await db.review_state.get(self._conn, storage_issue_id)
                 await self._retrigger_codex_review_unless_approved(
                     binding=binding,
                     issue=issue,
                     state=state,
+                )
+                return True, premerge_view
+        elif binding.required_status_checks:
+            try:
+                checks = await (await self._gh_client()).pr_checks(
+                    pr_number,
+                    repo=binding.github_repo,
+                    required_contexts=binding.required_status_checks,
+                )
+            except GitHubError as e:
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    reason=f"could not verify configured required checks: {e}",
+                    exc=e,
+                )
+                return True, premerge_view
+            if not checks.all_passed:
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    reason=(
+                        "configured required checks are no longer green for HEAD "
+                        f"{premerge_head_sha or '(unknown)'}"
+                    ),
                 )
                 return True, premerge_view
 

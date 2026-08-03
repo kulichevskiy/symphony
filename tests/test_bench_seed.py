@@ -87,6 +87,7 @@ def test_bench_seed_builds_candidate_db_from_profile(tmp_path: Path) -> None:
     assert payload["issue_title_prefix"] == "[EXP-1-A1]"
     assert payload["local_review"] is True
     assert payload["remote_review"] is True
+    assert payload["required_status_checks"] == ["backend", "frontend"]
     assert payload["webhook_enabled"] is False
     assert payload["verify_cmd"] == (
         "uv run pytest && uv run ruff check . && uv run mypy support_queue "

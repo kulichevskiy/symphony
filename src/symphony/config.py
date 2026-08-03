@@ -300,6 +300,10 @@ class RepoBinding(BaseModel):
     # Wall-clock cap for one `verify_cmd` invocation. `None` falls back to
     # `Config.command_timeout_secs`.
     verify_timeout_secs: int | None = Field(default=None, ge=1)
+    # Explicit CI contexts that gate review/merge when GitHub branch
+    # protection is unavailable (for example private personal repositories on
+    # GitHub Free). Empty keeps GitHub's branch-protection-required contexts.
+    required_status_checks: tuple[str, ...] = ()
     # Extra env injected into this binding's agent subprocesses. Values name
     # keys in symphony's `.env` (or the process env) — the secrets themselves
     # are never stored on the binding. `assemble_effective_config` replaces

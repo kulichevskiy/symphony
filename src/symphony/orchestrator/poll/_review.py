@@ -1319,7 +1319,15 @@ class _ReviewMixin(_OrchestratorBase):
         """
         storage_issue_id = run.issue_id
         try:
-            checks = await (await self._gh_client()).pr_checks(pr_number, repo=binding.github_repo)
+            gh = await self._gh_client()
+            if binding.required_status_checks:
+                checks = await gh.pr_checks(
+                    pr_number,
+                    repo=binding.github_repo,
+                    required_contexts=binding.required_status_checks,
+                )
+            else:
+                checks = await gh.pr_checks(pr_number, repo=binding.github_repo)
         except GitHubError as e:
             failures = await db.review_state.bump_ci_fetch_failures(self._conn, storage_issue_id)
             log.warning(
@@ -3847,7 +3855,15 @@ class _ReviewMixin(_OrchestratorBase):
         if not head_sha:
             raise GitHubError(f"pr view missing headRefOid for {binding.github_repo}#{pr_number}")
 
-        checks = await (await self._gh_client()).pr_checks(pr_number, repo=binding.github_repo)
+        gh = await self._gh_client()
+        if binding.required_status_checks:
+            checks = await gh.pr_checks(
+                pr_number,
+                repo=binding.github_repo,
+                required_contexts=binding.required_status_checks,
+            )
+        else:
+            checks = await gh.pr_checks(pr_number, repo=binding.github_repo)
         ci = [_review_check_from_github(run) for run in checks.runs]
         if not binding.resolved_remote_review():
             human_reviews = tuple(

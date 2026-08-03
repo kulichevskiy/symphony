@@ -262,6 +262,25 @@ async def test_pr_checks_passing_fake_matches_recorded_real_payload(
     assert real_checks.runs  # golden has at least one passing run
 
 
+async def test_pr_checks_fake_marks_unreported_configured_contexts_pending() -> None:
+    sim = _new_sim()
+    sim.prs[("acme/widgets", 1)] = SimPR(
+        repo="acme/widgets", number=1, head="feat/x", checks_passed=True
+    )
+
+    checks = await FakeGitHub(sim).pr_checks(
+        1,
+        repo="acme/widgets",
+        required_contexts=("backend", "frontend"),
+    )
+
+    assert checks.pending is True
+    assert [(run.name, run.bucket) for run in checks.runs] == [
+        ("backend", "pending"),
+        ("frontend", "pending"),
+    ]
+
+
 async def test_github_pr_webhook_fake_matches_recorded_real_payload() -> None:
     real_payload = _load("github_pr_webhook.json")  # merged pull_request delivery
 

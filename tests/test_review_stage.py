@@ -149,6 +149,7 @@ def _binding(
     issue_label: str | None = None,
     local_review: bool = False,
     remote_review: bool = True,
+    required_status_checks: tuple[str, ...] = (),
 ) -> RepoBinding:
     # `codex_model=None` leaves the legacy field unset (out of model_fields_set)
     # so a binding can pair `agent` with a `roles:` model cell without tripping
@@ -161,6 +162,7 @@ def _binding(
         branch_prefix="symphony",
         local_review=local_review,
         remote_review=remote_review,
+        required_status_checks=required_status_checks,
         linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
     )
     if codex_model is not None:
@@ -627,7 +629,13 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
     try:
         await _seed_active_review(conn)
         cfg = Config(
-            repos=[_binding(agent="codex", codex_model="gpt-5.1-codex-max")],
+            repos=[
+                _binding(
+                    agent="codex",
+                    codex_model="gpt-5.1-codex-max",
+                    required_status_checks=("backend", "frontend"),
+                )
+            ],
             log_root=tmp_path / "logs",
             workspace_root=tmp_path / "ws",
             db_path=tmp_path / "s.sqlite",
@@ -733,6 +741,11 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
         assert "Failing required CI checks: lint" in prompt
 
         push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+        gh.pr_checks.assert_awaited_once_with(
+            42,
+            repo="org/repo",
+            required_contexts=("backend", "frontend"),
+        )
         gh.pr_comment.assert_awaited_with(42, "@codex review", repo="org/repo")
 
         state = await db.review_state.get(conn, "iss-1")
