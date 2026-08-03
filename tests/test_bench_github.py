@@ -26,6 +26,10 @@ class RecordingCommands:
 
 
 class FreePrivateRepositoryCommands(RecordingCommands):
+    def __init__(self) -> None:
+        super().__init__()
+        self.protection_attempts = 0
+
     async def run(
         self,
         argv: list[str],
@@ -36,10 +40,12 @@ class FreePrivateRepositoryCommands(RecordingCommands):
     ) -> str:
         result = await super().run(argv, cwd=cwd, env=env, stdin=stdin)
         if any("branches/main/protection" in arg for arg in argv):
-            raise CommandError(
-                "Upgrade to GitHub Pro or make this repository public to enable this "
-                "feature. (HTTP 403)"
-            )
+            self.protection_attempts += 1
+            if self.protection_attempts == 1:
+                raise CommandError(
+                    "Upgrade to GitHub Pro or make this repository public to enable this "
+                    "feature. (HTTP 403)"
+                )
         return result
 
 
@@ -96,14 +102,32 @@ async def test_github_sandbox_creates_private_protected_repo(tmp_path: Path) -> 
 
 
 @pytest.mark.asyncio
-async def test_github_sandbox_allows_plan_limited_private_repo(tmp_path: Path) -> None:
+async def test_github_sandbox_makes_plan_limited_repo_public_and_protected(
+    tmp_path: Path,
+) -> None:
     commands = FreePrivateRepositoryCommands()
     sandbox = GitHubSandbox(owner="kulichevskiy", token="github-token", commands=commands)
 
     result = await sandbox.create_repository(name="EXP-1-A1", source=tmp_path)
 
     assert result.slug == "kulichevskiy/EXP-1-A1"
-    assert any(any("branches/main/protection" in arg for arg in call[0]) for call in commands.calls)
+    protection_calls = [
+        call for call in commands.calls if any("branches/main/protection" in arg for arg in call[0])
+    ]
+    assert len(protection_calls) == 2
+    assert any(
+        call[0]
+        == (
+            "gh",
+            "repo",
+            "edit",
+            "kulichevskiy/EXP-1-A1",
+            "--visibility",
+            "public",
+            "--accept-visibility-change-consequences",
+        )
+        for call in commands.calls
+    )
 
 
 @pytest.mark.asyncio
@@ -114,6 +138,20 @@ async def test_github_sandbox_archives_repository(tmp_path: Path) -> None:
     await sandbox.archive_repository(repository_slug="kulichevskiy/EXP-1-A1", cwd=tmp_path)
 
     assert commands.calls == [
+        (
+            (
+                "gh",
+                "repo",
+                "edit",
+                "kulichevskiy/EXP-1-A1",
+                "--visibility",
+                "private",
+                "--accept-visibility-change-consequences",
+            ),
+            tmp_path,
+            {"GH_TOKEN": "github-token"},
+            None,
+        ),
         (
             (
                 "gh",

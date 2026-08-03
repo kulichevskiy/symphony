@@ -145,17 +145,18 @@ class GitHubSandbox:
             },
             separators=(",", ":"),
         )
+        protection_argv = [
+            "gh",
+            "api",
+            "--method",
+            "PUT",
+            f"repos/{slug}/branches/main/protection",
+            "--input",
+            "-",
+        ]
         try:
             await self._commands.run(
-                [
-                    "gh",
-                    "api",
-                    "--method",
-                    "PUT",
-                    f"repos/{slug}/branches/main/protection",
-                    "--input",
-                    "-",
-                ],
+                protection_argv,
                 cwd=source,
                 env=token_env,
                 stdin=protection,
@@ -166,6 +167,25 @@ class GitHubSandbox:
                 and "Upgrade to GitHub Pro or make this repository public" in str(exc)
             ):
                 raise
+            await self._commands.run(
+                [
+                    "gh",
+                    "repo",
+                    "edit",
+                    slug,
+                    "--visibility",
+                    "public",
+                    "--accept-visibility-change-consequences",
+                ],
+                cwd=source,
+                env=token_env,
+            )
+            await self._commands.run(
+                protection_argv,
+                cwd=source,
+                env=token_env,
+                stdin=protection,
+            )
         return GitHubRepository(slug=slug, url=f"https://github.com/{slug}")
 
     async def review_metrics(self, *, repository_slug: str, cwd: Path) -> dict[str, int]:
@@ -229,6 +249,20 @@ class GitHubSandbox:
         }
 
     async def archive_repository(self, *, repository_slug: str, cwd: Path) -> None:
+        token_env = {"GH_TOKEN": self._token}
+        await self._commands.run(
+            [
+                "gh",
+                "repo",
+                "edit",
+                repository_slug,
+                "--visibility",
+                "private",
+                "--accept-visibility-change-consequences",
+            ],
+            cwd=cwd,
+            env=token_env,
+        )
         await self._commands.run(
             [
                 "gh",
@@ -240,6 +274,6 @@ class GitHubSandbox:
                 "-",
             ],
             cwd=cwd,
-            env={"GH_TOKEN": self._token},
+            env=token_env,
             stdin='{"archived":true}',
         )
