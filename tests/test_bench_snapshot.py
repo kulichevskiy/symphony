@@ -125,6 +125,109 @@ def test_bench_snapshot_rejects_unreconciled_model_usage(tmp_path: Path) -> None
         asyncio.run(snapshot_candidate(db_path))
 
 
+def test_bench_snapshot_rejects_compensating_per_run_usage_errors(tmp_path: Path) -> None:
+    db_path = tmp_path / "candidate.sqlite"
+    asyncio.run(_seed_run(db_path))
+
+    async def add_and_corrupt_second_run() -> None:
+        conn = await db.connect(db_path)
+        try:
+            await db.runs.create(
+                conn,
+                id="run-2",
+                issue_id="issue-1",
+                stage="implement",
+                status="completed",
+                pid=456,
+                started_at="2026-08-01T11:00:00+00:00",
+            )
+            await db.runs.update_status(
+                conn,
+                "run-2",
+                "completed",
+                ended_at="2026-08-01T11:01:00+00:00",
+            )
+            await db.runs.add_usage(
+                conn,
+                "run-2",
+                cost_usd=0.5,
+                input_tokens=100,
+                output_tokens=50,
+                cache_write_tokens=20,
+                cache_read_tokens=10,
+            )
+            await db.run_model_usage.replace_for_run(
+                conn,
+                "run-2",
+                [
+                    ModelUsage(
+                        provider="claude",
+                        model="claude-opus-4-8",
+                        input_tokens=100,
+                        output_tokens=50,
+                        cache_write_tokens=20,
+                        cache_read_tokens=10,
+                    )
+                ],
+            )
+            await conn.execute(
+                "UPDATE run_model_usage SET input_tokens = input_tokens - 1 WHERE run_id = 'run-1'"
+            )
+            await conn.execute(
+                "UPDATE run_model_usage SET input_tokens = input_tokens + 1 WHERE run_id = 'run-2'"
+            )
+            await conn.commit()
+        finally:
+            await conn.close()
+
+    asyncio.run(add_and_corrupt_second_run())
+
+    with pytest.raises(ValueError, match="run_model_usage totals do not reconcile"):
+        asyncio.run(snapshot_candidate(db_path))
+
+
+def test_bench_snapshot_defers_reconciliation_while_run_is_active(tmp_path: Path) -> None:
+    db_path = tmp_path / "candidate.sqlite"
+
+    async def seed_active_run() -> None:
+        conn = await db.connect(db_path)
+        try:
+            await db.issues.upsert(
+                conn,
+                id="issue-1",
+                identifier="BENCH-1",
+                title="Ticket",
+                team_key="BENCH",
+            )
+            await db.runs.create(
+                conn,
+                id="run-1",
+                issue_id="issue-1",
+                stage="implement",
+                status="running",
+                pid=123,
+                started_at="2026-08-01T10:00:00+00:00",
+            )
+            await db.runs.add_usage(
+                conn,
+                "run-1",
+                cost_usd=0.1,
+                input_tokens=100,
+                output_tokens=20,
+                cache_write_tokens=0,
+                cache_read_tokens=10,
+            )
+        finally:
+            await conn.close()
+
+    asyncio.run(seed_active_run())
+
+    snapshot = asyncio.run(snapshot_candidate(db_path))
+
+    assert snapshot["runs_by_status"] == {"running": 1}
+    assert "raw_tokens" not in snapshot
+
+
 async def _seed_nested_local_review(path: Path) -> None:
     await _seed_run(path)
     conn = await db.connect(path)

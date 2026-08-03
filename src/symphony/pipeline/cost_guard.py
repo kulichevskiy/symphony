@@ -68,10 +68,9 @@ class UsageCostEstimator:
     Claude reports `total_cost_usd` directly so deltas are trivial.
     Codex reports cumulative *token* counts per turn and never prices
     the run itself, so this estimator keeps the running max per token
-    bucket and prices the delta via `estimate_codex_cost_usd`. Sharing
-    one estimator across multiple subprocess calls (e.g. across local-
-    review iterations) preserves the cumulative-token invariant so
-    each successive call only pays for *new* tokens.
+    bucket and prices the delta via `estimate_codex_cost_usd`. One estimator
+    belongs to one subprocess stream; a new subprocess starts its cumulative
+    counters from zero and therefore needs a fresh estimator.
     """
 
     agent: str

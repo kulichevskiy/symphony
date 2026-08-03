@@ -28,7 +28,7 @@ async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dic
         await conn.execute("PRAGMA query_only = ON")
         cursor = await conn.execute(
             """
-            SELECT stage, status, started_at, ended_at, cost_usd, input_tokens, output_tokens,
+            SELECT id, stage, status, started_at, ended_at, cost_usd, input_tokens, output_tokens,
                    cache_write_tokens, cache_read_tokens
             FROM runs
             ORDER BY started_at, id
@@ -47,14 +47,14 @@ async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dic
         review_row = await review_cursor.fetchone()
         model_usage_cursor = await conn.execute(
             """
-            SELECT provider,
+            SELECT run_id, provider,
                    SUM(input_tokens) AS input_tokens,
                    SUM(output_tokens) AS output_tokens,
                    SUM(cache_write_tokens) AS cache_write_tokens,
                    SUM(cache_read_tokens) AS cache_read_tokens
             FROM run_model_usage
-            GROUP BY provider
-            ORDER BY provider
+            GROUP BY run_id, provider
+            ORDER BY run_id, provider
             """
         )
         model_usage_rows = await model_usage_cursor.fetchall()
@@ -86,28 +86,40 @@ async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dic
     output_tokens = sum(int(row["output_tokens"]) for row in rows)
     cache_write_tokens = sum(int(row["cache_write_tokens"]) for row in rows)
     cache_read_tokens = sum(int(row["cache_read_tokens"]) for row in rows)
-    run_token_totals = (input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
-    model_token_totals = tuple(
-        sum(int(row[key]) for row in model_usage_rows)
-        for key in (
-            "input_tokens",
-            "output_tokens",
-            "cache_write_tokens",
-            "cache_read_tokens",
-        )
+    token_keys = (
+        "input_tokens",
+        "output_tokens",
+        "cache_write_tokens",
+        "cache_read_tokens",
     )
-    if model_token_totals != run_token_totals:
-        raise ValueError("run_model_usage totals do not reconcile with runs")
-    raw_tokens = sum(
-        int(row["input_tokens"])
-        + int(row["output_tokens"])
-        + (
-            0
-            if row["provider"] == "codex"
-            else int(row["cache_write_tokens"]) + int(row["cache_read_tokens"])
+    model_totals_by_run: dict[str, list[int]] = {}
+    for row in model_usage_rows:
+        totals = model_totals_by_run.setdefault(str(row["run_id"]), [0, 0, 0, 0])
+        for index, key in enumerate(token_keys):
+            totals[index] += int(row[key])
+    run_ids = {str(row["id"]) for row in rows}
+    unreconciled = set(model_totals_by_run) - run_ids
+    for row in rows:
+        run_id = str(row["id"])
+        expected = tuple(int(row[key]) for key in token_keys)
+        actual = tuple(model_totals_by_run.get(run_id, [0, 0, 0, 0]))
+        if actual != expected:
+            unreconciled.add(run_id)
+    raw_tokens: int | None = None
+    if unreconciled:
+        if statuses.get("running", 0) == 0:
+            raise ValueError("run_model_usage totals do not reconcile with runs")
+    else:
+        raw_tokens = sum(
+            int(row["input_tokens"])
+            + int(row["output_tokens"])
+            + (
+                0
+                if row["provider"] == "codex"
+                else int(row["cache_write_tokens"]) + int(row["cache_read_tokens"])
+            )
+            for row in model_usage_rows
         )
-        for row in model_usage_rows
-    )
     metrics: dict[str, object] = {
         "active_agent_seconds": active_seconds,
         "agent_launches": (
@@ -118,7 +130,6 @@ async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dic
         "output_tokens": output_tokens,
         "cache_write_tokens": cache_write_tokens,
         "cache_read_tokens": cache_read_tokens,
-        "raw_tokens": raw_tokens,
         "cost_usd": sum(float(row["cost_usd"]) for row in rows),
         "effective_tokens": tokens,
         "remote_review_state_transitions": (
@@ -127,6 +138,8 @@ async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dic
         "runs_by_status": dict(sorted(statuses.items())),
         **local_metrics,
     }
+    if raw_tokens is not None:
+        metrics["raw_tokens"] = raw_tokens
     return metrics
 
 
