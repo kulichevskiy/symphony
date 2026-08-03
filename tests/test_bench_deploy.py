@@ -115,3 +115,7 @@ def test_deploy_uses_ssh_stdin_when_coolify_api_is_local_only() -> None:
     assert "uploaded private controls bundle" in script
     assert "/opt/symphony-bench/controls-current" in script
     assert "sudo -n tar" in script
+    assert "support_queue_reference/support_queue/main.py" in script
+    assert "support_queue_mutations/broken_workflow/support_queue/main.py" in script
+    assert "support_queue_mutations/broken_accessibility/frontend/src/App.tsx" in script
+    assert "hidden/support_queue/manifest.json" in script
