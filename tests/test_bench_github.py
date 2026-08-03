@@ -177,6 +177,18 @@ async def test_review_metrics_count_codex_comments_by_priority(tmp_path: Path) -
                             "user": {"login": "codex[bot]"},
                             "body": "[P2] Replay mutates state",
                         },
+                        {
+                            "user": {"login": "reviewer"},
+                            "body": "@codex review",
+                        },
+                        {
+                            "user": {"login": "reviewer"},
+                            "body": "  @Codex   review  ",
+                        },
+                        {
+                            "user": {"login": "reviewer"},
+                            "body": "Please run @codex review when ready",
+                        },
                     ]
                 ]
             ),
@@ -189,6 +201,7 @@ async def test_review_metrics_count_codex_comments_by_priority(tmp_path: Path) -
     assert all(call[1] == tmp_path for call in commands.calls)
 
     assert metrics == {
+        "remote_review_rounds": 2,
         "remote_review_comments": 5,
         "remote_review_unclassified": 1,
         "remote_review_unparseable": 1,

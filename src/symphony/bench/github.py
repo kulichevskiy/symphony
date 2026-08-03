@@ -192,6 +192,7 @@ class GitHubSandbox:
                 comments.extend((comment, inline) for comment in batch)
 
         counts = {priority: 0 for priority in range(4)}
+        rounds = 0
         unclassified = 0
         unparseable = 0
         for raw_comment, inline in comments:
@@ -201,9 +202,15 @@ class GitHubSandbox:
                 continue
             raw_user = raw_comment.get("user")
             login = raw_user.get("login", "") if isinstance(raw_user, dict) else ""
+            body = raw_comment.get("body")
+            if (
+                not inline
+                and isinstance(body, str)
+                and re.fullmatch(r"\s*@codex\s+review\s*", body, re.I)
+            ):
+                rounds += 1
             if not isinstance(login, str) or not re.search(r"(?:codex|chatgpt)", login, re.I):
                 continue
-            body = raw_comment.get("body")
             if not isinstance(body, str):
                 if inline:
                     unparseable += 1
@@ -214,6 +221,7 @@ class GitHubSandbox:
             elif inline:
                 unclassified += 1
         return {
+            "remote_review_rounds": rounds,
             "remote_review_comments": sum(counts.values()) + unclassified + unparseable,
             "remote_review_unclassified": unclassified,
             "remote_review_unparseable": unparseable,
