@@ -15,6 +15,7 @@ from symphony.credentials import RunCredentials
 class FakeGitHub:
     def __init__(self) -> None:
         self.archived: list[str] = []
+        self.reviewed: list[str] = []
 
     async def create_repository(self, *, name: str, source: Path) -> GitHubRepository:
         assert (source / "README.md").exists()
@@ -25,7 +26,13 @@ class FakeGitHub:
     async def review_metrics(self, *, repository_slug: str, cwd: Path) -> dict[str, int]:
         assert repository_slug.startswith("kulichevskiy/")
         assert cwd.name in {"A1", "B1"}
-        return {"remote_review_comments": 2, "remote_review_p1": 1, "remote_review_p2": 1}
+        self.reviewed.append(repository_slug)
+        return {
+            "remote_review_rounds": 2,
+            "remote_review_comments": 2,
+            "remote_review_p1": 1,
+            "remote_review_p2": 1,
+        }
 
     async def archive_repository(self, *, repository_slug: str, cwd: Path) -> None:
         del cwd
@@ -36,6 +43,12 @@ class FailingArchiveGitHub(FakeGitHub):
     async def archive_repository(self, *, repository_slug: str, cwd: Path) -> None:
         del repository_slug, cwd
         raise RuntimeError("archive denied")
+
+
+class FailingReviewGitHub(FakeGitHub):
+    async def review_metrics(self, *, repository_slug: str, cwd: Path) -> dict[str, int]:
+        del repository_slug, cwd
+        raise RuntimeError("review metrics unavailable")
 
 
 class FakeLinear:
@@ -136,6 +149,13 @@ class FinalizingCommands(FakeCommands):
         }
 
 
+class ProxyRoundCommands(FakeCommands):
+    async def snapshot(self, db_path: Path, log_root: Path) -> dict[str, object]:
+        metrics = await super().snapshot(db_path, log_root)
+        metrics["remote_review_rounds"] = 99
+        return metrics
+
+
 class FakeGrader:
     async def grade(self, **_kwargs: object) -> dict[str, int]:
         return {
@@ -164,6 +184,11 @@ class BlockingGrader:
         self.started.set()
         await asyncio.Event().wait()
         return {}
+
+
+class FailingGrader:
+    async def grade(self, **_kwargs: object) -> dict[str, int]:
+        raise RuntimeError("grading broke")
 
 
 class CapturingGrader(FakeGrader):
@@ -423,6 +448,75 @@ async def test_live_trial_reports_repository_archive_failure(
 
     assert raised.value.outcome.repository_url.endswith("/EXP-ARCHIVE-A1")  # type: ignore[union-attr]
     assert raised.value.outcome.metrics["hidden_checks_passed"] == 8
+
+
+@pytest.mark.asyncio
+async def test_failed_trial_receipt_counts_actual_remote_review_rounds(
+    tmp_path: Path, private_bench_controls: Path
+) -> None:
+    commands = FakeCommands()
+    root, private_root = _frozen_roots(tmp_path, "EXP-FAIL", private_bench_controls)
+    github = FakeGitHub()
+    executor = LiveTrialExecutor(
+        config=LiveBenchConfig(
+            root=root,
+            private_root=private_root,
+            control_db=tmp_path / "control.sqlite",
+            github_owner="kulichevskiy",
+            linear_team_id="team-id",
+            symphony_repository="https://github.com/kulichevskiy/symphony.git",
+            encryption_key="key",
+            poll_seconds=0,
+        ),
+        commands=commands,
+        credentials=RunCredentials(github_token="gh", linear_token="Bearer lin"),
+        github=github,
+        linear=FakeLinear(),
+        grader=FailingGrader(),
+        reviewer=FakeReviewer(),
+        candidate_snapshotter=commands.snapshot,
+    )
+
+    with pytest.raises(TrialExecutionError, match="grading broke") as raised:
+        await executor(Trial(experiment_id="EXP-FAIL", candidate="A", repetition=1, revision="sha"))
+
+    assert raised.value.outcome.metrics["remote_review_rounds"] == 2
+    assert github.reviewed == ["kulichevskiy/EXP-FAIL-A1"]
+
+
+@pytest.mark.asyncio
+async def test_failed_trial_receipt_does_not_present_proxy_as_exact_rounds(
+    tmp_path: Path, private_bench_controls: Path
+) -> None:
+    commands = ProxyRoundCommands()
+    root, private_root = _frozen_roots(tmp_path, "EXP-NO-REVIEW", private_bench_controls)
+    executor = LiveTrialExecutor(
+        config=LiveBenchConfig(
+            root=root,
+            private_root=private_root,
+            control_db=tmp_path / "control.sqlite",
+            github_owner="kulichevskiy",
+            linear_team_id="team-id",
+            symphony_repository="https://github.com/kulichevskiy/symphony.git",
+            encryption_key="key",
+            poll_seconds=0,
+        ),
+        commands=commands,
+        credentials=RunCredentials(github_token="gh", linear_token="Bearer lin"),
+        github=FailingReviewGitHub(),
+        linear=FakeLinear(),
+        grader=FailingGrader(),
+        reviewer=FakeReviewer(),
+        candidate_snapshotter=commands.snapshot,
+    )
+
+    with pytest.raises(TrialExecutionError, match="grading broke") as raised:
+        await executor(
+            Trial(experiment_id="EXP-NO-REVIEW", candidate="A", repetition=1, revision="sha")
+        )
+
+    assert "remote_review_rounds" not in raised.value.outcome.metrics
+    assert raised.value.outcome.metrics["remote_review_metrics_unavailable"] is True
 
 
 @pytest.mark.asyncio

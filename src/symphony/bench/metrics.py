@@ -81,7 +81,9 @@ async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dic
         "cache_read_tokens": sum(int(row["cache_read_tokens"]) for row in rows),
         "cost_usd": sum(float(row["cost_usd"]) for row in rows),
         "effective_tokens": tokens,
-        "remote_review_rounds": int(review_row["total"]) if review_row is not None else 0,
+        "remote_review_state_transitions": (
+            int(review_row["total"]) if review_row is not None else 0
+        ),
         "runs_by_status": dict(sorted(statuses.items())),
         **local_metrics,
     }

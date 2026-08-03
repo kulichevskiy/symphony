@@ -246,6 +246,7 @@ class LiveTrialExecutor:
         except asyncio.CancelledError:
             outcome = await self._bounded_partial_outcome(
                 repository=repository,
+                github=github,
                 campaign=campaign,
                 linear=linear,
                 candidate_root=candidate_root,
@@ -259,6 +260,7 @@ class LiveTrialExecutor:
         except GraderInfrastructureError as exc:
             outcome = await self._bounded_partial_outcome(
                 repository=repository,
+                github=github,
                 campaign=campaign,
                 linear=linear,
                 candidate_root=candidate_root,
@@ -273,6 +275,7 @@ class LiveTrialExecutor:
         except Exception as exc:
             outcome = await self._bounded_partial_outcome(
                 repository=repository,
+                github=github,
                 campaign=campaign,
                 linear=linear,
                 candidate_root=candidate_root,
@@ -330,6 +333,7 @@ class LiveTrialExecutor:
         self,
         *,
         repository: GitHubRepository | None,
+        github: GitHubProvisioner | None,
         campaign: LinearCampaign | None,
         linear: LinearProvisioner | None,
         candidate_root: Path,
@@ -352,6 +356,16 @@ class LiveTrialExecutor:
                 metrics["completed_tickets"] = sum(state.type == "completed" for state in states)
             except Exception:  # noqa: BLE001 - best-effort failure receipt
                 pass
+        metrics.pop("remote_review_rounds", None)
+        if repository is not None and github is not None:
+            try:
+                metrics.update(
+                    await github.review_metrics(
+                        repository_slug=repository.slug, cwd=candidate_root.parent
+                    )
+                )
+            except Exception:  # noqa: BLE001 - best-effort failure receipt
+                metrics["remote_review_metrics_unavailable"] = True
         metrics["wall_seconds"] = asyncio.get_running_loop().time() - started
         return TrialOutcome(
             repository_url=repository.url if repository is not None else None,
@@ -363,6 +377,7 @@ class LiveTrialExecutor:
         self,
         *,
         repository: GitHubRepository | None,
+        github: GitHubProvisioner | None,
         campaign: LinearCampaign | None,
         linear: LinearProvisioner | None,
         candidate_root: Path,
@@ -374,6 +389,7 @@ class LiveTrialExecutor:
             return await asyncio.wait_for(
                 self._partial_outcome(
                     repository=repository,
+                    github=github,
                     campaign=campaign,
                     linear=linear,
                     candidate_root=candidate_root,
@@ -384,6 +400,7 @@ class LiveTrialExecutor:
                 timeout=self._config.receipt_timeout_seconds,
             )
         except TimeoutError:
+            metrics.pop("remote_review_rounds", None)
             return TrialOutcome(
                 repository_url=repository.url if repository is not None else None,
                 issue_urls=list(campaign.issue_urls) if campaign is not None else [],
@@ -391,6 +408,7 @@ class LiveTrialExecutor:
                     **metrics,
                     "wall_seconds": asyncio.get_running_loop().time() - started,
                     "partial_receipt_timed_out": True,
+                    "remote_review_metrics_unavailable": True,
                 },
             )
 
