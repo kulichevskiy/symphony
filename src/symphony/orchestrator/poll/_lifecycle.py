@@ -65,6 +65,7 @@ from ._git import (
 from ._helpers import (
     _add_run_usage,
     _local_review_termination_reason,
+    _retry_transient_delivery,
     _termination_kwargs,
     build_pr_title,
     pr_number_from_url,
@@ -1283,13 +1284,16 @@ class _LifecycleMixin(_OrchestratorBase):
 
         pr_url: str = ""
         try:
-            pr_url = await gh.ensure_pr(
-                title=build_pr_title(issue),
-                body="",
-                base=base_branch,
-                head=branch,
-                repo=binding.github_repo,
-                linear_url=issue.url,
+            pr_url = await _retry_transient_delivery(
+                partial(
+                    gh.ensure_pr,
+                    title=build_pr_title(issue),
+                    body="",
+                    base=base_branch,
+                    head=branch,
+                    repo=binding.github_repo,
+                    linear_url=issue.url,
+                )
             )
         except Exception as e:  # noqa: BLE001
             log.warning("pr_create failed for %s: %s", issue.identifier, e)

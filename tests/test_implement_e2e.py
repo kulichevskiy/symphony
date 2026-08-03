@@ -1290,7 +1290,7 @@ async def test_blocked_run_opens_wait_then_retry_resumes_fresh_run_with_handoff(
     ("pr_error", "expected_error_text"),
     [
         (GitHubError("gh pr create: HTTP 401"), "HTTP 401"),
-        (TimeoutError("gh timed out"), "gh timed out"),
+        (GitHubError("gh pr create: invalid response"), "invalid response"),
     ],
 )
 async def test_pr_create_failure_parks_deliver_failed_then_retry_opens_pr(

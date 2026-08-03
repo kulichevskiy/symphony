@@ -10,19 +10,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
-import re
 from collections.abc import Awaitable, Callable
+from functools import partial
 from pathlib import Path
 
 from ...pipeline.local_review import DiffSize, parse_diff_numstat
+from ._helpers import _retry_transient_delivery
 
 _DEFAULT_PUSH_AUTH_HOST = "github.com"
-_TRANSIENT_PUSH_ERROR = re.compile(
-    r"(?:returned error:\s*(?:429|5\d\d)\b|http(?:/\S+)?\s+(?:429|5\d\d)\b|"
-    r"could not resolve host|failed to connect|connection (?:reset|timed out)|"
-    r"operation timed out|empty reply from server|remote end hung up)",
-    re.IGNORECASE,
-)
 
 # Per-workspace push-auth header, held in process memory only (OAuth in UI
 # 4/7 review fix). Never written to the workspace's `.git/config` — a daemon
@@ -181,14 +176,7 @@ async def _retry_transient_push(
     branch: str,
 ) -> None:
     """Retry idempotent pushes after short-lived network/server failures."""
-    for attempt in range(3):
-        try:
-            await push_fn(workspace_path, branch)
-            return
-        except Exception as exc:
-            if attempt == 2 or _TRANSIENT_PUSH_ERROR.search(str(exc)) is None:
-                raise
-            await asyncio.sleep(2**attempt)
+    await _retry_transient_delivery(partial(push_fn, workspace_path, branch))
 
 
 async def _default_push(workspace_path: Path, branch: str) -> None:

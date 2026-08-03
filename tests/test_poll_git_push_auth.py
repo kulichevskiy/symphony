@@ -21,6 +21,7 @@ from symphony.orchestrator.poll._git import (
     _push_auth_subprocess_env,
     _retry_transient_push,
 )
+from symphony.orchestrator.poll._helpers import _retry_transient_delivery
 
 
 async def _git(cwd: Path, *args: str) -> None:
@@ -164,3 +165,27 @@ async def test_permanent_push_error_does_not_retry(tmp_path: Path) -> None:
         await _retry_transient_push(push, tmp_path, "branch")
 
     assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_transient_pr_delivery_retries_without_operator_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    async def ensure_pr() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("gh timed out")
+        return "https://github.com/org/repo/pull/1"
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+    assert await _retry_transient_delivery(ensure_pr) == (
+        "https://github.com/org/repo/pull/1"
+    )
+    assert attempts == 2
