@@ -337,3 +337,46 @@ async def test_session_total_cost_reflects_codex_token_pricing(
     assert result.outcome == LoopOutcome.APPROVED
     # Pricing sanity: 1M input @ $1.25 + 0.5M output @ $10 = $1.25 + $5 = $6.25
     assert result.total_cost_usd == pytest.approx(6.25, rel=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_session_counts_each_codex_subprocess_from_zero(tmp_path: Path) -> None:
+    runner = _StagedRunner(
+        [
+            _codex_event_stream_with_cost(
+                "No verdict marker.",
+                input_tokens=1_000,
+                output_tokens=200,
+            ),
+            _codex_event_stream_with_cost(
+                f"good\n{VERDICT_APPROVED_MARKER}",
+                input_tokens=500,
+                output_tokens=100,
+            ),
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="r1",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert len(runner.specs) == 2
+    assert result.input_tokens == 1_500
+    assert result.output_tokens == 300
+    assert result.total_cost_usd == pytest.approx(0.004875, rel=1e-6)

@@ -45,6 +45,19 @@ async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dic
             """
         )
         review_row = await review_cursor.fetchone()
+        model_usage_cursor = await conn.execute(
+            """
+            SELECT provider,
+                   SUM(input_tokens) AS input_tokens,
+                   SUM(output_tokens) AS output_tokens,
+                   SUM(cache_write_tokens) AS cache_write_tokens,
+                   SUM(cache_read_tokens) AS cache_read_tokens
+            FROM run_model_usage
+            GROUP BY provider
+            ORDER BY provider
+            """
+        )
+        model_usage_rows = await model_usage_cursor.fetchall()
     finally:
         await conn.close()
 
@@ -73,6 +86,28 @@ async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dic
     output_tokens = sum(int(row["output_tokens"]) for row in rows)
     cache_write_tokens = sum(int(row["cache_write_tokens"]) for row in rows)
     cache_read_tokens = sum(int(row["cache_read_tokens"]) for row in rows)
+    run_token_totals = (input_tokens, output_tokens, cache_write_tokens, cache_read_tokens)
+    model_token_totals = tuple(
+        sum(int(row[key]) for row in model_usage_rows)
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_write_tokens",
+            "cache_read_tokens",
+        )
+    )
+    if model_token_totals != run_token_totals:
+        raise ValueError("run_model_usage totals do not reconcile with runs")
+    raw_tokens = sum(
+        int(row["input_tokens"])
+        + int(row["output_tokens"])
+        + (
+            0
+            if row["provider"] == "codex"
+            else int(row["cache_write_tokens"]) + int(row["cache_read_tokens"])
+        )
+        for row in model_usage_rows
+    )
     metrics: dict[str, object] = {
         "active_agent_seconds": active_seconds,
         "agent_launches": (
@@ -83,7 +118,7 @@ async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dic
         "output_tokens": output_tokens,
         "cache_write_tokens": cache_write_tokens,
         "cache_read_tokens": cache_read_tokens,
-        "raw_tokens": input_tokens + output_tokens + cache_write_tokens + cache_read_tokens,
+        "raw_tokens": raw_tokens,
         "cost_usd": sum(float(row["cost_usd"]) for row in rows),
         "effective_tokens": tokens,
         "remote_review_state_transitions": (

@@ -2,14 +2,16 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
 from click.testing import CliRunner
 
 from symphony import db
+from symphony.agent.model_usage import ModelUsage
 from symphony.bench.metrics import snapshot_candidate
 from symphony.cli import main
 
 
-async def _seed_run(path: Path) -> None:
+async def _seed_run(path: Path, *, provider: str = "codex") -> None:
     conn = await db.connect(path)
     try:
         await db.issues.upsert(
@@ -34,14 +36,29 @@ async def _seed_run(path: Path) -> None:
             "completed",
             ended_at="2026-08-01T10:02:00+00:00",
         )
+        cache_write_tokens = 20 if provider == "claude" else 0
         await db.runs.add_usage(
             conn,
             "run-1",
             cost_usd=1.25,
             input_tokens=100,
             output_tokens=50,
-            cache_write_tokens=20,
+            cache_write_tokens=cache_write_tokens,
             cache_read_tokens=10,
+        )
+        await db.run_model_usage.replace_for_run(
+            conn,
+            "run-1",
+            [
+                ModelUsage(
+                    provider=provider,
+                    model="claude-opus-4-8" if provider == "claude" else "gpt-5.6-sol",
+                    input_tokens=100,
+                    output_tokens=50,
+                    cache_write_tokens=cache_write_tokens,
+                    cache_read_tokens=10,
+                )
+            ],
         )
         await db.review_state.begin_review(
             conn,
@@ -69,15 +86,43 @@ def test_bench_snapshot_reports_stable_safety_metrics(tmp_path: Path) -> None:
         "active_agent_seconds": 120.0,
         "agent_launches": 1,
         "cache_read_tokens": 10,
-        "cache_write_tokens": 20,
+        "cache_write_tokens": 0,
         "cost_usd": 1.25,
-        "effective_tokens": 176.0,
+        "effective_tokens": 151.0,
         "input_tokens": 100,
         "output_tokens": 50,
-        "raw_tokens": 180,
+        "raw_tokens": 150,
         "remote_review_state_transitions": 2,
         "runs_by_status": {"completed": 1},
     }
+
+
+def test_bench_snapshot_reports_claude_raw_tokens(tmp_path: Path) -> None:
+    db_path = tmp_path / "candidate.sqlite"
+    asyncio.run(_seed_run(db_path, provider="claude"))
+
+    snapshot = asyncio.run(snapshot_candidate(db_path))
+
+    assert snapshot["raw_tokens"] == 180
+    assert snapshot["effective_tokens"] == 176.0
+
+
+def test_bench_snapshot_rejects_unreconciled_model_usage(tmp_path: Path) -> None:
+    db_path = tmp_path / "candidate.sqlite"
+    asyncio.run(_seed_run(db_path))
+
+    async def corrupt_usage() -> None:
+        conn = await db.connect(db_path)
+        try:
+            await conn.execute("UPDATE run_model_usage SET input_tokens = input_tokens - 1")
+            await conn.commit()
+        finally:
+            await conn.close()
+
+    asyncio.run(corrupt_usage())
+
+    with pytest.raises(ValueError, match="run_model_usage totals do not reconcile"):
+        asyncio.run(snapshot_candidate(db_path))
 
 
 async def _seed_nested_local_review(path: Path) -> None:

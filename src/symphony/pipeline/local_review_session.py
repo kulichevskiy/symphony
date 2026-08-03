@@ -314,26 +314,9 @@ async def run_local_review_session(
         base_branch=base_branch,
     )
 
-    # One estimator per role — codex sums token deltas across calls, so it
-    # must persist across iterations. Sharing the reviewer estimator across
-    # all finder subprocess calls (and likewise the verifier / fixer) keeps
-    # the cumulative-token invariant intact. Each pass runs its own resolved
-    # role (review_find / review_verify / fix), which may differ in agent and
-    # model, so each needs its own estimator: feeding a separate codex token
-    # stream through another role's estimator would corrupt the cumulative-max
-    # bookkeeping.
-    reviewer_estimator = UsageCostEstimator(
-        agent=reviewer_role.agent,
-        codex_model=reviewer_role.codex_model_arg(),
-    )
-    verifier_estimator = UsageCostEstimator(
-        agent=verifier_role.agent,
-        codex_model=verifier_role.codex_model_arg(),
-    )
-    fixer_estimator = UsageCostEstimator(
-        agent=fixer_role.agent,
-        codex_model=fixer_role.codex_model_arg(),
-    )
+    # Every runner invocation is a separate provider process. Its cumulative
+    # token stream starts from zero, so the estimator must be scoped to that
+    # invocation; the loop sums the resulting subprocess deltas.
     # A no-verdict verifier gets one retry. Reuse the successful finder for
     # that retry and retain verifier-authored notes from the incomplete attempt
     # so confirmed discoveries are not lost (production BENCH-59).
@@ -350,7 +333,6 @@ async def run_local_review_session(
         prompt: str,
         stem: str,
         run_suffix: str,
-        estimator: UsageCostEstimator,
         head_sha: str,
         pass_two: bool = False,
     ) -> ReviewerOutput:
@@ -398,20 +380,16 @@ async def run_local_review_session(
             wall_clock_secs=wall_clock_secs,
             stage="local_review",
         )
-        cost_before = estimator.total_cost_usd
-        input_before = estimator.total_input_tokens
-        output_before = estimator.total_output_tokens
-        cache_write_before = estimator.total_cache_write_tokens
-        cache_read_before = estimator.total_cache_read_tokens
+        estimator = UsageCostEstimator(agent=agent, codex_model=codex_model)
         collected = await collect_runner_output(
             runner, spec, usage_handler=estimator.delta, log_path=log_path
         )
         _persist_runner_transcript(last_message_dir, attempt_stem, collected)
-        cost_delta = estimator.total_cost_usd - cost_before
-        input_delta = estimator.total_input_tokens - input_before
-        output_delta = estimator.total_output_tokens - output_before
-        cache_write_delta = estimator.total_cache_write_tokens - cache_write_before
-        cache_read_delta = estimator.total_cache_read_tokens - cache_read_before
+        cost_delta = estimator.total_cost_usd
+        input_delta = estimator.total_input_tokens
+        output_delta = estimator.total_output_tokens
+        cache_write_delta = estimator.total_cache_write_tokens
+        cache_read_delta = estimator.total_cache_read_tokens
 
         last_message_text: str | None = None
         if last_message_path.exists():
@@ -510,7 +488,6 @@ async def run_local_review_session(
                 prompt=review_prompt,
                 stem=f"review-{iteration}",
                 run_suffix=f"rev-{iteration}",
-                estimator=reviewer_estimator,
                 head_sha=head_sha,
             )
             # Reviewer is unsandboxed: discard anything it wrote/committed so it
@@ -537,7 +514,6 @@ async def run_local_review_session(
                 prompt=finder_prompt,
                 stem=f"review-{iteration}-find",
                 run_suffix=f"rev-{iteration}-find",
-                estimator=reviewer_estimator,
                 head_sha=head_sha,
             )
             # Finder is unsandboxed: reset before the verifier sees the diff
@@ -585,7 +561,6 @@ async def run_local_review_session(
             prompt=verifier_prompt,
             stem=f"review-{iteration}-verify",
             run_suffix=f"rev-{iteration}-verify",
-            estimator=verifier_estimator,
             head_sha=head_sha,
             pass_two=True,
         )
@@ -742,20 +717,19 @@ async def run_local_review_session(
                 **(binding_env or {}),
             },
         )
-        cost_before = fixer_estimator.total_cost_usd
-        input_before = fixer_estimator.total_input_tokens
-        output_before = fixer_estimator.total_output_tokens
-        cache_write_before = fixer_estimator.total_cache_write_tokens
-        cache_read_before = fixer_estimator.total_cache_read_tokens
+        fixer_estimator = UsageCostEstimator(
+            agent=fixer_role.agent,
+            codex_model=fixer_role.codex_model_arg(),
+        )
         collected = await collect_runner_output(
             runner, spec, usage_handler=fixer_estimator.delta, log_path=log_path
         )
         _persist_runner_transcript(last_message_dir, f"fix-{iteration}", collected)
-        cost_delta = fixer_estimator.total_cost_usd - cost_before
-        input_delta = fixer_estimator.total_input_tokens - input_before
-        output_delta = fixer_estimator.total_output_tokens - output_before
-        cache_write_delta = fixer_estimator.total_cache_write_tokens - cache_write_before
-        cache_read_delta = fixer_estimator.total_cache_read_tokens - cache_read_before
+        cost_delta = fixer_estimator.total_cost_usd
+        input_delta = fixer_estimator.total_input_tokens
+        output_delta = fixer_estimator.total_output_tokens
+        cache_write_delta = fixer_estimator.total_cache_write_tokens
+        cache_read_delta = fixer_estimator.total_cache_read_tokens
         if collected.terminal_kind == "spawn_failed":
             # Classify this fix-run's own stdout+stderr so a FIX_RUN_FAILED
             # outcome carries the fixer's provider tag when the spawn itself
