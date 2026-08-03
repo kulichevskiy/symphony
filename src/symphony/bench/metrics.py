@@ -69,16 +69,21 @@ async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dic
     local_metrics = (
         await asyncio.to_thread(local_review_metrics, log_root) if log_root is not None else {}
     )
+    input_tokens = sum(int(row["input_tokens"]) for row in rows)
+    output_tokens = sum(int(row["output_tokens"]) for row in rows)
+    cache_write_tokens = sum(int(row["cache_write_tokens"]) for row in rows)
+    cache_read_tokens = sum(int(row["cache_read_tokens"]) for row in rows)
     metrics: dict[str, object] = {
         "active_agent_seconds": active_seconds,
         "agent_launches": (
             sum(1 for row in rows if row["stage"] not in nested_stages)
             + int(local_metrics.get("local_review_agent_launches", 0))
         ),
-        "input_tokens": sum(int(row["input_tokens"]) for row in rows),
-        "output_tokens": sum(int(row["output_tokens"]) for row in rows),
-        "cache_write_tokens": sum(int(row["cache_write_tokens"]) for row in rows),
-        "cache_read_tokens": sum(int(row["cache_read_tokens"]) for row in rows),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_write_tokens": cache_write_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "raw_tokens": input_tokens + output_tokens + cache_write_tokens + cache_read_tokens,
         "cost_usd": sum(float(row["cost_usd"]) for row in rows),
         "effective_tokens": tokens,
         "remote_review_state_transitions": (

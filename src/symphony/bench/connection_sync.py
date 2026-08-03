@@ -243,6 +243,7 @@ async def mirror_connections(control_path: Path, candidate_path: Path) -> int:
                 )
                 merged_sequence = max(control_sequence, candidate_sequence)
                 if control_connected and candidate_connected:
+                    assert current_row is not None
                     control_credential_generation = int(row["credential_generation"])
                     candidate_credential_generation = int(
                         current_row["credential_generation"]

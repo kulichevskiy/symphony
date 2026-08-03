@@ -74,6 +74,7 @@ def test_bench_snapshot_reports_stable_safety_metrics(tmp_path: Path) -> None:
         "effective_tokens": 176.0,
         "input_tokens": 100,
         "output_tokens": 50,
+        "raw_tokens": 180,
         "remote_review_state_transitions": 2,
         "runs_by_status": {"completed": 1},
     }

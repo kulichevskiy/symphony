@@ -17,6 +17,7 @@ def _trial(candidate: str, repetition: int, tokens: float, passed: int) -> Trial
         issue_urls=[f"https://linear.app/bench/BENCH-{repetition}"],
         metrics={
             "effective_tokens": tokens,
+            "raw_tokens": tokens * 2,
             "hidden_checks_passed": passed,
             "hidden_checks_total": 10,
             "spec_findings_total": 0,
@@ -47,6 +48,7 @@ def test_render_markdown_has_aggregate_and_trial_receipts() -> None:
 
     assert "# Symphony bench EXP-1" in rendered
     assert "| effective_tokens | 120 | 140 | +20 |" in rendered
+    assert "| raw_tokens | 240 | 280 | +40 |" in rendered
     assert "EXP-1-A1" in rendered
     assert "same-sha" in rendered
 

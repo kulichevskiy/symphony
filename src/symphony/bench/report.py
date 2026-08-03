@@ -22,6 +22,7 @@ _SUMMARY_METRICS = (
     "standards_findings_critical",
     "standards_findings_major",
     "standards_findings_minor",
+    "raw_tokens",
     "input_tokens",
     "output_tokens",
     "cache_read_tokens",
