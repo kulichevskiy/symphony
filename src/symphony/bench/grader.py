@@ -260,9 +260,7 @@ class FeedbackInboxGrader:
                         f"--junitxml={backend_report}",
                     ],
                     cwd=checkout,
-                    env={
-                        "FEEDBACK_INBOX_DB_PATH": str(results_root / "hidden-feedback.sqlite")
-                    },
+                    env={"FEEDBACK_INBOX_DB_PATH": str(results_root / "hidden-feedback.sqlite")},
                 )
             except CommandError as exc:
                 if not backend_report.exists():
@@ -325,14 +323,10 @@ class FeedbackInboxGrader:
         }
         _validate_hidden_shape(metrics, manifest)
         metrics.update(
-            hidden_checks_total=backend["hidden_checks_total"]
-            + frontend["hidden_checks_total"],
-            hidden_checks_passed=backend["hidden_checks_passed"]
-            + frontend["hidden_checks_passed"],
-            hidden_checks_failed=backend["hidden_checks_failed"]
-            + frontend["hidden_checks_failed"],
-            hidden_checks_errors=backend["hidden_checks_errors"]
-            + frontend["hidden_checks_errors"],
+            hidden_checks_total=backend["hidden_checks_total"] + frontend["hidden_checks_total"],
+            hidden_checks_passed=backend["hidden_checks_passed"] + frontend["hidden_checks_passed"],
+            hidden_checks_failed=backend["hidden_checks_failed"] + frontend["hidden_checks_failed"],
+            hidden_checks_errors=backend["hidden_checks_errors"] + frontend["hidden_checks_errors"],
             hidden_checks_skipped=backend["hidden_checks_skipped"]
             + frontend["hidden_checks_skipped"],
         )

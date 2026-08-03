@@ -269,9 +269,7 @@ async def test_live_trial_uses_the_experiment_harness_snapshot(
 ) -> None:
     root = tmp_path / "runs"
     private_root = tmp_path / "private"
-    snapshot_harness(
-        private_root / "EXP-FROZEN" / "_harness", controls_root=private_bench_controls
-    )
+    snapshot_harness(private_root / "EXP-FROZEN" / "_harness", controls_root=private_bench_controls)
     grader = CapturingGrader()
     reviewer = CapturingReviewer()
     commands = FakeCommands()

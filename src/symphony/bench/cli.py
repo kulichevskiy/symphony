@@ -559,9 +559,7 @@ async def _prepare_harness_with_preflight(
     started = time.monotonic()
     snapshot = private_root / experiment_id / "_harness"
     try:
-        version = await asyncio.to_thread(
-            snapshot_harness, snapshot, controls_root=controls_root
-        )
+        version = await asyncio.to_thread(snapshot_harness, snapshot, controls_root=controls_root)
         frozen = load_harness(snapshot)
     except BaseException:
         await asyncio.to_thread(shutil.rmtree, snapshot, ignore_errors=True)
@@ -577,12 +575,8 @@ async def _prepare_harness_with_preflight(
             await asyncio.to_thread(shutil.copytree, frozen.reference_root, reference)
             backend_hidden = preflight / "backend_hidden_test.py"
             frontend_hidden = preflight / "frontend_hidden_test.tsx"
-            await asyncio.to_thread(
-                shutil.copyfile, frozen.backend_hidden_test, backend_hidden
-            )
-            await asyncio.to_thread(
-                shutil.copyfile, frozen.frontend_hidden_test, frontend_hidden
-            )
+            await asyncio.to_thread(shutil.copyfile, frozen.backend_hidden_test, backend_hidden)
+            await asyncio.to_thread(shutil.copyfile, frozen.frontend_hidden_test, frontend_hidden)
             controls = await FeedbackInboxGrader(commands).validate_controls(
                 seed_root=seed,
                 reference_root=reference,

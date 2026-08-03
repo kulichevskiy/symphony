@@ -55,8 +55,7 @@ def create_bench_app(
                 record = next(
                     item
                     for item in report.trials
-                    if item.candidate == trial.candidate
-                    and item.repetition == trial.repetition
+                    if item.candidate == trial.candidate and item.repetition == trial.repetition
                 )
                 markdown = await asyncio.to_thread(
                     persist_trial_markdown, reports_root, report, record
@@ -70,6 +69,7 @@ def create_bench_app(
         if execute is None:
             yield
             return
+
         async def publish(trial: Trial) -> None:
             if reports_root is None:
                 return
@@ -81,9 +81,7 @@ def create_bench_app(
                 for item in report.trials
                 if item.candidate == trial.candidate and item.repetition == trial.repetition
             )
-            markdown = await asyncio.to_thread(
-                persist_trial_markdown, reports_root, report, record
-            )
+            markdown = await asyncio.to_thread(persist_trial_markdown, reports_root, report, record)
             store.queue_notification(trial, markdown)
 
         async def publish_experiment(experiment_id: str) -> None:

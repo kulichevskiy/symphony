@@ -46,9 +46,7 @@ def snapshot_harness(destination: Path, *, controls_root: Path) -> str:
         raise RuntimeError(f"private benchmark controls are incomplete: {', '.join(missing)}")
     destination.mkdir(parents=True, exist_ok=False)
     materialize_feedback_inbox(destination / "feedback_inbox")
-    materialize_feedback_inbox_reference(
-        reference_root, destination / "feedback_inbox_reference"
-    )
+    materialize_feedback_inbox_reference(reference_root, destination / "feedback_inbox_reference")
     for source_name, destination_name in (
         ("test_backend_hidden.py", "backend_hidden_test.py"),
         ("App.bench.test.tsx", "frontend_hidden_test.tsx"),

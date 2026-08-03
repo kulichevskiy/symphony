@@ -426,9 +426,7 @@ def test_restart_persists_interrupted_trial_and_final_receipts(tmp_path: Path) -
     db_path = tmp_path / "bench.sqlite"
     reports_root = tmp_path / "reports"
     store = ExperimentStore(db_path)
-    experiment = store.create(
-        ExperimentCreate(candidate_a="sha", candidate_b="sha", repetitions=1)
-    )
+    experiment = store.create(ExperimentCreate(candidate_a="sha", candidate_b="sha", repetitions=1))
     claimed = store.claim_next()
     assert claimed is not None
     trial = Trial(
@@ -453,9 +451,7 @@ def test_restart_persists_interrupted_trial_and_final_receipts(tmp_path: Path) -
     assert (directory / "A1.md").exists()
     assert "bench worker restarted" in (directory / "A1.md").read_text(encoding="utf-8")
     assert "Status: **failed**" in (directory / "FINAL.md").read_text(encoding="utf-8")
-    assert [notification["event_key"] for notification in notifications] == [
-        f"{experiment.id}:A1"
-    ]
+    assert [notification["event_key"] for notification in notifications] == [f"{experiment.id}:A1"]
 
 
 def test_app_marks_interrupted_trial_failed_before_claiming_more(tmp_path: Path) -> None:

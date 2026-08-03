@@ -189,8 +189,7 @@ def test_control_validation_rejects_broken_grader_as_infrastructure_failure() ->
 def test_hidden_manifest_cannot_redefine_the_fixed_benchmark_contract(tmp_path: Path) -> None:
     manifest = tmp_path / "manifest.json"
     manifest.write_text(
-        '{"backend_total":2,"frontend_total":2,'
-        '"seed_backend_passed":1,"seed_frontend_passed":1}',
+        '{"backend_total":2,"frontend_total":2,"seed_backend_passed":1,"seed_frontend_passed":1}',
         encoding="utf-8",
     )
 

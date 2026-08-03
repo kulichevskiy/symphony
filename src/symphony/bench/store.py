@@ -228,9 +228,7 @@ class ExperimentStore:
                 """,
                 (ended_at,),
             )
-            conn.execute(
-                "UPDATE bench_experiments SET status = 'failed' WHERE status = 'running'"
-            )
+            conn.execute("UPDATE bench_experiments SET status = 'failed' WHERE status = 'running'")
         trials = [
             Trial.model_validate(
                 {

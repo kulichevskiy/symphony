@@ -171,8 +171,7 @@ Do not include praise, summaries, markdown, or speculative findings. Use {"findi
 
 def _spec_prompt() -> str:
     tickets = "\n\n".join(
-        f"# {ticket.title}\n{ticket.description}"
-        for ticket in feedback_inbox_campaign().tickets
+        f"# {ticket.title}\n{ticket.description}" for ticket in feedback_inbox_campaign().tickets
     )
     return f"""You are the independent final SPEC reviewer for Feedback Inbox.
 Read the entire repository and its tests. Compare the merged implementation against every

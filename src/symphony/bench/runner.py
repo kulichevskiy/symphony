@@ -40,9 +40,7 @@ class ExperimentRunner:
             for pair in _trial_plan(experiment):
                 tasks = [asyncio.create_task(self._run_trial(trial)) for trial in pair]
                 try:
-                    done, pending = await asyncio.wait(
-                        tasks, return_when=asyncio.FIRST_EXCEPTION
-                    )
+                    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
                 except BaseException:
                     for task in tasks:
                         task.cancel()
