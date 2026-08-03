@@ -132,6 +132,7 @@ from ._git import (
     _git_fetch,
     _git_status_short,
     _push_auth_host,
+    _retry_transient_push,
     _workspace_dirty_files,
     _workspace_ref_landed_in_base,
 )
@@ -2914,7 +2915,7 @@ class _OrchestratorBase:
             if github_token:
                 await _configure_git_push_auth(workspace_path, github_token)
             try:
-                await push_fn(workspace_path, branch)
+                await _retry_transient_push(push_fn, workspace_path, branch)
             finally:
                 if github_token:
                     await _clear_git_push_auth(workspace_path)

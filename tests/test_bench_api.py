@@ -239,21 +239,21 @@ async def test_runner_runs_each_candidate_pair_concurrently(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_runner_cancels_sibling_and_keeps_both_failure_receipts(
+async def test_runner_lets_sibling_finish_when_candidate_fails(
     tmp_path: Path,
 ) -> None:
     store = ExperimentStore(tmp_path / "bench.sqlite")
     experiment = store.create(ExperimentCreate(candidate_a="a", candidate_b="b", repetitions=2))
 
     async def execute(trial: Trial) -> TrialOutcome:
-        if trial.candidate == "A":
+        if trial.candidate == "A" and trial.repetition == 1:
             await asyncio.sleep(0)
             raise TrialExecutionError(
                 "A failed",
                 outcome=TrialOutcome(repository_url="https://github.com/example/A1"),
             )
-        await asyncio.Event().wait()
-        raise AssertionError("unreachable")
+        await asyncio.sleep(0.01)
+        return TrialOutcome(repository_url="https://github.com/example/B1")
 
     with pytest.raises(TrialExecutionError, match="A failed"):
         await ExperimentRunner(store=store, execute=execute).run_next()
@@ -263,7 +263,9 @@ async def test_runner_cancels_sibling_and_keeps_both_failure_receipts(
     assert report.experiment.status == "failed"
     assert [(trial.candidate, trial.status) for trial in report.trials] == [
         ("A", "failed"),
-        ("B", "failed"),
+        ("B", "completed"),
+        ("A", "completed"),
+        ("B", "completed"),
     ]
 
 

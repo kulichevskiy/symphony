@@ -37,21 +37,23 @@ class ExperimentRunner:
         if experiment is None:
             return None
         try:
+            first_failure: BaseException | None = None
             for pair in _trial_plan(experiment):
                 tasks = [asyncio.create_task(self._run_trial(trial)) for trial in pair]
                 try:
-                    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
                 except BaseException:
                     for task in tasks:
                         task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
                     raise
-                failure = next((task.exception() for task in done if task.exception()), None)
-                if failure is not None:
-                    for task in pending:
-                        task.cancel()
-                    await asyncio.gather(*pending, return_exceptions=True)
-                    raise failure
+                if first_failure is None:
+                    first_failure = next(
+                        (result for result in results if isinstance(result, BaseException)),
+                        None,
+                    )
+            if first_failure is not None:
+                raise first_failure
         except BaseException:
             self._store.set_status(experiment.id, "failed")
             if self._publish_experiment is not None:
