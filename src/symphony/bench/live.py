@@ -18,7 +18,7 @@ from ..credentials import CredentialResolver, RunCredentials
 from ..crypto import CredentialCipher
 from ..ui.oauth import linear_provider
 from .campaign import Campaign
-from .connection_sync import snapshot_connections, sync_connections
+from .connection_sync import reconcile_connections, snapshot_connections
 from .github import Commands, GitHubRepository, GitHubSandbox, SubprocessCommands
 from .grader import GraderInfrastructureError, HiddenManifest, SupportQueueGrader
 from .harness import FrozenHarness, load_harness
@@ -595,13 +595,13 @@ class LiveTrialExecutor:
                 elapsed = asyncio.get_running_loop().time() - started
                 if elapsed >= self._config.wall_time_cap_seconds:
                     raise RuntimeError("bench wall-time safety cap exceeded")
-                await sync_connections(candidate_db, self._config.control_db)
+                await self._sync_trial_connections(candidate_db)
                 metrics = await self._checked_candidate_snapshot(candidate_root, candidate_db)
 
                 states = await linear.issue_states(campaign.issue_ids)
                 if all(state.type == "completed" for state in states):
                     while True:
-                        await sync_connections(candidate_db, self._config.control_db)
+                        await self._sync_trial_connections(candidate_db)
                         metrics = await self._checked_candidate_snapshot(
                             candidate_root, candidate_db
                         )
@@ -643,6 +643,10 @@ class LiveTrialExecutor:
         if launch_total > self._config.agent_launch_cap:
             raise RuntimeError("bench agent-launch safety cap exceeded")
         return metrics
+
+    async def _sync_trial_connections(self, candidate_db: Path) -> None:
+        """Reconcile runtime OAuth refreshes in both directions by generation."""
+        await reconcile_connections(candidate_db, self._config.control_db)
 
     async def _candidate_snapshot(
         self, candidate_root: Path, candidate_db: Path

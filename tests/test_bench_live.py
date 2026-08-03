@@ -3,6 +3,13 @@ from pathlib import Path
 
 import pytest
 
+from symphony import db
+from symphony.bench.connection_sync import (
+    mirror_connections,
+    reconcile_connections,
+    snapshot_connections,
+    sync_connections,
+)
 from symphony.bench.github import GitHubRepository
 from symphony.bench.harness import snapshot_harness
 from symphony.bench.linear import LinearCampaign, LinearIssueState
@@ -10,6 +17,7 @@ from symphony.bench.live import LiveBenchConfig, LiveTrialExecutor, _archive_sha
 from symphony.bench.metrics import local_review_metrics
 from symphony.bench.models import Trial, TrialExecutionCancelled, TrialExecutionError
 from symphony.credentials import RunCredentials
+from symphony.crypto import CredentialCipher
 
 
 class FakeGitHub:
@@ -413,6 +421,249 @@ async def test_live_trial_provisions_runs_and_returns_traceable_outcome(
     assert not (root / "EXP-1/A1").exists()
     assert (private_root / "EXP-1/A1/receipt-manifest.json").exists()
     assert github.archived == ["kulichevskiy/EXP-1-A1"]
+
+
+@pytest.mark.asyncio
+async def test_live_trial_reconciles_refreshed_connections_both_ways(
+    tmp_path: Path,
+) -> None:
+    cipher = CredentialCipher("test-encryption-key")
+    control_db = tmp_path / "control.sqlite"
+    candidate_a = tmp_path / "a.sqlite"
+    candidate_b = tmp_path / "b.sqlite"
+    control = await db.connect(control_db)
+    try:
+        await db.oauth_connections.set_connection(
+            control,
+            provider="linear",
+            credential="initial",
+            cipher=cipher,
+            updated_by="oauth",
+        )
+    finally:
+        await control.close()
+    await snapshot_connections(control_db, candidate_a)
+    await snapshot_connections(control_db, candidate_b)
+    for path, token in ((candidate_a, "token-a"), (candidate_b, "token-b")):
+        candidate = await db.connect(path)
+        try:
+            await db.oauth_connections.set_connection(
+                candidate,
+                provider="linear",
+                credential=token,
+                cipher=cipher,
+                updated_by="auto-refresh",
+            )
+        finally:
+            await candidate.close()
+
+    executor = LiveTrialExecutor(
+        config=LiveBenchConfig(
+            root=tmp_path / "runs",
+            private_root=tmp_path / "private",
+            control_db=control_db,
+            github_owner="kulichevskiy",
+            linear_team_id="team-id",
+            symphony_repository="repo",
+            encryption_key="key",
+        )
+    )
+
+    await executor._sync_trial_connections(candidate_a)  # noqa: SLF001
+    await executor._sync_trial_connections(candidate_b)  # noqa: SLF001
+    await executor._sync_trial_connections(candidate_a)  # noqa: SLF001
+
+    async def connection(path: Path) -> tuple[str | None, int]:
+        conn = await db.connect(path)
+        try:
+            credential = await db.oauth_connections.get_credential(conn, "linear", cipher)
+            status = await db.oauth_connections.get_status(conn, "linear")
+            assert status is not None
+            return credential, status.generation
+        finally:
+            await conn.close()
+
+    converged = [
+        await connection(control_db),
+        await connection(candidate_a),
+        await connection(candidate_b),
+    ]
+    assert len(set(converged)) == 1
+    assert converged[0][0] in {"token-a", "token-b"}
+    assert converged[0][1] == 2
+
+    control = await db.connect(control_db)
+    try:
+        await db.oauth_connections.delete(control, "linear")
+    finally:
+        await control.close()
+
+    candidate = await db.connect(candidate_a)
+    try:
+        await db.oauth_connections.set_connection(
+            candidate,
+            provider="linear",
+            credential="too-late-1",
+            cipher=cipher,
+            updated_by="auto-refresh",
+        )
+        await db.oauth_connections.set_connection(
+            candidate,
+            provider="linear",
+            credential="too-late-2",
+            cipher=cipher,
+            updated_by="auto-refresh",
+        )
+    finally:
+        await candidate.close()
+    await executor._sync_trial_connections(candidate_a)  # noqa: SLF001
+    await executor._sync_trial_connections(candidate_b)  # noqa: SLF001
+
+    for path in (control_db, candidate_a, candidate_b):
+        candidate = await db.connect(path)
+        try:
+            assert await db.oauth_connections.get_status(candidate, "linear") is None
+            generation = await (
+                await candidate.execute(
+                    "SELECT generation FROM oauth_credential_generations WHERE provider = ?",
+                    ("linear",),
+                )
+            ).fetchone()
+            assert generation is not None
+            assert generation["generation"] == 4
+        finally:
+            await candidate.close()
+
+
+@pytest.mark.asyncio
+async def test_connection_reconciliation_does_not_rollback_a_refresh_between_phases(
+    tmp_path: Path,
+) -> None:
+    cipher = CredentialCipher("test-encryption-key")
+    control_db = tmp_path / "control.sqlite"
+    candidate_db = tmp_path / "candidate.sqlite"
+    control = await db.connect(control_db)
+    try:
+        await db.oauth_connections.set_connection(
+            control,
+            provider="linear",
+            credential="initial",
+            cipher=cipher,
+            updated_by="oauth",
+        )
+    finally:
+        await control.close()
+    await snapshot_connections(control_db, candidate_db)
+
+    candidate = await db.connect(candidate_db)
+    try:
+        await db.oauth_connections.set_connection(
+            candidate,
+            provider="linear",
+            credential="first-refresh",
+            cipher=cipher,
+            updated_by="auto-refresh",
+        )
+    finally:
+        await candidate.close()
+    assert await sync_connections(candidate_db, control_db) == 1
+
+    candidate = await db.connect(candidate_db)
+    try:
+        await db.oauth_connections.set_connection(
+            candidate,
+            provider="linear",
+            credential="late-refresh",
+            cipher=cipher,
+            updated_by="auto-refresh",
+        )
+    finally:
+        await candidate.close()
+    assert await mirror_connections(control_db, candidate_db) == 0
+
+    async def connection(path: Path) -> tuple[str | None, int]:
+        conn = await db.connect(path)
+        try:
+            credential = await db.oauth_connections.get_credential(conn, "linear", cipher)
+            status = await db.oauth_connections.get_status(conn, "linear")
+            assert status is not None
+            return credential, status.generation
+        finally:
+            await conn.close()
+
+    assert await connection(candidate_db) == ("late-refresh", 3)
+    assert await reconcile_connections(candidate_db, control_db) == (1, 0)
+    assert await connection(control_db) == ("late-refresh", 3)
+    assert await connection(candidate_db) == ("late-refresh", 3)
+
+
+@pytest.mark.asyncio
+async def test_connection_reconciliation_ignores_failed_cas_generation_gaps(
+    tmp_path: Path,
+) -> None:
+    cipher = CredentialCipher("test-encryption-key")
+    control_db = tmp_path / "control.sqlite"
+    candidate_db = tmp_path / "candidate.sqlite"
+    control = await db.connect(control_db)
+    try:
+        await db.oauth_connections.set_connection(
+            control,
+            provider="linear",
+            credential="initial",
+            cipher=cipher,
+            updated_by="oauth",
+        )
+    finally:
+        await control.close()
+    await snapshot_connections(control_db, candidate_db)
+
+    candidate = await db.connect(candidate_db)
+    try:
+        await db.oauth_connections.set_connection(
+            candidate,
+            provider="linear",
+            credential="refreshed",
+            cipher=cipher,
+            updated_by="auto-refresh",
+        )
+    finally:
+        await candidate.close()
+    control = await db.connect(control_db)
+    try:
+        for _ in range(2):
+            written = await db.oauth_connections.set_connection(
+                control,
+                provider="linear",
+                credential="rejected",
+                cipher=cipher,
+                updated_by="auto-refresh",
+                expect_connected_generation=999,
+            )
+            assert not written
+    finally:
+        await control.close()
+
+    assert await reconcile_connections(candidate_db, control_db) == (1, 1)
+    for path in (control_db, candidate_db):
+        connection = await db.connect(path)
+        try:
+            credential = await db.oauth_connections.get_credential(
+                connection, "linear", cipher
+            )
+            status = await db.oauth_connections.get_status(connection, "linear")
+            sequence = await (
+                await connection.execute(
+                    "SELECT generation FROM oauth_credential_generations WHERE provider = ?",
+                    ("linear",),
+                )
+            ).fetchone()
+            assert credential == "refreshed"
+            assert status is not None
+            assert status.generation == 2
+            assert sequence is not None
+            assert sequence["generation"] == 3
+        finally:
+            await connection.close()
 
 
 @pytest.mark.asyncio

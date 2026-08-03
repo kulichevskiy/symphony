@@ -290,7 +290,7 @@ def test_bench_sync_connections_does_not_undo_a_control_disconnect(
     )
 
     assert result.exit_code == 0, result.output
-    assert result.output == "synced 0 connection(s)\n"
+    assert result.output == "synced 1 connection(s)\n"
     with sqlite3.connect(control_path) as control:
         assert (
             control.execute(
@@ -300,4 +300,4 @@ def test_bench_sync_connections_does_not_undo_a_control_disconnect(
         )
         assert control.execute(
             "SELECT generation FROM oauth_credential_generations WHERE provider = 'github'"
-        ).fetchone() == (1,)
+        ).fetchone() == (2,)
