@@ -2488,6 +2488,7 @@ class _ReviewMixin(_OrchestratorBase):
                 )
                 return False
 
+            had_conflicts = not rebase_clean
             conflicted_files: list[str] = []
             if not rebase_clean:
                 conflicted_files = await _git_conflicted_files(workspace_path)
@@ -2688,6 +2689,24 @@ class _ReviewMixin(_OrchestratorBase):
                             last_log=status_short,
                         )
                         return False
+
+            if not had_conflicts and await _workspace_head_sha(workspace_path) == start_sha:
+                # GitHub mergeability is eventually consistent after a force-push.
+                # A later poll can therefore still report CONFLICTING even though
+                # the synchronized branch is already based on the latest upstream.
+                # This is a stale trigger, not a broken fix-run or operator wait.
+                drop_dispatch_id()
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "completed",
+                    ended_at=self._now().isoformat(),
+                )
+                log.info(
+                    "merge-conflict trigger was stale for %s; branch already rebased",
+                    issue.identifier,
+                )
+                return False
 
             drop_dispatch_id()
             await _add_run_usage(self._conn, fix_run_id, cumulative_usage)

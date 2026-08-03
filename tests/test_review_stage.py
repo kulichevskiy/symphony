@@ -5783,7 +5783,7 @@ async def test_merge_conflict_fix_reports_status_when_rebase_has_no_unresolved_p
 
 
 @pytest.mark.asyncio
-async def test_merge_conflict_fix_uses_synced_head_as_noop_baseline(
+async def test_merge_conflict_fix_treats_clean_synced_rebase_as_stale_trigger(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5856,17 +5856,16 @@ async def test_merge_conflict_fix_uses_synced_head_as_noop_baseline(
         gh.pr_comment.assert_not_awaited()
         posted = [c.args[1] for c in linear.post_comment.await_args_list]
         assert not any("Fix pushed" in b for b in posted), posted
-        assert any("completed without advancing symphony/eng-1" in b for b in posted), posted
+        assert not any("completed without advancing symphony/eng-1" in b for b in posted), posted
 
         wait = await db.operator_waits.get(conn, "iss-1")
-        assert wait is not None
-        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+        assert wait is None
 
         history = await db.runs.history_for_issue(conn, "iss-1")
         monitor = next(r for r in history if r.id == "review-run")
         fix_run = next(r for r in history if r.stage == "review_fix")
-        assert monitor.status == "failed"
-        assert fix_run.status == "failed"
+        assert monitor.status == "running"
+        assert fix_run.status == "completed"
     finally:
         await conn.close()
 

@@ -4,29 +4,34 @@ The kit compares two pinned Symphony system versions in a real Linear → worktr
 GitHub CI → remote review → merge flow. A system version is one exact Git SHA, one complete JSON
 profile, and the exact executor-toolchain receipt measured while its image is built.
 
-V1 uses Feedback Inbox: one deliberately incomplete FastAPI/React seed and two complete dependent
-Linear tickets. The backend ticket builds the SQLite feedback API. The frontend ticket builds the
-operator inbox after the backend finishes.
+V1 uses Support Queue: one deliberately incomplete FastAPI/React seed and four complete Linear
+tickets. The core API unblocks workflow and frontend work in parallel; their results then unblock
+the end-to-end integration ticket. This diamond exercises dependent delivery, parallel branches,
+rebases, local review, remote review, and integration conflicts in one realistic product flow.
 
 ## Lifecycle
 
-1. Resolve A and B to full SHAs. Snapshot both profiles and every harness input: seed, two-ticket
+1. Resolve A and B to full SHAs. Snapshot both profiles and every harness input: seed, four-ticket
    campaign, private reference implementation, hidden backend/frontend checks, manifest,
    regression commands, and Spec/Standards review prompts. Store a checksum.
 2. Before creating the experiment, run a cheap grader preflight on both isolated Coolify lanes.
-   Each lane must discover exactly 9 backend and 7 frontend hidden checks, pass 16/16 on the private
-   reference, and produce the fixed 1/9 + 1/7 result on the incomplete seed. Missing dependencies,
-   imports, result files, malformed JUnit/JSON, errors, skips, or wrong counts are
-   `infrastructure_failed`; they are never recorded as product quality.
+   Each lane must discover exactly 16 backend and 13 frontend hidden checks, pass 29/29 on the
+   private reference, and produce the fixed 1/16 + 1/13 result on the incomplete seed. It must also
+   detect the exact expected failures in the broken-workflow and broken-accessibility mutation
+   controls. Missing dependencies, imports, result files, malformed JUnit/JSON, errors, skips,
+   wrong counts, or mutation survivors are `infrastructure_failed`; they are never recorded as
+   product quality.
 3. Run `A1 + B1`, then `A2 + B2`, then `A3 + B3`. Each pair starts concurrently on dedicated
    `bench-a` and `bench-b` executors. There is no S0 trial.
-4. For each trial, create a private `kulichevskiy/EXP-…-{A|B}N` repository from the same seed and a
-   human-readable Linear Project named `Feedback Inbox V1 · YYYY-MM-DD · <experiment suffix>`.
-   Create the two uniquely titled BENCH issues in that Project with frontend blocked by backend.
+4. Create one human-readable Linear Project per experiment, named
+   `Support Queue V1 · YYYY-MM-DD · <experiment suffix>`. For each trial, create a private
+   `kulichevskiy/EXP-…-{A|B}N` repository from the same seed and four uniquely titled BENCH issues
+   in that shared Project: core; workflow blocked by core; frontend blocked by core; and integration
+   blocked by workflow plus frontend.
 5. Seed the candidate database with webhooks disabled, then keep one normal `symphony` daemon alive
    while the harness polls issue state and safety metrics.
-6. Wait for both tickets to finish through implementation, local review, CI, remote Codex review,
-   and merge. Stop on Needs Input or a safety cap.
+6. Wait for all four tickets to finish through implementation, local review, CI, remote Codex
+   review, and merge. Stop on Needs Input or a safety cap.
 7. Clone final `main`; inject the private backend and frontend checks; verify their exact manifest;
    run repository regression checks; then run independent read-only Spec and Standards reviews.
 8. Persist `A1.md`, `B1.md`, and so on immediately after each trial. Each receipt contains status,
@@ -75,8 +80,9 @@ GitHub, Linear, Codex, and every agent provider used by the chosen profile. GitH
 repository and PR access. Linear needs issue, Project, state, and relation access to BENCH. Keep the
 stable `symphony-bench` label id/name in the environment.
 
-The ignored local directories `src/symphony/bench/assets/feedback_inbox_reference/` and
-`src/symphony/bench/assets/hidden/feedback_inbox/` are required to deploy. The script verifies and
+The ignored local directories `src/symphony/bench/assets/support_queue_reference/`,
+`src/symphony/bench/assets/support_queue_mutations/`, and
+`src/symphony/bench/assets/hidden/support_queue/` are required to deploy. The script verifies and
 uploads them before asking Coolify to build. They must never be added to Git.
 
 GitHub Free cannot protect branches in private personal repositories. In that exact plan-limited
