@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from xml.etree import ElementTree
 
@@ -16,29 +16,54 @@ class GraderInfrastructureError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class ControlExpectation:
+    backend_passed: int
+    frontend_passed: int
+
+
+@dataclass(frozen=True)
 class HiddenManifest:
     backend_total: int
     frontend_total: int
     seed_backend_passed: int
     seed_frontend_passed: int
+    mutations: dict[str, ControlExpectation] = field(default_factory=dict)
 
 
-_FIXED_FEEDBACK_INBOX_MANIFEST = HiddenManifest(
-    backend_total=9,
-    frontend_total=7,
+_FIXED_SUPPORT_QUEUE_MANIFEST = HiddenManifest(
+    backend_total=14,
+    frontend_total=10,
     seed_backend_passed=1,
     seed_frontend_passed=1,
+    mutations={
+        "broken_workflow": ControlExpectation(backend_passed=12, frontend_passed=10),
+        "broken_accessibility": ControlExpectation(backend_passed=14, frontend_passed=9),
+    },
 )
 
 
 def load_hidden_manifest(path: Path) -> HiddenManifest:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
+        raw_mutations = payload["mutations"]
+        if not isinstance(raw_mutations, dict):
+            raise TypeError("mutations must be an object")
+        mutations = {
+            str(name): ControlExpectation(
+                backend_passed=int(expectation["backend_passed"]),
+                frontend_passed=int(expectation["frontend_passed"]),
+            )
+            for name, expectation in raw_mutations.items()
+            if isinstance(expectation, dict)
+        }
+        if len(mutations) != len(raw_mutations):
+            raise TypeError("mutation expectation must be an object")
         manifest = HiddenManifest(
             backend_total=int(payload["backend_total"]),
             frontend_total=int(payload["frontend_total"]),
             seed_backend_passed=int(payload["seed_backend_passed"]),
             seed_frontend_passed=int(payload["seed_frontend_passed"]),
+            mutations=mutations,
         )
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
         raise GraderInfrastructureError(f"invalid hidden-check manifest: {exc}") from exc
@@ -47,9 +72,14 @@ def load_hidden_manifest(path: Path) -> HiddenManifest:
         or manifest.frontend_total < 1
         or not 0 <= manifest.seed_backend_passed < manifest.backend_total
         or not 0 <= manifest.seed_frontend_passed < manifest.frontend_total
+        or any(
+            not 0 <= expected.backend_passed <= manifest.backend_total
+            or not 0 <= expected.frontend_passed <= manifest.frontend_total
+            for expected in manifest.mutations.values()
+        )
     ):
         raise GraderInfrastructureError("invalid hidden-check manifest counters")
-    if manifest != _FIXED_FEEDBACK_INBOX_MANIFEST:
+    if manifest != _FIXED_SUPPORT_QUEUE_MANIFEST:
         raise GraderInfrastructureError(
             "hidden-check manifest does not match the fixed benchmark contract"
         )
@@ -60,7 +90,7 @@ def regression_commands() -> dict[str, list[str]]:
     return {
         "backend_tests": ["uv", "run", "--frozen", "--no-sync", "pytest", "-q"],
         "ruff": ["uv", "run", "--frozen", "--no-sync", "ruff", "check", "."],
-        "mypy": ["uv", "run", "--frozen", "--no-sync", "mypy", "feedback_inbox"],
+        "mypy": ["uv", "run", "--frozen", "--no-sync", "mypy", "support_queue"],
         "frontend_install": ["npm", "ci"],
         "frontend_tests": ["npm", "test", "--", "--run"],
         "frontend_build": ["npm", "run", "build"],
@@ -117,7 +147,7 @@ def parse_vitest_report(path: Path) -> dict[str, int]:
 def validate_control_result(
     metrics: dict[str, object], manifest: HiddenManifest, *, control: str
 ) -> None:
-    if control not in {"reference", "seed"}:
+    if control not in {"reference", "seed"} and control not in manifest.mutations:
         raise ValueError(f"unknown grader control {control!r}")
     for component, expected_total in (
         ("backend", manifest.backend_total),
@@ -135,11 +165,12 @@ def validate_control_result(
                 f"{control}: {component} checks had {errors} errors and {skipped} skipped"
             )
         passed = _metric_int(metrics, f"{component}_hidden_checks_passed")
-        expected_passed = (
-            expected_total
-            if control == "reference"
-            else getattr(manifest, f"seed_{component}_passed")
-        )
+        if control == "reference":
+            expected_passed = expected_total
+        elif control == "seed":
+            expected_passed = getattr(manifest, f"seed_{component}_passed")
+        else:
+            expected_passed = getattr(manifest.mutations[control], f"{component}_passed")
         if passed != expected_passed:
             raise GraderInfrastructureError(
                 f"{control}: expected {expected_passed}/{expected_total} {component} passes, "
@@ -147,7 +178,7 @@ def validate_control_result(
             )
 
 
-class FeedbackInboxGrader:
+class SupportQueueGrader:
     """Clone merged main and run private backend and frontend checks."""
 
     def __init__(self, commands: Commands) -> None:
@@ -202,11 +233,16 @@ class FeedbackInboxGrader:
         *,
         seed_root: Path,
         reference_root: Path,
+        mutation_roots: dict[str, Path],
         results_root: Path,
         backend_hidden_test: Path,
         frontend_hidden_test: Path,
         manifest: HiddenManifest,
     ) -> dict[str, object]:
+        if set(mutation_roots) != set(manifest.mutations):
+            raise GraderInfrastructureError(
+                "grader mutation controls do not match the fixed manifest"
+            )
         reference = await self._run_hidden_checks(
             checkout=reference_root,
             results_root=results_root / "reference",
@@ -223,7 +259,18 @@ class FeedbackInboxGrader:
             manifest=manifest,
         )
         validate_control_result(seed, manifest, control="seed")
-        return {"reference": reference, "seed": seed}
+        controls: dict[str, object] = {"reference": reference, "seed": seed}
+        for name, root in mutation_roots.items():
+            mutation = await self._run_hidden_checks(
+                checkout=root,
+                results_root=results_root / name,
+                backend_hidden_test=backend_hidden_test,
+                frontend_hidden_test=frontend_hidden_test,
+                manifest=manifest,
+            )
+            validate_control_result(mutation, manifest, control=name)
+            controls[name] = mutation
+        return controls
 
     async def _run_hidden_checks(
         self,
@@ -260,7 +307,7 @@ class FeedbackInboxGrader:
                         f"--junitxml={backend_report}",
                     ],
                     cwd=checkout,
-                    env={"FEEDBACK_INBOX_DB_PATH": str(results_root / "hidden-feedback.sqlite")},
+                    env={"SUPPORT_QUEUE_DB_PATH": str(results_root / "hidden-support.sqlite")},
                 )
             except CommandError as exc:
                 if not backend_report.exists():

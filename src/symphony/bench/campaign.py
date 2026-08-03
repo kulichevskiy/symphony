@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import shutil
 from dataclasses import dataclass
 from importlib.resources import as_file, files
@@ -29,11 +30,10 @@ class Campaign:
     tickets: tuple[CampaignTicket, ...]
 
 
-def materialize_feedback_inbox(destination: Path) -> None:
-    """Copy the immutable Feedback Inbox seed into a new trial repository."""
+def _materialize_seed(asset: str, destination: Path) -> None:
     if destination.exists():
         raise FileExistsError(destination)
-    source = files("symphony.bench.assets").joinpath("feedback_inbox")
+    source = files("symphony.bench.assets").joinpath(asset)
     with as_file(source) as source_path:
         shutil.copytree(
             source_path,
@@ -44,8 +44,18 @@ def materialize_feedback_inbox(destination: Path) -> None:
         )
 
 
-def materialize_feedback_inbox_reference(source: Path, destination: Path) -> None:
-    """Copy the private known-good implementation used only by grader preflight."""
+def materialize_feedback_inbox(destination: Path) -> None:
+    """Copy the immutable legacy Feedback Inbox seed."""
+    _materialize_seed("feedback_inbox", destination)
+
+
+def materialize_support_queue(destination: Path) -> None:
+    """Copy the immutable Support Queue seed into a new trial repository."""
+    _materialize_seed("support_queue", destination)
+
+
+def materialize_private_control(source: Path, destination: Path) -> None:
+    """Copy a private grader control into an isolated writable workspace."""
     if destination.exists():
         raise FileExistsError(destination)
     shutil.copytree(
@@ -152,10 +162,152 @@ prevention, and refresh after mutations. Run all documented frontend and reposit
     )
 
 
+def support_queue_campaign() -> Campaign:
+    """The fixed four-ticket Support Queue benchmark campaign."""
+    return Campaign(
+        name="Support Queue V1",
+        tickets=(
+            _ticket(
+                "core",
+                "Build the support queue core API",
+                """
+## Context
+
+The seed contains a FastAPI health endpoint, SQLite wiring, and a placeholder React screen. Build
+the persistent ticket and comment API that the other three tickets will extend.
+
+## Requirements
+
+- Persist tickets with integer `id`, trimmed `title`, optional `description`, priority
+  `low|medium|high|urgent`, status `open`, integer `version`, and UTC timestamps.
+- `POST /tickets` validates title 1..120 characters after trimming and description up to 4000
+  characters, returns 201, and starts at version 1.
+- `GET /tickets` filters by `status` and `priority`, returns newest first with stable id
+  tie-breaking, and rejects invalid filter values with 422.
+- `GET /tickets/{id}` returns one ticket with its comments or 404.
+- `POST /tickets/{id}/comments` persists a trimmed 1..2000 character body and returns 201.
+- Preserve data across application restarts and keep the health endpoint green.
+
+## Acceptance criteria
+
+A caller can create, filter, retrieve, comment on, and reload tickets without losing data. Invalid
+input returns the documented status and never mutates storage.
+
+## Verification
+
+Test persistence, boundaries, enum validation, deterministic ordering, filters, comments, unknown
+ids, and invalid bodies. Run every documented backend check.
+""",
+            ),
+            _ticket(
+                "workflow",
+                "Add support workflow and permissions",
+                """
+## Context
+
+The core ticket API exists. Add the state machine, assignment rules, permissions, and optimistic
+concurrency that operators need while the frontend is being built independently.
+
+## Requirements
+
+- Support status transitions `open -> in_progress -> resolved` and `resolved -> open`; reject every
+  other transition with 409.
+- `PATCH /tickets/{id}` accepts the required current `version` plus optional `status`, `assignee`,
+  and `priority`. A stale version returns 409 without mutation; every successful update increments
+  version exactly once.
+- Read actor identity and role from `X-Actor` and `X-Role: viewer|agent|admin`. Missing headers or a
+  viewer may read but cannot mutate. Agents may comment, assign themselves, and transition tickets;
+  only admins may assign another actor or change priority.
+- Return 403 for permission failures, 404 for unknown tickets, and 422 for malformed requests.
+- Apply permission, transition, and version checks inside the same database transaction as update.
+
+## Acceptance criteria
+
+Concurrent stale writes cannot overwrite newer data. Authorized actors can perform only their
+documented operations, and invalid transitions or permissions leave the ticket unchanged.
+
+## Verification
+
+Test the complete transition matrix, viewer/agent/admin permissions, self/other assignment, stale
+versions, atomic failure, and exact version increments.
+""",
+                blocked_by=("core",),
+            ),
+            _ticket(
+                "frontend",
+                "Build the support queue interface",
+                """
+## Context
+
+The core API contract is available. Build the operator interface against that stable contract while
+workflow and permissions are implemented in parallel.
+
+## Requirements
+
+- Show a Support Queue heading, create form, and ticket list with title, priority, status, assignee,
+  version, and comment count.
+- Provide status and priority filters. Load only the selected values and render distinct loading,
+  empty, and error states; errors offer Retry and never also claim the queue is empty.
+- Open a ticket detail view, show comments, and add a comment. Disable all controls for a pending
+  form so double submission creates only one record.
+- Use accessible labels, headings, status/alert roles, keyboard-operable controls, and meaningful
+  action names.
+- Preserve documented frontend test, build, and accessibility conventions.
+
+## Acceptance criteria
+
+An operator can create, filter, inspect, and comment on tickets. Slow requests cannot duplicate
+mutations, and transient failures recover through Retry.
+
+## Verification
+
+Test create, filters, detail, comments, loading, empty, error/retry, pending-state deduplication,
+accessible names, and refresh after mutations.
+""",
+                blocked_by=("core",),
+            ),
+            _ticket(
+                "integration",
+                "Integrate workflow, conflicts, and durable filters",
+                """
+## Context
+
+The backend workflow and basic frontend now exist. Connect them into one robust end-to-end operator
+flow and close the integration gaps that isolated tickets could not detect.
+
+## Requirements
+
+- Allow an agent to claim an unassigned ticket, advance valid statuses, resolve it, and reopen it;
+  send `X-Actor`, `X-Role`, and the displayed version on every mutation.
+- On a 409 stale-version response, keep the user's context, show an accessible conflict message,
+  reload the current ticket, and require an explicit retry. Never silently overwrite.
+- Store status and priority filters in URL search parameters. Initialize from valid URL values,
+  update history when filters change, and ignore invalid values without crashing.
+- Keep the selected detail and list synchronized after comment, assignment, and status mutations.
+- Finish responsive and accessibility behavior: visible focus, live status text, named navigation,
+  and no unlabeled interactive controls.
+
+## Acceptance criteria
+
+The full create-to-resolution flow works against the real API. Two stale browser views cannot lose
+updates, URLs reproduce the same filtered queue, and keyboard/screen-reader users receive state and
+conflict feedback.
+
+## Verification
+
+Test the full workflow, headers and versions, stale-conflict recovery, URL initialization/history,
+invalid URL values, synchronized list/detail state, keyboard operation, and accessibility roles.
+Run every repository check.
+""",
+                blocked_by=("workflow", "frontend"),
+            ),
+        ),
+    )
+
+
 def harness_version(root: Path | None = None) -> str:
     """Stable identity of the campaign, seed application, and hidden grader."""
     package = files("symphony.bench")
-    payload = b""
     with as_file(package) as packaged_root:
         seed_root = root or packaged_root
         ignored = {
@@ -166,15 +318,28 @@ def harness_version(root: Path | None = None) -> str:
             "node_modules",
             "dist",
         }
-        harness_files = sorted(
-            path
-            for path in seed_root.rglob("*")
-            if path.is_file()
-            and not ignored.intersection(path.relative_to(seed_root).parts)
-            and path.suffix not in {".pyc", ".pyo"}
-            and path.name != ".DS_Store"
-            and path.name != ".version"
-        )
+        if root is None:
+            ignored.update(
+                {
+                    "feedback_inbox_reference",
+                    "hidden",
+                    "support_queue_reference",
+                    "support_queue_mutations",
+                }
+            )
+        harness_files: list[Path] = []
+        for current, directories, names in os.walk(seed_root):
+            directories[:] = sorted(name for name in directories if name not in ignored)
+            current_path = Path(current)
+            harness_files.extend(
+                current_path / name
+                for name in sorted(names)
+                if Path(name).suffix not in {".pyc", ".pyo"}
+                and name not in {".DS_Store", ".version"}
+            )
+        digest = hashlib.sha256()
         for path in harness_files:
-            payload += str(path.relative_to(seed_root)).encode() + b"\0" + path.read_bytes()
-    return hashlib.sha256(payload).hexdigest()[:16]
+            digest.update(str(path.relative_to(seed_root)).encode())
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+    return digest.hexdigest()[:16]

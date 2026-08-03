@@ -8,10 +8,10 @@ from pathlib import Path
 from .campaign import (
     Campaign,
     CampaignTicket,
-    feedback_inbox_campaign,
     harness_version,
-    materialize_feedback_inbox,
-    materialize_feedback_inbox_reference,
+    materialize_private_control,
+    materialize_support_queue,
+    support_queue_campaign,
 )
 from .grader import HiddenManifest, load_hidden_manifest, regression_commands
 from .reviewer import final_review_prompts
@@ -25,6 +25,7 @@ class FrozenHarness:
     backend_hidden_test: Path
     frontend_hidden_test: Path
     reference_root: Path
+    mutation_roots: dict[str, Path]
     hidden_manifest: HiddenManifest
     regression_commands: dict[str, list[str]]
     spec_prompt: str
@@ -33,10 +34,13 @@ class FrozenHarness:
 
 def snapshot_harness(destination: Path, *, controls_root: Path) -> str:
     """Persist every workload artifact before an experiment becomes queue-visible."""
-    reference_root = controls_root / "feedback_inbox_reference"
-    hidden_root = controls_root / "hidden" / "feedback_inbox"
+    reference_root = controls_root / "support_queue_reference"
+    mutations_root = controls_root / "support_queue_mutations"
+    hidden_root = controls_root / "hidden" / "support_queue"
     required = (
-        reference_root / "feedback_inbox" / "main.py",
+        reference_root / "support_queue" / "main.py",
+        mutations_root / "broken_workflow" / "support_queue" / "main.py",
+        mutations_root / "broken_accessibility" / "support_queue" / "main.py",
         hidden_root / "test_backend_hidden.py",
         hidden_root / "App.bench.test.tsx",
         hidden_root / "manifest.json",
@@ -45,15 +49,19 @@ def snapshot_harness(destination: Path, *, controls_root: Path) -> str:
     if missing:
         raise RuntimeError(f"private benchmark controls are incomplete: {', '.join(missing)}")
     destination.mkdir(parents=True, exist_ok=False)
-    materialize_feedback_inbox(destination / "feedback_inbox")
-    materialize_feedback_inbox_reference(reference_root, destination / "feedback_inbox_reference")
+    materialize_support_queue(destination / "support_queue")
+    materialize_private_control(reference_root, destination / "support_queue_reference")
+    for name in ("broken_workflow", "broken_accessibility"):
+        materialize_private_control(
+            mutations_root / name, destination / "support_queue_mutations" / name
+        )
     for source_name, destination_name in (
         ("test_backend_hidden.py", "backend_hidden_test.py"),
         ("App.bench.test.tsx", "frontend_hidden_test.tsx"),
         ("manifest.json", "hidden_manifest.json"),
     ):
         shutil.copyfile(hidden_root / source_name, destination / destination_name)
-    campaign = feedback_inbox_campaign_payload()
+    campaign = support_queue_campaign_payload()
     (destination / "campaign.json").write_text(
         json.dumps(campaign, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -109,7 +117,11 @@ def load_harness(snapshot: Path) -> FrozenHarness:
         campaign=campaign_from_payload(campaign_payload),
         backend_hidden_test=snapshot / "backend_hidden_test.py",
         frontend_hidden_test=snapshot / "frontend_hidden_test.tsx",
-        reference_root=snapshot / "feedback_inbox_reference",
+        reference_root=snapshot / "support_queue_reference",
+        mutation_roots={
+            name: snapshot / "support_queue_mutations" / name
+            for name in ("broken_workflow", "broken_accessibility")
+        },
         hidden_manifest=load_hidden_manifest(snapshot / "hidden_manifest.json"),
         regression_commands=commands,
         spec_prompt=spec_prompt,
@@ -117,8 +129,8 @@ def load_harness(snapshot: Path) -> FrozenHarness:
     )
 
 
-def feedback_inbox_campaign_payload() -> dict[str, object]:
-    return asdict(feedback_inbox_campaign())
+def support_queue_campaign_payload() -> dict[str, object]:
+    return asdict(support_queue_campaign())
 
 
 def campaign_from_payload(payload: dict[str, object]) -> Campaign:

@@ -71,9 +71,14 @@ def test_bench_executor_image_excludes_all_private_grader_controls() -> None:
 
     assert "/app/src/symphony/bench/assets/hidden" in bench_stage
     assert "/app/src/symphony/bench/assets/feedback_inbox_reference" in bench_stage
+    assert "/app/src/symphony/bench/assets/support_queue_reference" in bench_stage
+    assert "/app/src/symphony/bench/assets/support_queue_mutations" in bench_stage
     dockerignore = (ROOT / ".dockerignore").read_text()
     assert "src/symphony/bench/assets/feedback_inbox_reference" in dockerignore
     assert "src/symphony/bench/assets/hidden/feedback_inbox" in dockerignore
+    assert "src/symphony/bench/assets/support_queue_reference" in dockerignore
+    assert "src/symphony/bench/assets/support_queue_mutations" in dockerignore
+    assert "src/symphony/bench/assets/hidden/support_queue" in dockerignore
     assert "symphony-bench-toolchain.txt" in dockerfile
     assert "dpkg-query" in dockerfile
 

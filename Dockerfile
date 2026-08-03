@@ -106,7 +106,10 @@ CMD []
 FROM runtime AS bench-executor
 USER root
 RUN test ! -e /app/src/symphony/bench/assets/hidden/feedback_inbox \
-    && test ! -e /app/src/symphony/bench/assets/feedback_inbox_reference
+    && test ! -e /app/src/symphony/bench/assets/feedback_inbox_reference \
+    && test ! -e /app/src/symphony/bench/assets/hidden/support_queue \
+    && test ! -e /app/src/symphony/bench/assets/support_queue_reference \
+    && test ! -e /app/src/symphony/bench/assets/support_queue_mutations
 USER symphony
 
 # Keep the ordinary image and the bench control plane feature-complete.

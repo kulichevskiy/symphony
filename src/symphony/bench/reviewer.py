@@ -13,7 +13,7 @@ from .. import db
 from ..codex_login import codex_expires_at, pin_file_auth_storage, read_codex_credential
 from ..credentials import CredentialResolver, CredentialWriteBack
 from ..crypto import CredentialCipher
-from .campaign import feedback_inbox_campaign
+from .campaign import support_queue_campaign
 from .github import Commands
 
 
@@ -171,9 +171,9 @@ Do not include praise, summaries, markdown, or speculative findings. Use {"findi
 
 def _spec_prompt() -> str:
     tickets = "\n\n".join(
-        f"# {ticket.title}\n{ticket.description}" for ticket in feedback_inbox_campaign().tickets
+        f"# {ticket.title}\n{ticket.description}" for ticket in support_queue_campaign().tickets
     )
-    return f"""You are the independent final SPEC reviewer for Feedback Inbox.
+    return f"""You are the independent final SPEC reviewer for Support Queue.
 Read the entire repository and its tests. Compare the merged implementation against every
 requirement below. Do not modify files or run network operations. Report only concrete mismatches
 that remain in the final main branch, with exact file evidence.
@@ -185,7 +185,7 @@ that remain in the final main branch, with exact file evidence.
 
 
 def _standards_prompt() -> str:
-    return f"""You are the independent final STANDARDS reviewer for Feedback Inbox.
+    return f"""You are the independent final STANDARDS reviewer for Support Queue.
 Read the entire repository, especially STANDARDS.md, README.md, CI configuration, production code,
 and tests. Do not judge product requirements here; judge only documented repository standards,
 correctness hazards, maintainability, security, and test quality. Do not modify files or use the

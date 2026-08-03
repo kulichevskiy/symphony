@@ -20,7 +20,7 @@ from ..ui.oauth import linear_provider
 from .campaign import Campaign
 from .connection_sync import snapshot_connections, sync_connections
 from .github import Commands, GitHubRepository, GitHubSandbox, SubprocessCommands
-from .grader import FeedbackInboxGrader, GraderInfrastructureError, HiddenManifest
+from .grader import GraderInfrastructureError, HiddenManifest, SupportQueueGrader
 from .harness import FrozenHarness, load_harness
 from .linear import LinearCampaign, LinearIssueState, LinearSandbox
 from .metrics import snapshot_candidate
@@ -121,7 +121,7 @@ class LiveTrialExecutor:
         self._credentials = credentials
         self._github = github
         self._linear = linear
-        self._grader = grader or FeedbackInboxGrader(self._commands)
+        self._grader = grader or SupportQueueGrader(self._commands)
         self._reviewer = reviewer or CodexFinalReviewer(
             commands=self._commands,
             control_db=config.control_db,
@@ -158,7 +158,7 @@ class LiveTrialExecutor:
         suffix = f"{trial.candidate}{trial.repetition}"
         trial_name = f"{trial.experiment_id}-{suffix}"
         trial_root = self._config.root / trial.experiment_id / suffix
-        app_root = trial_root / "feedback_inbox"
+        app_root = trial_root / "support_queue"
         candidate_root = trial_root / "symphony"
         repository: GitHubRepository | None = None
         github: GitHubProvisioner | None = None
@@ -176,7 +176,7 @@ class LiveTrialExecutor:
                 raise RuntimeError("bench Linear connection is missing; reconnect and retry")
 
             await asyncio.to_thread(trial_root.mkdir, parents=True, exist_ok=False)
-            await asyncio.to_thread(shutil.copytree, frozen.root / "feedback_inbox", app_root)
+            await asyncio.to_thread(shutil.copytree, frozen.root / "support_queue", app_root)
             github = self._github or GitHubSandbox(
                 owner=self._config.github_owner,
                 token=credentials.github_token,
@@ -543,7 +543,12 @@ class LiveTrialExecutor:
         )
         # The candidate needs runtime code, not grader controls or its own Git
         # object database. Remove all three before any agent is dispatched.
-        for private_asset in ("hidden", "feedback_inbox_reference"):
+        for private_asset in (
+            "hidden",
+            "feedback_inbox_reference",
+            "support_queue_reference",
+            "support_queue_mutations",
+        ):
             await asyncio.to_thread(
                 shutil.rmtree,
                 candidate_root / "src/symphony/bench/assets" / private_asset,
@@ -680,6 +685,7 @@ def _archive_trial_receipts(trial_root: Path, destination: Path) -> None:
         "backend-hidden-junit.xml",
         "frontend-hidden.json",
         "hidden-feedback.sqlite*",
+        "hidden-support.sqlite*",
         "final-*-review.json",
     ):
         for source in trial_root.glob(pattern):

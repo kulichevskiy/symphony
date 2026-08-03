@@ -97,11 +97,19 @@ async def test_harness_preflight_validates_controls_on_both_lanes_and_persists_r
             seen.append(self.commands)
             assert kwargs["seed_root"].exists()
             assert kwargs["reference_root"].exists()
+            assert sorted(kwargs["mutation_roots"]) == [
+                "broken_accessibility",
+                "broken_workflow",
+            ]
+            assert all(path.exists() for path in kwargs["mutation_roots"].values())
             assert kwargs["backend_hidden_test"].exists()
             assert kwargs["frontend_hidden_test"].exists()
-            return {"reference": {"hidden_checks_passed": 16}, "seed": {"hidden_checks_passed": 2}}
+            return {
+                "reference": {"hidden_checks_passed": 24},
+                "seed": {"hidden_checks_passed": 2},
+            }
 
-    monkeypatch.setattr(cli_module, "FeedbackInboxGrader", FakeGrader)
+    monkeypatch.setattr(cli_module, "SupportQueueGrader", FakeGrader)
     commands_a = object()
     commands_b = object()
 
@@ -154,7 +162,7 @@ async def test_failed_preflight_keeps_receipt_but_removes_private_harness(
         async def validate_controls(self, **_kwargs: object) -> dict[str, object]:
             raise cli_module.GraderInfrastructureError("broken control")
 
-    monkeypatch.setattr(cli_module, "FeedbackInboxGrader", BrokenGrader)
+    monkeypatch.setattr(cli_module, "SupportQueueGrader", BrokenGrader)
 
     with pytest.raises(cli_module.GraderInfrastructureError, match="broken control"):
         await _prepare_harness_with_preflight(
@@ -176,7 +184,7 @@ async def test_failed_preflight_keeps_receipt_but_removes_private_harness(
 async def test_invalid_private_controls_leave_no_partial_harness(
     tmp_path, private_bench_controls
 ) -> None:
-    manifest = private_bench_controls / "hidden/feedback_inbox/manifest.json"
+    manifest = private_bench_controls / "hidden/support_queue/manifest.json"
     manifest.write_text("{}", encoding="utf-8")
 
     with pytest.raises(cli_module.GraderInfrastructureError, match="manifest"):

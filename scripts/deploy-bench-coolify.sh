@@ -31,10 +31,13 @@ branch="${COOLIFY_BENCH_BRANCH:-$(git branch --show-current)}"
 repository_root="$(git rev-parse --show-toplevel)"
 controls_assets="${SYMPHONY_BENCH_CONTROLS_SOURCE:-$repository_root/src/symphony/bench/assets}"
 for control in \
-  feedback_inbox_reference/feedback_inbox/main.py \
-  hidden/feedback_inbox/test_backend_hidden.py \
-  hidden/feedback_inbox/App.bench.test.tsx \
-  hidden/feedback_inbox/manifest.json; do
+  support_queue_reference/support_queue/main.py \
+  support_queue_reference/frontend/src/App.tsx \
+  support_queue_mutations/broken_workflow/support_queue/main.py \
+  support_queue_mutations/broken_accessibility/frontend/src/App.tsx \
+  hidden/support_queue/test_backend_hidden.py \
+  hidden/support_queue/App.bench.test.tsx \
+  hidden/support_queue/manifest.json; do
   if [[ ! -f "$controls_assets/$control" ]]; then
     echo "missing private benchmark control: $controls_assets/$control" >&2
     exit 2
@@ -46,7 +49,7 @@ controls_bundle_id="$(
     --exclude='.venv' --exclude='node_modules' --exclude='dist' \
     --exclude='__pycache__' --exclude='.pytest_cache' --exclude='.mypy_cache' \
     --exclude='.ruff_cache' --exclude='*.tsbuildinfo' \
-    -cf - feedback_inbox_reference hidden/feedback_inbox \
+    -cf - support_queue_reference support_queue_mutations hidden/support_queue \
     | shasum -a 256 \
     | awk '{print substr($1, 1, 16)}'
 )"
@@ -58,13 +61,16 @@ tar -C "$controls_assets" \
   --exclude='.venv' --exclude='node_modules' --exclude='dist' \
   --exclude='__pycache__' --exclude='.pytest_cache' --exclude='.mypy_cache' \
   --exclude='.ruff_cache' --exclude='*.tsbuildinfo' \
-  -cf - feedback_inbox_reference hidden/feedback_inbox \
+  -cf - support_queue_reference support_queue_mutations hidden/support_queue \
   | ssh -o BatchMode=yes "$coolify_ssh_host" "sudo -n tar -xf - -C '$controls_upload'"
 ssh -o BatchMode=yes "$coolify_ssh_host" "
-  sudo -n test -f '$controls_upload/feedback_inbox_reference/feedback_inbox/main.py'
-  sudo -n test -f '$controls_upload/hidden/feedback_inbox/test_backend_hidden.py'
-  sudo -n test -f '$controls_upload/hidden/feedback_inbox/App.bench.test.tsx'
-  sudo -n test -f '$controls_upload/hidden/feedback_inbox/manifest.json'
+  sudo -n test -f '$controls_upload/support_queue_reference/support_queue/main.py'
+  sudo -n test -f '$controls_upload/support_queue_reference/frontend/src/App.tsx'
+  sudo -n test -f '$controls_upload/support_queue_mutations/broken_workflow/support_queue/main.py'
+  sudo -n test -f '$controls_upload/support_queue_mutations/broken_accessibility/frontend/src/App.tsx'
+  sudo -n test -f '$controls_upload/hidden/support_queue/test_backend_hidden.py'
+  sudo -n test -f '$controls_upload/hidden/support_queue/App.bench.test.tsx'
+  sudo -n test -f '$controls_upload/hidden/support_queue/manifest.json'
   if sudo -n test -d '$controls_bundle'; then
     sudo -n rm -rf '$controls_upload'
   else

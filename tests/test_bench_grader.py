@@ -4,9 +4,10 @@ import pytest
 
 from symphony.bench.github import CommandError
 from symphony.bench.grader import (
-    FeedbackInboxGrader,
+    ControlExpectation,
     GraderInfrastructureError,
     HiddenManifest,
+    SupportQueueGrader,
     load_hidden_manifest,
     parse_junit_report,
     parse_vitest_report,
@@ -162,6 +163,47 @@ def test_control_validation_accepts_reference_and_expected_negative_control() ->
     validate_control_result(seed, manifest, control="seed")
 
 
+def test_control_validation_accepts_known_mutations_and_rejects_insensitive_grader() -> None:
+    manifest = HiddenManifest(
+        backend_total=6,
+        frontend_total=5,
+        seed_backend_passed=1,
+        seed_frontend_passed=1,
+        mutations={
+            "broken_workflow": ControlExpectation(backend_passed=4, frontend_passed=5),
+            "broken_accessibility": ControlExpectation(backend_passed=6, frontend_passed=4),
+        },
+    )
+    reference = {
+        "backend_hidden_checks_total": 6,
+        "backend_hidden_checks_passed": 6,
+        "backend_hidden_checks_failed": 0,
+        "backend_hidden_checks_errors": 0,
+        "backend_hidden_checks_skipped": 0,
+        "frontend_hidden_checks_total": 5,
+        "frontend_hidden_checks_passed": 5,
+        "frontend_hidden_checks_failed": 0,
+        "frontend_hidden_checks_errors": 0,
+        "frontend_hidden_checks_skipped": 0,
+    }
+    broken_workflow = {
+        **reference,
+        "backend_hidden_checks_passed": 4,
+        "backend_hidden_checks_failed": 2,
+    }
+    broken_accessibility = {
+        **reference,
+        "frontend_hidden_checks_passed": 4,
+        "frontend_hidden_checks_failed": 1,
+    }
+
+    validate_control_result(broken_workflow, manifest, control="broken_workflow")
+    validate_control_result(broken_accessibility, manifest, control="broken_accessibility")
+
+    with pytest.raises(GraderInfrastructureError, match="broken_workflow"):
+        validate_control_result(reference, manifest, control="broken_workflow")
+
+
 def test_control_validation_rejects_broken_grader_as_infrastructure_failure() -> None:
     manifest = HiddenManifest(
         backend_total=4,
@@ -189,7 +231,8 @@ def test_control_validation_rejects_broken_grader_as_infrastructure_failure() ->
 def test_hidden_manifest_cannot_redefine_the_fixed_benchmark_contract(tmp_path: Path) -> None:
     manifest = tmp_path / "manifest.json"
     manifest.write_text(
-        '{"backend_total":2,"frontend_total":2,"seed_backend_passed":1,"seed_frontend_passed":1}',
+        '{"backend_total":2,"frontend_total":2,"seed_backend_passed":1,'
+        '"seed_frontend_passed":1,"mutations":{}}',
         encoding="utf-8",
     )
 
@@ -226,7 +269,7 @@ async def test_grader_injects_collectable_hidden_name_then_removes_it(tmp_path: 
     backend_hidden.write_text("# hidden")
     frontend_hidden.write_text("// hidden")
 
-    metrics = await FeedbackInboxGrader(commands).grade(
+    metrics = await SupportQueueGrader(commands).grade(
         repository_slug="kulichevskiy/trial",
         destination=tmp_path,
         github_token="token",
@@ -238,7 +281,7 @@ async def test_grader_injects_collectable_hidden_name_then_removes_it(tmp_path: 
     assert metrics["backend_hidden_checks_passed"] == 9
     assert metrics["frontend_hidden_checks_passed"] == 7
     assert commands.hidden_env is not None
-    assert commands.hidden_env["FEEDBACK_INBOX_DB_PATH"].endswith("hidden-feedback.sqlite")
+    assert commands.hidden_env["SUPPORT_QUEUE_DB_PATH"].endswith("hidden-support.sqlite")
     assert all(not path.exists() for path in commands.hidden_paths)
 
 
@@ -252,11 +295,33 @@ async def test_grader_classifies_crashed_process_as_infrastructure_even_with_rep
     frontend_hidden.write_text("// hidden")
 
     with pytest.raises(GraderInfrastructureError, match="process failed"):
-        await FeedbackInboxGrader(CrashingGraderCommands()).grade(
+        await SupportQueueGrader(CrashingGraderCommands()).grade(
             repository_slug="kulichevskiy/trial",
             destination=tmp_path,
             github_token="token",
             backend_hidden_test=backend_hidden,
             frontend_hidden_test=frontend_hidden,
             manifest=HiddenManifest(9, 7, 1, 1),
+        )
+
+
+@pytest.mark.asyncio
+async def test_grader_requires_every_declared_mutation_control(tmp_path: Path) -> None:
+    manifest = HiddenManifest(
+        9,
+        7,
+        1,
+        1,
+        mutations={"broken_workflow": ControlExpectation(8, 7)},
+    )
+
+    with pytest.raises(GraderInfrastructureError, match="mutation controls"):
+        await SupportQueueGrader(GraderCommands()).validate_controls(
+            seed_root=tmp_path / "seed",
+            reference_root=tmp_path / "reference",
+            mutation_roots={},
+            results_root=tmp_path / "results",
+            backend_hidden_test=tmp_path / "backend.py",
+            frontend_hidden_test=tmp_path / "frontend.tsx",
+            manifest=manifest,
         )

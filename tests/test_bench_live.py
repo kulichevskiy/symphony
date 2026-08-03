@@ -326,7 +326,7 @@ async def test_live_trial_uses_the_experiment_harness_snapshot(
     assert grader.kwargs["frontend_hidden_test"] == (
         private_root / "EXP-FROZEN" / "_harness/frontend_hidden_test.tsx"
     )
-    assert grader.kwargs["manifest"].backend_total == 9
+    assert grader.kwargs["manifest"].backend_total == 14
     assert isinstance(grader.kwargs["checks"], dict)
     assert "SPEC reviewer" in str(reviewer.kwargs["spec_prompt"])
     assert "STANDARDS reviewer" in str(reviewer.kwargs["standards_prompt"])

@@ -55,7 +55,7 @@ async def test_github_sandbox_creates_private_protected_repo(tmp_path: Path) -> 
     assert [call[0] for call in commands.calls[:5]] == [
         ("git", "init", "--initial-branch=main"),
         ("git", "add", "."),
-        ("git", "commit", "-m", "Seed Feedback Inbox benchmark"),
+        ("git", "commit", "-m", "Seed Support Queue benchmark"),
         ("gh", "api", "repos/kulichevskiy/EXP-1-A1"),
         (
             "gh",

@@ -89,7 +89,7 @@ def test_bench_seed_builds_candidate_db_from_profile(tmp_path: Path) -> None:
     assert payload["remote_review"] is True
     assert payload["webhook_enabled"] is False
     assert payload["verify_cmd"] == (
-        "uv run pytest && uv run ruff check . && uv run mypy feedback_inbox "
+        "uv run pytest && uv run ruff check . && uv run mypy support_queue "
         "&& cd frontend && npm ci && npm test -- --run && npm run build"
     )
     assert json.loads(roles)["implement"]["model"] == "gpt-5.6-sol"

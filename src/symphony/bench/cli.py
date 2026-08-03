@@ -19,7 +19,7 @@ from .app import create_bench_app
 from .campaign import harness_version
 from .connection_sync import sync_connections as _sync_connections
 from .executor import RemoteCommands, create_executor_app
-from .grader import FeedbackInboxGrader, GraderInfrastructureError
+from .grader import GraderInfrastructureError, SupportQueueGrader
 from .harness import load_harness, snapshot_harness
 from .live import LiveBenchConfig, LiveTrialExecutor
 from .metrics import snapshot_candidate
@@ -287,7 +287,7 @@ async def _seed(
         "runner": "local",
         "webhook_enabled": False,
         "verify_cmd": (
-            "uv run pytest && uv run ruff check . && uv run mypy feedback_inbox "
+            "uv run pytest && uv run ruff check . && uv run mypy support_queue "
             "&& cd frontend && npm ci && npm test -- --run && npm run build"
         ),
         "states": {
@@ -571,15 +571,21 @@ async def _prepare_harness_with_preflight(
         try:
             seed = preflight / "seed"
             reference = preflight / "reference"
-            await asyncio.to_thread(shutil.copytree, frozen.root / "feedback_inbox", seed)
+            await asyncio.to_thread(shutil.copytree, frozen.root / "support_queue", seed)
             await asyncio.to_thread(shutil.copytree, frozen.reference_root, reference)
+            mutations: dict[str, Path] = {}
+            for mutation_name, mutation_root in frozen.mutation_roots.items():
+                mutation = preflight / mutation_name
+                await asyncio.to_thread(shutil.copytree, mutation_root, mutation)
+                mutations[mutation_name] = mutation
             backend_hidden = preflight / "backend_hidden_test.py"
             frontend_hidden = preflight / "frontend_hidden_test.tsx"
             await asyncio.to_thread(shutil.copyfile, frozen.backend_hidden_test, backend_hidden)
             await asyncio.to_thread(shutil.copyfile, frozen.frontend_hidden_test, frontend_hidden)
-            controls = await FeedbackInboxGrader(commands).validate_controls(
+            controls = await SupportQueueGrader(commands).validate_controls(
                 seed_root=seed,
                 reference_root=reference,
+                mutation_roots=mutations,
                 results_root=preflight / "results",
                 backend_hidden_test=backend_hidden,
                 frontend_hidden_test=frontend_hidden,

@@ -7,7 +7,9 @@ from symphony.bench.campaign import (
     feedback_inbox_campaign,
     harness_version,
     materialize_feedback_inbox,
-    materialize_feedback_inbox_reference,
+    materialize_private_control,
+    materialize_support_queue,
+    support_queue_campaign,
 )
 from symphony.bench.harness import load_harness, snapshot_harness
 
@@ -24,6 +26,36 @@ def test_feedback_inbox_campaign_is_two_complete_sequential_afk_tickets() -> Non
         assert "## Acceptance criteria" in ticket.description
         assert "## Verification" in ticket.description
         assert "Do not ask questions" in ticket.description
+
+
+def test_support_queue_campaign_is_four_complete_diamond_afk_tickets() -> None:
+    campaign = support_queue_campaign()
+
+    assert campaign.name == "Support Queue V1"
+    assert [ticket.key for ticket in campaign.tickets] == [
+        "core",
+        "workflow",
+        "frontend",
+        "integration",
+    ]
+    assert [ticket.blocked_by for ticket in campaign.tickets] == [
+        (),
+        ("core",),
+        ("core",),
+        ("workflow", "frontend"),
+    ]
+    for ticket in campaign.tickets:
+        assert "## Context" in ticket.description
+        assert "## Requirements" in ticket.description
+        assert "## Acceptance criteria" in ticket.description
+        assert "## Verification" in ticket.description
+        assert "Do not ask questions" in ticket.description
+
+    combined = "\n".join(ticket.description for ticket in campaign.tickets)
+    assert "optimistic" in combined.lower()
+    assert "permissions" in combined.lower()
+    assert "URL" in combined
+    assert "accessibility" in combined.lower()
 
 
 def test_materialize_feedback_inbox_creates_runnable_full_stack_seed(tmp_path: Path) -> None:
@@ -52,6 +84,29 @@ def test_materialize_feedback_inbox_creates_runnable_full_stack_seed(tmp_path: P
     assert "mypy eventdesk" not in workflow
 
 
+def test_materialize_support_queue_creates_runnable_full_stack_seed(tmp_path: Path) -> None:
+    destination = tmp_path / "support-queue"
+
+    materialize_support_queue(destination)
+
+    expected = {
+        "README.md",
+        "STANDARDS.md",
+        "pyproject.toml",
+        ".github/workflows/ci.yml",
+        "support_queue/main.py",
+        "tests/test_health.py",
+        "frontend/package.json",
+        "frontend/src/App.tsx",
+    }
+    assert expected <= {
+        str(path.relative_to(destination)) for path in destination.rglob("*") if path.is_file()
+    }
+    assert not (destination / ".venv").exists()
+    assert not (destination / "frontend/node_modules").exists()
+    assert not (destination / "frontend/dist").exists()
+
+
 def test_materialize_private_reference_makes_read_only_source_directories_writable(
     tmp_path: Path,
 ) -> None:
@@ -63,7 +118,7 @@ def test_materialize_private_reference_makes_read_only_source_directories_writab
     source.chmod(0o555)
     destination = tmp_path / "reference"
 
-    materialize_feedback_inbox_reference(source, destination)
+    materialize_private_control(source, destination)
 
     (destination / ".venv").mkdir()
     (destination / "feedback_inbox/generated.py").write_text("# generated\n", encoding="utf-8")
@@ -107,18 +162,20 @@ def test_harness_snapshot_freezes_workload_and_verifies_checksum(
     frozen = load_harness(snapshot)
 
     assert frozen.version == version
-    assert frozen.campaign.name == "Feedback Inbox V1"
-    assert len(frozen.campaign.tickets) == 2
+    assert frozen.campaign.name == "Support Queue V1"
+    assert len(frozen.campaign.tickets) == 4
     assert frozen.backend_hidden_test.exists()
     assert frozen.frontend_hidden_test.exists()
-    assert (frozen.reference_root / "feedback_inbox/main.py").exists()
-    assert frozen.hidden_manifest.backend_total == 9
-    assert frozen.hidden_manifest.frontend_total == 7
-    assert (snapshot / "feedback_inbox/feedback_inbox/main.py").exists()
+    assert (frozen.reference_root / "support_queue/main.py").exists()
+    assert sorted(frozen.mutation_roots) == ["broken_accessibility", "broken_workflow"]
+    assert frozen.hidden_manifest.backend_total == 14
+    assert frozen.hidden_manifest.frontend_total == 10
+    assert (snapshot / "support_queue/support_queue/main.py").exists()
+    assert not (snapshot / "feedback_inbox").exists()
     assert not (snapshot / "eventdesk").exists()
     assert frozen.regression_commands["frontend_build"] == ["npm", "run", "build"]
     assert "SPEC reviewer" in frozen.spec_prompt
-    assert (snapshot / "feedback_inbox" / ".gitignore").exists()
+    assert (snapshot / "support_queue" / ".gitignore").exists()
 
     (snapshot / "campaign.json").write_text("{}")
     with pytest.raises(RuntimeError, match="checksum mismatch"):
