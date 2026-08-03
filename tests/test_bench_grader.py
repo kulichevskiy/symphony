@@ -78,7 +78,13 @@ def test_parse_junit_report_counts_outcomes(tmp_path: Path) -> None:
     report.write_text(
         """<?xml version="1.0"?>
         <testsuites tests="7" failures="2" errors="1" skipped="1">
-          <testsuite name="hidden" tests="7" failures="2" errors="1" skipped="1" />
+          <testsuite name="hidden" tests="7" failures="2" errors="1" skipped="1">
+            <testcase classname="bench" name="passes" />
+            <testcase classname="bench" name="fails"><failure /></testcase>
+            <testcase classname="bench" name="also fails"><failure /></testcase>
+            <testcase classname="bench" name="errors"><error /></testcase>
+            <testcase classname="bench" name="skips"><skipped /></testcase>
+          </testsuite>
         </testsuites>
         """,
         encoding="utf-8",
@@ -90,6 +96,7 @@ def test_parse_junit_report_counts_outcomes(tmp_path: Path) -> None:
         "hidden_checks_failed": 2,
         "hidden_checks_errors": 1,
         "hidden_checks_skipped": 1,
+        "hidden_failed_test_ids": ["also fails", "fails"],
     }
 
 
@@ -107,7 +114,9 @@ def test_parse_vitest_report_counts_outcomes(tmp_path: Path) -> None:
     report = tmp_path / "vitest.json"
     report.write_text(
         '{"numTotalTests":5,"numPassedTests":3,"numFailedTests":1,'
-        '"numPendingTests":1,"numTodoTests":0,"testResults":[]}',
+        '"numPendingTests":1,"numTodoTests":0,"testResults":['
+        '{"assertionResults":[{"fullName":"suite passes","status":"passed"},'
+        '{"fullName":"suite fails","status":"failed"}]}]}',
         encoding="utf-8",
     )
 
@@ -117,6 +126,7 @@ def test_parse_vitest_report_counts_outcomes(tmp_path: Path) -> None:
         "hidden_checks_failed": 1,
         "hidden_checks_errors": 0,
         "hidden_checks_skipped": 1,
+        "hidden_failed_test_ids": ["suite fails"],
     }
 
 
@@ -170,8 +180,16 @@ def test_control_validation_accepts_known_mutations_and_rejects_insensitive_grad
         seed_backend_passed=1,
         seed_frontend_passed=1,
         mutations={
-            "broken_workflow": ControlExpectation(backend_passed=4, frontend_passed=5),
-            "broken_accessibility": ControlExpectation(backend_passed=6, frontend_passed=4),
+            "broken_workflow": ControlExpectation(
+                backend_passed=4,
+                frontend_passed=5,
+                backend_failed_test_ids=("workflow-a", "workflow-b"),
+            ),
+            "broken_accessibility": ControlExpectation(
+                backend_passed=6,
+                frontend_passed=4,
+                frontend_failed_test_ids=("accessibility",),
+            ),
         },
     )
     reference = {
@@ -180,21 +198,25 @@ def test_control_validation_accepts_known_mutations_and_rejects_insensitive_grad
         "backend_hidden_checks_failed": 0,
         "backend_hidden_checks_errors": 0,
         "backend_hidden_checks_skipped": 0,
+        "backend_hidden_failed_test_ids": [],
         "frontend_hidden_checks_total": 5,
         "frontend_hidden_checks_passed": 5,
         "frontend_hidden_checks_failed": 0,
         "frontend_hidden_checks_errors": 0,
         "frontend_hidden_checks_skipped": 0,
+        "frontend_hidden_failed_test_ids": [],
     }
     broken_workflow = {
         **reference,
         "backend_hidden_checks_passed": 4,
         "backend_hidden_checks_failed": 2,
+        "backend_hidden_failed_test_ids": ["workflow-b", "workflow-a"],
     }
     broken_accessibility = {
         **reference,
         "frontend_hidden_checks_passed": 4,
         "frontend_hidden_checks_failed": 1,
+        "frontend_hidden_failed_test_ids": ["accessibility"],
     }
 
     validate_control_result(broken_workflow, manifest, control="broken_workflow")
@@ -202,6 +224,13 @@ def test_control_validation_accepts_known_mutations_and_rejects_insensitive_grad
 
     with pytest.raises(GraderInfrastructureError, match="broken_workflow"):
         validate_control_result(reference, manifest, control="broken_workflow")
+
+    wrong_failures = {
+        **broken_workflow,
+        "backend_hidden_failed_test_ids": ["unrelated-a", "unrelated-b"],
+    }
+    with pytest.raises(GraderInfrastructureError, match="expected backend failures"):
+        validate_control_result(wrong_failures, manifest, control="broken_workflow")
 
 
 def test_control_validation_rejects_broken_grader_as_infrastructure_failure() -> None:
@@ -246,7 +275,9 @@ def test_parse_junit_report_sums_pytest_suites_when_parent_has_no_counts(
     report = tmp_path / "report.xml"
     report.write_text(
         """<testsuites name="pytest tests">
-        <testsuite name="hidden-a" tests="3" failures="1" errors="0" skipped="0" />
+        <testsuite name="hidden-a" tests="3" failures="1" errors="0" skipped="0">
+          <testcase classname="bench" name="test_hidden"><failure /></testcase>
+        </testsuite>
         <testsuite name="hidden-b" tests="2" failures="0" errors="1" skipped="0" />
         </testsuites>""",
         encoding="utf-8",
@@ -258,6 +289,7 @@ def test_parse_junit_report_sums_pytest_suites_when_parent_has_no_counts(
         "hidden_checks_failed": 1,
         "hidden_checks_errors": 1,
         "hidden_checks_skipped": 0,
+        "hidden_failed_test_ids": ["test_hidden"],
     }
 
 

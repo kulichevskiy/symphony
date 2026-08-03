@@ -39,8 +39,11 @@ def snapshot_harness(destination: Path, *, controls_root: Path) -> str:
     hidden_root = controls_root / "hidden" / "support_queue"
     required = (
         reference_root / "support_queue" / "main.py",
+        reference_root / "frontend" / "src" / "App.tsx",
         mutations_root / "broken_workflow" / "support_queue" / "main.py",
+        mutations_root / "broken_workflow" / "frontend" / "src" / "App.tsx",
         mutations_root / "broken_accessibility" / "support_queue" / "main.py",
+        mutations_root / "broken_accessibility" / "frontend" / "src" / "App.tsx",
         hidden_root / "test_backend_hidden.py",
         hidden_root / "App.bench.test.tsx",
         hidden_root / "manifest.json",

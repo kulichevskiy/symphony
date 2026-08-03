@@ -168,8 +168,8 @@ def test_harness_snapshot_freezes_workload_and_verifies_checksum(
     assert frozen.frontend_hidden_test.exists()
     assert (frozen.reference_root / "support_queue/main.py").exists()
     assert sorted(frozen.mutation_roots) == ["broken_accessibility", "broken_workflow"]
-    assert frozen.hidden_manifest.backend_total == 14
-    assert frozen.hidden_manifest.frontend_total == 10
+    assert frozen.hidden_manifest.backend_total == 16
+    assert frozen.hidden_manifest.frontend_total == 13
     assert (snapshot / "support_queue/support_queue/main.py").exists()
     assert not (snapshot / "feedback_inbox").exists()
     assert not (snapshot / "eventdesk").exists()
@@ -210,3 +210,20 @@ def test_harness_snapshot_rejects_invalid_regression_command(
 
     with pytest.raises(RuntimeError, match="invalid harness regression command"):
         load_harness(snapshot)
+
+
+def test_harness_snapshot_requires_every_control_entrypoint(
+    tmp_path: Path, private_bench_controls: Path
+) -> None:
+    missing = (
+        private_bench_controls
+        / "support_queue_mutations"
+        / "broken_accessibility"
+        / "frontend"
+        / "src"
+        / "App.tsx"
+    )
+    missing.unlink()
+
+    with pytest.raises(RuntimeError, match="private benchmark controls are incomplete"):
+        snapshot_harness(tmp_path / "snapshot", controls_root=private_bench_controls)

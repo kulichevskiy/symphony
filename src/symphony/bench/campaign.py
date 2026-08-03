@@ -186,6 +186,10 @@ the persistent ticket and comment API that the other three tickets will extend.
   tie-breaking, and rejects invalid filter values with 422.
 - `GET /tickets/{id}` returns one ticket with its comments or 404.
 - `POST /tickets/{id}/comments` persists a trimmed 1..2000 character body and returns 201.
+- `PATCH /tickets/{id}` updates validated title or description. `DELETE /tickets/{id}` returns 204
+  and also deletes its comments.
+- `PATCH` and `DELETE /tickets/{ticket_id}/comments/{comment_id}` update a validated body or return
+  204. Unknown ticket/comment pairs return 404.
 - Preserve data across application restarts and keep the health endpoint green.
 
 ## Acceptance criteria
@@ -195,8 +199,8 @@ input returns the documented status and never mutates storage.
 
 ## Verification
 
-Test persistence, boundaries, enum validation, deterministic ordering, filters, comments, unknown
-ids, and invalid bodies. Run every documented backend check.
+Test persistence, boundaries, enum validation, deterministic ordering, filters, complete ticket
+and comment CRUD, unknown ids, and invalid bodies. Run every documented backend check.
 """,
             ),
             _ticket(
@@ -212,9 +216,11 @@ concurrency that operators need while the frontend is being built independently.
 
 - Support status transitions `open -> in_progress -> resolved` and `resolved -> open`; reject every
   other transition with 409.
-- `PATCH /tickets/{id}` accepts the required current `version` plus optional `status`, `assignee`,
-  and `priority`. A stale version returns 409 without mutation; every successful update increments
-  version exactly once.
+- Extend the core `PATCH /tickets/{id}` contract to require current `version` and accept `status`,
+  `assignee`, and `priority` alongside content fields. A stale version returns 409 without mutation;
+  every successful update increments version exactly once.
+- Only admins may edit ticket title or description, delete a ticket, assign another actor, or change
+  priority. A comment author or admin may edit/delete it; other agents receive 403.
 - Read actor identity and role from `X-Actor` and `X-Role: viewer|agent|admin`. Missing headers or a
   viewer may read but cannot mutate. Agents may comment, assign themselves, and transition tickets;
   only admins may assign another actor or change priority.
@@ -228,8 +234,8 @@ documented operations, and invalid transitions or permissions leave the ticket u
 
 ## Verification
 
-Test the complete transition matrix, viewer/agent/admin permissions, self/other assignment, stale
-versions, atomic failure, and exact version increments.
+Test the complete transition matrix, viewer/agent/admin permissions, self/other assignment, full
+ticket/comment CRUD, stale versions, atomic failure, and exact version increments.
 """,
                 blocked_by=("core",),
             ),

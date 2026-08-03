@@ -19,6 +19,8 @@ class GraderInfrastructureError(RuntimeError):
 class ControlExpectation:
     backend_passed: int
     frontend_passed: int
+    backend_failed_test_ids: tuple[str, ...] = ()
+    frontend_failed_test_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -31,13 +33,27 @@ class HiddenManifest:
 
 
 _FIXED_SUPPORT_QUEUE_MANIFEST = HiddenManifest(
-    backend_total=14,
-    frontend_total=10,
+    backend_total=16,
+    frontend_total=13,
     seed_backend_passed=1,
     seed_frontend_passed=1,
     mutations={
-        "broken_workflow": ControlExpectation(backend_passed=12, frontend_passed=10),
-        "broken_accessibility": ControlExpectation(backend_passed=14, frontend_passed=9),
+        "broken_workflow": ControlExpectation(
+            backend_passed=14,
+            frontend_passed=13,
+            backend_failed_test_ids=(
+                "test_failed_update_is_atomic",
+                "test_status_transition_matrix",
+            ),
+        ),
+        "broken_accessibility": ControlExpectation(
+            backend_passed=16,
+            frontend_passed=12,
+            frontend_failed_test_ids=(
+                "Support Queue hidden contract provides named navigation, live state, "
+                "and labeled controls",
+            ),
+        ),
     },
 )
 
@@ -52,6 +68,12 @@ def load_hidden_manifest(path: Path) -> HiddenManifest:
             str(name): ControlExpectation(
                 backend_passed=int(expectation["backend_passed"]),
                 frontend_passed=int(expectation["frontend_passed"]),
+                backend_failed_test_ids=_test_ids(
+                    expectation.get("backend_failed_test_ids", [])
+                ),
+                frontend_failed_test_ids=_test_ids(
+                    expectation.get("frontend_failed_test_ids", [])
+                ),
             )
             for name, expectation in raw_mutations.items()
             if isinstance(expectation, dict)
@@ -75,6 +97,10 @@ def load_hidden_manifest(path: Path) -> HiddenManifest:
         or any(
             not 0 <= expected.backend_passed <= manifest.backend_total
             or not 0 <= expected.frontend_passed <= manifest.frontend_total
+            or len(expected.backend_failed_test_ids)
+            != manifest.backend_total - expected.backend_passed
+            or len(expected.frontend_failed_test_ids)
+            != manifest.frontend_total - expected.frontend_passed
             for expected in manifest.mutations.values()
         )
     ):
@@ -98,7 +124,7 @@ def regression_commands() -> dict[str, list[str]]:
     }
 
 
-def parse_junit_report(path: Path) -> dict[str, int]:
+def parse_junit_report(path: Path) -> dict[str, object]:
     """Turn pytest's stable JUnit summary into comparable scalar metrics."""
     root = ElementTree.parse(path).getroot()
     if root.tag not in {"testsuite", "testsuites"}:
@@ -116,10 +142,15 @@ def parse_junit_report(path: Path) -> dict[str, int]:
         "hidden_checks_failed": failures,
         "hidden_checks_errors": errors,
         "hidden_checks_skipped": skipped,
+        "hidden_failed_test_ids": sorted(
+            testcase.attrib.get("name", "")
+            for testcase in root.iter("testcase")
+            if testcase.find("failure") is not None
+        ),
     }
 
 
-def parse_vitest_report(path: Path) -> dict[str, int]:
+def parse_vitest_report(path: Path) -> dict[str, object]:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -135,12 +166,33 @@ def parse_vitest_report(path: Path) -> dict[str, int]:
         raise GraderInfrastructureError(f"invalid Vitest result counters: {exc}") from exc
     if min(total, passed, failed, skipped) < 0 or passed + failed + skipped != total:
         raise GraderInfrastructureError("invalid Vitest test accounting")
+    failed_test_ids: list[str] = []
+    raw_results = payload.get("testResults", [])
+    if not isinstance(raw_results, list):
+        raise GraderInfrastructureError("invalid Vitest test results")
+    for result in raw_results:
+        if not isinstance(result, dict):
+            raise GraderInfrastructureError("invalid Vitest test result")
+        assertions = result.get("assertionResults", [])
+        if not isinstance(assertions, list):
+            raise GraderInfrastructureError("invalid Vitest assertion results")
+        for assertion in assertions:
+            if not isinstance(assertion, dict):
+                raise GraderInfrastructureError("invalid Vitest assertion result")
+            if assertion.get("status") == "failed":
+                name = assertion.get("fullName")
+                if not isinstance(name, str) or not name:
+                    raise GraderInfrastructureError("failed Vitest assertion has no name")
+                failed_test_ids.append(name)
+    if len(failed_test_ids) != failed:
+        raise GraderInfrastructureError("Vitest failed test identities do not match counters")
     return {
         "hidden_checks_total": total,
         "hidden_checks_passed": passed,
         "hidden_checks_failed": failed,
         "hidden_checks_errors": max(0, total - passed - failed - skipped),
         "hidden_checks_skipped": skipped,
+        "hidden_failed_test_ids": sorted(failed_test_ids),
     }
 
 
@@ -176,6 +228,18 @@ def validate_control_result(
                 f"{control}: expected {expected_passed}/{expected_total} {component} passes, "
                 f"got {passed}/{total}"
             )
+        if control in manifest.mutations:
+            expected_failures = getattr(
+                manifest.mutations[control], f"{component}_failed_test_ids"
+            )
+            actual_failures = _metric_test_ids(
+                metrics, f"{component}_hidden_failed_test_ids"
+            )
+            if actual_failures != expected_failures:
+                raise GraderInfrastructureError(
+                    f"{control}: expected {component} failures {list(expected_failures)!r}, "
+                    f"got {list(actual_failures)!r}"
+                )
 
 
 class SupportQueueGrader:
@@ -370,12 +434,16 @@ class SupportQueueGrader:
         }
         _validate_hidden_shape(metrics, manifest)
         metrics.update(
-            hidden_checks_total=backend["hidden_checks_total"] + frontend["hidden_checks_total"],
-            hidden_checks_passed=backend["hidden_checks_passed"] + frontend["hidden_checks_passed"],
-            hidden_checks_failed=backend["hidden_checks_failed"] + frontend["hidden_checks_failed"],
-            hidden_checks_errors=backend["hidden_checks_errors"] + frontend["hidden_checks_errors"],
-            hidden_checks_skipped=backend["hidden_checks_skipped"]
-            + frontend["hidden_checks_skipped"],
+            hidden_checks_total=_metric_int(backend, "hidden_checks_total")
+            + _metric_int(frontend, "hidden_checks_total"),
+            hidden_checks_passed=_metric_int(backend, "hidden_checks_passed")
+            + _metric_int(frontend, "hidden_checks_passed"),
+            hidden_checks_failed=_metric_int(backend, "hidden_checks_failed")
+            + _metric_int(frontend, "hidden_checks_failed"),
+            hidden_checks_errors=_metric_int(backend, "hidden_checks_errors")
+            + _metric_int(frontend, "hidden_checks_errors"),
+            hidden_checks_skipped=_metric_int(backend, "hidden_checks_skipped")
+            + _metric_int(frontend, "hidden_checks_skipped"),
         )
         return metrics
 
@@ -403,6 +471,24 @@ def _metric_int(metrics: dict[str, object], key: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise GraderInfrastructureError(f"hidden-check metric {key!r} is missing or invalid")
     return value
+
+
+def _test_ids(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+        raise TypeError("failed test ids must be a list of non-empty strings")
+    if len(set(value)) != len(value):
+        raise TypeError("failed test ids must be unique")
+    return tuple(sorted(value))
+
+
+def _metric_test_ids(metrics: dict[str, object], key: str) -> tuple[str, ...]:
+    value = metrics.get(key)
+    if not isinstance(value, list):
+        raise GraderInfrastructureError(f"hidden-check metric {key!r} is missing or invalid")
+    try:
+        return _test_ids(value)
+    except TypeError as exc:
+        raise GraderInfrastructureError(f"hidden-check metric {key!r} is invalid") from exc
 
 
 def _is_test_failure_exit(error: CommandError) -> bool:
