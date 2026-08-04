@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 
 from symphony.bench.models import Experiment, ExperimentReport, TrialRecord
-from symphony.bench.report import render_markdown
+from symphony.bench.report import render_markdown, render_trial_markdown
 
 
 def _trial(candidate: str, repetition: int, tokens: float, passed: int) -> TrialRecord:
@@ -80,3 +80,31 @@ def test_render_markdown_aggregates_only_matched_completed_pairs() -> None:
     assert "Matched completed repetitions: 1" in rendered
     assert "| effective_tokens | 100 | 120 | +20 |" in rendered
     assert "| effective_tokens | 550 |" not in rendered
+
+
+def test_render_trial_markdown_preserves_unavailable_raw_tokens() -> None:
+    trial = _trial("A", 1, 100, 9).model_copy(
+        update={
+            "status": "failed",
+            "metrics": {
+                "raw_tokens": None,
+                "token_metrics_unavailable": True,
+            },
+        }
+    )
+    report = ExperimentReport(
+        experiment=Experiment(
+            id="EXP-1",
+            status="failed",
+            candidate_a="same-sha",
+            candidate_b="same-sha",
+            repetitions=1,
+            created_at=datetime(2026, 8, 1, tzinfo=UTC),
+        ),
+        trials=[trial],
+    )
+
+    rendered = render_trial_markdown(report, trial)
+
+    assert "raw_tokens: `null`" in rendered
+    assert "token_metrics_unavailable: `True`" in rendered

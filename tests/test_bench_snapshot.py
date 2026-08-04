@@ -2,7 +2,6 @@ import asyncio
 import json
 from pathlib import Path
 
-import pytest
 from click.testing import CliRunner
 
 from symphony import db
@@ -94,6 +93,7 @@ def test_bench_snapshot_reports_stable_safety_metrics(tmp_path: Path) -> None:
         "raw_tokens": 150,
         "remote_review_state_transitions": 2,
         "runs_by_status": {"completed": 1},
+        "token_metrics_unavailable": False,
     }
 
 
@@ -105,6 +105,7 @@ def test_bench_snapshot_reports_claude_raw_tokens(tmp_path: Path) -> None:
 
     assert snapshot["raw_tokens"] == 180
     assert snapshot["effective_tokens"] == 176.0
+    assert snapshot["token_metrics_unavailable"] is False
 
 
 def test_bench_snapshot_rejects_unreconciled_model_usage(tmp_path: Path) -> None:
@@ -121,8 +122,10 @@ def test_bench_snapshot_rejects_unreconciled_model_usage(tmp_path: Path) -> None
 
     asyncio.run(corrupt_usage())
 
-    with pytest.raises(ValueError, match="run_model_usage totals do not reconcile"):
-        asyncio.run(snapshot_candidate(db_path))
+    snapshot = asyncio.run(snapshot_candidate(db_path))
+
+    assert snapshot["raw_tokens"] is None
+    assert snapshot["token_metrics_unavailable"] is True
 
 
 def test_bench_snapshot_rejects_compensating_per_run_usage_errors(tmp_path: Path) -> None:
@@ -182,8 +185,10 @@ def test_bench_snapshot_rejects_compensating_per_run_usage_errors(tmp_path: Path
 
     asyncio.run(add_and_corrupt_second_run())
 
-    with pytest.raises(ValueError, match="run_model_usage totals do not reconcile"):
-        asyncio.run(snapshot_candidate(db_path))
+    snapshot = asyncio.run(snapshot_candidate(db_path))
+
+    assert snapshot["raw_tokens"] is None
+    assert snapshot["token_metrics_unavailable"] is True
 
 
 def test_bench_snapshot_defers_reconciliation_while_run_is_active(tmp_path: Path) -> None:
@@ -225,7 +230,8 @@ def test_bench_snapshot_defers_reconciliation_while_run_is_active(tmp_path: Path
     snapshot = asyncio.run(snapshot_candidate(db_path))
 
     assert snapshot["runs_by_status"] == {"running": 1}
-    assert "raw_tokens" not in snapshot
+    assert snapshot["raw_tokens"] is None
+    assert snapshot["token_metrics_unavailable"] is True
 
 
 async def _seed_nested_local_review(path: Path) -> None:

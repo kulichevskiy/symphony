@@ -162,7 +162,9 @@ def render_trial_markdown(report: ExperimentReport, record: TrialRecord) -> str:
     for key in sorted(record.metrics):
         value = record.metrics[key]
         rendered = (
-            json.dumps(value, sort_keys=True) if isinstance(value, (dict, list)) else str(value)
+            json.dumps(value, sort_keys=True)
+            if value is None or isinstance(value, (dict, list))
+            else str(value)
         )
         lines.append(f"- {key}: `{rendered}`")
     lines.extend(

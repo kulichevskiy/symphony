@@ -92,6 +92,19 @@ class CompletingLinear(FakeLinear):
         )
 
 
+class NeedsInputLinear(FakeLinear):
+    async def issue_states(self, issue_ids: tuple[str, ...]) -> tuple[LinearIssueState, ...]:
+        return tuple(
+            LinearIssueState(
+                id=issue_id,
+                identifier=issue_id,
+                name="Needs Input" if index == 0 else "Waiting",
+                type="started" if index == 0 else "unstarted",
+            )
+            for index, issue_id in enumerate(issue_ids)
+        )
+
+
 class FakeCommands:
     def __init__(self) -> None:
         self.calls: list[tuple[str, ...]] = []
@@ -132,6 +145,18 @@ class FakeCommands:
             "agent_launches": 6,
             "effective_tokens": 1234.0,
             "runs_by_status": {"completed": 6},
+        }
+
+
+class UnreconciledRunningCommands(FakeCommands):
+    async def snapshot(self, _db_path: Path, _log_root: Path) -> dict[str, object]:
+        return {
+            "active_agent_seconds": 120.0,
+            "agent_launches": 6,
+            "effective_tokens": 1234.0,
+            "raw_tokens": None,
+            "runs_by_status": {"running": 1},
+            "token_metrics_unavailable": True,
         }
 
 
@@ -734,6 +759,48 @@ async def test_failed_trial_receipt_counts_actual_remote_review_rounds(
 
     assert raised.value.outcome.metrics["remote_review_rounds"] == 2
     assert github.reviewed == ["kulichevskiy/EXP-FAIL-A1"]
+
+
+@pytest.mark.asyncio
+async def test_failed_trial_receipt_marks_unreconciled_raw_tokens_unavailable(
+    tmp_path: Path, private_bench_controls: Path
+) -> None:
+    commands = UnreconciledRunningCommands()
+    root, private_root = _frozen_roots(
+        tmp_path, "EXP-UNRECONCILED", private_bench_controls
+    )
+    executor = LiveTrialExecutor(
+        config=LiveBenchConfig(
+            root=root,
+            private_root=private_root,
+            control_db=tmp_path / "control.sqlite",
+            github_owner="kulichevskiy",
+            linear_team_id="team-id",
+            symphony_repository="https://github.com/kulichevskiy/symphony.git",
+            encryption_key="key",
+            poll_seconds=0,
+        ),
+        commands=commands,
+        credentials=RunCredentials(github_token="gh", linear_token="Bearer lin"),
+        github=FakeGitHub(),
+        linear=NeedsInputLinear(),
+        grader=FakeGrader(),
+        reviewer=FakeReviewer(),
+        candidate_snapshotter=commands.snapshot,
+    )
+
+    with pytest.raises(TrialExecutionError, match="candidate trial stopped") as raised:
+        await executor(
+            Trial(
+                experiment_id="EXP-UNRECONCILED",
+                candidate="A",
+                repetition=1,
+                revision="sha",
+            )
+        )
+
+    assert raised.value.outcome.metrics["raw_tokens"] is None
+    assert raised.value.outcome.metrics["token_metrics_unavailable"] is True
 
 
 @pytest.mark.asyncio

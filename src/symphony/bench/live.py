@@ -350,6 +350,8 @@ class LiveTrialExecutor:
                 metrics.update(await self._candidate_snapshot(candidate_root, candidate_db))
             except Exception:  # noqa: BLE001 - best-effort failure receipt
                 pass
+        metrics.setdefault("raw_tokens", None)
+        metrics.setdefault("token_metrics_unavailable", True)
         if campaign is not None and linear is not None:
             try:
                 states = await linear.issue_states(campaign.issue_ids)
@@ -406,6 +408,10 @@ class LiveTrialExecutor:
                 issue_urls=list(campaign.issue_urls) if campaign is not None else [],
                 metrics={
                     **metrics,
+                    "raw_tokens": metrics.get("raw_tokens"),
+                    "token_metrics_unavailable": metrics.get(
+                        "token_metrics_unavailable", True
+                    ),
                     "wall_seconds": asyncio.get_running_loop().time() - started,
                     "partial_receipt_timed_out": True,
                     "remote_review_metrics_unavailable": True,
@@ -638,6 +644,10 @@ class LiveTrialExecutor:
         launch_total = metrics.get("agent_launches")
         if not isinstance(token_total, (int, float)) or not isinstance(launch_total, int):
             raise RuntimeError("candidate bench snapshot is missing safety metrics")
+        statuses = metrics.get("runs_by_status")
+        running = int(statuses.get("running", 0)) if isinstance(statuses, dict) else 0
+        if running == 0 and metrics.get("token_metrics_unavailable") is True:
+            raise RuntimeError("candidate token metrics did not reconcile")
         if float(token_total) > self._config.observed_token_cap:
             raise RuntimeError("bench observed-token safety cap exceeded")
         if launch_total > self._config.agent_launch_cap:

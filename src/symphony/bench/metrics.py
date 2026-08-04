@@ -106,10 +106,7 @@ async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dic
         if actual != expected:
             unreconciled.add(run_id)
     raw_tokens: int | None = None
-    if unreconciled:
-        if statuses.get("running", 0) == 0:
-            raise ValueError("run_model_usage totals do not reconcile with runs")
-    else:
+    if not unreconciled:
         raw_tokens = sum(
             int(row["input_tokens"])
             + int(row["output_tokens"])
@@ -130,6 +127,8 @@ async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dic
         "output_tokens": output_tokens,
         "cache_write_tokens": cache_write_tokens,
         "cache_read_tokens": cache_read_tokens,
+        "raw_tokens": raw_tokens,
+        "token_metrics_unavailable": raw_tokens is None,
         "cost_usd": sum(float(row["cost_usd"]) for row in rows),
         "effective_tokens": tokens,
         "remote_review_state_transitions": (
@@ -138,8 +137,6 @@ async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dic
         "runs_by_status": dict(sorted(statuses.items())),
         **local_metrics,
     }
-    if raw_tokens is not None:
-        metrics["raw_tokens"] = raw_tokens
     return metrics
 
 
