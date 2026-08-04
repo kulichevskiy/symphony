@@ -6241,9 +6241,7 @@ async def test_configured_required_checks_gate_private_repo_without_protection(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
-        binding = _binding().model_copy(
-            update={"required_status_checks": ("backend", "frontend")}
-        )
+        binding = _binding().model_copy(update={"required_status_checks": ("backend", "frontend")})
         view = _no_checks_view()
         view["headRefOid"] = "head-sha"
         view["statusCheckRollup"] = [

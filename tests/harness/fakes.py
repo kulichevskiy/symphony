@@ -683,14 +683,14 @@ class FakeGitHub:
             # is the seam `get_required_contexts` reads to tell required from
             # optional rollup failures.
             runs = [
-                    CheckRun(
-                        name=c.name,
-                        state=_check_state(c),
-                        bucket=_check_bucket(c),
-                    )
-                    for c in sim_pr.checks
-                    if c.required or c.name in required_contexts
-                ]
+                CheckRun(
+                    name=c.name,
+                    state=_check_state(c),
+                    bucket=_check_bucket(c),
+                )
+                for c in sim_pr.checks
+                if c.required or c.name in required_contexts
+            ]
             if required_contexts:
                 present = {run.name for run in runs}
                 runs.extend(

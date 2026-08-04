@@ -185,7 +185,5 @@ async def test_transient_pr_delivery_retries_without_operator_input(
 
     monkeypatch.setattr(asyncio, "sleep", no_sleep)
 
-    assert await _retry_transient_delivery(ensure_pr) == (
-        "https://github.com/org/repo/pull/1"
-    )
+    assert await _retry_transient_delivery(ensure_pr) == ("https://github.com/org/repo/pull/1")
     assert attempts == 2

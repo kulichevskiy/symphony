@@ -68,12 +68,8 @@ def load_hidden_manifest(path: Path) -> HiddenManifest:
             str(name): ControlExpectation(
                 backend_passed=int(expectation["backend_passed"]),
                 frontend_passed=int(expectation["frontend_passed"]),
-                backend_failed_test_ids=_test_ids(
-                    expectation.get("backend_failed_test_ids", [])
-                ),
-                frontend_failed_test_ids=_test_ids(
-                    expectation.get("frontend_failed_test_ids", [])
-                ),
+                backend_failed_test_ids=_test_ids(expectation.get("backend_failed_test_ids", [])),
+                frontend_failed_test_ids=_test_ids(expectation.get("frontend_failed_test_ids", [])),
             )
             for name, expectation in raw_mutations.items()
             if isinstance(expectation, dict)
@@ -229,12 +225,8 @@ def validate_control_result(
                 f"got {passed}/{total}"
             )
         if control in manifest.mutations:
-            expected_failures = getattr(
-                manifest.mutations[control], f"{component}_failed_test_ids"
-            )
-            actual_failures = _metric_test_ids(
-                metrics, f"{component}_hidden_failed_test_ids"
-            )
+            expected_failures = getattr(manifest.mutations[control], f"{component}_failed_test_ids")
+            actual_failures = _metric_test_ids(metrics, f"{component}_hidden_failed_test_ids")
             if actual_failures != expected_failures:
                 raise GraderInfrastructureError(
                     f"{control}: expected {component} failures {list(expected_failures)!r}, "

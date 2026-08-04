@@ -3202,8 +3202,7 @@ class _MergeMixin(_OrchestratorBase):
                     pr_url=pr_url,
                     run_id=run_id,
                     reason=(
-                        f"merge-agent pushed unreviewed HEAD "
-                        f"{premerge_head_sha or '(unknown)'}"
+                        f"merge-agent pushed unreviewed HEAD {premerge_head_sha or '(unknown)'}"
                     ),
                 )
                 state = await db.review_state.get(self._conn, storage_issue_id)

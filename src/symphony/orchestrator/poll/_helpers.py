@@ -42,15 +42,15 @@ _TRANSIENT_DELIVERY_ERROR = re.compile(
     r"operation timed out|empty reply from server|remote end hung up)",
     re.IGNORECASE,
 )
+
+
 async def _retry_transient_delivery[T](operation: Callable[[], Awaitable[T]]) -> T:
     """Retry an idempotent delivery operation after transient transport errors."""
     for attempt in range(3):
         try:
             return await operation()
         except Exception as exc:
-            transient = isinstance(exc, TimeoutError) or _TRANSIENT_DELIVERY_ERROR.search(
-                str(exc)
-            )
+            transient = isinstance(exc, TimeoutError) or _TRANSIENT_DELIVERY_ERROR.search(str(exc))
             if attempt == 2 or not transient:
                 raise
             await asyncio.sleep(2**attempt)

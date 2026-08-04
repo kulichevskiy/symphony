@@ -495,9 +495,7 @@ async def test_pr_checks_uses_configured_contexts_without_branch_protection(fake
 
 
 async def test_pr_checks_marks_missing_configured_context_pending(fake_gh) -> None:  # type: ignore[no-untyped-def]
-    payload = json.dumps(
-        [{"name": "backend", "state": "SUCCESS", "bucket": "pass", "link": None}]
-    )
+    payload = json.dumps([{"name": "backend", "state": "SUCCESS", "bucket": "pass", "link": None}])
     fake_gh({"pr checks": [0, payload]})
 
     result = await GitHub().pr_checks(

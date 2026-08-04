@@ -105,9 +105,7 @@ async def sync_connections(candidate_path: Path, control_path: Path) -> int:
                         await control.rollback()
                     continue
                 current_sequence = (
-                    int(current_row["sequence_generation"])
-                    if current_row is not None
-                    else 0
+                    int(current_row["sequence_generation"]) if current_row is not None else 0
                 )
                 control_credential_generation = (
                     int(current_row["credential_generation"])
@@ -233,21 +231,15 @@ async def mirror_connections(control_path: Path, candidate_path: Path) -> int:
                 current_row = await current.fetchone()
                 control_sequence = int(row["sequence_generation"])
                 candidate_sequence = (
-                    int(current_row["sequence_generation"])
-                    if current_row is not None
-                    else 0
+                    int(current_row["sequence_generation"]) if current_row is not None else 0
                 )
                 control_connected = bool(row["connected"])
-                candidate_connected = bool(
-                    current_row is not None and current_row["connected"]
-                )
+                candidate_connected = bool(current_row is not None and current_row["connected"])
                 merged_sequence = max(control_sequence, candidate_sequence)
                 if control_connected and candidate_connected:
                     assert current_row is not None
                     control_credential_generation = int(row["credential_generation"])
-                    candidate_credential_generation = int(
-                        current_row["credential_generation"]
-                    )
+                    candidate_credential_generation = int(current_row["credential_generation"])
                     candidate_is_newer = candidate_credential_generation > (
                         control_credential_generation
                     ) or (

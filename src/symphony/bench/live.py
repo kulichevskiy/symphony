@@ -409,9 +409,7 @@ class LiveTrialExecutor:
                 metrics={
                     **metrics,
                     "raw_tokens": metrics.get("raw_tokens"),
-                    "token_metrics_unavailable": metrics.get(
-                        "token_metrics_unavailable", True
-                    ),
+                    "token_metrics_unavailable": metrics.get("token_metrics_unavailable", True),
                     "wall_seconds": asyncio.get_running_loop().time() - started,
                     "partial_receipt_timed_out": True,
                     "remote_review_metrics_unavailable": True,

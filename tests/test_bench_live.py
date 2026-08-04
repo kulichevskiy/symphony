@@ -672,9 +672,7 @@ async def test_connection_reconciliation_ignores_failed_cas_generation_gaps(
     for path in (control_db, candidate_db):
         connection = await db.connect(path)
         try:
-            credential = await db.oauth_connections.get_credential(
-                connection, "linear", cipher
-            )
+            credential = await db.oauth_connections.get_credential(connection, "linear", cipher)
             status = await db.oauth_connections.get_status(connection, "linear")
             sequence = await (
                 await connection.execute(
@@ -766,9 +764,7 @@ async def test_failed_trial_receipt_marks_unreconciled_raw_tokens_unavailable(
     tmp_path: Path, private_bench_controls: Path
 ) -> None:
     commands = UnreconciledRunningCommands()
-    root, private_root = _frozen_roots(
-        tmp_path, "EXP-UNRECONCILED", private_bench_controls
-    )
+    root, private_root = _frozen_roots(tmp_path, "EXP-UNRECONCILED", private_bench_controls)
     executor = LiveTrialExecutor(
         config=LiveBenchConfig(
             root=root,

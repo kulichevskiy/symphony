@@ -1015,12 +1015,7 @@ class _ReviewMixin(_OrchestratorBase):
         if await self._review_poll_deferred_by_deliver_failed_wait(run.issue_id, run.id):
             return
         handled_feedback = await self._poll_review_run(run, current_binding, current_issue)
-        if (
-            rearm_retry_pending
-            and not force_retrigger
-            and not rearm_done
-            and handled_feedback
-        ):
+        if rearm_retry_pending and not force_retrigger and not rearm_done and handled_feedback:
             await self._clear_review_rearm_retry(run.id)
 
     async def _refresh_review_poll_candidate(
