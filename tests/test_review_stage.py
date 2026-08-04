@@ -1482,6 +1482,57 @@ async def test_review_fix_already_done_on_current_head_completes_without_parking
 
 
 @pytest.mark.asyncio
+async def test_already_resolved_review_rearm_failure_retries_without_new_fixer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        binding = _binding()
+        issue = _issue_in_review()
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+
+        retrigger = AsyncMock(side_effect=[False, True])
+        monkeypatch.setattr(orch, "_retrigger_codex_review_unless_approved", retrigger)
+
+        run = next(
+            r for r in await db.runs.history_for_issue(conn, "iss-1") if r.id == "review-run"
+        )
+        state = await db.review_state.get(conn, "iss-1")
+        await orch._rearm_after_already_resolved_fix(  # noqa: SLF001
+            run=run,
+            binding=binding,
+            issue=issue,
+            state=state,
+        )
+
+        assert await db.runs.has_review_rearm_retry(conn, run.id)
+        assert await db.runs.review_rearm_retry_is_forced(conn, run.id)
+
+        refresh = AsyncMock(return_value=(binding, issue))
+        poll = AsyncMock(return_value=False)
+        deliver_wait = AsyncMock(return_value=False)
+        monkeypatch.setattr(orch, "_refresh_review_poll_candidate", refresh)
+        monkeypatch.setattr(orch, "_poll_review_run", poll)
+        monkeypatch.setattr(orch, "_review_poll_deferred_by_deliver_failed_wait", deliver_wait)
+
+        await orch._poll_review_run_with_limits(run, binding, issue)  # noqa: SLF001
+
+        assert retrigger.await_args_list[-1].kwargs["require_no_signal"] is False
+        assert not await db.runs.has_review_rearm_retry(conn, run.id)
+        poll.assert_awaited_once()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_review_fix_dirty_tree_blocked_marker_preserved_not_committed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

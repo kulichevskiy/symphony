@@ -859,9 +859,18 @@ class _ReviewMixin(_OrchestratorBase):
         task.add_done_callback(partial(self._review_poll_done, run_id=run.id, issue_id=issue.id))
         return task
 
-    async def _mark_review_rearm_retry(self, run_id: str) -> None:
+    async def _mark_review_rearm_retry(
+        self,
+        run_id: str,
+        *,
+        force_retrigger: bool = False,
+    ) -> None:
         self._review_rearm_retry_run_ids.add(run_id)
-        await db.runs.mark_review_rearm_retry(self._conn, run_id)
+        await db.runs.mark_review_rearm_retry(
+            self._conn,
+            run_id,
+            force_retrigger=force_retrigger,
+        )
 
     async def _clear_review_rearm_retry(self, run_id: str) -> None:
         self._review_rearm_retry_run_ids.discard(run_id)
@@ -985,6 +994,11 @@ class _ReviewMixin(_OrchestratorBase):
             return
         current_binding, current_issue = current
         rearm_retry_pending = await self._review_rearm_retry_pending(run.id)
+        force_retrigger = (
+            await db.runs.review_rearm_retry_is_forced(self._conn, run.id)
+            if rearm_retry_pending
+            else False
+        )
         if await self._review_poll_deferred_by_deliver_failed_wait(run.issue_id, run.id):
             return
         rearm_done = True
@@ -994,14 +1008,19 @@ class _ReviewMixin(_OrchestratorBase):
                 binding=current_binding,
                 issue=current_issue,
                 state=state,
-                require_no_signal=True,
+                require_no_signal=not force_retrigger,
             )
             if rearm_done:
                 await self._clear_review_rearm_retry(run.id)
         if await self._review_poll_deferred_by_deliver_failed_wait(run.issue_id, run.id):
             return
         handled_feedback = await self._poll_review_run(run, current_binding, current_issue)
-        if rearm_retry_pending and not rearm_done and handled_feedback:
+        if (
+            rearm_retry_pending
+            and not force_retrigger
+            and not rearm_done
+            and handled_feedback
+        ):
             await self._clear_review_rearm_retry(run.id)
 
     async def _refresh_review_poll_candidate(
@@ -1863,7 +1882,8 @@ class _ReviewMixin(_OrchestratorBase):
                     issue.identifier,
                 )
                 state = await db.review_state.get(self._conn, issue.id)
-                await self._retrigger_codex_review_unless_approved(
+                await self._rearm_after_already_resolved_fix(
+                    run=run,
                     binding=binding,
                     issue=issue,
                     state=state,
@@ -2049,6 +2069,24 @@ class _ReviewMixin(_OrchestratorBase):
             state=state,
         )
         return posted
+
+    async def _rearm_after_already_resolved_fix(
+        self,
+        *,
+        run: db.runs.Run,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        state: db.review_state.ReviewState,
+    ) -> None:
+        rearmed = await self._retrigger_codex_review_unless_approved(
+            binding=binding,
+            issue=issue,
+            state=state,
+        )
+        if not rearmed:
+            # The old signal is now deduplicated, so persist a forced re-arm.
+            # Otherwise a transient GitHub failure could strand the AFK flow.
+            await self._mark_review_rearm_retry(run.id, force_retrigger=True)
 
     async def _review_verdict_and_head_for_pr(
         self,
@@ -2347,7 +2385,8 @@ class _ReviewMixin(_OrchestratorBase):
                     issue.identifier,
                 )
                 state = await db.review_state.get(self._conn, issue.id)
-                await self._retrigger_codex_review_unless_approved(
+                await self._rearm_after_already_resolved_fix(
+                    run=run,
                     binding=binding,
                     issue=issue,
                     state=state,
