@@ -73,6 +73,14 @@ COMPLETION_CONTRACT_ALREADY_DONE = (
     "changes.\n"
 )
 
+REVIEW_FIX_COMPLETION_CONTRACT_ALREADY_DONE = (
+    "- `SYMPHONY_ALREADY_DONE: <current-head-sha> (<evidence>)` — the review "
+    "signal is delayed or duplicated and the current HEAD already resolves it, "
+    "so there is nothing to commit. Use this ONLY after verifying the feedback "
+    "against the current tree and confirming the working tree is clean. Name the "
+    "current HEAD SHA and concise evidence.\n"
+)
+
 
 def implement_handoff_block(*, blocked_reason: str = "", operator_comment: str = "") -> str:
     """Render the operator-handoff section for a blocked-run resume.
@@ -180,6 +188,8 @@ def review_fix_prompt(
         "- Make the smallest change that resolves the failing review signal.\n"
         "- Commit your changes on the current branch (do not push).\n"
         "- Do not edit unrelated files.\n"
+        f"{COMPLETION_CONTRACT}"
+        f"{REVIEW_FIX_COMPLETION_CONTRACT_ALREADY_DONE}"
         f"{HEADLESS_RULES}"
     )
 
@@ -208,6 +218,7 @@ def review_comment_fix_prompt(
         "- Commit your changes on the current branch (do not push).\n"
         "- Do not edit unrelated files.\n\n"
         f"{COMPLETION_CONTRACT}"
+        f"{REVIEW_FIX_COMPLETION_CONTRACT_ALREADY_DONE}"
         f"{HEADLESS_RULES}"
     )
 

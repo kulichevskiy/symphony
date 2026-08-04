@@ -1264,7 +1264,9 @@ async def test_review_fix_dirty_tree_no_commit_recovers_via_commit_turn(
             start_sha="before-fix-sha",
         )
 
-        assert result == "after-commit-sha"
+        assert result is not None
+        assert result.sha == "after-commit-sha"
+        assert result.changed is True
         commit_turn.assert_awaited_once()
         # A recovered advance is NOT a failure — no operator-wait escalation.
         fail.assert_not_awaited()
@@ -1328,7 +1330,7 @@ async def test_review_fix_dirty_tree_commit_turn_no_op_escalates_with_uncommitte
             start_sha="before-fix-sha",
         )
 
-        assert result == ""
+        assert result is None
         commit_turn.assert_awaited_once()
         fail.assert_awaited_once()
         reason = fail.await_args.kwargs["error"]
@@ -1394,10 +1396,87 @@ async def test_review_fix_clean_tree_no_op_unchanged(
             start_sha="before-fix-sha",
         )
 
-        assert result == ""
+        assert result is None
         commit_turn.assert_not_awaited()
         fail.assert_awaited_once()
         assert "completed without advancing" in fail.await_args.kwargs["error"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_fix_already_done_on_current_head_completes_without_parking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delayed review signal may describe work another fix already landed.
+
+    The fixer must be able to prove that the current HEAD already resolves the
+    signal without manufacturing an empty commit or parking the whole pipeline.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        orch = _validate_orch(conn, tmp_path)
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="review-fix",
+            issue_id="iss-1",
+            stage="review_fix",
+            status="running",
+            pid=None,
+            started_at=datetime.now(UTC).isoformat(),
+        )
+
+        head_sha = "a" * 40
+        log_root = tmp_path / "logs"
+        log_root.mkdir(parents=True, exist_ok=True)
+        (log_root / "review-fix.log").write_text(
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": (
+                        "The CI fix already resolved this delayed review finding.\n"
+                        f"SYMPHONY_ALREADY_DONE: {head_sha} (verified on current HEAD)"
+                    ),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        async def fake_dirty_files(_ws: Path) -> list[str]:
+            return []
+
+        async def fake_head_sha(_ws: Path) -> str:
+            return head_sha
+
+        monkeypatch.setattr(review_module, "_workspace_dirty_files", fake_dirty_files)
+        monkeypatch.setattr(review_module, "_workspace_head_sha", fake_head_sha)
+
+        fail = AsyncMock()
+        monkeypatch.setattr(orch, "_fail_review_run", fail)
+
+        run = MagicMock()
+        run.id = "review-run"
+        run.issue_id = "iss-1"
+
+        result = await orch._validate_review_fix_advanced(  # noqa: SLF001
+            run=run,
+            fix_run_id="review-fix",
+            binding=_binding(),
+            issue=_issue_in_progress(),
+            workspace_path=tmp_path,
+            branch="symphony/eng-1",
+            start_sha=head_sha,
+        )
+
+        assert result is not None
+        assert result.sha == head_sha
+        assert result.changed is False
+        fail.assert_not_awaited()
     finally:
         await conn.close()
 
@@ -1476,7 +1555,7 @@ async def test_review_fix_dirty_tree_blocked_marker_preserved_not_committed(
             start_sha="before-fix-sha",
         )
 
-        assert result == ""
+        assert result is None
         commit_turn.assert_not_awaited()
         fail.assert_awaited_once()
         reason = fail.await_args.kwargs["error"]
@@ -1549,7 +1628,7 @@ async def test_review_fix_dirty_tree_commit_turn_partial_commit_still_escalates(
             start_sha="before-fix-sha",
         )
 
-        assert result == ""
+        assert result is None
         commit_turn.assert_awaited_once()
         fail.assert_awaited_once()
         reason = fail.await_args.kwargs["error"]

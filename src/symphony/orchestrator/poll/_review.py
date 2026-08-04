@@ -29,6 +29,7 @@ from collections.abc import (
     Callable,
 )
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -293,6 +294,25 @@ _CODEX_REVIEWED_COMMIT_RE = re.compile(
     r"reviewed\s+commit:\s*\**\s*`?\s*([0-9a-fA-F]{7,40})",
     re.IGNORECASE,
 )
+
+_COMMIT_SHA_RE = re.compile(r"\b[0-9a-fA-F]{7,40}\b")
+
+
+@dataclass(frozen=True)
+class _ReviewFixAdvance:
+    sha: str
+    changed: bool
+
+
+def _review_fix_claim_sha(ref: str) -> str:
+    match = _COMMIT_SHA_RE.search(ref)
+    return match.group(0) if match else ""
+
+
+def _sha_matches(left: str, right: str) -> bool:
+    left = left.strip().lower()
+    right = right.strip().lower()
+    return bool(left and right and (left.startswith(right) or right.startswith(left)))
 
 
 def _codex_lgtm_reactions_from_issue_comments(
@@ -1816,7 +1836,7 @@ class _ReviewMixin(_OrchestratorBase):
                 )
                 return False
 
-            pushed_sha = await self._validate_review_fix_advanced(
+            advance = await self._validate_review_fix_advanced(
                 run=run,
                 fix_run_id=fix_run_id,
                 binding=binding,
@@ -1825,8 +1845,9 @@ class _ReviewMixin(_OrchestratorBase):
                 branch=branch,
                 start_sha=start_sha,
             )
-            if not pushed_sha:
+            if advance is None:
                 return False
+            pushed_sha = advance.sha
 
             await db.runs.update_status(
                 self._conn,
@@ -1834,6 +1855,20 @@ class _ReviewMixin(_OrchestratorBase):
                 "completed",
                 ended_at=self._now().isoformat(),
             )
+
+            if not advance.changed:
+                log.info(
+                    "review fix signal was already resolved on %s for %s",
+                    pushed_sha[:12],
+                    issue.identifier,
+                )
+                state = await db.review_state.get(self._conn, issue.id)
+                await self._retrigger_codex_review_unless_approved(
+                    binding=binding,
+                    issue=issue,
+                    state=state,
+                )
+                return True
 
             local_review_result: LoopResult | None = None
             local_only_review = (
@@ -2285,7 +2320,7 @@ class _ReviewMixin(_OrchestratorBase):
                 )
                 return False
 
-            pushed_sha = await self._validate_review_fix_advanced(
+            advance = await self._validate_review_fix_advanced(
                 run=run,
                 fix_run_id=fix_run_id,
                 binding=binding,
@@ -2294,8 +2329,9 @@ class _ReviewMixin(_OrchestratorBase):
                 branch=branch,
                 start_sha=start_sha,
             )
-            if not pushed_sha:
+            if advance is None:
                 return False
+            pushed_sha = advance.sha
 
             await db.runs.update_status(
                 self._conn,
@@ -2303,6 +2339,20 @@ class _ReviewMixin(_OrchestratorBase):
                 "completed",
                 ended_at=self._now().isoformat(),
             )
+
+            if not advance.changed:
+                log.info(
+                    "review feedback was already resolved on %s for %s",
+                    pushed_sha[:12],
+                    issue.identifier,
+                )
+                state = await db.review_state.get(self._conn, issue.id)
+                await self._retrigger_codex_review_unless_approved(
+                    binding=binding,
+                    issue=issue,
+                    state=state,
+                )
+                return True
 
             try:
                 await self._push_fn(workspace_path, branch)
@@ -2719,7 +2769,7 @@ class _ReviewMixin(_OrchestratorBase):
             drop_dispatch_id()
             await _add_run_usage(self._conn, fix_run_id, cumulative_usage)
 
-            pushed_sha = await self._validate_review_fix_advanced(
+            advance = await self._validate_review_fix_advanced(
                 run=run,
                 fix_run_id=fix_run_id,
                 binding=binding,
@@ -2728,8 +2778,9 @@ class _ReviewMixin(_OrchestratorBase):
                 branch=branch,
                 start_sha=start_sha,
             )
-            if not pushed_sha:
+            if advance is None:
                 return False
+            pushed_sha = advance.sha
 
             await db.runs.update_status(
                 self._conn,
@@ -2808,10 +2859,10 @@ class _ReviewMixin(_OrchestratorBase):
         workspace_path: Path,
         branch: str,
         start_sha: str,
-    ) -> str:
+    ) -> _ReviewFixAdvance | None:
         current_sha = await _workspace_head_sha(workspace_path)
         if current_sha and current_sha != start_sha:
-            return current_sha
+            return _ReviewFixAdvance(sha=current_sha, changed=True)
 
         short_sha = (current_sha or start_sha)[:12] or "(unknown)"
         status_short = await _git_status_short(workspace_path)
@@ -2845,7 +2896,31 @@ class _ReviewMixin(_OrchestratorBase):
             # via _fail_run; just clear review rearm state and return.
             await self._clear_review_rearm_retry(run.id)
             self._clear_review_no_signal_rearm_heads(run.id)
-            return ""
+            return None
+        role = binding.resolved_role("fix", self.config.roles)
+        final_message = _read_run_final_message(log_path, agent=role.agent)
+        marker = parse_completion_marker(final_message)
+        if marker.kind == "already_done":
+            claimed_sha = _review_fix_claim_sha(marker.already_done_ref)
+            dirty_files = await _workspace_dirty_files(workspace_path)
+            if (
+                current_sha
+                and not dirty_files
+                and _sha_matches(claimed_sha, current_sha)
+                and _sha_matches(current_sha, start_sha)
+            ):
+                log.info(
+                    "review fix-run for %s verified delayed/duplicate signal "
+                    "already resolved on %s",
+                    issue.identifier,
+                    current_sha[:12],
+                )
+                return _ReviewFixAdvance(sha=current_sha, changed=False)
+            reason = (
+                f"review fix-run claimed SYMPHONY_ALREADY_DONE but could not verify "
+                f"current clean HEAD {short_sha} from marker: "
+                f"{marker.already_done_ref or '(missing ref)'}"
+            )
         # SYM-223: a clean rc=0 exit (no transient API error) that left the
         # worktree dirty without advancing HEAD means the fixer made edits and
         # ended its turn without committing — e.g. it backgrounded a long check
@@ -2857,9 +2932,6 @@ class _ReviewMixin(_OrchestratorBase):
         if api_error is None:
             dirty_files = await _workspace_dirty_files(workspace_path)
             if dirty_files:
-                role = binding.resolved_role("fix", self.config.roles)
-                final_message = _read_run_final_message(log_path, agent=role.agent)
-                marker = parse_completion_marker(final_message)
                 if marker.kind == "blocked":
                     # The fixer explicitly ended SYMPHONY_BLOCKED on a human
                     # action rather than forgetting to commit. Forcing a
@@ -2893,7 +2965,7 @@ class _ReviewMixin(_OrchestratorBase):
                         else dirty_files
                     )
                     if current_sha and current_sha != start_sha and not remaining_dirty:
-                        return current_sha
+                        return _ReviewFixAdvance(sha=current_sha, changed=True)
                     short_sha = (current_sha or start_sha)[:12] or "(unknown)"
                     status_short = await _git_status_short(workspace_path)
                     last_log = f"git status --short:\n{status_short}" if status_short else ""
@@ -2927,7 +2999,7 @@ class _ReviewMixin(_OrchestratorBase):
             auto_retry=False,
             operator_wait=True,
         )
-        return ""
+        return None
 
     async def _failing_check_log_tail(
         self,
