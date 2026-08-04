@@ -1881,12 +1881,10 @@ class _ReviewMixin(_OrchestratorBase):
                     pushed_sha[:12],
                     issue.identifier,
                 )
-                state = await db.review_state.get(self._conn, issue.id)
                 await self._rearm_after_already_resolved_fix(
                     run=run,
                     binding=binding,
                     issue=issue,
-                    state=state,
                 )
                 return True
 
@@ -2076,8 +2074,8 @@ class _ReviewMixin(_OrchestratorBase):
         run: db.runs.Run,
         binding: RepoBinding,
         issue: LinearIssue,
-        state: db.review_state.ReviewState,
     ) -> None:
+        state = await db.review_state.get(self._conn, run.issue_id)
         rearmed = await self._retrigger_codex_review_unless_approved(
             binding=binding,
             issue=issue,
@@ -2384,12 +2382,10 @@ class _ReviewMixin(_OrchestratorBase):
                     pushed_sha[:12],
                     issue.identifier,
                 )
-                state = await db.review_state.get(self._conn, issue.id)
                 await self._rearm_after_already_resolved_fix(
                     run=run,
                     binding=binding,
                     issue=issue,
-                    state=state,
                 )
                 return True
 

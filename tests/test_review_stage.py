@@ -1491,6 +1491,7 @@ async def test_already_resolved_review_rearm_failure_retries_without_new_fixer(
         await _seed_active_review(conn)
         binding = _binding()
         issue = _issue_in_review()
+        issue.id = "tracker-iss-1"
         cfg = Config(
             repos=[binding],
             log_root=tmp_path / "logs",
@@ -1505,16 +1506,15 @@ async def test_already_resolved_review_rearm_failure_retries_without_new_fixer(
         run = next(
             r for r in await db.runs.history_for_issue(conn, "iss-1") if r.id == "review-run"
         )
-        state = await db.review_state.get(conn, "iss-1")
         await orch._rearm_after_already_resolved_fix(  # noqa: SLF001
             run=run,
             binding=binding,
             issue=issue,
-            state=state,
         )
 
         assert await db.runs.has_review_rearm_retry(conn, run.id)
         assert await db.runs.review_rearm_retry_is_forced(conn, run.id)
+        assert retrigger.await_args_list[0].kwargs["state"].pr_number == 42
 
         refresh = AsyncMock(return_value=(binding, issue))
         poll = AsyncMock(return_value=False)
