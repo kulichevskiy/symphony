@@ -29,6 +29,7 @@ class ExperimentStore:
                 CREATE TABLE IF NOT EXISTS bench_experiments (
                     id TEXT PRIMARY KEY,
                     status TEXT NOT NULL,
+                    mode TEXT NOT NULL DEFAULT 'paired',
                     candidate_a TEXT NOT NULL,
                     candidate_b TEXT NOT NULL,
                     candidate_a_profile TEXT NOT NULL DEFAULT '{}',
@@ -62,6 +63,9 @@ class ExperimentStore:
                     FOREIGN KEY (experiment_id) REFERENCES bench_experiments(id)
                 )
                 """
+            )
+            self._ensure_column(
+                conn, "bench_experiments", "mode", "TEXT NOT NULL DEFAULT 'paired'"
             )
             self._ensure_column(
                 conn, "bench_experiments", "candidate_a_profile", "TEXT NOT NULL DEFAULT '{}'"
@@ -117,16 +121,17 @@ class ExperimentStore:
             conn.execute(
                 """
                 INSERT INTO bench_experiments
-                    (id, status, candidate_a, candidate_b, candidate_a_profile,
+                    (id, status, mode, candidate_a, candidate_b, candidate_a_profile,
                      candidate_b_profile, system_version_a, system_version_b,
                      executor_toolchain_version, harness_version, repetitions, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     experiment.id,
                     experiment.status,
+                    experiment.mode,
                     experiment.candidate_a,
-                    experiment.candidate_b,
+                    experiment.candidate_b or "",
                     json.dumps(experiment.candidate_a_profile, sort_keys=True),
                     json.dumps(experiment.candidate_b_profile, sort_keys=True),
                     experiment.system_version_a,
@@ -143,7 +148,7 @@ class ExperimentStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, status, candidate_a, candidate_b, candidate_a_profile,
+                SELECT id, status, mode, candidate_a, candidate_b, candidate_a_profile,
                        candidate_b_profile, system_version_a, system_version_b,
                        executor_toolchain_version, harness_version, repetitions, created_at
                 FROM bench_experiments WHERE id = ?
@@ -153,6 +158,7 @@ class ExperimentStore:
         if row is None:
             return None
         payload = dict(row)
+        payload["candidate_b"] = payload["candidate_b"] or None
         payload["candidate_a_profile"] = json.loads(payload["candidate_a_profile"])
         payload["candidate_b_profile"] = json.loads(payload["candidate_b_profile"])
         return Experiment.model_validate(payload)
@@ -162,7 +168,7 @@ class ExperimentStore:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
-                SELECT id, status, candidate_a, candidate_b, candidate_a_profile,
+                SELECT id, status, mode, candidate_a, candidate_b, candidate_a_profile,
                        candidate_b_profile, system_version_a, system_version_b,
                        executor_toolchain_version, harness_version, repetitions, created_at
                 FROM bench_experiments
@@ -178,6 +184,7 @@ class ExperimentStore:
                 (row["id"],),
             )
         claimed = dict(row)
+        claimed["candidate_b"] = claimed["candidate_b"] or None
         claimed["candidate_a_profile"] = json.loads(claimed["candidate_a_profile"])
         claimed["candidate_b_profile"] = json.loads(claimed["candidate_b_profile"])
         claimed["status"] = "running"

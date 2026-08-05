@@ -295,6 +295,30 @@ def test_local_review_metrics_count_final_verdicts_and_severity(tmp_path: Path) 
     }
 
 
+def test_local_review_metrics_count_hybrid_combined_verdict_only(tmp_path: Path) -> None:
+    review = tmp_path / "local_review" / "parent"
+    review.mkdir(parents=True)
+    (review / "review-0-spec.last.txt").write_text(
+        "Spec axis.\n<<<VERDICT:CHANGES_REQUESTED>>>\n", encoding="utf-8"
+    )
+    (review / "review-0-bug.last.txt").write_text(
+        "[P2] Race — queue.py:10 — stale state", encoding="utf-8"
+    )
+    (review / "review-0-hybrid.last.txt").write_text(
+        "## Findings\n- [Major] queue.py:10 stale state\n<<<VERDICT:CHANGES_REQUESTED>>>\n",
+        encoding="utf-8",
+    )
+    for name in ("review-0-spec.out.log", "review-0-bug.out.log", "fix-0.out.log"):
+        (review / name).write_text("transcript", encoding="utf-8")
+
+    metrics = local_review_metrics(tmp_path)
+    assert metrics["local_review_agent_launches"] == 3
+    assert metrics["local_review_rounds"] == 1
+    assert metrics["local_review_unparseable_rounds"] == 0
+    assert metrics["local_review_findings"] == 1
+    assert metrics["local_review_major"] == 1
+
+
 def test_prior_solutions_and_hidden_harness_leave_executor_volume(tmp_path: Path) -> None:
     shared = tmp_path / "shared"
     trial = shared / "EXP-OLD" / "A1"

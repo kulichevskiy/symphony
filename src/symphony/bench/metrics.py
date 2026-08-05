@@ -16,7 +16,7 @@ _LOCAL_REVIEW_MARKERS = (
 )
 _LOCAL_FINDING_RE = re.compile(r"(?m)^[ \t]{0,3}[-*][ \t]+(.+)$")
 _LOCAL_SEVERITY_RE = re.compile(r"^\*{0,2}\[(Critical|Major|Minor)\]", re.IGNORECASE)
-_LOCAL_FINDER_FILE_RE = re.compile(r"^review-\d+-find(?:-attempt-\d+)?\.last\.txt$")
+_LOCAL_AUXILIARY_FILE_RE = re.compile(r"^review-\d+-(?:find|spec|bug)(?:-attempt-\d+)?\.last\.txt$")
 
 
 async def snapshot_candidate(db_path: Path, log_root: Path | None = None) -> dict[str, object]:
@@ -151,7 +151,7 @@ def local_review_metrics(log_root: Path | None) -> dict[str, int]:
             for _path in review_root.glob(pattern)
         )
         for path in review_root.glob("*/review-*.last.txt"):
-            if _LOCAL_FINDER_FILE_RE.fullmatch(path.name):
+            if _LOCAL_AUXILIARY_FILE_RE.fullmatch(path.name):
                 continue
             try:
                 message = path.read_text(encoding="utf-8")

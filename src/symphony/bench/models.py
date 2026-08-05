@@ -7,9 +7,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 ExperimentStatus = Literal["queued", "running", "completed", "failed"]
+ExperimentMode = Literal["paired", "single"]
 TrialStatus = Literal["running", "completed", "failed"]
 _TOOLCHAIN_RECEIPT = Path("/usr/local/share/symphony-bench-toolchain.txt")
 
@@ -26,11 +27,21 @@ EXECUTOR_TOOLCHAIN_VERSION = read_executor_toolchain_version()
 
 
 class ExperimentCreate(BaseModel):
+    mode: ExperimentMode = "paired"
     candidate_a: str = Field(min_length=1)
-    candidate_b: str = Field(min_length=1)
+    candidate_b: str | None = Field(default=None, min_length=1)
     candidate_a_profile: dict[str, object] = Field(default_factory=dict)
     candidate_b_profile: dict[str, object] = Field(default_factory=dict)
     repetitions: int = Field(default=3, ge=1, le=10)
+
+    @model_validator(mode="after")
+    def validate_candidates(self) -> ExperimentCreate:
+        if self.mode == "paired" and self.candidate_b is None:
+            raise ValueError("candidate_b is required in paired mode")
+        if self.mode == "single":
+            self.candidate_b = None
+            self.candidate_b_profile = {}
+        return self
 
 
 class Experiment(ExperimentCreate):
@@ -55,10 +66,14 @@ class Experiment(ExperimentCreate):
                 request.candidate_a_profile,
                 EXECUTOR_TOOLCHAIN_VERSION,
             ),
-            system_version_b=system_version(
-                request.candidate_b,
-                request.candidate_b_profile,
-                EXECUTOR_TOOLCHAIN_VERSION,
+            system_version_b=(
+                system_version(
+                    request.candidate_b,
+                    request.candidate_b_profile,
+                    EXECUTOR_TOOLCHAIN_VERSION,
+                )
+                if request.candidate_b is not None
+                else ""
             ),
             executor_toolchain_version=EXECUTOR_TOOLCHAIN_VERSION,
             harness_version=harness_version,

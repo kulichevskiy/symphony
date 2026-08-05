@@ -299,6 +299,71 @@ class _StagedRunner:
         pass
 
 
+class _HybridRunner:
+    def __init__(self) -> None:
+        self.specs: list[RunnerSpec] = []
+        self.head = "implemented-head"
+        self.spec_round = 0
+
+    def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        self.specs.append(spec)
+
+        async def gen() -> AsyncIterator[RunnerEvent]:
+            if spec.stage == "local_review_fix":
+                self.head = "fixed-head"
+                yield RunnerEvent(
+                    kind="stdout",
+                    line=json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "id": "fix",
+                                "type": "agent_message",
+                                "text": "Fixed and committed.",
+                            },
+                        }
+                    ),
+                )
+            elif spec.run_id.endswith("-spec"):
+                self.spec_round += 1
+                text = (
+                    "## Findings\n"
+                    "- [Major] api.py:10 agents cannot create tickets. Allow agents.\n"
+                    f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+                    if self.spec_round == 1
+                    else f"Spec and standards pass.\n{VERDICT_APPROVED_MARKER}"
+                )
+                yield RunnerEvent(
+                    kind="stdout",
+                    line=json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {"id": "spec", "type": "agent_message", "text": text},
+                        }
+                    ),
+                )
+            else:
+                yield RunnerEvent(
+                    kind="stdout",
+                    line=json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "id": "bug",
+                                "type": "agent_message",
+                                "text": "No findings.",
+                            },
+                        }
+                    ),
+                )
+            yield RunnerEvent(kind="exit", returncode=0)
+
+        return gen()
+
+    async def kill(self, run_id: str) -> None:
+        pass
+
+
 @pytest.mark.asyncio
 async def test_session_total_cost_reflects_codex_token_pricing(
     tmp_path: Path,
@@ -337,6 +402,41 @@ async def test_session_total_cost_reflects_codex_token_pricing(
     assert result.outcome == LoopOutcome.APPROVED
     # Pricing sanity: 1M input @ $1.25 + 0.5M output @ $10 = $1.25 + $5 = $6.25
     assert result.total_cost_usd == pytest.approx(6.25, rel=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_hybrid_session_runs_two_axes_one_fix_and_targeted_closure(tmp_path: Path) -> None:
+    runner = _HybridRunner()
+
+    async def head_sha(_: Path) -> str:
+        return runner.head
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="r1",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.6-sol"),
+        verifier_role=ResolvedRole(agent="codex", model="gpt-5.6-sol"),
+        fixer_role=ResolvedRole(agent="codex", model="gpt-5.6-sol"),
+        cap=9,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        review_mode="hybrid",
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    fix_specs = [spec for spec in runner.specs if spec.stage == "local_review_fix"]
+    assert len(fix_specs) == 1
+    bug_specs = [spec for spec in runner.specs if spec.run_id.endswith("-bug")]
+    assert len(bug_specs) == 2
+    assert bug_specs[0].command[bug_specs[0].command.index("--base") + 1] == "main"
+    assert bug_specs[1].command[bug_specs[1].command.index("--base") + 1] == "implemented-head"
+    assert "agents cannot create tickets" in bug_specs[1].command[-1].lower()
 
 
 @pytest.mark.asyncio

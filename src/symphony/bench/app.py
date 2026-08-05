@@ -12,7 +12,14 @@ from uuid import uuid4
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
 
 from .grader import GraderInfrastructureError
-from .models import BenchNotification, Experiment, ExperimentCreate, ExperimentReport, Trial
+from .models import (
+    BenchNotification,
+    Experiment,
+    ExperimentCreate,
+    ExperimentMode,
+    ExperimentReport,
+    Trial,
+)
 from .report import persist_experiment_markdown, persist_trial_markdown
 from .runner import ExperimentRunner, TrialExecutor
 from .store import ExperimentStore
@@ -29,7 +36,7 @@ def create_bench_app(
     default_profile: dict[str, object] | None = None,
     resolve_revision: Callable[[str], Awaitable[str]] | None = None,
     harness_version: str = "",
-    prepare_harness: Callable[[str], Awaitable[str]] | None = None,
+    prepare_harness: Callable[[str, ExperimentMode], Awaitable[str]] | None = None,
     recover_execution: Callable[[], Awaitable[None]] | None = None,
     reports_root: Path | None = None,
 ) -> FastAPI:
@@ -146,14 +153,17 @@ def create_bench_app(
         updates: dict[str, object] = {}
         if "candidate_a_profile" not in request.model_fields_set:
             updates["candidate_a_profile"] = defaults
-        if "candidate_b_profile" not in request.model_fields_set:
+        if request.mode == "paired" and "candidate_b_profile" not in request.model_fields_set:
             updates["candidate_b_profile"] = defaults
         if resolve_revision is not None:
             try:
-                if request.candidate_a == request.candidate_b:
+                if request.mode == "single":
+                    updates["candidate_a"] = await resolve_revision(request.candidate_a)
+                elif request.candidate_a == request.candidate_b:
                     revision = await resolve_revision(request.candidate_a)
                     updates.update(candidate_a=revision, candidate_b=revision)
                 else:
+                    assert request.candidate_b is not None
                     candidate_a, candidate_b = await asyncio.gather(
                         resolve_revision(request.candidate_a),
                         resolve_revision(request.candidate_b),
@@ -168,7 +178,7 @@ def create_bench_app(
         pinned_harness = harness_version
         if prepare_harness is not None:
             try:
-                pinned_harness = await prepare_harness(experiment_id)
+                pinned_harness = await prepare_harness(experiment_id, request.mode)
             except GraderInfrastructureError as exc:
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

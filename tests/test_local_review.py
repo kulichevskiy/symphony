@@ -13,13 +13,16 @@ from symphony.pipeline.local_review import (
     VERDICT_CHANGES_REQUESTED_MARKER,
     DiffSize,
     LocalVerdictKind,
+    build_builtin_codex_review_command,
     build_local_review_command,
     default_reviewer_agent,
     extract_last_agent_message,
     is_small_diff,
     local_review_finder_prompt,
     local_review_prompt,
+    local_review_spec_prompt,
     local_review_verifier_prompt,
+    merge_hybrid_review_messages,
     parse_diff_numstat,
     parse_local_review_output,
 )
@@ -96,7 +99,131 @@ def test_local_review_prompt_handles_missing_origin_ref() -> None:
     assert "Do not narrate" in prompt or "do not narrate" in prompt
 
 
+def test_local_review_spec_prompt_checks_issue_and_repository_standards() -> None:
+    prompt = local_review_spec_prompt(
+        issue_title="Agents may create tickets",
+        issue_body="Creation is not admin-only.",
+        labels=["backend"],
+        comparison_ref="main",
+    )
+    assert "Spec" in prompt
+    assert "Standards" in prompt
+    assert "acceptance criteria" in prompt
+    assert "AGENTS.md" in prompt
+    assert "Agents may create tickets" in prompt
+    assert VERDICT_APPROVED_MARKER in prompt
+
+
+def test_merge_hybrid_review_messages_deduplicates_and_caps_p2() -> None:
+    spec = (
+        "## Findings\n"
+        "- [Major] api.py:10 agents cannot create tickets. Allow authenticated agents.\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+    )
+    bug = "\n".join(
+        [
+            "[P1] Agents cannot create tickets — api.py:10 — Allow authenticated agents.",
+            *[
+                f"[P2] Race {index} — queue.py:{index} — Guard race {index}."
+                for index in range(1, 8)
+            ],
+            "[P3] Rename helper — queue.py:99 — Clearer name.",
+        ]
+    )
+
+    merged = merge_hybrid_review_messages(
+        spec_message=spec,
+        builtin_message=bug,
+        head_sha="abc123",
+        max_p2=5,
+    )
+
+    assert merged.kind is LocalVerdictKind.CHANGES_REQUESTED
+    assert merged.findings.count("[Major]") == 1
+    assert merged.findings.count("[Minor]") == 5
+    assert "Race 5" in merged.findings
+    assert "Race 6" not in merged.findings
+    assert "Rename helper" not in merged.findings
+
+
+def test_merge_hybrid_review_messages_caps_p2_across_both_axes() -> None:
+    spec = (
+        "## Findings\n"
+        + "\n".join(
+            f"- [Minor] spec.py:{index} missing case {index}."
+            for index in range(1, 5)
+        )
+        + f"\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+    )
+    bug = "\n".join(
+        f"[P2] Bug {index} — bug.py:{index} — Guard case {index}."
+        for index in range(1, 5)
+    )
+
+    merged = merge_hybrid_review_messages(
+        spec_message=spec,
+        builtin_message=bug,
+        head_sha="abc123",
+        max_p2=5,
+    )
+
+    assert merged.findings.count("[Minor]") == 5
+    assert "Bug 1" in merged.findings
+    assert "Bug 2" not in merged.findings
+
+
+def test_merge_hybrid_review_messages_approves_when_both_axes_are_clean() -> None:
+    merged = merge_hybrid_review_messages(
+        spec_message=f"All requirements hold.\n{VERDICT_APPROVED_MARKER}",
+        builtin_message="No findings.",
+        head_sha="abc123",
+    )
+    assert merged.kind is LocalVerdictKind.APPROVED
+
+
+def test_merge_hybrid_review_messages_does_not_approve_unknown_builtin_output() -> None:
+    merged = merge_hybrid_review_messages(
+        spec_message=f"All requirements hold.\n{VERDICT_APPROVED_MARKER}",
+        builtin_message="I could not inspect the repository.",
+        head_sha="abc123",
+    )
+    assert merged.kind is LocalVerdictKind.UNPARSEABLE
+
+
+def test_merge_hybrid_review_messages_keeps_worst_duplicate_severity() -> None:
+    merged = merge_hybrid_review_messages(
+        spec_message=(
+            "## Findings\n"
+            "- [Major] api.py:10 agents cannot create tickets. Allow agents.\n"
+            f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+        ),
+        builtin_message=(
+            "[P0] Agents cannot create tickets — api.py:10 — Allow authenticated agents."
+        ),
+        head_sha="abc123",
+    )
+    assert merged.findings.count("api.py:10") == 1
+    assert "[Critical]" in merged.findings
+
+
 # --- command builder -----------------------------------------------------
+
+
+def test_build_builtin_codex_review_command_uses_review_mode_and_base() -> None:
+    argv = build_builtin_codex_review_command(
+        comparison_ref="reviewed-head",
+        prompt="find correctness bugs",
+        codex_model="gpt-5.6-sol",
+        effort="high",
+        last_message_path="/tmp/bug-review.txt",
+    )
+    assert argv[:3] == ["codex", "exec", "review"]
+    assert argv[argv.index("--base") + 1] == "reviewed-head"
+    assert argv[argv.index("--model") + 1] == "gpt-5.6-sol"
+    assert argv[argv.index("-o") + 1] == "/tmp/bug-review.txt"
+    assert "--json" in argv
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv
+    assert argv[-1] == "find correctness bugs"
 
 
 def test_build_local_review_command_codex_uses_plain_exec_read_only() -> None:

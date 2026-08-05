@@ -66,7 +66,7 @@ def test_submit_pins_revision_profile_and_harness_version(tmp_path: Path) -> Non
         seen.append(revision)
         return "a" * 40
 
-    async def prepare(experiment_id: str) -> str:
+    async def prepare(experiment_id: str, _mode: str) -> str:
         prepared.append(experiment_id)
         return "snapshotted-harness"
 
@@ -103,7 +103,7 @@ def test_submit_rejects_broken_grader_preflight_without_queueing_experiment(
 ) -> None:
     db_path = tmp_path / "bench.sqlite"
 
-    async def prepare(_experiment_id: str) -> str:
+    async def prepare(_experiment_id: str, _mode: str) -> str:
         raise GraderInfrastructureError("reference: expected 9 backend checks, got 0")
 
     app = create_bench_app(
@@ -126,7 +126,7 @@ def test_submit_rejects_broken_grader_preflight_without_queueing_experiment(
 def test_submit_does_not_run_preflight_while_an_experiment_is_active(tmp_path: Path) -> None:
     prepared: list[str] = []
 
-    async def prepare(experiment_id: str) -> str:
+    async def prepare(experiment_id: str, _mode: str) -> str:
         prepared.append(experiment_id)
         return "harness"
 
@@ -212,6 +212,65 @@ async def test_runner_interleaves_candidates_and_completes_experiment(tmp_path: 
     ]
     assert report.json()["trials"][0]["repository_url"].endswith("/A1")
     assert report.json()["trials"][0]["metrics"] == {"effective_tokens": 10}
+
+
+@pytest.mark.asyncio
+async def test_runner_single_mode_executes_only_candidate_a(tmp_path: Path) -> None:
+    store = ExperimentStore(tmp_path / "bench.sqlite")
+    experiment = store.create(
+        ExperimentCreate(
+            candidate_a="same-sha",
+            repetitions=1,
+            mode="single",
+        )
+    )
+    seen: list[str] = []
+
+    async def execute(trial: Trial) -> TrialOutcome:
+        seen.append(f"{trial.candidate}{trial.repetition}")
+        return TrialOutcome()
+
+    await ExperimentRunner(store=store, execute=execute).run_next()
+
+    assert seen == ["A1"]
+    persisted = store.get(experiment.id)
+    assert persisted is not None
+    assert persisted.mode == "single"
+    assert persisted.candidate_b is None
+    assert [trial.candidate for trial in store.report(experiment.id).trials] == ["A"]  # type: ignore[union-attr]
+
+
+def test_submit_single_mode_does_not_resolve_or_preflight_candidate_b(tmp_path: Path) -> None:
+    resolved: list[str] = []
+    prepared: list[tuple[str, str]] = []
+
+    async def resolve(revision: str) -> str:
+        resolved.append(revision)
+        return "a" * 40
+
+    async def prepare(experiment_id: str, mode: str) -> str:
+        prepared.append((experiment_id, mode))
+        return "single-harness"
+
+    with TestClient(
+        create_bench_app(
+            db_path=tmp_path / "bench.sqlite",
+            api_token="token",
+            resolve_revision=resolve,
+            prepare_harness=prepare,
+        )
+    ) as client:
+        response = client.post(
+            "/experiments",
+            headers={"Authorization": "Bearer token"},
+            json={"mode": "single", "candidate_a": "main", "repetitions": 1},
+        )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert resolved == ["main"]
+    assert body["candidate_b"] is None
+    assert prepared == [(body["id"], "single")]
 
 
 @pytest.mark.asyncio

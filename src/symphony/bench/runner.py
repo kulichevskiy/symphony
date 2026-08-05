@@ -104,27 +104,33 @@ class ExperimentRunner:
             await self._publish(trial)
 
 
-def _trial_plan(experiment: Experiment) -> list[tuple[Trial, Trial]]:
-    pairs: list[tuple[Trial, Trial]] = []
+def _trial_plan(experiment: Experiment) -> list[tuple[Trial, ...]]:
+    batches: list[tuple[Trial, ...]] = []
     for repetition in range(1, experiment.repetitions + 1):
-        pairs.append(
-            (
-                Trial(
-                    experiment_id=experiment.id,
-                    candidate="A",
-                    repetition=repetition,
-                    revision=experiment.candidate_a,
-                    profile=experiment.candidate_a_profile,
-                    system_version=experiment.system_version_a,
-                ),
-                Trial(
-                    experiment_id=experiment.id,
-                    candidate="B",
-                    repetition=repetition,
-                    revision=experiment.candidate_b,
-                    profile=experiment.candidate_b_profile,
-                    system_version=experiment.system_version_b,
-                ),
-            )
+        candidate_a = Trial(
+            experiment_id=experiment.id,
+            candidate="A",
+            repetition=repetition,
+            revision=experiment.candidate_a,
+            profile=experiment.candidate_a_profile,
+            system_version=experiment.system_version_a,
         )
-    return pairs
+        if experiment.mode == "single":
+            batches.append((candidate_a,))
+        else:
+            if experiment.candidate_b is None:
+                raise ValueError("paired experiment is missing candidate B")
+            batches.append(
+                (
+                    candidate_a,
+                    Trial(
+                        experiment_id=experiment.id,
+                        candidate="B",
+                        repetition=repetition,
+                        revision=experiment.candidate_b,
+                        profile=experiment.candidate_b_profile,
+                        system_version=experiment.system_version_b,
+                    ),
+                )
+            )
+    return batches

@@ -84,29 +84,59 @@ def render_markdown(report: ExperimentReport) -> str:
         f"# Symphony bench {experiment.id}",
         "",
         f"Status: **{experiment.status}**  ",
-        f"Candidate A: `{experiment.candidate_a}`  ",
-        f"Candidate B: `{experiment.candidate_b}`  ",
-        f"System A: `{experiment.system_version_a}`  ",
-        f"System B: `{experiment.system_version_b}`  ",
+    ]
+    if experiment.mode == "single":
+        completed_a = [
+            trial
+            for trial in report.trials
+            if trial.candidate == "A" and trial.status == "completed"
+        ]
+        lines.extend(
+            [
+                "Mode: single candidate  ",
+                f"Candidate A: `{experiment.candidate_a}`  ",
+                f"System A: `{experiment.system_version_a}`  ",
+                "| Metric | Candidate A |",
+                "|---|---:|",
+            ]
+        )
+        for metric in _SUMMARY_METRICS:
+            lines.append(f"| {metric} | {_number(_average(completed_a, metric))} |")
+    else:
+        lines.extend(
+            [
+                f"Candidate A: `{experiment.candidate_a}`  ",
+                f"Candidate B: `{experiment.candidate_b}`  ",
+                f"System A: `{experiment.system_version_a}`  ",
+                f"System B: `{experiment.system_version_b}`  ",
+                "Matched completed repetitions: "
+                + (", ".join(str(item) for item in matched_repetitions) or "none"),
+                "| Metric | A | B | B − A |",
+                "|---|---:|---:|---:|",
+            ]
+        )
+        for metric in _SUMMARY_METRICS:
+            a_value = _average(by_candidate["A"], metric)
+            b_value = _average(by_candidate["B"], metric)
+            delta = b_value - a_value if a_value is not None and b_value is not None else None
+            lines.append(
+                f"| {metric} | {_number(a_value)} | {_number(b_value)} | "
+                f"{_number(delta, signed=True)} |"
+            )
+
+    repetition_line = f"Repetitions: {experiment.repetitions}"
+    if experiment.mode == "paired":
+        repetition_line += "; order: A/B pairs in parallel"
+    common = [
         f"Executor toolchain: `{experiment.executor_toolchain_version}`  ",
         f"Harness: `{experiment.harness_version}`  ",
-        f"Repetitions: {experiment.repetitions}; order: A/B pairs in parallel",
-        "Matched completed repetitions: "
-        + (", ".join(str(item) for item in matched_repetitions) or "none"),
+        repetition_line,
         "",
         "## Aggregate means",
         "",
-        "| Metric | A | B | B − A |",
-        "|---|---:|---:|---:|",
     ]
-    for metric in _SUMMARY_METRICS:
-        a_value = _average(by_candidate["A"], metric)
-        b_value = _average(by_candidate["B"], metric)
-        delta = b_value - a_value if a_value is not None and b_value is not None else None
-        lines.append(
-            f"| {metric} | {_number(a_value)} | {_number(b_value)} | "
-            f"{_number(delta, signed=True)} |"
-        )
+    table_start = next(index for index, line in enumerate(lines) if line.startswith("| Metric |"))
+    lines[table_start:table_start] = common
 
     lines.extend(["", "## Trial receipts", ""])
     for trial in report.trials:

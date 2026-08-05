@@ -1653,6 +1653,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     on_iteration=_on_iteration,
                     allow_fixes=allow_fixes,
                     log_path=self.config.log_root / f"{local_review_run_id}.log",
+                    review_mode=binding.local_review_mode,
                 )
             finally:
                 await self._finalize_local_review_run(

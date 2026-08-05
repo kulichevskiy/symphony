@@ -23,7 +23,7 @@ from .grader import GraderInfrastructureError, SupportQueueGrader
 from .harness import load_harness, snapshot_harness
 from .live import LiveBenchConfig, LiveTrialExecutor
 from .metrics import snapshot_candidate
-from .models import ExperimentReport, Trial, TrialOutcome
+from .models import ExperimentMode, ExperimentReport, Trial, TrialOutcome
 from .report import render_markdown
 from .reviewer import cleanup_stale_reviewer_credentials
 
@@ -111,8 +111,14 @@ def _request(
 
 @verify.command("submit")
 @_connection_options
+@click.option(
+    "--mode",
+    type=click.Choice(("paired", "single")),
+    default="paired",
+    show_default=True,
+)
 @click.option("--candidate-a", required=True, help="Git revision for candidate A.")
-@click.option("--candidate-b", required=True, help="Git revision for candidate B.")
+@click.option("--candidate-b", help="Git revision for candidate B (paired mode only).")
 @click.option(
     "--profile-a",
     type=click.Path(path_type=Path, exists=True, dir_okay=False),
@@ -127,18 +133,28 @@ def _request(
 def submit(
     url: str,
     token: str,
+    mode: str,
     candidate_a: str,
-    candidate_b: str,
+    candidate_b: str | None,
     profile_a: Path | None,
     profile_b: Path | None,
     repetitions: int,
 ) -> None:
-    """Queue an interleaved A/B experiment."""
-    payload: dict[str, object] = {
-        "candidate_a": candidate_a,
-        "candidate_b": candidate_b,
-        "repetitions": repetitions,
-    }
+    """Queue a paired experiment or one single-candidate trial."""
+    if mode == "paired" and candidate_b is None:
+        raise click.UsageError("--candidate-b is required in paired mode")
+    if mode == "single":
+        payload: dict[str, object] = {
+            "mode": mode,
+            "candidate_a": candidate_a,
+            "repetitions": repetitions,
+        }
+    else:
+        payload = {
+            "candidate_a": candidate_a,
+            "candidate_b": candidate_b,
+            "repetitions": repetitions,
+        }
     if profile_a is not None:
         payload["candidate_a_profile"] = _read_profile(profile_a)
     if profile_b is not None:
@@ -696,12 +712,15 @@ def _serve_with_profile(
     async def resolve_revision(revision: str) -> str:
         return await executor_a.resolve_revision(revision)
 
-    async def prepare_harness(experiment_id: str) -> str:
+    async def prepare_harness(experiment_id: str, mode: ExperimentMode) -> str:
+        lanes: tuple[tuple[str, Path, RemoteCommands], ...] = (("A", root_a, commands_a),)
+        if mode == "paired":
+            lanes += (("B", root_b, commands_b),)
         return await _prepare_harness_with_preflight(
             experiment_id,
             private_root=private_root,
             controls_root=controls_root,
-            lanes=(("A", root_a, commands_a), ("B", root_b, commands_b)),
+            lanes=lanes,
         )
 
     app = create_bench_app(

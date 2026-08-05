@@ -710,6 +710,211 @@ def local_review_verifier_prompt(
     )
 
 
+def local_review_spec_prompt(
+    *,
+    issue_title: str,
+    issue_body: str,
+    labels: list[str],
+    comparison_ref: str,
+    previous_findings: str = "",
+) -> str:
+    """Read-only Spec/Standards axis for the hybrid local gate."""
+    obligations = ""
+    if previous_findings.strip():
+        obligations = (
+            "# Previous findings to verify\n\n"
+            "This is a closure review. Verify that every finding below is "
+            "actually fixed and that its fix introduced no regression:\n\n"
+            f"{previous_findings.strip()}\n\n"
+        )
+    return (
+        "You are Symphony's local Spec and Standards reviewer. Review the "
+        "current branch, but do not fix it.\n\n"
+        "# What to read\n\n"
+        f"1. Read `git diff {comparison_ref}...HEAD` (fall back to "
+        f"`git diff {comparison_ref}..HEAD` when needed).\n"
+        "2. Read the Linear issue below and turn its acceptance criteria "
+        "into a concrete checklist item.\n"
+        "3. Find and read repository standards that govern the changed files, "
+        "including AGENTS.md, CONTRIBUTING.md, coding-standards documents, "
+        "and relevant ADRs.\n\n"
+        "# Two independent axes\n\n"
+        "- **Spec:** missing or partial requirements, behavior not requested, "
+        "and requirements implemented incorrectly.\n"
+        "- **Standards:** violations of documented repository rules. Do not "
+        "report style that automated tooling already enforces.\n\n"
+        "A concrete Spec or Standards violation blocks approval. Keep the two "
+        "axes named in your explanation, but emit one combined Findings list.\n\n"
+        + obligations
+        + _VERDICT_CONTRACT_BLOCK
+        + _NO_MUTATION_BLOCK
+        + _issue_block(issue_title, issue_body, labels)
+    )
+
+
+def builtin_bug_review_prompt(
+    *, issue_title: str, issue_body: str, previous_findings: str = ""
+) -> str:
+    """Extra instructions for Codex's built-in review mode."""
+    body = issue_body.strip() or "(no description)"
+    obligations = ""
+    if previous_findings.strip():
+        obligations = (
+            "\n\nThis is a closure review. Re-check these previous findings against the "
+            f"fix diff and report any unresolved or regressed item:\n{previous_findings.strip()}"
+        )
+    return (
+        "Review implementation correctness only: data loss, security, broken "
+        "behavior, races, stale state, transaction errors, and tests that fail "
+        "to protect changed behavior. Do not repeat style or documented-spec "
+        "findings handled by the separate Spec/Standards axis. Return all P0/P1 "
+        "findings, at most the five highest-value P2 findings, and omit P3. "
+        "Use the normal `[P0]`..`[P3]` Codex review format with file:line.\n\n"
+        f"Issue: {issue_title}\n\n{body}{obligations}"
+    )
+
+
+def build_builtin_codex_review_command(
+    *,
+    comparison_ref: str,
+    prompt: str,
+    codex_model: str = DEFAULT_CODEX_MODEL,
+    effort: str | None = None,
+    last_message_path: str | None = None,
+) -> list[str]:
+    """Run the same built-in Codex review surface locally."""
+    command = [
+        "codex",
+        "exec",
+        "review",
+        "--base",
+        comparison_ref,
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--json",
+        "--model",
+        codex_model,
+    ]
+    if effort is not None:
+        command.extend(["--config", codex_reasoning_effort_config(effort)])
+    if last_message_path is not None:
+        command.extend(["-o", last_message_path])
+    command.append(prompt)
+    return command
+
+
+def _finding_location(text: str) -> str:
+    location = _FINDING_LOCATION_RE.search(text)
+    if location is None:
+        return ""
+    return f"{location.group('path').casefold()}:{location.group('line')}"
+
+
+def _finding_terms(text: str) -> set[str]:
+    without_location = _FINDING_LOCATION_RE.sub(" ", text.casefold())
+    return {
+        term
+        for term in re.findall(r"[a-z0-9_]+", without_location)
+        if term not in {"critical", "major", "minor", "the", "a", "an", "to", "and"}
+    }
+
+
+def _same_root_cause(left: str, right: str) -> bool:
+    if _finding_location(left) != _finding_location(right):
+        return False
+    left_terms = _finding_terms(left)
+    right_terms = _finding_terms(right)
+    if not left_terms or not right_terms:
+        return left.casefold() == right.casefold()
+    overlap = len(left_terms & right_terms) / len(left_terms | right_terms)
+    return overlap >= 0.5
+
+
+def _severity_rank(text: str) -> int:
+    match = _HYBRID_SEVERITY_RE.match(text)
+    if match is None:
+        return 0
+    return {"critical": 3, "major": 2, "minor": 1}[match.group(1).casefold()]
+
+
+def _builtin_findings(message: str) -> list[str]:
+    findings: list[str] = []
+    for priority, raw_body in _BUILTIN_FINDING_RE.findall(message):
+        if priority == "P3":
+            continue
+        severity = {"P0": "Critical", "P1": "Major", "P2": "Minor"}[priority]
+        body = " ".join(raw_body.split())
+        findings.append(f"[{severity}] {body}")
+    return findings
+
+
+def merge_hybrid_review_messages(
+    *,
+    spec_message: str,
+    builtin_message: str,
+    head_sha: str,
+    max_p2: int = 5,
+) -> LocalVerdict:
+    """Combine both local axes into one deduplicated, bounded fix batch."""
+    spec = _classify_message(message=spec_message, head_sha=head_sha)
+    if spec.kind is LocalVerdictKind.UNPARSEABLE or not builtin_message.strip():
+        return LocalVerdict(
+            kind=LocalVerdictKind.UNPARSEABLE,
+            raw_message=f"SPEC:\n{spec_message}\n\nBUILTIN:\n{builtin_message}",
+        )
+
+    builtin_has_priority = _BUILTIN_FINDING_RE.search(builtin_message) is not None
+    if not builtin_has_priority and _BUILTIN_CLEAN_RE.search(builtin_message) is None:
+        return LocalVerdict(
+            kind=LocalVerdictKind.UNPARSEABLE,
+            raw_message=f"SPEC:\n{spec_message}\n\nBUILTIN:\n{builtin_message}",
+        )
+
+    candidates: list[str] = []
+    if spec.kind is LocalVerdictKind.CHANGES_REQUESTED:
+        candidates.extend(_FINDING_BULLET_RE.findall(spec.findings))
+    candidates.extend(_builtin_findings(builtin_message))
+
+    deduped: list[str] = []
+    for finding in candidates:
+        duplicate_at = next(
+            (index for index, current in enumerate(deduped) if _same_root_cause(current, finding)),
+            None,
+        )
+        if duplicate_at is None:
+            deduped.append(finding)
+        elif _severity_rank(finding) > _severity_rank(deduped[duplicate_at]):
+            deduped[duplicate_at] = finding
+
+    bounded: list[str] = []
+    p2_used = 0
+    for finding in deduped:
+        if _severity_rank(finding) == 1:
+            if p2_used >= max_p2:
+                continue
+            p2_used += 1
+        bounded.append(finding)
+
+    if not bounded:
+        return LocalVerdict(
+            kind=LocalVerdictKind.APPROVED,
+            trigger_signature=f"local_hybrid_approved:{head_sha}",
+            raw_message=f"SPEC:\n{spec_message}\n\nBUILTIN:\n{builtin_message}",
+        )
+
+    findings = "\n".join(f"- {finding}" for finding in bounded)
+    digest = _stable_digest(findings)
+    return LocalVerdict(
+        kind=LocalVerdictKind.CHANGES_REQUESTED,
+        findings=findings,
+        trigger_signature=f"local_hybrid:{head_sha}:{digest}",
+        findings_signature=f"local_hybrid_findings:{digest}",
+        raw_message=f"SPEC:\n{spec_message}\n\nBUILTIN:\n{builtin_message}",
+    )
+
+
 def build_local_review_command(
     *,
     agent: ReviewerAgent,
@@ -878,6 +1083,16 @@ _VERDICT_LINE_RE = re.compile(
 _FINDINGS_HEADING_RE = re.compile(r"(?im)^\s*#{1,6}\s*findings\b\s*$")
 _FINDING_BULLET_RE = re.compile(r"(?m)^[-*+]\s+(.+)$")
 _SEVERITY_PREFIX_RE = re.compile(r"^\[(?:Critical|Major|Minor)\]\s+")
+_BUILTIN_FINDING_RE = re.compile(
+    r"(?ms)^(?:[-*+]\s*)?\[(P[0-3])\]\s+(.+?)"
+    r"(?=^(?:[-*+]\s*)?\[P[0-3]\]\s+|\Z)"
+)
+_FINDING_LOCATION_RE = re.compile(r"(?P<path>[A-Za-z0-9_./-]+):(?P<line>\d+)")
+_BUILTIN_CLEAN_RE = re.compile(
+    r"\b(?:no findings|no actionable findings|did not find any findings|nothing to flag)\b",
+    re.IGNORECASE,
+)
+_HYBRID_SEVERITY_RE = re.compile(r"^\[(Critical|Major|Minor)\]", re.IGNORECASE)
 
 
 def extract_last_agent_message(
@@ -1034,7 +1249,9 @@ __all__ = [
     "PLAINTEXT_AUTH_PHRASES",
     "VERDICT_APPROVED_MARKER",
     "VERDICT_CHANGES_REQUESTED_MARKER",
+    "build_builtin_codex_review_command",
     "build_local_review_command",
+    "builtin_bug_review_prompt",
     "classify_json_field_auth_error",
     "classify_plaintext_auth_error",
     "classify_stream_api_error",
@@ -1043,7 +1260,9 @@ __all__ = [
     "is_small_diff",
     "local_review_finder_prompt",
     "local_review_prompt",
+    "local_review_spec_prompt",
     "local_review_verifier_prompt",
+    "merge_hybrid_review_messages",
     "parse_diff_numstat",
     "parse_local_review_output",
 ]

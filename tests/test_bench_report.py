@@ -82,6 +82,27 @@ def test_render_markdown_aggregates_only_matched_completed_pairs() -> None:
     assert "| effective_tokens | 550 |" not in rendered
 
 
+def test_render_markdown_single_mode_reports_one_candidate_without_fake_comparison() -> None:
+    report = ExperimentReport(
+        experiment=Experiment(
+            id="EXP-1",
+            status="completed",
+            candidate_a="same-sha",
+            repetitions=1,
+            mode="single",
+            created_at=datetime(2026, 8, 1, tzinfo=UTC),
+        ),
+        trials=[_trial("A", 1, 100, 9)],
+    )
+
+    rendered = render_markdown(report)
+
+    assert "Mode: single candidate" in rendered
+    assert "Candidate B" not in rendered
+    assert "B − A" not in rendered
+    assert "| effective_tokens | 100 |" in rendered
+
+
 def test_render_trial_markdown_preserves_unavailable_raw_tokens() -> None:
     trial = _trial("A", 1, 100, 9).model_copy(
         update={

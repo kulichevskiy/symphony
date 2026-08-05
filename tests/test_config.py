@@ -645,6 +645,33 @@ def test_local_review_iteration_cap_default_global_is_3(tmp_path: Path, monkeypa
     assert binding.resolved_local_review_iteration_cap(cfg.local_review_iteration_cap) == 3
 
 
+def test_local_review_mode_defaults_legacy_and_accepts_hybrid() -> None:
+    assert _review_binding().local_review_mode == "legacy"
+    assert _review_binding(local_review_mode="hybrid").local_review_mode == "hybrid"
+
+
+def test_hybrid_local_review_requires_a_codex_review_role(
+    tmp_path: Path, monkeypatch
+) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("LINEAR_API_KEY", "x")
+    raw = f"""
+repos:
+  - linear_team_key: ENG
+    github_repo: org/repo
+    local_review: true
+    local_review_mode: hybrid
+    roles:
+      review_find:
+        agent: claude
+      review_verify:
+        agent: claude
+{_BINDING_STATES}
+"""
+
+    with pytest.raises(ValueError, match="hybrid local review requires a Codex review role"):
+        Config.model_validate(yaml.safe_load(raw))
+
+
 def test_local_review_iteration_cap_per_binding_override(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
     raw = f"""

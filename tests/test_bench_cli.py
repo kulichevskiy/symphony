@@ -57,6 +57,38 @@ def test_verify_submit_calls_bench_and_prints_experiment_id() -> None:
     assert route.calls[0].request.extensions["timeout"]["read"] == 15 * 60
 
 
+@respx.mock
+def test_verify_submit_single_omits_candidate_b() -> None:
+    route = respx.post("https://bench.example/experiments").mock(
+        return_value=httpx.Response(201, json={"id": "EXP-ONE", "status": "queued"})
+    )
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "verify",
+            "submit",
+            "--url",
+            "https://bench.example",
+            "--token",
+            "secret",
+            "--mode",
+            "single",
+            "--candidate-a",
+            "same-sha",
+            "--repetitions",
+            "1",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(route.calls[0].request.content) == {
+        "mode": "single",
+        "candidate_a": "same-sha",
+        "repetitions": 1,
+    }
+
+
 def test_bench_settings_load_routing_from_mounted_env(
     tmp_path,
     monkeypatch,
