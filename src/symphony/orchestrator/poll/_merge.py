@@ -1089,6 +1089,7 @@ class _MergeMixin(_OrchestratorBase):
                     issue=issue,
                     pr_url=pr_url,
                     result=pending_local_only_needs_approval,
+                    operator_wait=True,
                 )
                 return True
 

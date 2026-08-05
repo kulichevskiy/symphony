@@ -5499,8 +5499,20 @@ async def test_required_check_fix_reruns_local_review_before_push_for_local_only
             False,
             False,
         ),
-        (LoopOutcome.EXHAUSTED, "state-na", None, True, True),
-        (LoopOutcome.STUCK_LOOP, "state-na", None, True, True),
+        (
+            LoopOutcome.EXHAUSTED,
+            "state-na",
+            db.operator_waits.KIND_REVIEW_FAILED,
+            True,
+            True,
+        ),
+        (
+            LoopOutcome.STUCK_LOOP,
+            "state-na",
+            db.operator_waits.KIND_REVIEW_FAILED,
+            True,
+            True,
+        ),
     ],
     ids=lambda value: value.value if isinstance(value, LoopOutcome) else str(value),
 )
@@ -5615,7 +5627,7 @@ async def test_required_check_fix_handles_post_fix_local_review_terminals(
 
         assert dispatched is expected_dispatched
         orch._run_local_review_phase.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
-        if expected_wait_kind is None:
+        if expected_dispatched:
             push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
             assert events == ["push", "move"]
         else:
@@ -5635,7 +5647,7 @@ async def test_required_check_fix_handles_post_fix_local_review_terminals(
             assert unresolved_findings in comment
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert history[-1].stage == "merge"
-        assert history[-1].status == ("needs_approval" if expected_wait_kind is None else "failed")
+        assert history[-1].status == ("needs_approval" if expected_dispatched else "failed")
     finally:
         await conn.close()
 

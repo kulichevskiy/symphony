@@ -1279,7 +1279,11 @@ async def test_review_failed_retry_uses_tracker_issue_id_for_scoped_issue(
         default_tracker.comments_since.assert_not_awaited()
         secondary_tracker.comments_since.assert_awaited_once()
         assert secondary_tracker.comments_since.await_args.args[0] == issue.id
-        secondary_tracker.lookup_issue.assert_awaited_once_with(issue.id)
+        assert secondary_tracker.lookup_issue.await_count == 2
+        assert all(
+            awaited.args == (issue.id,)
+            for awaited in secondary_tracker.lookup_issue.await_args_list
+        )
         secondary_tracker.move_issue.assert_awaited_once_with(issue.id, "state-review")
         secondary_tracker.post_comment.assert_awaited_once()
         assert secondary_tracker.post_comment.await_args.args[0] == issue.id

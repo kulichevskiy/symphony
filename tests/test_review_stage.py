@@ -1089,7 +1089,9 @@ async def test_red_ci_local_only_parks_non_converged_local_review(
         monitor = next(r for r in history if r.id == "review-run")
         assert monitor.status == "needs_approval"
         assert findings in monitor.termination_detail
-        assert await db.operator_waits.get(conn, "iss-1") is None
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
     finally:
         await conn.close()
 

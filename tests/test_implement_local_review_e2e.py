@@ -442,7 +442,9 @@ async def test_deliver_failed_retry_preserves_local_review_needs_approval_after_
             if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body")) == "@codex review"
         ]
         assert codex_calls == []
-        assert await db.operator_waits.get(conn, "iss-1") is None
+        parked = await db.operator_waits.get(conn, "iss-1")
+        assert parked is not None
+        assert parked.kind == db.operator_waits.KIND_REVIEW_FAILED
         move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
         assert "state-na" in move_targets
 
@@ -1321,7 +1323,25 @@ async def test_local_strategy_non_convergence_parks_pr_in_needs_approval(
         assert review_rows[0].status == "needs_approval"
         assert "src/auth.py:12 missing token validation" in review_rows[0].termination_detail
         wait = await db.operator_waits.get(conn, "iss-1")
-        assert wait is None
+        assert wait is not None
+        assert wait.run_id == review_rows[0].id
+        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+        assert orch._slash_command_run_eligible(wait.run_id)  # noqa: SLF001
+
+        # Linear's GitHub integration may react to the freshly opened PR after
+        # Symphony parks the issue and move it back to In Progress. The durable
+        # wait must make the next operator-command poll restore Needs Approval.
+        bounced = _issue()
+        bounced.state_id = "state-progress"
+        bounced.state_name = "In Progress"
+        bounced.state_type = "started"
+        linear.lookup_issue = AsyncMock(return_value=bounced)
+        linear.comments_since = AsyncMock(return_value=[])
+        linear.move_issue.reset_mock()
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
     finally:
         await conn.close()
 

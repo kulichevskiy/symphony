@@ -1931,6 +1931,7 @@ class _ReviewMixin(_OrchestratorBase):
                             pr_url=state.pr_url,
                         ),
                         result=local_review_result,
+                        operator_wait=True,
                     )
                     return True
                 if (
