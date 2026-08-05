@@ -212,7 +212,6 @@ def test_merge_hybrid_review_messages_keeps_worst_duplicate_severity() -> None:
 def test_build_builtin_codex_review_command_uses_review_mode_and_base() -> None:
     argv = build_builtin_codex_review_command(
         comparison_ref="reviewed-head",
-        prompt="find correctness bugs",
         codex_model="gpt-5.6-sol",
         effort="high",
         last_message_path="/tmp/bug-review.txt",
@@ -223,7 +222,7 @@ def test_build_builtin_codex_review_command_uses_review_mode_and_base() -> None:
     assert argv[argv.index("-o") + 1] == "/tmp/bug-review.txt"
     assert "--json" in argv
     assert "--dangerously-bypass-approvals-and-sandbox" in argv
-    assert argv[-1] == "find correctness bugs"
+    assert argv[-1] == "/tmp/bug-review.txt"
 
 
 def test_build_local_review_command_codex_uses_plain_exec_read_only() -> None:

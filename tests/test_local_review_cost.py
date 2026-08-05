@@ -436,7 +436,8 @@ async def test_hybrid_session_runs_two_axes_one_fix_and_targeted_closure(tmp_pat
     assert len(bug_specs) == 2
     assert bug_specs[0].command[bug_specs[0].command.index("--base") + 1] == "main"
     assert bug_specs[1].command[bug_specs[1].command.index("--base") + 1] == "implemented-head"
-    assert "agents cannot create tickets" in bug_specs[1].command[-1].lower()
+    assert "agents cannot create tickets" not in " ".join(bug_specs[1].command).lower()
+    assert bug_specs[1].command[-2] == "-o"
 
 
 @pytest.mark.asyncio

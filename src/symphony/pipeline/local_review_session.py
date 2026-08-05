@@ -61,7 +61,6 @@ from .local_review import (
     StreamApiError,
     build_builtin_codex_review_command,
     build_local_review_command,
-    builtin_bug_review_prompt,
     classify_pass_api_error,
     classify_plaintext_auth_error,
     extract_last_agent_message,
@@ -373,7 +372,6 @@ async def run_local_review_session(
                 raise ValueError("built-in review requires codex and a comparison ref")
             command = build_builtin_codex_review_command(
                 comparison_ref=comparison_ref,
-                prompt=prompt,
                 codex_model=codex_model or DEFAULT_CODEX_MODEL,
                 effort=effort,
                 last_message_path=str(last_message_path),
@@ -518,11 +516,6 @@ async def run_local_review_session(
                 comparison_ref=comparison_ref,
                 previous_findings=hybrid_previous_findings,
             )
-            bug_prompt = builtin_bug_review_prompt(
-                issue_title=issue_title,
-                issue_body=issue_body,
-                previous_findings=hybrid_previous_findings,
-            )
             spec_out, bug_out = await asyncio.gather(
                 _run_reviewer_pass(
                     agent=reviewer_role.agent,
@@ -539,7 +532,9 @@ async def run_local_review_session(
                     codex_model=bug_role.codex_model_arg(),
                     claude_model=None,
                     effort=bug_role.effort,
-                    prompt=bug_prompt,
+                    # `codex exec review --base` owns its prompt; the CLI
+                    # rejects a custom positional prompt in this mode.
+                    prompt="",
                     stem=f"review-{iteration}-bug",
                     run_suffix=f"rev-{iteration}-bug",
                     head_sha=head_sha,

@@ -752,32 +752,9 @@ def local_review_spec_prompt(
     )
 
 
-def builtin_bug_review_prompt(
-    *, issue_title: str, issue_body: str, previous_findings: str = ""
-) -> str:
-    """Extra instructions for Codex's built-in review mode."""
-    body = issue_body.strip() or "(no description)"
-    obligations = ""
-    if previous_findings.strip():
-        obligations = (
-            "\n\nThis is a closure review. Re-check these previous findings against the "
-            f"fix diff and report any unresolved or regressed item:\n{previous_findings.strip()}"
-        )
-    return (
-        "Review implementation correctness only: data loss, security, broken "
-        "behavior, races, stale state, transaction errors, and tests that fail "
-        "to protect changed behavior. Do not repeat style or documented-spec "
-        "findings handled by the separate Spec/Standards axis. Return all P0/P1 "
-        "findings, at most the five highest-value P2 findings, and omit P3. "
-        "Use the normal `[P0]`..`[P3]` Codex review format with file:line.\n\n"
-        f"Issue: {issue_title}\n\n{body}{obligations}"
-    )
-
-
 def build_builtin_codex_review_command(
     *,
     comparison_ref: str,
-    prompt: str,
     codex_model: str = DEFAULT_CODEX_MODEL,
     effort: str | None = None,
     last_message_path: str | None = None,
@@ -801,7 +778,6 @@ def build_builtin_codex_review_command(
         command.extend(["--config", codex_reasoning_effort_config(effort)])
     if last_message_path is not None:
         command.extend(["-o", last_message_path])
-    command.append(prompt)
     return command
 
 
@@ -1251,7 +1227,6 @@ __all__ = [
     "VERDICT_CHANGES_REQUESTED_MARKER",
     "build_builtin_codex_review_command",
     "build_local_review_command",
-    "builtin_bug_review_prompt",
     "classify_json_field_auth_error",
     "classify_plaintext_auth_error",
     "classify_stream_api_error",
