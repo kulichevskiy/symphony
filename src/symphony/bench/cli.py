@@ -28,7 +28,13 @@ from .report import render_markdown
 from .reviewer import cleanup_stale_reviewer_credentials
 
 _BENCH_BINDING_OVERRIDES = frozenset(
-    {"allow_auto_merge", "auto_merge", "local_review", "remote_review"}
+    {
+        "allow_auto_merge",
+        "auto_merge",
+        "local_review",
+        "local_review_mode",
+        "remote_review",
+    }
 )
 
 

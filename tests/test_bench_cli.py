@@ -7,11 +7,16 @@ from click.testing import CliRunner
 
 from symphony.bench import cli as cli_module
 from symphony.bench.cli import (
+    _BENCH_BINDING_OVERRIDES,
     _BenchSecrets,
     _cleanup_stale_grader_preflights,
     _prepare_harness_with_preflight,
 )
 from symphony.cli import main
+
+
+def test_bench_profile_allows_hybrid_local_review_mode() -> None:
+    assert "local_review_mode" in _BENCH_BINDING_OVERRIDES
 
 
 @respx.mock
