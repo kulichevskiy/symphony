@@ -2351,9 +2351,15 @@ class _MergeMixin(_OrchestratorBase):
         head_sha: str,
     ) -> _NoSignalMergeReadiness:
         """Whether a clean no_signal head is merge-ready via conflict-fix or bypass."""
+        zero_rollup_pending_ci = (
+            not binding.resolved_remote_review()
+            and verdict.kind is VerdictKind.PENDING
+            and verdict.rule == "pending_ci"
+            and _no_signal_head_check_state(view) == "none"
+        )
         no_signal_mergeable = (
             verdict.kind is VerdictKind.PENDING
-            and verdict.rule == "no_signal"
+            and (verdict.rule == "no_signal" or zero_rollup_pending_ci)
             and str(view.get("mergeable") or "").upper() == "MERGEABLE"
         )
         conflict_fix_ready = False
@@ -2382,6 +2388,21 @@ class _MergeMixin(_OrchestratorBase):
         return _NoSignalMergeReadiness(
             conflict_fix_ready=conflict_fix_ready,
             review_bypass_ready=review_bypass_ready,
+        )
+
+    async def _zero_rollup_merge_authorized(
+        self,
+        *,
+        binding: RepoBinding,
+        issue_id: str,
+        head_sha: str,
+    ) -> bool:
+        """Whether an exact-head verify pass authorizes a zero-rollup merge."""
+        return binding.allow_unverified_merge or await db.issue_prs.has_verify_passed(
+            self._conn,
+            issue_id=issue_id,
+            github_repo=binding.github_repo,
+            head_sha=head_sha,
         )
 
     async def _gate_no_signal_merge_on_ci(
@@ -2413,13 +2434,12 @@ class _MergeMixin(_OrchestratorBase):
         # an operator instead of silently merging unverified code.
         check_state = _no_signal_head_check_state(view)
         if check_state == "none":
-            verified = await db.issue_prs.has_verify_passed(
-                self._conn,
+            zero_rollup_authorized = await self._zero_rollup_merge_authorized(
+                binding=binding,
                 issue_id=candidate.issue_id,
-                github_repo=binding.github_repo,
                 head_sha=head_sha,
             )
-            if not (binding.allow_unverified_merge or verified):
+            if not zero_rollup_authorized:
                 await self._mark_merge_needs_approval(
                     binding=binding,
                     issue=issue,
@@ -3158,6 +3178,7 @@ class _MergeMixin(_OrchestratorBase):
             premerge_view = await (await self._gh_client()).pr_view(
                 pr_number,
                 repo=binding.github_repo,
+                include_status_checks=True,
             )
         except Exception as e:  # noqa: BLE001
             log.warning(
@@ -3230,7 +3251,14 @@ class _MergeMixin(_OrchestratorBase):
                     exc=e,
                 )
                 return True, premerge_view
-            if not checks.all_passed:
+            premerge_checks_ready = checks.all_passed
+            if not premerge_checks_ready and _no_signal_head_check_state(premerge_view) == "none":
+                premerge_checks_ready = await self._zero_rollup_merge_authorized(
+                    binding=binding,
+                    issue_id=storage_issue_id,
+                    head_sha=premerge_head_sha,
+                )
+            if not premerge_checks_ready:
                 await self._mark_merge_needs_approval(
                     binding=binding,
                     issue=issue,

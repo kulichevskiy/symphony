@@ -3206,6 +3206,14 @@ async def test_premerge_rechecks_configured_checks_when_head_is_unchanged(
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
+        await _seed_review_candidate(conn)
+        await db.issue_prs.mark_verify_passed(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            head_sha="approved-head",
+            marked_at="2026-05-10T00:01:30+00:00",
+        )
         binding = _binding(agent="claude").model_copy(
             update={"required_status_checks": ("backend", "frontend")}
         )
@@ -3221,6 +3229,13 @@ async def test_premerge_rechecks_configured_checks_when_head_is_unchanged(
                 "headRefOid": "approved-head",
                 "mergeable": "MERGEABLE",
                 "mergeStateStatus": "CLEAN",
+                "statusCheckRollup": [
+                    {
+                        "__typename": "CheckRun",
+                        "name": "frontend",
+                        "status": "IN_PROGRESS",
+                    }
+                ],
             }
         )
         gh.pr_checks = AsyncMock(
@@ -3249,6 +3264,13 @@ async def test_premerge_rechecks_configured_checks_when_head_is_unchanged(
             "headRefOid": "approved-head",
             "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
+            "statusCheckRollup": [
+                {
+                    "__typename": "CheckRun",
+                    "name": "frontend",
+                    "status": "IN_PROGRESS",
+                }
+            ],
         }
         gh.pr_checks.assert_awaited_once_with(
             42,
@@ -3258,6 +3280,74 @@ async def test_premerge_rechecks_configured_checks_when_head_is_unchanged(
         orch._review_verdict_for_pr.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
         orch._mark_merge_needs_approval.assert_awaited_once()  # type: ignore[attr-defined]  # noqa: SLF001
         orch._retrigger_codex_review_unless_approved.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_premerge_missing_configured_checks_accepts_exact_head_verify(
+    tmp_path: Path,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        await db.issue_prs.mark_verify_passed(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            head_sha="approved-head",
+            marked_at="2026-05-10T00:01:30+00:00",
+        )
+        binding = _binding(agent="claude").model_copy(
+            update={
+                "remote_review": False,
+                "required_status_checks": ("backend", "frontend"),
+                "verify_cmd": "pnpm build && pnpm test",
+            }
+        )
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={
+                "headRefOid": "approved-head",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "statusCheckRollup": [],
+            }
+        )
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(
+                runs=[
+                    CheckRun(name="backend", state="PENDING", bucket="pending"),
+                    CheckRun(name="frontend", state="PENDING", bucket="pending"),
+                ]
+            )
+        )
+        orch = Orchestrator(cfg, MagicMock(), conn, runner=MagicMock(), gh=gh)
+        orch._mark_merge_needs_approval = AsyncMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        halted, view = await orch._verify_premerge_head(  # noqa: SLF001
+            binding=binding,
+            issue=_issue(),
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            run_id="merge-run",
+            approved_head_sha="approved-head",
+        )
+
+        assert halted is False
+        assert view is not None
+        gh.pr_view.assert_awaited_once_with(
+            42,
+            repo="org/repo",
+            include_status_checks=True,
+        )
+        orch._mark_merge_needs_approval.assert_not_awaited()  # type: ignore[attr-defined]  # noqa: SLF001
     finally:
         await conn.close()
 
@@ -6102,6 +6192,58 @@ async def test_no_signal_zero_checks_green_verify_merges(tmp_path: Path) -> None
 
 
 @pytest.mark.asyncio
+async def test_missing_configured_checks_green_verify_merges(tmp_path: Path) -> None:
+    """Zero reported CI may use the exact-head verify fallback.
+
+    Configured contexts are synthesized as pending when GitHub has not
+    created a workflow run. That classifier result must still reach the
+    zero-rollup verify gate instead of polling forever.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_review_candidate(conn)
+        await db.runs.create(
+            conn,
+            id="local-review",
+            issue_id="iss-1",
+            stage="local_review",
+            status="completed",
+            pid=None,
+            started_at="2026-05-10T00:00:30+00:00",
+        )
+        await db.issue_prs.mark_verify_passed(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            head_sha="abc123",
+            marked_at="2026-05-10T00:01:30+00:00",
+        )
+        binding = _binding().model_copy(
+            update={
+                "local_review": True,
+                "remote_review": False,
+                "required_status_checks": ("backend", "frontend"),
+                "verify_cmd": "pnpm build && pnpm test",
+            }
+        )
+        orch = _make_poll_merge_orchestrator(
+            conn,
+            binding=binding,
+            verdict=Verdict(kind=VerdictKind.PENDING, rule="pending_ci"),
+            view=_no_checks_view(),
+        )
+        scheduled = asyncio.create_task(asyncio.sleep(0))
+        orch._schedule_merge = MagicMock(return_value=scheduled)  # type: ignore[method-assign]  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        assert orch._schedule_merge.call_args.kwargs["skip_review"] is True  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_no_signal_zero_checks_verify_for_stale_head_waits(
     tmp_path: Path,
 ) -> None:
@@ -6178,6 +6320,13 @@ async def test_no_signal_pending_check_never_merges(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_no_review_candidate(conn)
+        await db.issue_prs.mark_verify_passed(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            head_sha="abc123",
+            marked_at="2026-05-10T00:01:30+00:00",
+        )
         binding = _binding().model_copy(update={"local_review": False, "remote_review": False})
         pending_view = _no_checks_view()
         pending_view["statusCheckRollup"] = [
