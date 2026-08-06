@@ -265,7 +265,7 @@ class LinearSandbox:
                     "input": {
                         "name": name,
                         "teamIds": [team_id],
-                        "description": project_description,
+                        "content": project_description,
                     }
                 },
             ),

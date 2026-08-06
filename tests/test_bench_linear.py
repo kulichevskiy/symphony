@@ -128,7 +128,7 @@ async def test_linear_sandbox_creates_labeled_campaign_and_real_dependency_chain
         {
             "name": "Feedback Inbox V1 · 2026-08-02 · 1",
             "teamIds": ["team-id"],
-            "description": (
+            "content": (
                 "## Hypothesis\nThe revised review process will finish the sample project.\n\n"
                 "## Experiment design\nRun one isolated copy of the project."
             ),
