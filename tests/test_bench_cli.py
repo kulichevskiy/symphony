@@ -48,6 +48,11 @@ def test_verify_submit_calls_bench_and_prints_experiment_id() -> None:
             "same-sha",
             "--candidate-b",
             "same-sha",
+            "--hypothesis",
+            "The revised review process will finish the complete sample project.",
+            "--design",
+            "Run the project once with each version and compare completion, time, "
+            "and review findings.",
             "--repetitions",
             "3",
         ],
@@ -57,7 +62,11 @@ def test_verify_submit_calls_bench_and_prints_experiment_id() -> None:
     assert result.output.endswith("EXP-123 queued\n")
     assert route.calls[0].request.headers["Authorization"] == "Bearer secret"
     assert route.calls[0].request.content == (
-        b'{"candidate_a":"same-sha","candidate_b":"same-sha","repetitions":3}'
+        b'{"candidate_a":"same-sha","candidate_b":"same-sha",'
+        b'"hypothesis":"The revised review process will finish the complete sample project.",'
+        b'"design":"Run the project once with each version and compare completion, time, '
+        b'and review findings.",'
+        b'"repetitions":3}'
     )
     assert route.calls[0].request.extensions["timeout"]["read"] == 15 * 60
 
@@ -81,6 +90,10 @@ def test_verify_submit_single_omits_candidate_b() -> None:
             "single",
             "--candidate-a",
             "same-sha",
+            "--hypothesis",
+            "The tested version will finish the complete sample project.",
+            "--design",
+            "Run one isolated copy and record completion, quality, time, and cost.",
             "--repetitions",
             "1",
         ],
@@ -90,6 +103,8 @@ def test_verify_submit_single_omits_candidate_b() -> None:
     assert json.loads(route.calls[0].request.content) == {
         "mode": "single",
         "candidate_a": "same-sha",
+        "hypothesis": "The tested version will finish the complete sample project.",
+        "design": "Run one isolated copy and record completion, quality, time, and cost.",
         "repetitions": 1,
     }
 

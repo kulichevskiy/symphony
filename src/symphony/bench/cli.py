@@ -23,7 +23,7 @@ from .grader import GraderInfrastructureError, SupportQueueGrader
 from .harness import load_harness, snapshot_harness
 from .live import LiveBenchConfig, LiveTrialExecutor
 from .metrics import snapshot_candidate
-from .models import ExperimentMode, ExperimentReport, Trial, TrialOutcome
+from .models import Experiment, ExperimentMode, ExperimentReport, Trial, TrialOutcome
 from .report import render_markdown
 from .reviewer import cleanup_stale_reviewer_credentials
 
@@ -126,6 +126,16 @@ def _request(
 @click.option("--candidate-a", required=True, help="Git revision for candidate A.")
 @click.option("--candidate-b", help="Git revision for candidate B (paired mode only).")
 @click.option(
+    "--hypothesis",
+    required=True,
+    help="Plain-English claim that this experiment tests.",
+)
+@click.option(
+    "--design",
+    required=True,
+    help="Plain-English explanation of how the experiment tests the hypothesis.",
+)
+@click.option(
     "--profile-a",
     type=click.Path(path_type=Path, exists=True, dir_okay=False),
     help="Optional immutable JSON config snapshot for candidate A.",
@@ -142,6 +152,8 @@ def submit(
     mode: str,
     candidate_a: str,
     candidate_b: str | None,
+    hypothesis: str,
+    design: str,
     profile_a: Path | None,
     profile_b: Path | None,
     repetitions: int,
@@ -153,12 +165,16 @@ def submit(
         payload: dict[str, object] = {
             "mode": mode,
             "candidate_a": candidate_a,
+            "hypothesis": hypothesis,
+            "design": design,
             "repetitions": repetitions,
         }
     else:
         payload = {
             "candidate_a": candidate_a,
             "candidate_b": candidate_b,
+            "hypothesis": hypothesis,
+            "design": design,
             "repetitions": repetitions,
         }
     if profile_a is not None:
@@ -715,6 +731,16 @@ def _serve_with_profile(
         executor = executor_b if trial.candidate == "B" else executor_a
         return await executor(trial)
 
+    async def publish_interrupted(trial: Trial) -> None:
+        executor = executor_b if trial.candidate == "B" else executor_a
+        await executor.publish_interrupted(trial)
+
+    async def start_experiment(experiment: Experiment) -> str:
+        return await executor_a.start_experiment(experiment)
+
+    async def publish_failed_experiment(experiment: Experiment) -> None:
+        await executor_a.publish_failed_experiment(experiment)
+
     async def resolve_revision(revision: str) -> str:
         return await executor_a.resolve_revision(revision)
 
@@ -738,6 +764,10 @@ def _serve_with_profile(
         harness_version=harness_version(),
         prepare_harness=prepare_harness,
         recover_execution=recover_execution,
+        recover_chronicle=executor_a.recover_chronicle,
+        start_experiment=start_experiment,
+        publish_interrupted=publish_interrupted,
+        publish_failed_experiment=publish_failed_experiment,
         reports_root=private_root / "reports",
     )
     uvicorn_module.run(app, host=host, port=port)

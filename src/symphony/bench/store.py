@@ -32,12 +32,16 @@ class ExperimentStore:
                     mode TEXT NOT NULL DEFAULT 'paired',
                     candidate_a TEXT NOT NULL,
                     candidate_b TEXT NOT NULL,
+                    hypothesis TEXT NOT NULL DEFAULT '',
+                    design TEXT NOT NULL DEFAULT '',
                     candidate_a_profile TEXT NOT NULL DEFAULT '{}',
                     candidate_b_profile TEXT NOT NULL DEFAULT '{}',
                     system_version_a TEXT NOT NULL DEFAULT '',
                     system_version_b TEXT NOT NULL DEFAULT '',
                     executor_toolchain_version TEXT NOT NULL DEFAULT '',
                     harness_version TEXT NOT NULL DEFAULT '',
+                    linear_project_id TEXT NOT NULL DEFAULT '',
+                    chronicle_recovery_pending INTEGER NOT NULL DEFAULT 0,
                     repetitions INTEGER NOT NULL,
                     created_at TEXT NOT NULL
                 )
@@ -59,6 +63,7 @@ class ExperimentStore:
                     repository_url TEXT,
                     issue_urls TEXT NOT NULL DEFAULT '[]',
                     metrics TEXT NOT NULL DEFAULT '{}',
+                    chronicle_recovery_pending INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (experiment_id, candidate, repetition),
                     FOREIGN KEY (experiment_id) REFERENCES bench_experiments(id)
                 )
@@ -66,6 +71,12 @@ class ExperimentStore:
             )
             self._ensure_column(
                 conn, "bench_experiments", "mode", "TEXT NOT NULL DEFAULT 'paired'"
+            )
+            self._ensure_column(
+                conn, "bench_experiments", "hypothesis", "TEXT NOT NULL DEFAULT ''"
+            )
+            self._ensure_column(
+                conn, "bench_experiments", "design", "TEXT NOT NULL DEFAULT ''"
             )
             self._ensure_column(
                 conn, "bench_experiments", "candidate_a_profile", "TEXT NOT NULL DEFAULT '{}'"
@@ -88,8 +99,37 @@ class ExperimentStore:
             self._ensure_column(
                 conn, "bench_experiments", "harness_version", "TEXT NOT NULL DEFAULT ''"
             )
+            self._ensure_column(
+                conn, "bench_experiments", "linear_project_id", "TEXT NOT NULL DEFAULT ''"
+            )
+            self._ensure_column(
+                conn,
+                "bench_experiments",
+                "chronicle_recovery_pending",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
             self._ensure_column(conn, "bench_trials", "profile", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(conn, "bench_trials", "system_version", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(
+                conn,
+                "bench_trials",
+                "chronicle_recovery_pending",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            conn.execute(
+                """
+                UPDATE bench_experiments
+                SET hypothesis = 'Not recorded for experiments created before chronicle support.'
+                WHERE hypothesis = ''
+                """
+            )
+            conn.execute(
+                """
+                UPDATE bench_experiments
+                SET design = 'Not recorded for experiments created before chronicle support.'
+                WHERE design = ''
+                """
+            )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS bench_notifications (
@@ -111,20 +151,25 @@ class ExperimentStore:
         *,
         harness_version: str = "",
         experiment_id: str | None = None,
+        ready: bool = True,
     ) -> Experiment:
         experiment = Experiment.queued(
             experiment_id=experiment_id or f"EXP-{uuid4().hex[:12].upper()}",
             request=request,
             harness_version=harness_version,
         )
+        if not ready:
+            experiment = experiment.model_copy(update={"status": "preparing"})
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO bench_experiments
-                    (id, status, mode, candidate_a, candidate_b, candidate_a_profile,
+                    (id, status, mode, candidate_a, candidate_b, hypothesis, design,
+                     candidate_a_profile,
                      candidate_b_profile, system_version_a, system_version_b,
-                     executor_toolchain_version, harness_version, repetitions, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     executor_toolchain_version, harness_version, linear_project_id,
+                     repetitions, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     experiment.id,
@@ -132,12 +177,15 @@ class ExperimentStore:
                     experiment.mode,
                     experiment.candidate_a,
                     experiment.candidate_b or "",
+                    experiment.hypothesis,
+                    experiment.design,
                     json.dumps(experiment.candidate_a_profile, sort_keys=True),
                     json.dumps(experiment.candidate_b_profile, sort_keys=True),
                     experiment.system_version_a,
                     experiment.system_version_b,
                     experiment.executor_toolchain_version,
                     experiment.harness_version,
+                    experiment.linear_project_id,
                     experiment.repetitions,
                     experiment.created_at.isoformat(),
                 ),
@@ -148,9 +196,11 @@ class ExperimentStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, status, mode, candidate_a, candidate_b, candidate_a_profile,
+                SELECT id, status, mode, candidate_a, candidate_b, hypothesis, design,
+                       candidate_a_profile,
                        candidate_b_profile, system_version_a, system_version_b,
-                       executor_toolchain_version, harness_version, repetitions, created_at
+                       executor_toolchain_version, harness_version, linear_project_id,
+                       repetitions, created_at
                 FROM bench_experiments WHERE id = ?
                 """,
                 (experiment_id,),
@@ -168,9 +218,11 @@ class ExperimentStore:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 """
-                SELECT id, status, mode, candidate_a, candidate_b, candidate_a_profile,
+                SELECT id, status, mode, candidate_a, candidate_b, hypothesis, design,
+                       candidate_a_profile,
                        candidate_b_profile, system_version_a, system_version_b,
-                       executor_toolchain_version, harness_version, repetitions, created_at
+                       executor_toolchain_version, harness_version, linear_project_id,
+                       repetitions, created_at
                 FROM bench_experiments
                 WHERE status = 'queued'
                 ORDER BY created_at, id
@@ -195,17 +247,46 @@ class ExperimentStore:
             row = conn.execute(
                 """
                 SELECT 1 FROM bench_experiments
-                WHERE status IN ('queued', 'running')
+                WHERE status IN ('preparing', 'queued', 'running')
                 LIMIT 1
                 """
             ).fetchone()
         return row is not None
 
+    def preparing(self) -> list[Experiment]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id FROM bench_experiments
+                WHERE status = 'preparing'
+                ORDER BY created_at, id
+                """
+            ).fetchall()
+        return [experiment for row in rows if (experiment := self.get(str(row["id"]))) is not None]
+
+    def activate(self, experiment_id: str, project_id: str) -> None:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE bench_experiments
+                SET status = 'queued', linear_project_id = ?
+                WHERE id = ? AND status = 'preparing'
+                """,
+                (project_id, experiment_id),
+            )
+        if cursor.rowcount != 1:
+            raise KeyError(experiment_id)
+
     def set_status(self, experiment_id: str, status: ExperimentStatus) -> None:
         with self._connect() as conn:
             cursor = conn.execute(
-                "UPDATE bench_experiments SET status = ? WHERE id = ?",
-                (status, experiment_id),
+                """
+                UPDATE bench_experiments
+                SET status = ?, chronicle_recovery_pending =
+                    CASE WHEN ? = 'failed' THEN 1 ELSE chronicle_recovery_pending END
+                WHERE id = ?
+                """,
+                (status, status, experiment_id),
             )
         if cursor.rowcount != 1:
             raise KeyError(experiment_id)
@@ -215,27 +296,40 @@ class ExperimentStore:
         ended_at = datetime.now(UTC).isoformat()
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            trial_rows = conn.execute(
-                """
-                SELECT experiment_id, candidate, repetition, revision, profile, system_version
-                FROM bench_trials
-                WHERE status = 'running'
-                ORDER BY started_at, experiment_id, candidate, repetition
-                """
-            ).fetchall()
-            experiment_rows = conn.execute(
-                "SELECT id FROM bench_experiments WHERE status = 'running' ORDER BY created_at, id"
-            ).fetchall()
             conn.execute(
                 """
                 UPDATE bench_trials
                 SET status = 'failed', ended_at = ?,
-                    error = 'bench worker restarted during this trial'
+                    error = 'bench worker restarted during this trial',
+                    chronicle_recovery_pending = 1
                 WHERE status = 'running'
                 """,
                 (ended_at,),
             )
-            conn.execute("UPDATE bench_experiments SET status = 'failed' WHERE status = 'running'")
+            conn.execute(
+                """
+                UPDATE bench_experiments
+                SET status = 'failed', chronicle_recovery_pending = 1
+                WHERE status = 'running'
+                """
+            )
+            trial_rows = conn.execute(
+                """
+                SELECT t.experiment_id, t.candidate, t.repetition, t.revision, t.profile,
+                       t.system_version, e.hypothesis, e.design, e.linear_project_id
+                FROM bench_trials AS t
+                JOIN bench_experiments AS e ON e.id = t.experiment_id
+                WHERE t.chronicle_recovery_pending = 1
+                ORDER BY t.started_at, t.experiment_id, t.candidate, t.repetition
+                """
+            ).fetchall()
+            experiment_rows = conn.execute(
+                """
+                SELECT id FROM bench_experiments
+                WHERE chronicle_recovery_pending = 1
+                ORDER BY created_at, id
+                """
+            ).fetchall()
         trials = [
             Trial.model_validate(
                 {
@@ -246,6 +340,25 @@ class ExperimentStore:
             for row in trial_rows
         ]
         return trials, [str(row["id"]) for row in experiment_rows]
+
+    def acknowledge_trial_chronicle_recovery(self, trial: Trial) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE bench_trials SET chronicle_recovery_pending = 0
+                WHERE experiment_id = ? AND candidate = ? AND repetition = ?
+                """,
+                (trial.experiment_id, trial.candidate, trial.repetition),
+            )
+
+    def acknowledge_experiment_chronicle_recovery(self, experiment_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE bench_experiments SET chronicle_recovery_pending = 0 WHERE id = ?
+                """,
+                (experiment_id,),
+            )
 
     def start_trial(self, trial: Trial) -> None:
         with self._connect() as conn:

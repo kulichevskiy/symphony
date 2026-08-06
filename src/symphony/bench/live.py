@@ -18,6 +18,13 @@ from ..credentials import CredentialResolver, RunCredentials
 from ..crypto import CredentialCipher
 from ..ui.oauth import linear_provider
 from .campaign import Campaign
+from .chronicle import (
+    failed_experiment_update,
+    failed_run_update,
+    launch_update,
+    project_description,
+    successful_run_update,
+)
 from .connection_sync import reconcile_connections, snapshot_connections
 from .github import Commands, GitHubRepository, GitHubSandbox, SubprocessCommands
 from .grader import GraderInfrastructureError, HiddenManifest, SupportQueueGrader
@@ -25,6 +32,7 @@ from .harness import FrozenHarness, load_harness
 from .linear import LinearCampaign, LinearIssueState, LinearSandbox
 from .metrics import snapshot_candidate
 from .models import (
+    Experiment,
     Trial,
     TrialExecutionCancelled,
     TrialExecutionError,
@@ -36,6 +44,7 @@ T = TypeVar("T")
 CandidateSnapshotter = Callable[[Path, Path], Awaitable[dict[str, object]]]
 log = logging.getLogger(__name__)
 _TRIAL_DIRECTORY_RE = re.compile(r"[AB][1-9][0-9]*\Z")
+_CHRONICLE_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 class GitHubProvisioner(Protocol):
@@ -47,6 +56,15 @@ class GitHubProvisioner(Protocol):
 
 
 class LinearProvisioner(Protocol):
+    async def ensure_project(
+        self,
+        *,
+        team_id: str,
+        experiment_id: str,
+        campaign: Campaign,
+        project_description: str,
+    ) -> str: ...
+
     async def create_campaign(
         self,
         *,
@@ -54,9 +72,20 @@ class LinearProvisioner(Protocol):
         label: str,
         repo_url: str,
         campaign: Campaign,
+        project_description: str = "",
+        project_id: str = "",
     ) -> LinearCampaign: ...
 
     async def issue_states(self, issue_ids: tuple[str, ...]) -> tuple[LinearIssueState, ...]: ...
+
+    async def publish_project_update(
+        self,
+        *,
+        project_id: str,
+        health: str,
+        body: str,
+        event_key: str | None = None,
+    ) -> None: ...
 
 
 class ProductGrader(Protocol):
@@ -170,10 +199,19 @@ class LiveTrialExecutor:
         try:
             frozen = self._load_trial_harness(trial)
             credentials = self._credentials or await self._resolve_credentials()
-            if not credentials.github_token:
-                raise RuntimeError("bench GitHub connection is missing; reconnect and retry")
             if not credentials.linear_token:
                 raise RuntimeError("bench Linear connection is missing; reconnect and retry")
+
+            owns_linear = self._linear is None
+            linear = self._linear or LinearSandbox(
+                credentials.linear_token,
+                routing_label_id=self._config.linear_label_id,
+                authorization_resolver=(
+                    self._resolve_linear_authorization if self._credentials is None else None
+                ),
+            )
+            if not credentials.github_token:
+                raise RuntimeError("bench GitHub connection is missing; reconnect and retry")
 
             await asyncio.to_thread(trial_root.mkdir, parents=True, exist_ok=False)
             await asyncio.to_thread(shutil.copytree, frozen.root / "support_queue", app_root)
@@ -186,20 +224,14 @@ class LiveTrialExecutor:
                 lambda: github.create_repository(name=trial_name, source=app_root)
             )
 
-            owns_linear = self._linear is None
-            linear = self._linear or LinearSandbox(
-                credentials.linear_token,
-                routing_label_id=self._config.linear_label_id,
-                authorization_resolver=(
-                    self._resolve_linear_authorization if self._credentials is None else None
-                ),
-            )
             campaign = await self._retry_provision(
                 lambda: linear.create_campaign(
                     team_id=self._config.linear_team_id,
                     label=trial_name,
                     repo_url=repository.url,
                     campaign=frozen.campaign,
+                    project_description=project_description(trial),
+                    project_id=trial.linear_project_id,
                 )
             )
             connections_db = trial_root / "connections.sqlite"
@@ -243,6 +275,22 @@ class LiveTrialExecutor:
             metrics.update(
                 await github.review_metrics(repository_slug=repository.slug, cwd=trial_root)
             )
+            metrics["wall_seconds"] = asyncio.get_running_loop().time() - started
+            await self._publish_chronicle(
+                linear=linear,
+                project_id=campaign.project_id,
+                event_key=f"{trial.experiment_id}:{suffix}:completed",
+                health="onTrack",
+                body=successful_run_update(
+                    trial,
+                    TrialOutcome(
+                        repository_url=repository.url,
+                        issue_urls=list(campaign.issue_urls),
+                        metrics=metrics,
+                    ),
+                ),
+                metrics=metrics,
+            )
         except asyncio.CancelledError:
             outcome = await self._bounded_partial_outcome(
                 repository=repository,
@@ -253,6 +301,14 @@ class LiveTrialExecutor:
                 candidate_db=trial_root / "candidate.sqlite",
                 metrics=metrics,
                 started=started,
+            )
+            await self._publish_failure_update(
+                linear=linear,
+                campaign=campaign,
+                trial=trial,
+                error="bench worker stopped during this run",
+                outcome=outcome,
+                event="interrupted",
             )
             if not cancelled_outcome.done():
                 cancelled_outcome.set_result(outcome)
@@ -267,6 +323,14 @@ class LiveTrialExecutor:
                 candidate_db=trial_root / "candidate.sqlite",
                 metrics=metrics,
                 started=started,
+            )
+            await self._publish_failure_update(
+                linear=linear,
+                campaign=campaign,
+                trial=trial,
+                error=f"infrastructure_failed: {exc}",
+                outcome=outcome,
+                event="failed",
             )
             raise TrialExecutionError(
                 f"infrastructure_failed: {exc}",
@@ -283,14 +347,19 @@ class LiveTrialExecutor:
                 metrics=metrics,
                 started=started,
             )
+            await self._publish_failure_update(
+                linear=linear,
+                campaign=campaign,
+                trial=trial,
+                error=str(exc),
+                outcome=outcome,
+                event="failed",
+            )
             raise TrialExecutionError(
                 str(exc),
                 outcome=outcome,
             ) from exc
         finally:
-            if owns_linear:
-                assert isinstance(linear, LinearSandbox)
-                await linear.aclose()
             try:
                 await asyncio.to_thread(
                     _archive_trial_receipts,
@@ -310,6 +379,23 @@ class LiveTrialExecutor:
                 except Exception as exc:  # noqa: BLE001 - reported after a successful trial
                     archive_error = exc
                     log.exception("could not archive benchmark repository %s", repository.slug)
+            if archive_error is not None:
+                metrics["wall_seconds"] = asyncio.get_running_loop().time() - started
+                await self._publish_failure_update(
+                    linear=linear,
+                    campaign=campaign,
+                    trial=trial,
+                    error=f"could not archive benchmark repository: {archive_error}",
+                    outcome=TrialOutcome(
+                        repository_url=repository.url if repository is not None else None,
+                        issue_urls=list(campaign.issue_urls) if campaign is not None else [],
+                        metrics=metrics,
+                    ),
+                    event="archive-failed",
+                )
+            if owns_linear:
+                assert isinstance(linear, LinearSandbox)
+                await linear.aclose()
         metrics["wall_seconds"] = asyncio.get_running_loop().time() - started
         outcome = TrialOutcome(
             repository_url=repository.url,
@@ -322,6 +408,282 @@ class LiveTrialExecutor:
                 outcome=outcome,
             )
         return outcome
+
+    async def start_experiment(self, experiment: Experiment) -> str:
+        frozen = load_harness(self._config.private_root / experiment.id / "_harness")
+        linear, owns_linear = await self._chronicle_linear()
+        try:
+            project_id = await linear.ensure_project(
+                team_id=self._config.linear_team_id,
+                experiment_id=experiment.id,
+                campaign=frozen.campaign,
+                project_description=project_description(experiment),
+            )
+            launch_is_durable = await self._publish_chronicle(
+                linear=linear,
+                project_id=project_id,
+                event_key=f"{experiment.id}:started",
+                health="onTrack",
+                body=launch_update(experiment),
+            )
+            if not launch_is_durable:
+                raise RuntimeError("experiment launch update is neither delivered nor durable")
+            return project_id
+        finally:
+            if owns_linear:
+                assert isinstance(linear, LinearSandbox)
+                await linear.aclose()
+
+    async def publish_failed_experiment(self, experiment: Experiment) -> None:
+        if not experiment.linear_project_id:
+            return
+        event_key = f"{experiment.id}:failed"
+        body = failed_experiment_update(experiment)
+        pending = await self._queue_chronicle_event(
+            project_id=experiment.linear_project_id,
+            event_key=event_key,
+            health="offTrack",
+            body=body,
+        )
+        try:
+            linear, owns_linear = await self._chronicle_linear()
+        except Exception:  # noqa: BLE001 - the durable event remains for restart recovery
+            log.exception("could not connect to Linear for terminal experiment update")
+            return
+        try:
+            await self._deliver_chronicle_event(
+                linear=linear,
+                pending=pending,
+                project_id=experiment.linear_project_id,
+                event_key=event_key,
+                health="offTrack",
+                body=body,
+            )
+        finally:
+            if owns_linear:
+                assert isinstance(linear, LinearSandbox)
+                await linear.aclose()
+
+    async def recover_chronicle(self) -> None:
+        pending = sorted(
+            (self._config.private_root / "_chronicle").glob("*.json"),
+            key=_chronicle_recovery_order,
+        )
+        if not pending:
+            return
+        try:
+            linear, owns_linear = await self._chronicle_linear()
+        except Exception:  # noqa: BLE001 - leave all durable events for the next restart
+            log.exception("could not connect to Linear to recover benchmark chronicle")
+            return
+        blocked_experiments: set[str] = set()
+        try:
+            for path in pending:
+                experiment_id = path.stem.partition(":")[0]
+                if experiment_id in blocked_experiments:
+                    continue
+                try:
+                    payload = json.loads(await asyncio.to_thread(path.read_text, encoding="utf-8"))
+                    await linear.publish_project_update(
+                        project_id=str(payload["project_id"]),
+                        event_key=str(payload["event_key"]),
+                        health=str(payload["health"]),
+                        body=str(payload["body"]),
+                    )
+                    await asyncio.to_thread(path.unlink, missing_ok=True)
+                except Exception:  # noqa: BLE001 - leave the durable event for the next restart
+                    blocked_experiments.add(experiment_id)
+                    log.exception("could not recover benchmark chronicle event from %s", path)
+        finally:
+            if owns_linear:
+                assert isinstance(linear, LinearSandbox)
+                await linear.aclose()
+
+    async def _chronicle_linear(self) -> tuple[LinearProvisioner, bool]:
+        if self._linear is not None:
+            return self._linear, False
+        credentials = self._credentials or await self._resolve_credentials()
+        if not credentials.linear_token:
+            raise RuntimeError("bench Linear connection is missing; reconnect and retry")
+        return (
+            LinearSandbox(
+                credentials.linear_token,
+                routing_label_id=self._config.linear_label_id,
+                authorization_resolver=(
+                    self._resolve_linear_authorization if self._credentials is None else None
+                ),
+            ),
+            True,
+        )
+
+    async def _publish_chronicle(
+        self,
+        *,
+        linear: LinearProvisioner,
+        project_id: str,
+        event_key: str,
+        health: str,
+        body: str,
+        metrics: dict[str, object] | None = None,
+    ) -> bool:
+        try:
+            pending = await self._queue_chronicle_event(
+                project_id=project_id,
+                event_key=event_key,
+                health=health,
+                body=body,
+            )
+        except OSError as exc:
+            pending = None
+            if metrics is not None:
+                metrics["linear_chronicle_error"] = str(exc)
+            log.exception("could not persist benchmark chronicle event %s", event_key)
+        delivered = await self._deliver_chronicle_event(
+            linear=linear,
+            pending=pending,
+            project_id=project_id,
+            event_key=event_key,
+            health=health,
+            body=body,
+            metrics=metrics,
+        )
+        return pending is not None or delivered
+
+    async def _queue_chronicle_event(
+        self, *, project_id: str, event_key: str, health: str, body: str
+    ) -> Path:
+        pending = self._config.private_root / "_chronicle" / f"{event_key}.json"
+        await asyncio.to_thread(
+            _write_chronicle_event,
+            pending,
+            {"project_id": project_id, "event_key": event_key, "health": health, "body": body},
+        )
+        return pending
+
+    async def _deliver_chronicle_event(
+        self,
+        *,
+        linear: LinearProvisioner,
+        pending: Path | None,
+        project_id: str,
+        event_key: str,
+        health: str,
+        body: str,
+        metrics: dict[str, object] | None = None,
+    ) -> bool:
+        if pending is not None:
+            experiment_id = pending.stem.partition(":")[0]
+            lock = _CHRONICLE_LOCKS.setdefault(experiment_id, asyncio.Lock())
+            async with lock:
+                if not await asyncio.to_thread(pending.exists):
+                    return True
+                paths = sorted(
+                    (
+                        path
+                        for path in pending.parent.glob("*.json")
+                        if path.stem.partition(":")[0] == experiment_id
+                    ),
+                    key=_chronicle_recovery_order,
+                )
+                for path in paths:
+                    try:
+                        payload = json.loads(
+                            await asyncio.to_thread(path.read_text, encoding="utf-8")
+                        )
+                        await linear.publish_project_update(
+                            project_id=str(payload["project_id"]),
+                            event_key=str(payload["event_key"]),
+                            health=str(payload["health"]),
+                            body=str(payload["body"]),
+                        )
+                    except Exception as exc:  # noqa: BLE001 - preserve the ordered outbox
+                        if path == pending and metrics is not None:
+                            metrics["linear_chronicle_error"] = str(exc)
+                        log.exception("could not publish benchmark chronicle event from %s", path)
+                        return False
+                    try:
+                        await asyncio.to_thread(path.unlink, missing_ok=True)
+                    except OSError:
+                        log.exception("could not remove delivered chronicle event %s", path)
+                        return path == pending
+                return not await asyncio.to_thread(pending.exists)
+        try:
+            await linear.publish_project_update(
+                project_id=project_id,
+                event_key=event_key,
+                health=health,
+                body=body,
+            )
+        except Exception as exc:  # noqa: BLE001 - chronicle delivery must not change trial result
+            if metrics is not None:
+                metrics["linear_chronicle_error"] = str(exc)
+            log.exception("could not publish benchmark chronicle event %s", event_key)
+            return False
+        if pending is not None:
+            try:
+                await asyncio.to_thread(pending.unlink, missing_ok=True)
+            except OSError:
+                log.exception("could not remove delivered chronicle event %s", pending)
+        return True
+
+    async def publish_interrupted(self, trial: Trial) -> None:
+        if not trial.linear_project_id:
+            log.warning("no Linear project for interrupted trial %s", trial.experiment_id)
+            return
+        event_key = f"{trial.experiment_id}:{trial.candidate}{trial.repetition}:interrupted"
+        body = failed_run_update(
+            trial,
+            "bench worker restarted during this run",
+            TrialOutcome(metrics={"token_metrics_unavailable": True}),
+        )
+        pending = await self._queue_chronicle_event(
+            project_id=trial.linear_project_id,
+            event_key=event_key,
+            health="offTrack",
+            body=body,
+        )
+        try:
+            linear, owns_linear = await self._chronicle_linear()
+        except Exception:  # noqa: BLE001 - the durable event remains for restart recovery
+            log.exception("could not connect to Linear for interrupted trial update")
+            return
+        try:
+            await self._deliver_chronicle_event(
+                linear=linear,
+                pending=pending,
+                project_id=trial.linear_project_id,
+                event_key=event_key,
+                health="offTrack",
+                body=body,
+            )
+        finally:
+            if owns_linear:
+                assert isinstance(linear, LinearSandbox)
+                await linear.aclose()
+
+    async def _publish_failure_update(
+        self,
+        *,
+        linear: LinearProvisioner | None,
+        campaign: LinearCampaign | None,
+        trial: Trial,
+        error: str,
+        outcome: TrialOutcome,
+        event: str,
+    ) -> None:
+        project_id = campaign.project_id if campaign is not None else trial.linear_project_id
+        if linear is None or not project_id:
+            return
+        await self._publish_chronicle(
+            linear=linear,
+            project_id=project_id,
+            event_key=(
+                f"{trial.experiment_id}:{trial.candidate}{trial.repetition}:{event}"
+            ),
+            health="offTrack",
+            body=failed_run_update(trial, error, outcome),
+            metrics=outcome.metrics,
+        )
 
     def _load_trial_harness(self, trial: Trial) -> FrozenHarness:
         snapshot = self._config.private_root / trial.experiment_id / "_harness"
@@ -714,3 +1076,25 @@ def _archive_trial_receipts(trial_root: Path, destination: Path) -> None:
         encoding="utf-8",
     )
     shutil.rmtree(trial_root)
+
+
+def _write_chronicle_event(path: Path, payload: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _chronicle_recovery_order(path: Path) -> tuple[str, int, str]:
+    event_key = path.stem
+    experiment_id, _, event = event_key.partition(":")
+    if event == "started":
+        stage = 0
+    elif event == "failed":
+        stage = 2
+    else:
+        stage = 1
+    return experiment_id, stage, event_key

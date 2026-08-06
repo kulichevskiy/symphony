@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,13 @@ from symphony.bench.harness import snapshot_harness
 from symphony.bench.linear import LinearCampaign, LinearIssueState
 from symphony.bench.live import LiveBenchConfig, LiveTrialExecutor, _archive_shared_trials
 from symphony.bench.metrics import local_review_metrics
-from symphony.bench.models import Trial, TrialExecutionCancelled, TrialExecutionError
+from symphony.bench.models import (
+    Experiment,
+    ExperimentCreate,
+    Trial,
+    TrialExecutionCancelled,
+    TrialExecutionError,
+)
 from symphony.credentials import RunCredentials
 from symphony.crypto import CredentialCipher
 
@@ -60,12 +67,35 @@ class FailingReviewGitHub(FakeGitHub):
 
 
 class FakeLinear:
+    def __init__(self) -> None:
+        self.campaign_calls: list[dict[str, object]] = []
+        self.project_updates: list[tuple[str, str]] = []
+        self.ensure_calls: list[dict[str, object]] = []
+
+    async def ensure_project(self, **kwargs: object) -> str:
+        self.ensure_calls.append(dict(kwargs))
+        return "project-id"
+
     async def create_campaign(self, **_kwargs: object) -> LinearCampaign:
+        self.campaign_calls.append(dict(_kwargs))
         return LinearCampaign(
             issue_ids=tuple(f"id-{index}" for index in range(2)),
             issue_identifiers=tuple(f"BENCH-{index}" for index in range(2)),
             issue_urls=tuple(f"https://linear.app/BENCH-{index}" for index in range(2)),
+            project_id="project-id",
         )
+
+    async def publish_project_update(
+        self,
+        *,
+        project_id: str,
+        health: str,
+        body: str,
+        event_key: str | None = None,
+    ) -> None:
+        del event_key
+        assert project_id == "project-id"
+        self.project_updates.append((health, body))
 
     async def issue_states(self, issue_ids: tuple[str, ...]) -> tuple[LinearIssueState, ...]:
         return tuple(
@@ -76,6 +106,7 @@ class FakeLinear:
 
 class CompletingLinear(FakeLinear):
     def __init__(self) -> None:
+        super().__init__()
         self.polls = 0
 
     async def issue_states(self, issue_ids: tuple[str, ...]) -> tuple[LinearIssueState, ...]:
@@ -103,6 +134,23 @@ class NeedsInputLinear(FakeLinear):
             )
             for index, issue_id in enumerate(issue_ids)
         )
+
+
+class FailingChronicleLinear(FakeLinear):
+    async def publish_project_update(self, **_kwargs: object) -> None:
+        raise RuntimeError("Linear temporarily unavailable")
+
+
+class FirstChronicleFailureLinear(FakeLinear):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def publish_project_update(self, **kwargs: object) -> None:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise RuntimeError("first event unavailable")
+        await super().publish_project_update(**kwargs)
 
 
 class FakeCommands:
@@ -417,6 +465,7 @@ async def test_live_trial_provisions_runs_and_returns_traceable_outcome(
     commands = FakeCommands()
     root, private_root = _frozen_roots(tmp_path, "EXP-1", private_bench_controls)
     github = FakeGitHub()
+    linear = FakeLinear()
     executor = LiveTrialExecutor(
         config=LiveBenchConfig(
             root=root,
@@ -431,14 +480,21 @@ async def test_live_trial_provisions_runs_and_returns_traceable_outcome(
         commands=commands,
         credentials=RunCredentials(github_token="gh", linear_token="Bearer lin"),
         github=github,
-        linear=FakeLinear(),
+        linear=linear,
         grader=FakeGrader(),
         reviewer=FakeReviewer(),
         candidate_snapshotter=commands.snapshot,
     )
 
     outcome = await executor(
-        Trial(experiment_id="EXP-1", candidate="A", repetition=1, revision="abc123")
+        Trial(
+            experiment_id="EXP-1",
+            candidate="A",
+            repetition=1,
+            revision="abc123",
+            hypothesis="The revised review process will finish the complete sample project.",
+            design="Run one isolated copy of the project with version A.",
+        )
     )
 
     assert outcome.repository_url == "https://github.com/kulichevskiy/EXP-1-A1"
@@ -470,6 +526,13 @@ async def test_live_trial_provisions_runs_and_returns_traceable_outcome(
     assert not (root / "EXP-1/A1").exists()
     assert (private_root / "EXP-1/A1/receipt-manifest.json").exists()
     assert github.archived == ["kulichevskiy/EXP-1-A1"]
+    assert "## Hypothesis" in str(linear.campaign_calls[0]["project_description"])
+    assert linear.project_updates == [
+        ("onTrack", linear.project_updates[0][1])
+    ]
+    assert "finished successfully" in linear.project_updates[0][1]
+    assert "version a, run 1 finished successfully" in linear.project_updates[0][1].lower()
+    assert "hidden checks" in linear.project_updates[0][1].lower()
 
 
 @pytest.mark.asyncio
@@ -719,6 +782,7 @@ async def test_live_trial_reports_repository_archive_failure(
 ) -> None:
     commands = FakeCommands()
     root, private_root = _frozen_roots(tmp_path, "EXP-ARCHIVE", private_bench_controls)
+    linear = FakeLinear()
     executor = LiveTrialExecutor(
         config=LiveBenchConfig(
             root=root,
@@ -734,7 +798,7 @@ async def test_live_trial_reports_repository_archive_failure(
         commands=commands,
         credentials=RunCredentials(github_token="gh", linear_token="Bearer lin"),
         github=FailingArchiveGitHub(),
-        linear=FakeLinear(),
+        linear=linear,
         grader=FakeGrader(),
         reviewer=FakeReviewer(),
         candidate_snapshotter=commands.snapshot,
@@ -747,6 +811,326 @@ async def test_live_trial_reports_repository_archive_failure(
 
     assert raised.value.outcome.repository_url.endswith("/EXP-ARCHIVE-A1")  # type: ignore[union-attr]
     assert raised.value.outcome.metrics["hidden_checks_passed"] == 8
+    assert linear.project_updates[-1][0] == "offTrack"
+    assert "archive denied" in linear.project_updates[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_live_trial_publishes_worker_restart_from_durable_project_receipt(
+    tmp_path: Path,
+) -> None:
+    private_root = tmp_path / "private"
+    linear = FakeLinear()
+    executor = LiveTrialExecutor(
+        config=LiveBenchConfig(
+            root=tmp_path / "runs",
+            private_root=private_root,
+            control_db=tmp_path / "control.sqlite",
+            github_owner="kulichevskiy",
+            linear_team_id="team-id",
+            symphony_repository="repo",
+            encryption_key="key",
+        ),
+        credentials=RunCredentials(github_token="gh", linear_token="lin"),
+        linear=linear,
+    )
+
+    await executor.publish_interrupted(
+        Trial(
+            experiment_id="EXP-RESTART",
+            candidate="A",
+            repetition=1,
+            revision="sha",
+            linear_project_id="project-id",
+        )
+    )
+
+    assert linear.project_updates[-1][0] == "offTrack"
+    assert "worker restarted" in linear.project_updates[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_live_trial_starts_project_chronicle_before_any_trial(
+    tmp_path: Path, private_bench_controls: Path
+) -> None:
+    _, private_root = _frozen_roots(tmp_path, "EXP-START", private_bench_controls)
+    linear = FakeLinear()
+    executor = LiveTrialExecutor(
+        config=LiveBenchConfig(
+            root=tmp_path / "runs",
+            private_root=private_root,
+            control_db=tmp_path / "control.sqlite",
+            github_owner="kulichevskiy",
+            linear_team_id="team-id",
+            symphony_repository="repo",
+            encryption_key="key",
+        ),
+        credentials=RunCredentials(github_token="gh", linear_token="lin"),
+        linear=linear,
+    )
+    experiment = Experiment.queued(
+        experiment_id="EXP-START",
+        request=ExperimentCreate(
+            mode="single",
+            candidate_a="sha",
+            hypothesis="The new review process will finish the whole sample project.",
+            design="Run one isolated copy with the new review process.",
+            repetitions=1,
+        ),
+    )
+
+    project_id = await executor.start_experiment(experiment)
+
+    assert project_id == "project-id"
+    assert "## Hypothesis" in str(linear.ensure_calls[0]["project_description"])
+    assert linear.project_updates[-1][0] == "onTrack"
+    assert "Experiment started" in linear.project_updates[-1][1]
+
+
+@pytest.mark.asyncio
+async def test_chronicle_delivery_failure_does_not_fail_trial_and_retries_after_restart(
+    tmp_path: Path, private_bench_controls: Path
+) -> None:
+    commands = FakeCommands()
+    root, private_root = _frozen_roots(tmp_path, "EXP-OUTBOX", private_bench_controls)
+    config = LiveBenchConfig(
+        root=root,
+        private_root=private_root,
+        control_db=tmp_path / "control.sqlite",
+        github_owner="kulichevskiy",
+        linear_team_id="team-id",
+        symphony_repository="repo",
+        encryption_key="key",
+        poll_seconds=0,
+    )
+    executor = LiveTrialExecutor(
+        config=config,
+        commands=commands,
+        credentials=RunCredentials(github_token="gh", linear_token="lin"),
+        github=FakeGitHub(),
+        linear=FailingChronicleLinear(),
+        grader=FakeGrader(),
+        reviewer=FakeReviewer(),
+        candidate_snapshotter=commands.snapshot,
+    )
+
+    outcome = await executor(
+        Trial(experiment_id="EXP-OUTBOX", candidate="A", repetition=1, revision="sha")
+    )
+
+    assert outcome.metrics["linear_chronicle_error"] == "Linear temporarily unavailable"
+    pending = list((private_root / "_chronicle").glob("*.json"))
+    assert len(pending) == 1
+
+    recovered = FakeLinear()
+    recovery = LiveTrialExecutor(
+        config=config,
+        credentials=RunCredentials(github_token="gh", linear_token="lin"),
+        linear=recovered,
+    )
+    await recovery.recover_chronicle()
+
+    assert recovered.project_updates[-1][0] == "onTrack"
+    assert not pending[0].exists()
+
+
+@pytest.mark.asyncio
+async def test_chronicle_recovery_keeps_terminal_failure_last(tmp_path: Path) -> None:
+    private_root = tmp_path / "private"
+    pending = private_root / "_chronicle"
+    pending.mkdir(parents=True)
+    (pending / "EXP-ORDER:failed.json").write_text(
+        '{"body":"Failed.","event_key":"EXP-ORDER:failed",'
+        '"health":"offTrack","project_id":"project-id"}\n',
+        encoding="utf-8",
+    )
+    (pending / "EXP-ORDER:started.json").write_text(
+        '{"body":"Started.","event_key":"EXP-ORDER:started",'
+        '"health":"onTrack","project_id":"project-id"}\n',
+        encoding="utf-8",
+    )
+    linear = FakeLinear()
+    executor = LiveTrialExecutor(
+        config=LiveBenchConfig(
+            root=tmp_path / "runs",
+            private_root=private_root,
+            control_db=tmp_path / "control.sqlite",
+            github_owner="kulichevskiy",
+            linear_team_id="team-id",
+            symphony_repository="repo",
+            encryption_key="key",
+        ),
+        credentials=RunCredentials(github_token="gh", linear_token="lin"),
+        linear=linear,
+    )
+
+    await executor.recover_chronicle()
+
+    assert [health for health, _body in linear.project_updates] == ["onTrack", "offTrack"]
+
+
+@pytest.mark.asyncio
+async def test_chronicle_recovery_stops_later_events_after_earlier_failure(tmp_path: Path) -> None:
+    private_root = tmp_path / "private"
+    pending = private_root / "_chronicle"
+    pending.mkdir(parents=True)
+    for event, health in (("started", "onTrack"), ("failed", "offTrack")):
+        (pending / f"EXP-BLOCK:{event}.json").write_text(
+            json.dumps(
+                {
+                    "body": event,
+                    "event_key": f"EXP-BLOCK:{event}",
+                    "health": health,
+                    "project_id": "project-id",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+    linear = FirstChronicleFailureLinear()
+    executor = LiveTrialExecutor(
+        config=LiveBenchConfig(
+            root=tmp_path / "runs",
+            private_root=private_root,
+            control_db=tmp_path / "control.sqlite",
+            github_owner="kulichevskiy",
+            linear_team_id="team-id",
+            symphony_repository="repo",
+            encryption_key="key",
+        ),
+        credentials=RunCredentials(github_token="gh", linear_token="lin"),
+        linear=linear,
+    )
+
+    await executor.recover_chronicle()
+
+    assert linear.attempts == 1
+    assert len(list(pending.glob("*.json"))) == 2
+
+
+@pytest.mark.asyncio
+async def test_terminal_update_waits_for_pending_launch_update(
+    tmp_path: Path, private_bench_controls: Path
+) -> None:
+    _, private_root = _frozen_roots(tmp_path, "EXP-SEQUENCE", private_bench_controls)
+    config = LiveBenchConfig(
+        root=tmp_path / "runs",
+        private_root=private_root,
+        control_db=tmp_path / "control.sqlite",
+        github_owner="kulichevskiy",
+        linear_team_id="team-id",
+        symphony_repository="repo",
+        encryption_key="key",
+    )
+    experiment = Experiment.queued(
+        experiment_id="EXP-SEQUENCE",
+        request=ExperimentCreate(
+            mode="single",
+            candidate_a="sha",
+            hypothesis="The tested version will finish the whole sample project.",
+            design="Run one isolated copy of the sample project.",
+            repetitions=1,
+        ),
+    )
+    launch = LiveTrialExecutor(
+        config=config,
+        credentials=RunCredentials(github_token="gh", linear_token="lin"),
+        linear=FailingChronicleLinear(),
+    )
+    project_id = await launch.start_experiment(experiment)
+    failed = experiment.model_copy(
+        update={"status": "failed", "linear_project_id": project_id}
+    )
+    delivered = FakeLinear()
+    terminal = LiveTrialExecutor(
+        config=config,
+        credentials=RunCredentials(github_token="gh", linear_token="lin"),
+        linear=delivered,
+    )
+
+    await terminal.publish_failed_experiment(failed)
+
+    assert [health for health, _body in delivered.project_updates] == ["onTrack", "offTrack"]
+    assert not list((private_root / "_chronicle").glob("*.json"))
+
+
+@pytest.mark.asyncio
+async def test_chronicle_outbox_write_failure_does_not_fail_successful_trial(
+    tmp_path: Path, private_bench_controls: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands = FakeCommands()
+    root, private_root = _frozen_roots(tmp_path, "EXP-WRITE", private_bench_controls)
+
+    def fail_write(_path: Path, _payload: dict[str, str]) -> None:
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr("symphony.bench.live._write_chronicle_event", fail_write)
+    executor = LiveTrialExecutor(
+        config=LiveBenchConfig(
+            root=root,
+            private_root=private_root,
+            control_db=tmp_path / "control.sqlite",
+            github_owner="kulichevskiy",
+            linear_team_id="team-id",
+            symphony_repository="repo",
+            encryption_key="key",
+            poll_seconds=0,
+        ),
+        commands=commands,
+        credentials=RunCredentials(github_token="gh", linear_token="lin"),
+        github=FakeGitHub(),
+        linear=FakeLinear(),
+        grader=FakeGrader(),
+        reviewer=FakeReviewer(),
+        candidate_snapshotter=commands.snapshot,
+    )
+
+    outcome = await executor(
+        Trial(experiment_id="EXP-WRITE", candidate="A", repetition=1, revision="sha")
+    )
+
+    assert outcome.metrics["linear_chronicle_error"] == "disk unavailable"
+
+
+@pytest.mark.asyncio
+async def test_chronicle_outbox_cleanup_failure_does_not_fail_successful_trial(
+    tmp_path: Path, private_bench_controls: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    commands = FakeCommands()
+    root, private_root = _frozen_roots(tmp_path, "EXP-UNLINK", private_bench_controls)
+    original_unlink = Path.unlink
+
+    def fail_chronicle_unlink(path: Path, *, missing_ok: bool = False) -> None:
+        if path.parent.name == "_chronicle":
+            raise OSError("unlink unavailable")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_chronicle_unlink)
+    executor = LiveTrialExecutor(
+        config=LiveBenchConfig(
+            root=root,
+            private_root=private_root,
+            control_db=tmp_path / "control.sqlite",
+            github_owner="kulichevskiy",
+            linear_team_id="team-id",
+            symphony_repository="repo",
+            encryption_key="key",
+            poll_seconds=0,
+        ),
+        commands=commands,
+        credentials=RunCredentials(github_token="gh", linear_token="lin"),
+        github=FakeGitHub(),
+        linear=FakeLinear(),
+        grader=FakeGrader(),
+        reviewer=FakeReviewer(),
+        candidate_snapshotter=commands.snapshot,
+    )
+
+    outcome = await executor(
+        Trial(experiment_id="EXP-UNLINK", candidate="A", repetition=1, revision="sha")
+    )
+
+    assert outcome.metrics["hidden_checks_passed"] == 8
 
 
 @pytest.mark.asyncio
@@ -756,6 +1140,7 @@ async def test_failed_trial_receipt_counts_actual_remote_review_rounds(
     commands = FakeCommands()
     root, private_root = _frozen_roots(tmp_path, "EXP-FAIL", private_bench_controls)
     github = FakeGitHub()
+    linear = FakeLinear()
     executor = LiveTrialExecutor(
         config=LiveBenchConfig(
             root=root,
@@ -770,7 +1155,7 @@ async def test_failed_trial_receipt_counts_actual_remote_review_rounds(
         commands=commands,
         credentials=RunCredentials(github_token="gh", linear_token="Bearer lin"),
         github=github,
-        linear=FakeLinear(),
+        linear=linear,
         grader=FailingGrader(),
         reviewer=FakeReviewer(),
         candidate_snapshotter=commands.snapshot,
@@ -781,6 +1166,9 @@ async def test_failed_trial_receipt_counts_actual_remote_review_rounds(
 
     assert raised.value.outcome.metrics["remote_review_rounds"] == 2
     assert github.reviewed == ["kulichevskiy/EXP-FAIL-A1"]
+    assert linear.project_updates[-1][0] == "offTrack"
+    assert "version a, run 1 failed" in linear.project_updates[-1][1].lower()
+    assert "grading broke" in linear.project_updates[-1][1]
 
 
 @pytest.mark.asyncio
@@ -1006,6 +1394,7 @@ async def test_live_trial_external_cancellation_keeps_partial_outcome(
     root, private_root = _frozen_roots(tmp_path, "EXP-CANCEL", private_bench_controls)
     commands = FakeCommands()
     github = FakeGitHub()
+    linear = FakeLinear()
     executor = LiveTrialExecutor(
         config=LiveBenchConfig(
             root=root,
@@ -1020,7 +1409,7 @@ async def test_live_trial_external_cancellation_keeps_partial_outcome(
         commands=commands,
         credentials=RunCredentials(github_token="gh", linear_token="lin"),
         github=github,
-        linear=FakeLinear(),
+        linear=linear,
         grader=grader,
         reviewer=FakeReviewer(),
         candidate_snapshotter=commands.snapshot,
@@ -1037,3 +1426,5 @@ async def test_live_trial_external_cancellation_keeps_partial_outcome(
     assert raised.value.outcome.repository_url.endswith("/EXP-CANCEL-A1")  # type: ignore[union-attr]
     assert raised.value.outcome.metrics["completed_tickets"] == 2
     assert github.archived == ["kulichevskiy/EXP-CANCEL-A1"]
+    assert linear.project_updates[-1][0] == "offTrack"
+    assert "bench worker stopped" in linear.project_updates[-1][1]

@@ -81,6 +81,19 @@ async def test_linear_sandbox_creates_labeled_campaign_and_real_dependency_chain
                 ),
             )
         )
+    responses.append(
+        httpx.Response(
+            200,
+            json={
+                "data": {
+                    "projectUpdateCreate": {
+                        "success": True,
+                        "projectUpdate": {"id": "update-id"},
+                    }
+                }
+            },
+        )
+    )
     route = respx.post("https://api.linear.app/graphql").mock(side_effect=responses)
 
     async with LinearSandbox(
@@ -93,22 +106,104 @@ async def test_linear_sandbox_creates_labeled_campaign_and_real_dependency_chain
             label="EXP-1-A1",
             repo_url="https://github.com/kulichevskiy/EXP-1-A1",
             campaign=feedback_inbox_campaign(),
+            project_description=(
+                "## Hypothesis\nThe revised review process will finish the sample project.\n\n"
+                "## Experiment design\nRun one isolated copy of the project."
+            ),
+        )
+        await sandbox.publish_project_update(
+            project_id=result.project_id,
+            health="onTrack",
+            body="The experiment started with one isolated run of version A.",
         )
 
     assert result.issue_identifiers == tuple(f"BENCH-{index}" for index in range(1, 3))
     calls = [json.loads(call.request.content) for call in route.calls]
     issue_calls = [call for call in calls if "mutation BenchIssue" in call["query"]]
-    project_calls = [call for call in calls if "mutation BenchProject" in call["query"]]
+    project_calls = [call for call in calls if "mutation BenchProject(" in call["query"]]
     relation_calls = [call for call in calls if "mutation BenchRelation" in call["query"]]
+    update_calls = [call for call in calls if "mutation BenchProjectUpdate" in call["query"]]
     assert all(call["variables"]["input"]["labelIds"] == ["label-id"] for call in issue_calls)
     assert [call["variables"]["input"] for call in project_calls] == [
-        {"name": "Feedback Inbox V1 · 2026-08-02 · 1", "teamIds": ["team-id"]}
+        {
+            "name": "Feedback Inbox V1 · 2026-08-02 · 1",
+            "teamIds": ["team-id"],
+            "description": (
+                "## Hypothesis\nThe revised review process will finish the sample project.\n\n"
+                "## Experiment design\nRun one isolated copy of the project."
+            ),
+        }
+    ]
+    assert [call["variables"]["input"] for call in update_calls] == [
+        {
+            "projectId": "project-id",
+            "health": "onTrack",
+            "body": "The experiment started with one isolated run of version A.",
+        }
     ]
     assert all(call["variables"]["input"]["projectId"] == "project-id" for call in issue_calls)
     assert [call["variables"]["input"] for call in relation_calls] == [
         {"issueId": "issue-1", "relatedIssueId": "issue-2", "type": "blocks"},
     ]
     assert all("issueLabelCreate" not in call["query"] for call in calls)
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_linear_sandbox_does_not_repeat_the_same_project_chronicle_entry() -> None:
+    route = respx.post("https://api.linear.app/graphql").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "projectUpdateCreate": {
+                        "success": True,
+                        "projectUpdate": {"id": "update-id"},
+                    }
+                }
+            },
+        )
+    )
+
+    async with LinearSandbox("Bearer token", routing_label_id="label-id") as sandbox:
+        await sandbox.publish_project_update(
+            project_id="project-id", health="onTrack", body="Experiment started."
+        )
+        await sandbox.publish_project_update(
+            project_id="project-id", health="onTrack", body="Experiment started."
+        )
+
+    assert route.call_count == 1
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_linear_sandbox_reconciles_durable_project_chronicle_marker() -> None:
+    marker = "<!-- symphony-bench-event:EXP-1:started -->"
+    route = respx.post("https://api.linear.app/graphql").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "data": {
+                    "project": {
+                        "projectUpdates": {"nodes": [{"body": f"Started.\n\n{marker}"}]}
+                    }
+                }
+            },
+        )
+    )
+
+    async with LinearSandbox("Bearer token", routing_label_id="label-id") as sandbox:
+        await sandbox.publish_project_update(
+            project_id="project-id",
+            health="onTrack",
+            body="Started.",
+            event_key="EXP-1:started",
+        )
+
+    calls = [json.loads(call.request.content) for call in route.calls]
+    assert len(calls) == 1
+    assert "query BenchProjectUpdates" in calls[0]["query"]
 
 
 @pytest.mark.asyncio

@@ -38,6 +38,10 @@ def create_bench_app(
     harness_version: str = "",
     prepare_harness: Callable[[str, ExperimentMode], Awaitable[str]] | None = None,
     recover_execution: Callable[[], Awaitable[None]] | None = None,
+    recover_chronicle: Callable[[], Awaitable[None]] | None = None,
+    start_experiment: Callable[[Experiment], Awaitable[str]] | None = None,
+    publish_interrupted: Callable[[Trial], Awaitable[None]] | None = None,
+    publish_failed_experiment: Callable[[Experiment], Awaitable[None]] | None = None,
     reports_root: Path | None = None,
 ) -> FastAPI:
     if not api_token:
@@ -48,7 +52,42 @@ def create_bench_app(
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         if recover_execution is not None:
             await recover_execution()
+        if recover_chronicle is not None:
+            await recover_chronicle()
+        if start_experiment is not None:
+            for prepared_experiment in store.preparing():
+                try:
+                    project_id = await start_experiment(prepared_experiment)
+                    store.activate(prepared_experiment.id, project_id)
+                except Exception:  # noqa: BLE001 - retry preparation on the next restart
+                    log.exception(
+                        "could not resume experiment preparation %s", prepared_experiment.id
+                    )
         interrupted_trials, interrupted_experiments = store.fail_interrupted()
+        if publish_interrupted is not None:
+            for trial in interrupted_trials:
+                try:
+                    await publish_interrupted(trial)
+                    store.acknowledge_trial_chronicle_recovery(trial)
+                except Exception:  # noqa: BLE001 - recovery must not block the worker restart
+                    log.exception(
+                        "could not publish interrupted trial %s %s%d",
+                        trial.experiment_id,
+                        trial.candidate,
+                        trial.repetition,
+                    )
+        if publish_failed_experiment is not None:
+            for experiment_id in interrupted_experiments:
+                interrupted_experiment = store.get(experiment_id)
+                if interrupted_experiment is None:
+                    continue
+                try:
+                    await publish_failed_experiment(interrupted_experiment)
+                    store.acknowledge_experiment_chronicle_recovery(experiment_id)
+                except Exception:  # noqa: BLE001 - recovery must not block the worker restart
+                    log.exception(
+                        "could not publish interrupted experiment %s", experiment_id
+                    )
         if interrupted_experiments:
             log.error(
                 "marked %d interrupted experiment(s) failed on startup",
@@ -92,12 +131,14 @@ def create_bench_app(
             store.queue_notification(trial, markdown)
 
         async def publish_experiment(experiment_id: str) -> None:
-            if reports_root is None:
-                return
             report = store.report(experiment_id)
             if report is None:
                 raise RuntimeError(f"missing experiment report for {experiment_id}")
-            await asyncio.to_thread(persist_experiment_markdown, reports_root, report)
+            if reports_root is not None:
+                await asyncio.to_thread(persist_experiment_markdown, reports_root, report)
+            if report.experiment.status == "failed" and publish_failed_experiment is not None:
+                await publish_failed_experiment(report.experiment)
+                store.acknowledge_experiment_chronicle_recovery(experiment_id)
 
         runner = ExperimentRunner(
             store=store,
@@ -189,11 +230,26 @@ def create_bench_app(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                     detail=f"harness snapshot failed: {exc}",
                 ) from exc
-        return store.create(
+        experiment = store.create(
             request.model_copy(update=updates),
             harness_version=pinned_harness,
             experiment_id=experiment_id,
+            ready=start_experiment is None,
         )
+        if start_experiment is not None:
+            try:
+                project_id = await start_experiment(experiment)
+            except Exception as exc:  # noqa: BLE001 - provider error becomes API failure
+                store.set_status(experiment.id, "failed")
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"experiment chronicle could not start: {exc}",
+                ) from exc
+            store.activate(experiment.id, project_id)
+            experiment = experiment.model_copy(
+                update={"status": "queued", "linear_project_id": project_id}
+            )
+        return experiment
 
     @app.post(
         "/experiments",

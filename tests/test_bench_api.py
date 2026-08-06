@@ -4,11 +4,13 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from symphony.bench.app import create_bench_app
 from symphony.bench.grader import GraderInfrastructureError
 from symphony.bench.models import (
     EXECUTOR_TOOLCHAIN_VERSION,
+    Experiment,
     ExperimentCreate,
     Trial,
     TrialExecutionError,
@@ -18,6 +20,81 @@ from symphony.bench.models import (
 )
 from symphony.bench.runner import ExperimentRunner
 from symphony.bench.store import ExperimentStore
+
+_HYPOTHESIS = "The tested Symphony version will finish the complete sample project."
+_DESIGN = "Run the isolated sample project and record completion, quality, time, and cost."
+
+
+def _experiment_request(**values: object) -> ExperimentCreate:
+    return ExperimentCreate(hypothesis=_HYPOTHESIS, design=_DESIGN, **values)
+
+
+def _experiment_payload(**values: object) -> dict[str, object]:
+    return {"hypothesis": _HYPOTHESIS, "design": _DESIGN, **values}
+
+
+def test_experiment_requires_plain_english_hypothesis_and_design() -> None:
+    with pytest.raises(ValidationError):
+        ExperimentCreate(candidate_a="same-sha", candidate_b="same-sha")
+
+    request = ExperimentCreate(
+        candidate_a="same-sha",
+        candidate_b="same-sha",
+        hypothesis="The revised review process will finish the complete sample project.",
+        design=(
+            "Run the same sample project once with each version. Compare whether both versions "
+            "finish, how long they take, and how many review problems they find."
+        ),
+    )
+
+    assert request.hypothesis.startswith("The revised review process")
+    assert request.design.startswith("Run the same sample project")
+
+
+def test_experiment_is_not_claimable_until_launch_chronicle_is_ready(tmp_path: Path) -> None:
+    store = ExperimentStore(tmp_path / "bench.sqlite")
+    experiment = store.create(
+        _experiment_request(candidate_a="sha", candidate_b="sha", repetitions=1),
+        ready=False,
+    )
+
+    assert experiment.status == "preparing"
+    assert store.claim_next() is None
+
+    store.activate(experiment.id, "project-id")
+    claimed = store.claim_next()
+    assert claimed is not None
+    assert claimed.status == "running"
+    assert claimed.linear_project_id == "project-id"
+
+
+def test_restart_resumes_experiment_preparation_before_it_can_be_claimed(tmp_path: Path) -> None:
+    db_path = tmp_path / "bench.sqlite"
+    store = ExperimentStore(db_path)
+    experiment = store.create(
+        _experiment_request(candidate_a="sha", candidate_b="sha", repetitions=1),
+        ready=False,
+    )
+    prepared: list[str] = []
+
+    async def start_experiment(pending: Experiment) -> str:
+        prepared.append(pending.id)
+        return "project-id"
+
+    with TestClient(
+        create_bench_app(
+            db_path=db_path,
+            api_token="token",
+            start_experiment=start_experiment,
+        )
+    ):
+        pass
+
+    resumed = store.get(experiment.id)
+    assert prepared == [experiment.id]
+    assert resumed is not None
+    assert resumed.status == "queued"
+    assert resumed.linear_project_id == "project-id"
 
 
 def test_executor_toolchain_version_reads_built_image_receipt(tmp_path: Path) -> None:
@@ -34,14 +111,18 @@ def test_submit_and_read_experiment_survives_restart(tmp_path: Path) -> None:
     with TestClient(create_bench_app(db_path=db_path, api_token="test-token")) as client:
         unauthorized = client.post(
             "/experiments",
-            json={"candidate_a": "ee195f4", "candidate_b": "ee195f4", "repetitions": 3},
+            json=_experiment_payload(
+                candidate_a="ee195f4", candidate_b="ee195f4", repetitions=3
+            ),
         )
         assert unauthorized.status_code == 401
 
         submitted = client.post(
             "/experiments",
             headers=headers,
-            json={"candidate_a": "ee195f4", "candidate_b": "ee195f4", "repetitions": 3},
+            json=_experiment_payload(
+                candidate_a="ee195f4", candidate_b="ee195f4", repetitions=3
+            ),
         )
         assert submitted.status_code == 201
         body = submitted.json()
@@ -82,7 +163,7 @@ def test_submit_pins_revision_profile_and_harness_version(tmp_path: Path) -> Non
         response = client.post(
             "/experiments",
             headers={"Authorization": "Bearer token"},
-            json={"candidate_a": "main", "candidate_b": "main", "repetitions": 1},
+            json=_experiment_payload(candidate_a="main", candidate_b="main", repetitions=1),
         )
 
     assert response.status_code == 201
@@ -115,7 +196,7 @@ def test_submit_rejects_broken_grader_preflight_without_queueing_experiment(
         response = client.post(
             "/experiments",
             headers={"Authorization": "Bearer token"},
-            json={"candidate_a": "sha", "candidate_b": "sha", "repetitions": 1},
+            json=_experiment_payload(candidate_a="sha", candidate_b="sha", repetitions=1),
         )
 
     assert response.status_code == 500
@@ -140,12 +221,12 @@ def test_submit_does_not_run_preflight_while_an_experiment_is_active(tmp_path: P
         first = client.post(
             "/experiments",
             headers=headers,
-            json={"candidate_a": "sha", "candidate_b": "sha", "repetitions": 1},
+            json=_experiment_payload(candidate_a="sha", candidate_b="sha", repetitions=1),
         )
         second = client.post(
             "/experiments",
             headers=headers,
-            json={"candidate_a": "sha", "candidate_b": "sha", "repetitions": 1},
+            json=_experiment_payload(candidate_a="sha", candidate_b="sha", repetitions=1),
         )
 
     assert first.status_code == 201
@@ -164,7 +245,7 @@ def test_system_version_includes_executor_toolchain_identity() -> None:
 async def test_runner_interleaves_candidates_and_completes_experiment(tmp_path: Path) -> None:
     store = ExperimentStore(tmp_path / "bench.sqlite")
     experiment = store.create(
-        ExperimentCreate(candidate_a="same-sha", candidate_b="same-sha", repetitions=3)
+        _experiment_request(candidate_a="same-sha", candidate_b="same-sha", repetitions=3)
     )
     seen: list[tuple[str, int, str]] = []
 
@@ -218,7 +299,7 @@ async def test_runner_interleaves_candidates_and_completes_experiment(tmp_path: 
 async def test_runner_single_mode_executes_only_candidate_a(tmp_path: Path) -> None:
     store = ExperimentStore(tmp_path / "bench.sqlite")
     experiment = store.create(
-        ExperimentCreate(
+        _experiment_request(
             candidate_a="same-sha",
             repetitions=1,
             mode="single",
@@ -263,7 +344,7 @@ def test_submit_single_mode_does_not_resolve_or_preflight_candidate_b(tmp_path: 
         response = client.post(
             "/experiments",
             headers={"Authorization": "Bearer token"},
-            json={"mode": "single", "candidate_a": "main", "repetitions": 1},
+            json=_experiment_payload(mode="single", candidate_a="main", repetitions=1),
         )
 
     assert response.status_code == 201
@@ -276,7 +357,7 @@ def test_submit_single_mode_does_not_resolve_or_preflight_candidate_b(tmp_path: 
 @pytest.mark.asyncio
 async def test_runner_runs_each_candidate_pair_concurrently(tmp_path: Path) -> None:
     store = ExperimentStore(tmp_path / "bench.sqlite")
-    store.create(ExperimentCreate(candidate_a="a", candidate_b="b", repetitions=2))
+    store.create(_experiment_request(candidate_a="a", candidate_b="b", repetitions=2))
     waiting: dict[int, set[str]] = {}
     released: list[int] = []
 
@@ -302,7 +383,9 @@ async def test_runner_lets_sibling_finish_when_candidate_fails(
     tmp_path: Path,
 ) -> None:
     store = ExperimentStore(tmp_path / "bench.sqlite")
-    experiment = store.create(ExperimentCreate(candidate_a="a", candidate_b="b", repetitions=2))
+    experiment = store.create(
+        _experiment_request(candidate_a="a", candidate_b="b", repetitions=2)
+    )
 
     async def execute(trial: Trial) -> TrialOutcome:
         if trial.candidate == "A" and trial.repetition == 1:
@@ -345,7 +428,7 @@ def test_app_worker_drains_one_experiment_at_a_time(tmp_path: Path) -> None:
         submitted = client.post(
             "/experiments",
             headers=headers,
-            json={"candidate_a": "sha", "candidate_b": "sha", "repetitions": 1},
+            json=_experiment_payload(candidate_a="sha", candidate_b="sha", repetitions=1),
         ).json()
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
@@ -397,7 +480,7 @@ def test_completed_trial_persists_report_and_notification_until_ack(tmp_path: Pa
         submitted = client.post(
             "/experiments",
             headers=headers,
-            json={"candidate_a": "sha", "candidate_b": "sha", "repetitions": 1},
+            json=_experiment_payload(candidate_a="sha", candidate_b="sha", repetitions=1),
         ).json()
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
@@ -469,7 +552,7 @@ def test_failed_pair_persists_both_trial_receipts_and_final_report(tmp_path: Pat
         submitted = client.post(
             "/experiments",
             headers=headers,
-            json={"candidate_a": "sha", "candidate_b": "sha", "repetitions": 1},
+            json=_experiment_payload(candidate_a="sha", candidate_b="sha", repetitions=1),
         ).json()
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
@@ -489,7 +572,9 @@ def test_restart_persists_interrupted_trial_and_final_receipts(tmp_path: Path) -
     db_path = tmp_path / "bench.sqlite"
     reports_root = tmp_path / "reports"
     store = ExperimentStore(db_path)
-    experiment = store.create(ExperimentCreate(candidate_a="sha", candidate_b="sha", repetitions=1))
+    experiment = store.create(
+        _experiment_request(candidate_a="sha", candidate_b="sha", repetitions=1)
+    )
     claimed = store.claim_next()
     assert claimed is not None
     trial = Trial(
@@ -517,10 +602,92 @@ def test_restart_persists_interrupted_trial_and_final_receipts(tmp_path: Path) -
     assert [notification["event_key"] for notification in notifications] == [f"{experiment.id}:A1"]
 
 
+def test_restart_publishes_interrupted_trial_to_project_chronicle(tmp_path: Path) -> None:
+    db_path = tmp_path / "bench.sqlite"
+    store = ExperimentStore(db_path)
+    experiment = store.create(
+        _experiment_request(candidate_a="sha", candidate_b="sha", repetitions=1)
+    )
+    assert store.claim_next() is not None
+    store.start_trial(
+        Trial(
+            experiment_id=experiment.id,
+            candidate="A",
+            repetition=1,
+            revision="sha",
+        )
+    )
+    published: list[Trial] = []
+    failed: list[Experiment] = []
+
+    async def publish_interrupted(trial: Trial) -> None:
+        published.append(trial)
+
+    async def publish_failed(experiment: Experiment) -> None:
+        failed.append(experiment)
+
+    app = create_bench_app(
+        db_path=db_path,
+        api_token="token",
+        publish_interrupted=publish_interrupted,
+        publish_failed_experiment=publish_failed,
+    )
+    with TestClient(app):
+        pass
+
+    assert [(trial.experiment_id, trial.hypothesis, trial.design) for trial in published] == [
+        (experiment.id, _HYPOTHESIS, _DESIGN)
+    ]
+    assert [(item.id, item.status) for item in failed] == [(experiment.id, "failed")]
+
+
+def test_failed_experiment_publishes_terminal_project_update(tmp_path: Path) -> None:
+    started: list[Experiment] = []
+    failed: list[Experiment] = []
+
+    async def start_experiment(experiment: Experiment) -> str:
+        started.append(experiment)
+        return "project-id"
+
+    async def execute(_trial: Trial) -> TrialOutcome:
+        raise RuntimeError("candidate failed")
+
+    async def publish_failed(experiment: Experiment) -> None:
+        failed.append(experiment)
+
+    app = create_bench_app(
+        db_path=tmp_path / "bench.sqlite",
+        api_token="token",
+        execute=execute,
+        start_experiment=start_experiment,
+        publish_failed_experiment=publish_failed,
+        idle_poll_seconds=0.01,
+    )
+    headers = {"Authorization": "Bearer token"}
+    with TestClient(app) as client:
+        submitted = client.post(
+            "/experiments",
+            headers=headers,
+            json=_experiment_payload(candidate_a="sha", candidate_b="sha", repetitions=1),
+        ).json()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            current = client.get(f"/experiments/{submitted['id']}", headers=headers).json()
+            if current["status"] == "failed":
+                break
+            time.sleep(0.01)
+
+    assert started[0].hypothesis == _HYPOTHESIS
+    assert failed[-1].status == "failed"
+    assert failed[-1].linear_project_id == "project-id"
+
+
 def test_app_marks_interrupted_trial_failed_before_claiming_more(tmp_path: Path) -> None:
     db_path = tmp_path / "bench.sqlite"
     store = ExperimentStore(db_path)
-    experiment = store.create(ExperimentCreate(candidate_a="sha", candidate_b="sha", repetitions=1))
+    experiment = store.create(
+        _experiment_request(candidate_a="sha", candidate_b="sha", repetitions=1)
+    )
     claimed = store.claim_next()
     assert claimed is not None
     trial = Trial(
@@ -541,10 +708,51 @@ def test_app_marks_interrupted_trial_failed_before_claiming_more(tmp_path: Path)
     assert report.trials[0].error == "bench worker restarted during this trial"
 
 
+def test_restart_retries_interrupted_chronicle_until_it_is_durable(tmp_path: Path) -> None:
+    db_path = tmp_path / "bench.sqlite"
+    store = ExperimentStore(db_path)
+    experiment = store.create(
+        _experiment_request(candidate_a="sha", candidate_b="sha", repetitions=1)
+    )
+    assert store.claim_next() is not None
+    trial = Trial(experiment_id=experiment.id, candidate="A", repetition=1, revision="sha")
+    store.start_trial(trial)
+    attempts: list[str] = []
+
+    async def fail_once(interrupted: Trial) -> None:
+        attempts.append(interrupted.experiment_id)
+        raise OSError("outbox unavailable")
+
+    with TestClient(
+        create_bench_app(
+            db_path=db_path,
+            api_token="token",
+            publish_interrupted=fail_once,
+        )
+    ):
+        pass
+
+    async def succeed(interrupted: Trial) -> None:
+        attempts.append(interrupted.experiment_id)
+
+    with TestClient(
+        create_bench_app(
+            db_path=db_path,
+            api_token="token",
+            publish_interrupted=succeed,
+        )
+    ):
+        pass
+
+    assert attempts == [experiment.id, experiment.id]
+
+
 @pytest.mark.asyncio
 async def test_failed_trial_keeps_partial_receipts_and_metrics(tmp_path: Path) -> None:
     store = ExperimentStore(tmp_path / "bench.sqlite")
-    experiment = store.create(ExperimentCreate(candidate_a="sha", candidate_b="sha", repetitions=1))
+    experiment = store.create(
+        _experiment_request(candidate_a="sha", candidate_b="sha", repetitions=1)
+    )
 
     async def fail(_trial: Trial) -> TrialOutcome:
         raise TrialExecutionError(

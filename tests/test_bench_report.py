@@ -4,6 +4,14 @@ from symphony.bench.models import Experiment, ExperimentReport, TrialRecord
 from symphony.bench.report import render_markdown, render_trial_markdown
 
 
+def _experiment(**values: object) -> Experiment:
+    return Experiment(
+        hypothesis="The tested version will finish the complete sample project.",
+        design="Run an isolated copy and record completion, quality, time, and cost.",
+        **values,
+    )
+
+
 def _trial(candidate: str, repetition: int, tokens: float, passed: int) -> TrialRecord:
     return TrialRecord(
         experiment_id="EXP-1",
@@ -28,7 +36,7 @@ def _trial(candidate: str, repetition: int, tokens: float, passed: int) -> Trial
 
 def test_render_markdown_has_aggregate_and_trial_receipts() -> None:
     report = ExperimentReport(
-        experiment=Experiment(
+        experiment=_experiment(
             id="EXP-1",
             status="completed",
             candidate_a="same-sha",
@@ -59,7 +67,7 @@ def test_render_markdown_aggregates_only_matched_completed_pairs() -> None:
         update={"status": "failed", "error": "trial failed"}
     )
     report = ExperimentReport(
-        experiment=Experiment(
+        experiment=_experiment(
             id="EXP-1",
             status="failed",
             candidate_a="same-sha",
@@ -84,7 +92,7 @@ def test_render_markdown_aggregates_only_matched_completed_pairs() -> None:
 
 def test_render_markdown_single_mode_reports_one_candidate_without_fake_comparison() -> None:
     report = ExperimentReport(
-        experiment=Experiment(
+        experiment=_experiment(
             id="EXP-1",
             status="completed",
             candidate_a="same-sha",
@@ -114,7 +122,7 @@ def test_render_trial_markdown_preserves_unavailable_raw_tokens() -> None:
         }
     )
     report = ExperimentReport(
-        experiment=Experiment(
+        experiment=_experiment(
             id="EXP-1",
             status="failed",
             candidate_a="same-sha",

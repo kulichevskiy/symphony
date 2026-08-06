@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
+from uuid import NAMESPACE_URL, uuid5
 
 import httpx
 
@@ -38,6 +39,18 @@ query BenchProjects($marker: String!) {
 _CREATE_PROJECT = """
 mutation BenchProject($input: ProjectCreateInput!) {
   projectCreate(input: $input) { success project { id name url } }
+}
+"""
+
+_CREATE_PROJECT_UPDATE = """
+mutation BenchProjectUpdate($input: ProjectUpdateCreateInput!) {
+  projectUpdateCreate(input: $input) { success projectUpdate { id } }
+}
+"""
+
+_PROJECT_UPDATES = """
+query BenchProjectUpdates($id: String!) {
+  project(id: $id) { projectUpdates(first: 50) { nodes { body } } }
 }
 """
 
@@ -81,6 +94,7 @@ class LinearCampaign:
     issue_ids: tuple[str, ...]
     issue_identifiers: tuple[str, ...]
     issue_urls: tuple[str, ...]
+    project_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -110,6 +124,7 @@ class LinearSandbox:
         self._issues: dict[str, dict[str, dict[str, str]]] = {}
         self._relations: set[tuple[str, str]] = set()
         self._projects: dict[str, str] = {}
+        self._project_updates: set[tuple[str, str, str]] = set()
 
     async def __aenter__(self) -> LinearSandbox:
         return self
@@ -178,7 +193,14 @@ class LinearSandbox:
             raise LinearSandboxError(f"Linear {field} returned success=false")
         return payload
 
-    async def _project_id(self, *, team_id: str, label: str, campaign: Campaign) -> str:
+    async def _project_id(
+        self,
+        *,
+        team_id: str,
+        label: str,
+        campaign: Campaign,
+        project_description: str,
+    ) -> str:
         experiment_id = _TRIAL_SUFFIX.sub("", label).removesuffix("-")
         cached = self._projects.get(experiment_id)
         if cached is not None:
@@ -193,10 +215,31 @@ class LinearSandbox:
                 team_id=team_id,
                 experiment_id=experiment_id,
                 campaign=campaign,
+                project_description=project_description,
             )
 
+    async def ensure_project(
+        self,
+        *,
+        team_id: str,
+        experiment_id: str,
+        campaign: Campaign,
+        project_description: str,
+    ) -> str:
+        return await self._project_id(
+            team_id=team_id,
+            label=experiment_id,
+            campaign=campaign,
+            project_description=project_description,
+        )
+
     async def _find_or_create_project(
-        self, *, team_id: str, experiment_id: str, campaign: Campaign
+        self,
+        *,
+        team_id: str,
+        experiment_id: str,
+        campaign: Campaign,
+        project_description: str,
     ) -> str:
         marker = experiment_id.removeprefix("EXP-")
         data = await self._query(_PROJECTS, {"marker": marker}, retry_transient=True)
@@ -218,7 +261,13 @@ class LinearSandbox:
         payload = self._successful(
             await self._query(
                 _CREATE_PROJECT,
-                {"input": {"name": name, "teamIds": [team_id]}},
+                {
+                    "input": {
+                        "name": name,
+                        "teamIds": [team_id],
+                        "description": project_description,
+                    }
+                },
             ),
             "projectCreate",
         )
@@ -233,6 +282,8 @@ class LinearSandbox:
         label: str,
         repo_url: str,
         campaign: Campaign,
+        project_description: str = "",
+        project_id: str = "",
     ) -> LinearCampaign:
         team_data = await self._query(_TEAM, {"id": team_id}, retry_transient=True)
         team = team_data.get("team")
@@ -242,7 +293,13 @@ class LinearSandbox:
         todo_id = next((state["id"] for state in states if state.get("name") == "Todo"), None)
         if todo_id is None:
             raise LinearSandboxError("BENCH team has no Todo state")
-        project_id = await self._project_id(team_id=team_id, label=label, campaign=campaign)
+        if not project_id:
+            project_id = await self._project_id(
+                team_id=team_id,
+                label=label,
+                campaign=campaign,
+                project_description=project_description,
+            )
 
         issue_by_key = self._issues.setdefault(label, {})
         expected_titles = {f"[{label}] {ticket.title}": ticket.key for ticket in campaign.tickets}
@@ -336,7 +393,51 @@ class LinearSandbox:
             issue_ids=tuple(issue["id"] for issue in ordered),
             issue_identifiers=tuple(issue["identifier"] for issue in ordered),
             issue_urls=tuple(issue["url"] for issue in ordered),
+            project_id=project_id,
         )
+
+    async def publish_project_update(
+        self,
+        *,
+        project_id: str,
+        health: str,
+        body: str,
+        event_key: str | None = None,
+    ) -> None:
+        marker = f"<!-- symphony-bench-event:{event_key} -->" if event_key else ""
+        marked_body = f"{body}\n\n{marker}" if marker else body
+        event = (project_id, health, marked_body)
+        if event in self._project_updates:
+            return
+        if marker:
+            data = await self._query(
+                _PROJECT_UPDATES,
+                {"id": project_id},
+                retry_transient=True,
+            )
+            project = data.get("project")
+            updates = project.get("projectUpdates", {}).get("nodes", []) if project else []
+            if any(marker in str(update.get("body", "")) for update in updates):
+                self._project_updates.add(event)
+                return
+        update_input: dict[str, str] = {
+            "projectId": project_id,
+            "health": health,
+            "body": marked_body,
+        }
+        if event_key:
+            update_input["id"] = str(
+                uuid5(NAMESPACE_URL, f"symphony-bench:{project_id}:{event_key}")
+            )
+        self._successful(
+            await self._query(
+                _CREATE_PROJECT_UPDATE,
+                {"input": update_input},
+                retry_transient=True,
+            ),
+            "projectUpdateCreate",
+        )
+        self._project_updates.add(event)
 
     async def issue_states(self, issue_ids: tuple[str, ...]) -> tuple[LinearIssueState, ...]:
         states: list[LinearIssueState] = []
