@@ -1,4 +1,5 @@
 import json
+from importlib.resources import files
 
 import httpx
 import pytest
@@ -17,6 +18,14 @@ from symphony.cli import main
 
 def test_bench_profile_allows_hybrid_local_review_mode() -> None:
     assert "local_review_mode" in _BENCH_BINDING_OVERRIDES
+
+
+def test_packaged_bench_profile_allows_five_local_review_fixes() -> None:
+    profile = json.loads(
+        files("symphony.bench.assets").joinpath("profiles/current.json").read_text()
+    )
+
+    assert profile["knobs"]["local_review_iteration_cap"] == 5
 
 
 @respx.mock

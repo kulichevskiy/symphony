@@ -29,7 +29,7 @@
   "knobs": {
     "global_max_concurrent": 1,
     "review_iteration_cap": 12,
-    "local_review_iteration_cap": 3
+    "local_review_iteration_cap": 5
   },
   "binding": {
     "local_review": true,
