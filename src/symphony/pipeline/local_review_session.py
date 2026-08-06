@@ -996,7 +996,7 @@ async def run_local_review_session(
         fixer_agent=fixer_role.agent,
         reviewer=_reviewer,
         fixer=_fixer,
-        cap=1 if review_mode == "hybrid" else cap,
+        cap=cap,
         on_iteration=on_iteration,
     )
 

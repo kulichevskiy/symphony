@@ -254,7 +254,8 @@ class RepoBinding(BaseModel):
     remote_review: bool = True
     # `legacy` keeps the finder -> verifier loop. `hybrid` runs two isolated
     # local axes (Spec/Standards + Codex built-in bug review), merges their
-    # findings into one fix batch, then performs one targeted closure review.
+    # findings into a fix batch, and repeats targeted closure reviews up to
+    # the configured local-review fixer cap.
     local_review_mode: Literal["legacy", "hybrid"] = "legacy"
     # Reviewer agent for local/hybrid strategies. `None` picks the opposite
     # family of `agent` (claude ↔ codex) so the reviewer has independent
