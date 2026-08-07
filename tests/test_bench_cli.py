@@ -20,7 +20,7 @@ def test_bench_profile_allows_hybrid_local_review_mode() -> None:
     assert "local_review_mode" in _BENCH_BINDING_OVERRIDES
 
 
-def test_packaged_bench_profile_allows_five_local_review_fixes() -> None:
+def test_packaged_bench_profile_keeps_review_limits_and_remote_gate() -> None:
     profile = json.loads(
         files("symphony.bench.assets").joinpath("profiles/current.json").read_text()
     )
