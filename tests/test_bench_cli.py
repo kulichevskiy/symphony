@@ -26,6 +26,7 @@ def test_packaged_bench_profile_allows_five_local_review_fixes() -> None:
     )
 
     assert profile["knobs"]["local_review_iteration_cap"] == 5
+    assert profile["binding"]["remote_review"] is True
 
 
 @respx.mock
