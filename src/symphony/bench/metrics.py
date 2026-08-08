@@ -15,7 +15,8 @@ _LOCAL_REVIEW_MARKERS = (
     "<<<VERDICT:CHANGES_REQUESTED>>>",
 )
 _LOCAL_FINDING_RE = re.compile(r"(?m)^[ \t]{0,3}[-*][ \t]+(.+)$")
-_LOCAL_SEVERITY_RE = re.compile(
+_LOCAL_SEVERITY_RE = re.compile(r"\[(Critical|Major|Minor)\]", re.IGNORECASE)
+_LOCAL_LEADING_SEVERITY_RE = re.compile(
     r"^\*{0,2}`?\[(Critical|Major|Minor)\]", re.IGNORECASE
 )
 _LOCAL_AUXILIARY_FILE_RE = re.compile(r"^review-\d+-(?:find|spec|bug)(?:-attempt-\d+)?\.last\.txt$")
@@ -171,8 +172,15 @@ def local_review_metrics(log_root: Path | None) -> dict[str, int]:
             body_at = findings_at + len("## findings") if findings_at >= 0 else 0
             for match in _LOCAL_FINDING_RE.finditer(message[body_at:marker_at]):
                 counts["findings"] += 1
-                severity = _LOCAL_SEVERITY_RE.match(match.group(1).strip())
-                key = severity.group(1).lower() if severity is not None else "unclassified"
+                finding = match.group(1)
+                canonical = _LOCAL_LEADING_SEVERITY_RE.match(finding)
+                severities = list(_LOCAL_SEVERITY_RE.finditer(finding))
+                if canonical is not None:
+                    key = canonical.group(1).lower()
+                elif len(severities) == 1:
+                    key = severities[0].group(1).lower()
+                else:
+                    key = "unclassified"
                 counts[key] += 1
     return {
         "local_review_agent_launches": counts["agent_launches"],

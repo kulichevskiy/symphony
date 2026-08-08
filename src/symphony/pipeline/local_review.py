@@ -809,10 +809,17 @@ def _same_root_cause(left: str, right: str) -> bool:
 
 
 def _severity_rank(text: str) -> int:
-    match = _HYBRID_SEVERITY_RE.match(text)
-    if match is None:
+    canonical = _LEADING_SEVERITY_TAG_RE.match(text)
+    if canonical is not None:
+        return {"critical": 3, "major": 2, "minor": 1}[
+            canonical.group(1).casefold()
+        ]
+    matches = list(_SEVERITY_TAG_RE.finditer(text))
+    if len(matches) != 1:
         return 0
-    return {"critical": 3, "major": 2, "minor": 1}[match.group(1).casefold()]
+    return {"critical": 3, "major": 2, "minor": 1}[
+        matches[0].group(1).casefold()
+    ]
 
 
 def _builtin_findings(message: str) -> list[str]:
@@ -1058,8 +1065,9 @@ _VERDICT_LINE_RE = re.compile(
 )
 _FINDINGS_HEADING_RE = re.compile(r"(?im)^\s*#{1,6}\s*findings\b\s*$")
 _FINDING_BULLET_RE = re.compile(r"(?m)^[-*+]\s+(.+)$")
-_SEVERITY_PREFIX_RE = re.compile(
-    r"^\*{0,2}`?\[(?:Critical|Major|Minor)\](?:`|\*{0,2})?\s+"
+_SEVERITY_TAG_RE = re.compile(r"\[(Critical|Major|Minor)\]", re.IGNORECASE)
+_LEADING_SEVERITY_TAG_RE = re.compile(
+    r"^\*{0,2}`?\[(Critical|Major|Minor)\]", re.IGNORECASE
 )
 _BUILTIN_FINDING_RE = re.compile(
     r"(?ms)^(?:[-*+]\s*)?\[(P[0-3])\]\s+(.+?)"
@@ -1070,11 +1078,6 @@ _BUILTIN_CLEAN_RE = re.compile(
     r"\b(?:no findings|no actionable findings|did not find any findings|nothing to flag)\b",
     re.IGNORECASE,
 )
-_HYBRID_SEVERITY_RE = re.compile(
-    r"^\*{0,2}`?\[(Critical|Major|Minor)\]", re.IGNORECASE
-)
-
-
 def extract_last_agent_message(
     *, agent: ReviewerAgent, stdout: str, last_message_file: str | None = None
 ) -> str:
@@ -1185,7 +1188,9 @@ def _classify_message(*, message: str, head_sha: str) -> LocalVerdict:
         )
     findings = _extract_findings(message=message, verdict_index=matches[-1].start())
     bullets = _FINDING_BULLET_RE.findall(findings)
-    if not bullets or any(_SEVERITY_PREFIX_RE.match(bullet) is None for bullet in bullets):
+    if not bullets or any(
+        len(list(_SEVERITY_TAG_RE.finditer(bullet))) != 1 for bullet in bullets
+    ):
         return LocalVerdict(kind=LocalVerdictKind.UNPARSEABLE, raw_message=message)
     digest = _stable_digest(findings)
     return LocalVerdict(

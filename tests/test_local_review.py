@@ -172,6 +172,19 @@ def test_merge_hybrid_review_messages_caps_p2_across_both_axes() -> None:
     assert "Bug 2" not in merged.findings
 
 
+def test_merge_hybrid_review_messages_uses_builtin_canonical_severity() -> None:
+    merged = merge_hybrid_review_messages(
+        spec_message=f"All requirements hold.\n{VERDICT_APPROVED_MARKER}",
+        builtin_message=(
+            "[P2] Literal severity — parser.py:3 — Reject a literal [Major] tag."
+        ),
+        head_sha="abc123",
+        max_p2=0,
+    )
+
+    assert merged.kind is LocalVerdictKind.APPROVED
+
+
 def test_merge_hybrid_review_messages_approves_when_both_axes_are_clean() -> None:
     merged = merge_hybrid_review_messages(
         spec_message=f"All requirements hold.\n{VERDICT_APPROVED_MARKER}",
@@ -569,6 +582,35 @@ def test_parse_local_review_output_accepts_code_wrapped_severity() -> None:
 
     assert verdict.kind == LocalVerdictKind.CHANGES_REQUESTED
     assert "null title" in verdict.findings
+
+
+def test_parse_local_review_output_accepts_severity_after_location() -> None:
+    """Claude may put the required severity after its file:line citation."""
+    message = (
+        "## Findings\n"
+        "- `.gitignore:1` — [Critical] generated files can be committed.\n"
+        "- `support_queue/main.py:144` — [Major] null title returns 500.\n\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}\n"
+    )
+    stdout = json.dumps({"type": "result", "result": message})
+
+    verdict = parse_local_review_output(agent="claude", stdout=stdout, head_sha="abc123")
+
+    assert verdict.kind == LocalVerdictKind.CHANGES_REQUESTED
+    assert "null title" in verdict.findings
+
+
+def test_parse_local_review_output_rejects_multiple_severities_per_finding() -> None:
+    message = (
+        "## Findings\n"
+        "- [Major] `a.py:1` is actually [Minor] after all.\n\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}\n"
+    )
+    stdout = _codex_jsonl_with_final_message(message)
+
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc123")
+
+    assert verdict.kind == LocalVerdictKind.UNPARSEABLE
 
 
 def test_parse_local_review_output_rejects_unclassified_findings() -> None:
