@@ -124,7 +124,13 @@ class GitHubClient(Protocol):
 
     async def pr_diff(self, pr: int | str, *, repo: str | None = None) -> str: ...
 
-    async def pr_checks(self, pr: int | str, *, repo: str | None = None) -> PRChecks: ...
+    async def pr_checks(
+        self,
+        pr: int | str,
+        *,
+        repo: str | None = None,
+        required_contexts: tuple[str, ...] = (),
+    ) -> PRChecks: ...
 
     async def pr_review_comments(self, pr: int | str, *, repo: str) -> list[dict[str, Any]]: ...
 
@@ -506,18 +512,27 @@ class GitHub:
     async def pr_diff(self, pr: int | str, *, repo: str | None = None) -> str:
         return await self._run(["pr", "diff", str(pr), *self._repo_args(repo)])
 
-    async def pr_checks(self, pr: int | str, *, repo: str | None = None) -> PRChecks:
-        # `--required` mirrors GitHub's mergeability rule: optional checks
-        # should not block merge gating even if they fail.
+    async def pr_checks(
+        self,
+        pr: int | str,
+        *,
+        repo: str | None = None,
+        required_contexts: tuple[str, ...] = (),
+    ) -> PRChecks:
+        configured = tuple(
+            dict.fromkeys(name.strip() for name in required_contexts if name.strip())
+        )
         argv = [
             "pr",
             "checks",
             str(pr),
-            "--required",
-            *self._repo_args(repo),
-            "--json",
-            "name,state,bucket,link",
         ]
+        # Without an explicit fallback, `--required` mirrors GitHub branch
+        # protection. Configured contexts deliberately read all checks and
+        # filter locally so private GitHub Free repositories still fail closed.
+        if not configured:
+            argv.append("--required")
+        argv.extend((*self._repo_args(repo), "--json", "name,state,bucket,link"))
         stdout, stderr, returncode = await self._run_capture(argv)
         # `gh pr checks --required` exits 1 in two distinct cases:
         #   a) no checks / no required checks: stderr contains "no checks reported"
@@ -525,20 +540,22 @@ class GitHub:
         #   b) one or more required checks are failing: stdout is a valid JSON array.
         # Both exit 1; exit 8 means checks are still pending.
         output = f"{stderr}\n{stdout}".casefold()
-        if returncode == 1 and (
+        no_checks = returncode == 1 and (
             "no checks reported" in output or "no required checks reported" in output
-        ):
-            return PRChecks()
-        if returncode not in (0, 1, 8):
+        )
+        if not no_checks and returncode not in (0, 1, 8):
             raise GitHubError(
                 f"gh {' '.join(argv)} exited {returncode}: {stderr.strip() or stdout.strip()}"
             )
-        try:
-            data = json.loads(stdout)
-        except json.JSONDecodeError as e:
-            raise GitHubError(
-                f"could not parse gh output as JSON: {e}; output={stdout[:200]!r}"
-            ) from e
+        if no_checks:
+            data: object = []
+        else:
+            try:
+                data = json.loads(stdout)
+            except json.JSONDecodeError as e:
+                raise GitHubError(
+                    f"could not parse gh output as JSON: {e}; output={stdout[:200]!r}"
+                ) from e
         if not isinstance(data, list):
             raise GitHubError(f"pr checks: expected array, got {type(data).__name__}")
         runs: list[CheckRun] = []
@@ -552,6 +569,15 @@ class GitHub:
                     bucket=str(entry.get("bucket", "")),
                     link=entry.get("link") or None,
                 )
+            )
+        if configured:
+            required = set(configured)
+            runs = [run for run in runs if run.name in required]
+            present = {run.name for run in runs}
+            runs.extend(
+                CheckRun(name=name, state="PENDING", bucket="pending")
+                for name in configured
+                if name not in present
             )
         return PRChecks(runs=runs)
 

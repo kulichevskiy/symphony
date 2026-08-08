@@ -1,0 +1,1 @@
+"""Feedback Inbox application."""

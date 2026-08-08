@@ -211,7 +211,7 @@ class _FixerScript:
 async def test_loop_total_cost_sums_reviewer_and_fixer() -> None:
     reviewer = _ReviewerScript(
         messages=[
-            f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Major] bug\n{VERDICT_CHANGES_REQUESTED_MARKER}",
             f"good\n{VERDICT_APPROVED_MARKER}",
         ],
         costs=[0.10, 0.05],
@@ -299,6 +299,74 @@ class _StagedRunner:
         pass
 
 
+class _HybridRunner:
+    def __init__(self, *, required_fixes: int = 1) -> None:
+        self.specs: list[RunnerSpec] = []
+        self.head = "implemented-head"
+        self.spec_round = 0
+        self.fix_round = 0
+        self.required_fixes = required_fixes
+
+    def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        self.specs.append(spec)
+
+        async def gen() -> AsyncIterator[RunnerEvent]:
+            if spec.stage == "local_review_fix":
+                self.fix_round += 1
+                self.head = f"fixed-head-{self.fix_round}"
+                yield RunnerEvent(
+                    kind="stdout",
+                    line=json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "id": "fix",
+                                "type": "agent_message",
+                                "text": "Fixed and committed.",
+                            },
+                        }
+                    ),
+                )
+            elif spec.run_id.endswith("-spec"):
+                self.spec_round += 1
+                text = (
+                    "## Findings\n"
+                    f"- [Major] api.py:{self.spec_round} remaining defect. Fix it.\n"
+                    f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+                    if self.spec_round <= self.required_fixes
+                    else f"Spec and standards pass.\n{VERDICT_APPROVED_MARKER}"
+                )
+                yield RunnerEvent(
+                    kind="stdout",
+                    line=json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {"id": "spec", "type": "agent_message", "text": text},
+                        }
+                    ),
+                )
+            else:
+                yield RunnerEvent(
+                    kind="stdout",
+                    line=json.dumps(
+                        {
+                            "type": "item.completed",
+                            "item": {
+                                "id": "bug",
+                                "type": "agent_message",
+                                "text": "No findings.",
+                            },
+                        }
+                    ),
+                )
+            yield RunnerEvent(kind="exit", returncode=0)
+
+        return gen()
+
+    async def kill(self, run_id: str) -> None:
+        pass
+
+
 @pytest.mark.asyncio
 async def test_session_total_cost_reflects_codex_token_pricing(
     tmp_path: Path,
@@ -337,3 +405,114 @@ async def test_session_total_cost_reflects_codex_token_pricing(
     assert result.outcome == LoopOutcome.APPROVED
     # Pricing sanity: 1M input @ $1.25 + 0.5M output @ $10 = $1.25 + $5 = $6.25
     assert result.total_cost_usd == pytest.approx(6.25, rel=1e-6)
+
+
+@pytest.mark.asyncio
+async def test_hybrid_session_runs_two_axes_and_stops_after_first_clean_closure(
+    tmp_path: Path,
+) -> None:
+    runner = _HybridRunner()
+
+    async def head_sha(_: Path) -> str:
+        return runner.head
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="r1",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.6-sol"),
+        verifier_role=ResolvedRole(agent="codex", model="gpt-5.6-sol"),
+        fixer_role=ResolvedRole(agent="codex", model="gpt-5.6-sol"),
+        cap=9,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        review_mode="hybrid",
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    fix_specs = [spec for spec in runner.specs if spec.stage == "local_review_fix"]
+    assert len(fix_specs) == 1
+    bug_specs = [spec for spec in runner.specs if spec.run_id.endswith("-bug")]
+    assert len(bug_specs) == 2
+    assert bug_specs[0].command[bug_specs[0].command.index("--base") + 1] == "main"
+    assert bug_specs[1].command[bug_specs[1].command.index("--base") + 1] == "implemented-head"
+    assert "remaining defect" not in " ".join(bug_specs[1].command).lower()
+    assert bug_specs[1].command[-2] == "-o"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_session_uses_configured_fix_cap_until_approved(tmp_path: Path) -> None:
+    runner = _HybridRunner(required_fixes=2)
+
+    async def head_sha(_: Path) -> str:
+        return runner.head
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="r-multi-fix",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.6-sol"),
+        verifier_role=ResolvedRole(agent="codex", model="gpt-5.6-sol"),
+        fixer_role=ResolvedRole(agent="codex", model="gpt-5.6-sol"),
+        cap=3,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        review_mode="hybrid",
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    assert len([spec for spec in runner.specs if spec.stage == "local_review_fix"]) == 2
+    assert len([spec for spec in runner.specs if spec.run_id.endswith("-bug")]) == 3
+
+
+@pytest.mark.asyncio
+async def test_session_counts_each_codex_subprocess_from_zero(tmp_path: Path) -> None:
+    runner = _StagedRunner(
+        [
+            _codex_event_stream_with_cost(
+                "No verdict marker.",
+                input_tokens=1_000,
+                output_tokens=200,
+            ),
+            _codex_event_stream_with_cost(
+                f"good\n{VERDICT_APPROVED_MARKER}",
+                input_tokens=500,
+                output_tokens=100,
+            ),
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="r1",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=5,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert len(runner.specs) == 2
+    assert result.input_tokens == 1_500
+    assert result.output_tokens == 300
+    assert result.total_cost_usd == pytest.approx(0.004875, rel=1e-6)

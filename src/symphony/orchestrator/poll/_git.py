@@ -10,9 +10,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+from collections.abc import Awaitable, Callable
+from functools import partial
 from pathlib import Path
 
 from ...pipeline.local_review import DiffSize, parse_diff_numstat
+from ._helpers import _retry_transient_delivery
 
 _DEFAULT_PUSH_AUTH_HOST = "github.com"
 
@@ -165,6 +168,15 @@ async def _clear_git_push_auth(workspace_path: Path) -> None:
     no header to clear either way.
     """
     _push_auth_env.pop(workspace_path, None)
+
+
+async def _retry_transient_push(
+    push_fn: Callable[[Path, str], Awaitable[None]],
+    workspace_path: Path,
+    branch: str,
+) -> None:
+    """Retry idempotent pushes after short-lived network/server failures."""
+    await _retry_transient_delivery(partial(push_fn, workspace_path, branch))
 
 
 async def _default_push(workspace_path: Path, branch: str) -> None:

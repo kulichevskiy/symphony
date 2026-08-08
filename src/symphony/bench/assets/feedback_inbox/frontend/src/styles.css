@@ -1,0 +1,33 @@
+:root {
+  color: #172033;
+  background: #f5f7fb;
+  font-family: Inter, system-ui, sans-serif;
+}
+
+main {
+  max-width: 48rem;
+  margin: 4rem auto;
+  padding: 2rem;
+  background: white;
+  border-radius: 1rem;
+}
+
+form {
+  display: flex;
+  gap: 1rem;
+  align-items: end;
+}
+
+label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+button,
+input {
+  padding: 0.6rem;
+}
+
+[role="alert"] {
+  color: #b42318;
+}

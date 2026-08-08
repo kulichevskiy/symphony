@@ -35,6 +35,14 @@ def test_dockerfile_installs_full_agent_toolchain() -> None:
     assert "@openai/codex" in text
 
 
+def test_dockerfile_pins_reproducible_agent_toolchain_versions() -> None:
+    text = _read("Dockerfile")
+
+    assert "ghcr.io/astral-sh/uv:0.12.1" in text
+    assert "@anthropic-ai/claude-code@2.1.220" in text
+    assert "@openai/codex@0.146.0" in text
+
+
 def test_dockerfile_verifies_toolchain_on_path() -> None:
     text = _read("Dockerfile")
 

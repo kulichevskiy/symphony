@@ -1,6 +1,7 @@
 .git
 .github
 .venv
+**/.venv
 **/__pycache__
 *.py[cod]
 .pytest_cache
@@ -21,6 +22,13 @@ config.local.yaml
 logs/
 workspaces/
 .symphony/
+
+# Never bake worker-only benchmark controls into images.
+src/symphony/bench/assets/feedback_inbox_reference
+src/symphony/bench/assets/hidden/feedback_inbox
+src/symphony/bench/assets/support_queue_reference
+src/symphony/bench/assets/support_queue_mutations
+src/symphony/bench/assets/hidden/support_queue
 
 # Frontend is built in-image from source; drop local deps/output.
 frontend/node_modules

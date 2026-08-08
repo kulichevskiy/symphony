@@ -643,10 +643,20 @@ async def add_cost(conn: aiosqlite.Connection, run_id: str, cost_usd: float) -> 
     await add_usage(conn, run_id, cost_usd=cost_usd)
 
 
-async def mark_review_rearm_retry(conn: aiosqlite.Connection, run_id: str) -> None:
+async def mark_review_rearm_retry(
+    conn: aiosqlite.Connection,
+    run_id: str,
+    *,
+    force_retrigger: bool = False,
+) -> None:
     await conn.execute(
-        "INSERT OR IGNORE INTO review_rearm_retries (run_id) VALUES (?)",
-        (run_id,),
+        """
+        INSERT INTO review_rearm_retries (run_id, force_retrigger)
+        VALUES (?, ?)
+        ON CONFLICT(run_id) DO UPDATE SET
+            force_retrigger = MAX(force_retrigger, excluded.force_retrigger)
+        """,
+        (run_id, int(force_retrigger)),
     )
     await conn.commit()
 
@@ -687,6 +697,15 @@ async def has_review_rearm_retry(conn: aiosqlite.Connection, run_id: str) -> boo
     )
     row = await cur.fetchone()
     return row is not None
+
+
+async def review_rearm_retry_is_forced(conn: aiosqlite.Connection, run_id: str) -> bool:
+    cur = await conn.execute(
+        "SELECT force_retrigger FROM review_rearm_retries WHERE run_id = ?",
+        (run_id,),
+    )
+    row = await cur.fetchone()
+    return row is not None and bool(row["force_retrigger"])
 
 
 async def has_active(

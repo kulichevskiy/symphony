@@ -19,7 +19,9 @@ from symphony.orchestrator.poll._git import (
     _clear_git_push_auth,
     _configure_git_push_auth,
     _push_auth_subprocess_env,
+    _retry_transient_push,
 )
+from symphony.orchestrator.poll._helpers import _retry_transient_delivery
 
 
 async def _git(cwd: Path, *args: str) -> None:
@@ -126,3 +128,62 @@ async def test_configure_defaults_to_github_com_without_origin(tmp_path: Path) -
 
     await _clear_git_push_auth(repo)
     assert _configured_headers(repo) == {}
+
+
+@pytest.mark.asyncio
+async def test_transient_push_retries_without_operator_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attempts = 0
+
+    async def push(_workspace: Path, _branch: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("The requested URL returned error: 503")
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+    await _retry_transient_push(push, tmp_path, "branch")
+
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_permanent_push_error_does_not_retry(tmp_path: Path) -> None:
+    attempts = 0
+
+    async def push(_workspace: Path, _branch: str) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError("The requested URL returned error: 401")
+
+    with pytest.raises(RuntimeError, match="401"):
+        await _retry_transient_push(push, tmp_path, "branch")
+
+    assert attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_transient_pr_delivery_retries_without_operator_input(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attempts = 0
+
+    async def ensure_pr() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("gh timed out")
+        return "https://github.com/org/repo/pull/1"
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", no_sleep)
+
+    assert await _retry_transient_delivery(ensure_pr) == ("https://github.com/org/repo/pull/1")
+    assert attempts == 2

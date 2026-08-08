@@ -11,10 +11,10 @@ COPY frontend/ ./
 RUN pnpm build
 
 # --- Stage 2: runtime image with the full agent toolchain -----------------
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-bookworm AS runtime
 
 # uv, from the official static binary image.
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+COPY --from=ghcr.io/astral-sh/uv:0.12.1 /uv /uvx /usr/local/bin/
 
 # System deps: git + node/npm (for the coding-agent CLIs) + gh (GitHub CLI).
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # The two coding-agent CLIs, on PATH globally.
-RUN npm install -g @anthropic-ai/claude-code @openai/codex
+RUN npm install -g @anthropic-ai/claude-code@2.1.220 @openai/codex@0.146.0
 
 # Corepack shims (pnpm/yarn) so agents + verify_cmd can run repos pinned to
 # pnpm (e.g. `verify_cmd: pnpm build && pnpm test`); node ships corepack.
@@ -39,6 +39,21 @@ RUN corepack enable
 # Fail the build now if any tool is missing from PATH, rather than at runtime.
 RUN command -v claude && command -v codex && command -v gh \
     && command -v git && command -v uv && command -v node
+
+# Record the exact built runtime, including the base/apt layer. Rebuilding the
+# same Git SHA under a changed toolchain must produce a different system version.
+RUN { \
+      python --version 2>&1; \
+      uv --version; \
+      node --version; \
+      npm --version; \
+      git --version; \
+      gh --version | head -n 1; \
+      codex --version; \
+      claude --version; \
+      dpkg-query -W -f='${Package}=${Version}\n' | sort | sha256sum; \
+    } | paste -sd ';' - > /usr/local/share/symphony-bench-toolchain.txt \
+    && test -s /usr/local/share/symphony-bench-toolchain.txt
 
 # Non-root runtime user; ~ is /home/symphony so config's ~/.claude etc. resolve.
 RUN useradd --create-home --shell /bin/bash symphony
@@ -85,3 +100,17 @@ RUN git config --global credential."https://github.com".helper "!gh auth git-cre
 # set in the compose `environment:` block.
 ENTRYPOINT ["uv", "run", "--frozen", "--no-sync", "--no-dev", "symphony"]
 CMD []
+
+# Candidate execution gets the full Symphony runtime but never the worker-only
+# controls mount. The worker injects hidden files only after candidate agents stop.
+FROM runtime AS bench-executor
+USER root
+RUN test ! -e /app/src/symphony/bench/assets/hidden/feedback_inbox \
+    && test ! -e /app/src/symphony/bench/assets/feedback_inbox_reference \
+    && test ! -e /app/src/symphony/bench/assets/hidden/support_queue \
+    && test ! -e /app/src/symphony/bench/assets/support_queue_reference \
+    && test ! -e /app/src/symphony/bench/assets/support_queue_mutations
+USER symphony
+
+# Keep the ordinary image and the bench control plane feature-complete.
+FROM runtime AS production

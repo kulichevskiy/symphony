@@ -97,7 +97,7 @@ async def test_first_review_approves_short_circuits_loop() -> None:
 async def test_fix_then_approve_runs_full_cycle() -> None:
     reviewer = _ReviewerScript(
         messages=[
-            f"## Findings\n- bug A\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Major] bug A\n{VERDICT_CHANGES_REQUESTED_MARKER}",
             f"now correct\n{VERDICT_APPROVED_MARKER}",
         ],
         head_shas=["sha-a", "sha-b"],  # fixer should advance the head
@@ -115,6 +115,62 @@ async def test_fix_then_approve_runs_full_cycle() -> None:
     assert "bug A" in fixer.received[0].findings
 
 
+@pytest.mark.asyncio
+async def test_cap_counts_fix_rounds_and_verifies_the_last_fix() -> None:
+    """A successful final fix must be reviewed before the loop exhausts.
+
+    The cap limits change-driving fixer turns, not read-only verification.
+    Otherwise cap=1 applies a fix and immediately escalates an unverified
+    branch even when the very next review would approve it.
+    """
+    reviewer = _ReviewerScript(
+        messages=[
+            f"## Findings\n- [Major] bug A\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"fixed and verified\n{VERDICT_APPROVED_MARKER}",
+        ],
+        head_shas=["sha-a", "sha-b"],
+    )
+    fixer = _FixerScript()
+
+    result = await run_local_review_loop(
+        reviewer_agent="codex",
+        reviewer=reviewer,
+        fixer=fixer,
+        cap=1,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    assert result.iterations == 2
+    assert reviewer.calls == [0, 1]
+    assert len(fixer.received) == 1
+
+
+@pytest.mark.asyncio
+async def test_fixer_receives_prior_findings_as_regression_obligations() -> None:
+    """A later fix must not silently reintroduce an earlier confirmed bug."""
+    reviewer = _ReviewerScript(
+        messages=[
+            f"## Findings\n- [Critical] CPU exhaustion\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Minor] safe paths rejected\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"clean\n{VERDICT_APPROVED_MARKER}",
+        ],
+        head_shas=["sha-a", "sha-b", "sha-c"],
+    )
+    fixer = _FixerScript()
+
+    result = await run_local_review_loop(
+        reviewer_agent="codex",
+        reviewer=reviewer,
+        fixer=fixer,
+        cap=2,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    assert len(fixer.received) == 2
+    assert "CPU exhaustion" in fixer.received[1].findings
+    assert "safe paths rejected" in fixer.received[1].findings
+
+
 # --- exhaustion --------------------------------------------------------
 
 
@@ -122,11 +178,12 @@ async def test_fix_then_approve_runs_full_cycle() -> None:
 async def test_exhausts_when_cap_hit_with_distinct_findings_each_round() -> None:
     reviewer = _ReviewerScript(
         messages=[
-            f"## Findings\n- bug 1\n{VERDICT_CHANGES_REQUESTED_MARKER}",
-            f"## Findings\n- bug 2\n{VERDICT_CHANGES_REQUESTED_MARKER}",
-            f"## Findings\n- bug 3\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Major] bug 1\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Major] bug 2\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Major] bug 3\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Major] bug 4\n{VERDICT_CHANGES_REQUESTED_MARKER}",
         ],
-        head_shas=["a", "b", "c"],
+        head_shas=["a", "b", "c", "d"],
     )
     fixer = _FixerScript()
     result = await run_local_review_loop(
@@ -136,12 +193,11 @@ async def test_exhausts_when_cap_hit_with_distinct_findings_each_round() -> None
         cap=3,
     )
     assert result.outcome == LoopOutcome.EXHAUSTED
-    assert result.iterations == 3
-    # Reviewer ran cap times; the fixer also ran cap times so the branch
-    # carries the best-effort fix when an operator picks it up at the
-    # Needs Approval escalation. The unverified-fixed state beats the
-    # known-broken state for handoff.
-    assert len(reviewer.calls) == 3
+    assert result.iterations == 4
+    # The cap limits mutations. The branch carries all three best-effort
+    # fixes, and a fourth read-only review proves the last fix did not close
+    # the remaining findings before escalation.
+    assert len(reviewer.calls) == 4
     assert len(fixer.received) == 3
 
 
@@ -171,7 +227,7 @@ async def test_stuck_loop_when_reviewer_repeats_same_signature() -> None:
     short-circuits rather than burning another fix-run on identical
     findings.
     """
-    message = f"## Findings\n- bug X\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+    message = f"## Findings\n- [Major] bug X\n{VERDICT_CHANGES_REQUESTED_MARKER}"
     reviewer = _ReviewerScript(
         messages=[message, message],
         head_shas=["sha-stale", "sha-stale"],  # fixer somehow didn't bump head
@@ -191,7 +247,7 @@ async def test_stuck_loop_when_reviewer_repeats_same_signature() -> None:
 @pytest.mark.asyncio
 async def test_same_findings_but_new_head_sha_triggers_stuck() -> None:
     """Same unresolved findings after a fix commit are non-convergence."""
-    message = f"## Findings\n- bug Y\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+    message = f"## Findings\n- [Major] bug Y\n{VERDICT_CHANGES_REQUESTED_MARKER}"
     reviewer = _ReviewerScript(
         messages=[message, message],
         head_shas=["sha-1", "sha-2"],
@@ -370,7 +426,7 @@ async def test_unparseable_review_retried_once_then_reviewer_failed() -> None:
 async def test_fix_run_failure_aborts_loop() -> None:
     reviewer = _ReviewerScript(
         messages=[
-            f"## Findings\n- bug Z\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Major] bug Z\n{VERDICT_CHANGES_REQUESTED_MARKER}",
             "unused",
         ],
     )
@@ -405,8 +461,8 @@ async def test_blocked_fix_run_halts_loop_without_next_review() -> None:
 
     reviewer = _ReviewerScript(
         messages=[
-            f"## Findings\n- bug Z\n{VERDICT_CHANGES_REQUESTED_MARKER}",
-            f"## Findings\n- bug Z still\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Major] bug Z\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Major] bug Z still\n{VERDICT_CHANGES_REQUESTED_MARKER}",
         ],
         head_shas=["s0", "s1"],
     )
@@ -432,8 +488,8 @@ async def test_blocked_fix_run_halts_loop_without_next_review() -> None:
 async def test_on_iteration_fires_once_per_verdict_in_order() -> None:
     reviewer = _ReviewerScript(
         messages=[
-            f"## Findings\n- A\n{VERDICT_CHANGES_REQUESTED_MARKER}",
-            f"## Findings\n- B\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Major] A\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Major] B\n{VERDICT_CHANGES_REQUESTED_MARKER}",
             f"ok\n{VERDICT_APPROVED_MARKER}",
         ],
         head_shas=["s1", "s2", "s3"],
@@ -503,8 +559,8 @@ async def test_reviewer_failure_classified_as_reviewer_failed() -> None:
 async def test_verdicts_collected_in_order() -> None:
     reviewer = _ReviewerScript(
         messages=[
-            f"## Findings\n- A\n{VERDICT_CHANGES_REQUESTED_MARKER}",
-            f"## Findings\n- B\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Major] A\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Major] B\n{VERDICT_CHANGES_REQUESTED_MARKER}",
             f"ok\n{VERDICT_APPROVED_MARKER}",
         ],
         head_shas=["s1", "s2", "s3"],
@@ -628,7 +684,7 @@ async def test_stuck_loop_verdict_still_surfaces_a_surviving_api_error() -> None
 
     async def _reviewer(i: int) -> ReviewerOutput:
         return ReviewerOutput(
-            stdout=_codex_jsonl(f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"),
+            stdout=_codex_jsonl(f"## Findings\n- [Major] bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"),
             head_sha="s1",
             ok=True,
             api_error=api_err,

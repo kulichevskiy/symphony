@@ -47,6 +47,25 @@ from symphony.pipeline.review_classifier import Verdict, VerdictKind
 from ._workspace_helpers import advance_head
 
 
+@pytest.mark.parametrize(
+    ("outcome", "expected"),
+    [
+        (LoopOutcome.APPROVED, True),
+        (LoopOutcome.EXHAUSTED, True),
+        (LoopOutcome.STUCK_LOOP, False),
+        (LoopOutcome.REVIEWER_FAILED, True),
+        (LoopOutcome.FIX_RUN_FAILED, False),
+    ],
+)
+def test_local_review_remote_handoff_policy(
+    outcome: LoopOutcome,
+    expected: bool,
+) -> None:
+    result = LoopResult(outcome=outcome, iterations=1, verdicts=())
+
+    assert review_module._local_review_permits_remote(result) is expected  # noqa: SLF001
+
+
 def test_codex_lgtm_reaction_carries_reviewed_commit_sha() -> None:
     """The "Reviewed commit: <sha>" line is threaded onto the reaction so the
     classifier can reject the approval once HEAD moves past that commit."""
@@ -130,6 +149,7 @@ def _binding(
     issue_label: str | None = None,
     local_review: bool = False,
     remote_review: bool = True,
+    required_status_checks: tuple[str, ...] = (),
 ) -> RepoBinding:
     # `codex_model=None` leaves the legacy field unset (out of model_fields_set)
     # so a binding can pair `agent` with a `roles:` model cell without tripping
@@ -142,6 +162,7 @@ def _binding(
         branch_prefix="symphony",
         local_review=local_review,
         remote_review=remote_review,
+        required_status_checks=required_status_checks,
         linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
     )
     if codex_model is not None:
@@ -608,7 +629,13 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
     try:
         await _seed_active_review(conn)
         cfg = Config(
-            repos=[_binding(agent="codex", codex_model="gpt-5.1-codex-max")],
+            repos=[
+                _binding(
+                    agent="codex",
+                    codex_model="gpt-5.1-codex-max",
+                    required_status_checks=("backend", "frontend"),
+                )
+            ],
             log_root=tmp_path / "logs",
             workspace_root=tmp_path / "ws",
             db_path=tmp_path / "s.sqlite",
@@ -714,6 +741,11 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
         assert "Failing required CI checks: lint" in prompt
 
         push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+        gh.pr_checks.assert_awaited_once_with(
+            42,
+            repo="org/repo",
+            required_contexts=("backend", "frontend"),
+        )
         gh.pr_comment.assert_awaited_with(42, "@codex review", repo="org/repo")
 
         state = await db.review_state.get(conn, "iss-1")
@@ -1057,7 +1089,9 @@ async def test_red_ci_local_only_parks_non_converged_local_review(
         monitor = next(r for r in history if r.id == "review-run")
         assert monitor.status == "needs_approval"
         assert findings in monitor.termination_detail
-        assert await db.operator_waits.get(conn, "iss-1") is None
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
     finally:
         await conn.close()
 
@@ -1232,7 +1266,9 @@ async def test_review_fix_dirty_tree_no_commit_recovers_via_commit_turn(
             start_sha="before-fix-sha",
         )
 
-        assert result == "after-commit-sha"
+        assert result is not None
+        assert result.sha == "after-commit-sha"
+        assert result.changed is True
         commit_turn.assert_awaited_once()
         # A recovered advance is NOT a failure — no operator-wait escalation.
         fail.assert_not_awaited()
@@ -1296,7 +1332,7 @@ async def test_review_fix_dirty_tree_commit_turn_no_op_escalates_with_uncommitte
             start_sha="before-fix-sha",
         )
 
-        assert result == ""
+        assert result is None
         commit_turn.assert_awaited_once()
         fail.assert_awaited_once()
         reason = fail.await_args.kwargs["error"]
@@ -1362,10 +1398,138 @@ async def test_review_fix_clean_tree_no_op_unchanged(
             start_sha="before-fix-sha",
         )
 
-        assert result == ""
+        assert result is None
         commit_turn.assert_not_awaited()
         fail.assert_awaited_once()
         assert "completed without advancing" in fail.await_args.kwargs["error"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_fix_already_done_on_current_head_completes_without_parking(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delayed review signal may describe work another fix already landed.
+
+    The fixer must be able to prove that the current HEAD already resolves the
+    signal without manufacturing an empty commit or parking the whole pipeline.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        orch = _validate_orch(conn, tmp_path)
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="review-fix",
+            issue_id="iss-1",
+            stage="review_fix",
+            status="running",
+            pid=None,
+            started_at=datetime.now(UTC).isoformat(),
+        )
+
+        head_sha = "a" * 40
+        log_root = tmp_path / "logs"
+        log_root.mkdir(parents=True, exist_ok=True)
+        (log_root / "review-fix.log").write_text(
+            json.dumps(
+                {
+                    "type": "result",
+                    "result": (
+                        "The CI fix already resolved this delayed review finding.\n"
+                        f"SYMPHONY_ALREADY_DONE: {head_sha} (verified on current HEAD)"
+                    ),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        async def fake_dirty_files(_ws: Path) -> list[str]:
+            return []
+
+        async def fake_head_sha(_ws: Path) -> str:
+            return head_sha
+
+        monkeypatch.setattr(review_module, "_workspace_dirty_files", fake_dirty_files)
+        monkeypatch.setattr(review_module, "_workspace_head_sha", fake_head_sha)
+
+        fail = AsyncMock()
+        monkeypatch.setattr(orch, "_fail_review_run", fail)
+
+        run = MagicMock()
+        run.id = "review-run"
+        run.issue_id = "iss-1"
+
+        result = await orch._validate_review_fix_advanced(  # noqa: SLF001
+            run=run,
+            fix_run_id="review-fix",
+            binding=_binding(),
+            issue=_issue_in_progress(),
+            workspace_path=tmp_path,
+            branch="symphony/eng-1",
+            start_sha=head_sha,
+        )
+
+        assert result is not None
+        assert result.sha == head_sha
+        assert result.changed is False
+        fail.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_already_resolved_review_rearm_failure_retries_without_new_fixer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        binding = _binding()
+        issue = _issue_in_review()
+        issue.id = "tracker-iss-1"
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, AsyncMock(), conn, runner=MagicMock(), gh=MagicMock())
+
+        retrigger = AsyncMock(side_effect=[False, True])
+        monkeypatch.setattr(orch, "_retrigger_codex_review_unless_approved", retrigger)
+
+        run = next(
+            r for r in await db.runs.history_for_issue(conn, "iss-1") if r.id == "review-run"
+        )
+        await orch._rearm_after_already_resolved_fix(  # noqa: SLF001
+            run=run,
+            binding=binding,
+            issue=issue,
+        )
+
+        assert await db.runs.has_review_rearm_retry(conn, run.id)
+        assert await db.runs.review_rearm_retry_is_forced(conn, run.id)
+        assert retrigger.await_args_list[0].kwargs["state"].pr_number == 42
+
+        refresh = AsyncMock(return_value=(binding, issue))
+        poll = AsyncMock(return_value=False)
+        deliver_wait = AsyncMock(return_value=False)
+        monkeypatch.setattr(orch, "_refresh_review_poll_candidate", refresh)
+        monkeypatch.setattr(orch, "_poll_review_run", poll)
+        monkeypatch.setattr(orch, "_review_poll_deferred_by_deliver_failed_wait", deliver_wait)
+
+        await orch._poll_review_run_with_limits(run, binding, issue)  # noqa: SLF001
+
+        assert retrigger.await_args_list[-1].kwargs["require_no_signal"] is False
+        assert not await db.runs.has_review_rearm_retry(conn, run.id)
+        poll.assert_awaited_once()
     finally:
         await conn.close()
 
@@ -1444,7 +1608,7 @@ async def test_review_fix_dirty_tree_blocked_marker_preserved_not_committed(
             start_sha="before-fix-sha",
         )
 
-        assert result == ""
+        assert result is None
         commit_turn.assert_not_awaited()
         fail.assert_awaited_once()
         reason = fail.await_args.kwargs["error"]
@@ -1517,7 +1681,7 @@ async def test_review_fix_dirty_tree_commit_turn_partial_commit_still_escalates(
             start_sha="before-fix-sha",
         )
 
-        assert result == ""
+        assert result is None
         commit_turn.assert_awaited_once()
         fail.assert_awaited_once()
         reason = fail.await_args.kwargs["error"]
@@ -5764,7 +5928,7 @@ async def test_merge_conflict_fix_reports_status_when_rebase_has_no_unresolved_p
 
 
 @pytest.mark.asyncio
-async def test_merge_conflict_fix_uses_synced_head_as_noop_baseline(
+async def test_merge_conflict_fix_treats_clean_synced_rebase_as_stale_trigger(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5837,17 +6001,16 @@ async def test_merge_conflict_fix_uses_synced_head_as_noop_baseline(
         gh.pr_comment.assert_not_awaited()
         posted = [c.args[1] for c in linear.post_comment.await_args_list]
         assert not any("Fix pushed" in b for b in posted), posted
-        assert any("completed without advancing symphony/eng-1" in b for b in posted), posted
+        assert not any("completed without advancing symphony/eng-1" in b for b in posted), posted
 
         wait = await db.operator_waits.get(conn, "iss-1")
-        assert wait is not None
-        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+        assert wait is None
 
         history = await db.runs.history_for_issue(conn, "iss-1")
         monitor = next(r for r in history if r.id == "review-run")
         fix_run = next(r for r in history if r.stage == "review_fix")
-        assert monitor.status == "failed"
-        assert fix_run.status == "failed"
+        assert monitor.status == "running"
+        assert fix_run.status == "completed"
     finally:
         await conn.close()
 

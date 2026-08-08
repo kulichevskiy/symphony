@@ -8,10 +8,11 @@ domain module exists. Re-exported by the package ``__init__``.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any, TypedDict
@@ -35,6 +36,25 @@ from ...tracker import Issue as LinearIssue
 _ACCEPTANCE_MISSING_WHERE_TO_VERIFY_NOTE = (
     "Acceptance: degraded to code-only — no `Where to verify` in ticket description"
 )
+_TRANSIENT_DELIVERY_ERROR = re.compile(
+    r"(?:returned error:\s*(?:429|5\d\d)\b|http(?:/\S+)?\s+(?:429|5\d\d)\b|"
+    r"could not resolve host|failed to connect|connection (?:reset|timed out)|"
+    r"operation timed out|empty reply from server|remote end hung up)",
+    re.IGNORECASE,
+)
+
+
+async def _retry_transient_delivery[T](operation: Callable[[], Awaitable[T]]) -> T:
+    """Retry an idempotent delivery operation after transient transport errors."""
+    for attempt in range(3):
+        try:
+            return await operation()
+        except Exception as exc:
+            transient = isinstance(exc, TimeoutError) or _TRANSIENT_DELIVERY_ERROR.search(str(exc))
+            if attempt == 2 or not transient:
+                raise
+            await asyncio.sleep(2**attempt)
+    raise AssertionError("unreachable")
 
 
 def _sum_usage(left: UsageDelta, right: UsageDelta) -> UsageDelta:

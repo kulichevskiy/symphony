@@ -65,6 +65,7 @@ from ._git import (
 from ._helpers import (
     _add_run_usage,
     _local_review_termination_reason,
+    _retry_transient_delivery,
     _termination_kwargs,
     build_pr_title,
     pr_number_from_url,
@@ -998,7 +999,10 @@ class _LifecycleMixin(_OrchestratorBase):
                 parent_run_id=run_id,
                 allow_fixes=allow_fixes,
             )
-            if _local_review_infra_failed(local_review_result):
+            if _local_review_infra_failed(local_review_result) and not (
+                binding.resolved_remote_review()
+                and _local_review_permits_remote(local_review_result)
+            ):
                 # A transient provider API error in the reviewer/fix turn left
                 # the agent's commits intact and did no further work — requeue
                 # with backoff instead of escalating, until the budget is spent.
@@ -1280,13 +1284,16 @@ class _LifecycleMixin(_OrchestratorBase):
 
         pr_url: str = ""
         try:
-            pr_url = await gh.ensure_pr(
-                title=build_pr_title(issue),
-                body="",
-                base=base_branch,
-                head=branch,
-                repo=binding.github_repo,
-                linear_url=issue.url,
+            pr_url = await _retry_transient_delivery(
+                partial(
+                    gh.ensure_pr,
+                    title=build_pr_title(issue),
+                    body="",
+                    base=base_branch,
+                    head=branch,
+                    repo=binding.github_repo,
+                    linear_url=issue.url,
+                )
             )
         except Exception as e:  # noqa: BLE001
             log.warning("pr_create failed for %s: %s", issue.identifier, e)
@@ -1414,11 +1421,10 @@ class _LifecycleMixin(_OrchestratorBase):
                 )
             return run_id
 
-        # 6. Start the Review stage. A local loop is a hard pre-PR gate:
-        #    true/true runs remote review after local APPROVED, or after an
-        #    operator explicitly bypasses the local gate with $skip-local-review.
-        #    Other local terminals are parked below instead of falling through
-        #    to the GitHub bot.
+        # 6. Start the Review stage. A local loop is a hard pre-PR gate except
+        #    for recoverable non-approval in hybrid mode: EXHAUSTED or a
+        #    reviewer-infrastructure failure hands off to the independent
+        #    remote reviewer. STUCK_LOOP and fixer failures remain blocked.
         local_review_blocks_remote = (
             binding.resolved_local_review()
             and not _local_review_permits_remote(local_review_result)
@@ -1431,14 +1437,21 @@ class _LifecycleMixin(_OrchestratorBase):
             pr_url=pr_url,
             post_codex_review=post_codex_review,
         )
-        if binding.resolved_local_review() and _local_review_needs_approval(local_review_result):
+        if (
+            binding.resolved_local_review()
+            and _local_review_needs_approval(local_review_result)
+            and not (
+                binding.resolved_remote_review()
+                and _local_review_permits_remote(local_review_result)
+            )
+        ):
             await self._park_local_only_review_needs_approval(
                 run=review_run,
                 binding=binding,
                 issue=issue,
                 pr_url=pr_url,
                 result=local_review_result,
-                operator_wait=binding.resolved_remote_review(),
+                operator_wait=True,
             )
             return run_id
         if (
@@ -1640,6 +1653,7 @@ class _LifecycleMixin(_OrchestratorBase):
                     on_iteration=_on_iteration,
                     allow_fixes=allow_fixes,
                     log_path=self.config.log_root / f"{local_review_run_id}.log",
+                    review_mode=binding.local_review_mode,
                 )
             finally:
                 await self._finalize_local_review_run(

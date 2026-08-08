@@ -56,12 +56,10 @@ COMPLETION_CONTRACT = (
     "you are actually waiting on a human.\n"
 )
 
-# Implement-only addendum to the completion contract. The already-done no-op
-# outcome is wired solely into the Implement completion gate
-# (`classify_implement_completion` + the already-satisfied close path in
-# poll.py). The review / acceptance fix-run gates do NOT implement it, so
-# advertising `SYMPHONY_ALREADY_DONE` to a fix run would invite a marker its
-# completion path silently mishandles. Appended only by `implement_prompt`.
+# Implement addendum to the completion contract. Implement validates the named
+# delivering commit through `classify_implement_completion`; review fix-runs
+# have their own current-HEAD contract below. Acceptance fix-runs do not support
+# this marker and therefore do not advertise it.
 COMPLETION_CONTRACT_ALREADY_DONE = (
     "- `SYMPHONY_ALREADY_DONE: <commit-sha> (<PR/issue ref>)` — every "
     "acceptance criterion is ALREADY satisfied in the current tree by work "
@@ -71,6 +69,14 @@ COMPLETION_CONTRACT_ALREADY_DONE = (
     "already part of the target branch's history — it is verified before the "
     "issue is auto-closed. Do not use this when you simply chose not to make "
     "changes.\n"
+)
+
+REVIEW_FIX_COMPLETION_CONTRACT_ALREADY_DONE = (
+    "- `SYMPHONY_ALREADY_DONE: <current-head-sha> (<evidence>)` — the review "
+    "signal is delayed or duplicated and the current HEAD already resolves it, "
+    "so there is nothing to commit. Use this ONLY after verifying the feedback "
+    "against the current tree and confirming the working tree is clean. Name the "
+    "current HEAD SHA and concise evidence.\n"
 )
 
 
@@ -180,6 +186,8 @@ def review_fix_prompt(
         "- Make the smallest change that resolves the failing review signal.\n"
         "- Commit your changes on the current branch (do not push).\n"
         "- Do not edit unrelated files.\n"
+        f"{COMPLETION_CONTRACT}"
+        f"{REVIEW_FIX_COMPLETION_CONTRACT_ALREADY_DONE}"
         f"{HEADLESS_RULES}"
     )
 
@@ -208,6 +216,7 @@ def review_comment_fix_prompt(
         "- Commit your changes on the current branch (do not push).\n"
         "- Do not edit unrelated files.\n\n"
         f"{COMPLETION_CONTRACT}"
+        f"{REVIEW_FIX_COMPLETION_CONTRACT_ALREADY_DONE}"
         f"{HEADLESS_RULES}"
     )
 

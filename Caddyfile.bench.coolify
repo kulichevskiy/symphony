@@ -1,0 +1,18 @@
+{
+    auto_https off
+}
+
+:80 {
+    handle /health {
+        reverse_proxy worker:8080
+    }
+    handle /experiments* {
+        reverse_proxy worker:8080
+    }
+    handle /notifications* {
+        reverse_proxy worker:8080
+    }
+    handle {
+        reverse_proxy connections:8787
+    }
+}

@@ -277,6 +277,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
             paired_issue_ids.add(issue_id)
             pairs.append((issue_id, run_id))
         for issue_id, run_id in pairs:
+            await self._reassert_review_failed_wait_state(issue_id, run_id)
             try:
                 after, seen_ids = await self._resolve_comment_cursor(issue_id, run_id)
             except Exception:  # noqa: BLE001 — keep loop alive
@@ -324,6 +325,39 @@ class _SlashCommandsMixin(_OrchestratorBase):
                     latest_self_authored.created_at,
                     {latest_self_authored.id},
                 )
+
+    async def _reassert_review_failed_wait_state(self, issue_id: str, run_id: str) -> None:
+        """Repair tracker automation moving a parked review back into an active lane."""
+        wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
+        if wait is None or wait.kind != db.operator_waits.KIND_REVIEW_FAILED:
+            return
+        binding = self._review_failed_run_bindings.get(run_id)
+        if binding is None:
+            return
+        tracker_issue_id, tracker_ctx = await self._tracker_identity_for_issue(issue_id)
+        tracker = self.tracker(tracker_ctx)
+        try:
+            issue = await tracker.lookup_issue(tracker_issue_id)
+            active_states = {
+                binding.linear_states.in_progress,
+                binding.linear_states.local_code_review,
+                binding.linear_states.code_review,
+            }
+            if issue.state_name not in active_states:
+                return
+            states = await self._states_for_binding(binding)
+            needs_approval_id = states.get(binding.linear_states.needs_approval)
+            if needs_approval_id is None:
+                return
+            await tracker.move_issue(tracker_issue_id, needs_approval_id)
+            log.info(
+                "restored %s to %s for parked review run %s",
+                issue.identifier,
+                binding.linear_states.needs_approval,
+                run_id,
+            )
+        except LinearError as e:
+            log.warning("could not restore parked review state for %s: %s", issue_id, e)
 
     async def _handle_unseen_slash_comment(
         self, issue_id: str, run_id: str, comment: LinearComment

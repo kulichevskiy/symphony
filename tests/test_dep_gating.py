@@ -68,11 +68,12 @@ def _issue(
     state_id: str = "state-todo",
     state_name: str = "Todo",
     state_type: str = "unstarted",
+    title: str = "Blocked work",
 ) -> LinearIssue:
     return LinearIssue(
         id=id,
         identifier=identifier,
-        title="Blocked work",
+        title=title,
         description="",
         url=f"https://linear.app/team/issue/{identifier}/blocked-work",
         state_id=state_id,
@@ -214,6 +215,30 @@ async def test_waiting_none_preserves_old_pickup_behavior(tmp_path: Path) -> Non
         orch._dispatch_one.assert_awaited_once_with(binding, issue)  # noqa: SLF001
         linear.move_issue.assert_not_awaited()
         linear.post_comment.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_scan_filters_ready_issues_by_binding_title_prefix(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding(waiting=None)
+        binding.issue_title_prefix = "[EXP-CURRENT]"
+        cfg = Config(repos=[binding])
+        current = _issue([], id="current", title="[EXP-CURRENT] Add bookings")
+        stale = _issue([], id="stale", title="[EXP-OLD] Add bookings")
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[stale, current])
+        linear.lookup_issue = AsyncMock(return_value=current)
+        linear.move_issue = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        orch = _make_orch(cfg, linear, conn)
+
+        await _scan_and_wait(orch, binding)
+
+        orch._dispatch_one.assert_awaited_once_with(binding, current)  # noqa: SLF001
     finally:
         await conn.close()
 

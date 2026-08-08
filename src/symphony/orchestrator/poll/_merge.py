@@ -558,21 +558,23 @@ class _MergeMixin(_OrchestratorBase):
         if not failing_rollup_checks:
             return []
 
-        try:
-            required_contexts = await get_required_contexts(
-                binding.github_repo,
-                pr_number,
-                gh=await self._gh_client(),
-                cache=required_context_cache,
-            )
-        except GitHubError as e:
-            log.warning(
-                "could not fetch required status contexts for %s#%d: %s",
-                binding.github_repo,
-                pr_number,
-                e,
-            )
-            return []
+        required_contexts = binding.required_status_checks
+        if not required_contexts:
+            try:
+                required_contexts = await get_required_contexts(
+                    binding.github_repo,
+                    pr_number,
+                    gh=await self._gh_client(),
+                    cache=required_context_cache,
+                )
+            except GitHubError as e:
+                log.warning(
+                    "could not fetch required status contexts for %s#%d: %s",
+                    binding.github_repo,
+                    pr_number,
+                    e,
+                )
+                return []
         required = {context.strip() for context in required_contexts if context.strip()}
         if not required:
             return []
@@ -1087,6 +1089,7 @@ class _MergeMixin(_OrchestratorBase):
                     issue=issue,
                     pr_url=pr_url,
                     result=pending_local_only_needs_approval,
+                    operator_wait=True,
                 )
                 return True
 
@@ -1901,11 +1904,23 @@ class _MergeMixin(_OrchestratorBase):
                 )
             return True
 
-    async def _reconcile_merged_issues_linear_state(self) -> int:
+    async def _reconcile_pending_merged_issues_linear_state(self) -> int:
+        issue_ids = frozenset(self._merged_linear_state_recheck_issue_ids)
+        if not issue_ids:
+            return 0
+        corrected = await self._reconcile_merged_issues_linear_state(issue_ids=issue_ids)
+        self._merged_linear_state_recheck_issue_ids.difference_update(issue_ids)
+        return corrected
+
+    async def _reconcile_merged_issues_linear_state(
+        self, *, issue_ids: set[str] | frozenset[str] | None = None
+    ) -> int:
         since = self._now() - timedelta(hours=MERGED_LINEAR_STATE_RECONCILE_LOOKBACK_HOURS)
         recent_merged = await db.issue_prs.list_recent_merged(self._conn, since=since)
         corrected = 0
         for pr in recent_merged:
+            if issue_ids is not None and pr.issue_id not in issue_ids:
+                continue
             binding = self._binding_for_pr(pr)
             if binding is None:
                 log.warning(
@@ -2336,9 +2351,15 @@ class _MergeMixin(_OrchestratorBase):
         head_sha: str,
     ) -> _NoSignalMergeReadiness:
         """Whether a clean no_signal head is merge-ready via conflict-fix or bypass."""
+        zero_rollup_pending_ci = (
+            not binding.resolved_remote_review()
+            and verdict.kind is VerdictKind.PENDING
+            and verdict.rule == "pending_ci"
+            and _no_signal_head_check_state(view) == "none"
+        )
         no_signal_mergeable = (
             verdict.kind is VerdictKind.PENDING
-            and verdict.rule == "no_signal"
+            and (verdict.rule == "no_signal" or zero_rollup_pending_ci)
             and str(view.get("mergeable") or "").upper() == "MERGEABLE"
         )
         conflict_fix_ready = False
@@ -2367,6 +2388,21 @@ class _MergeMixin(_OrchestratorBase):
         return _NoSignalMergeReadiness(
             conflict_fix_ready=conflict_fix_ready,
             review_bypass_ready=review_bypass_ready,
+        )
+
+    async def _zero_rollup_merge_authorized(
+        self,
+        *,
+        binding: RepoBinding,
+        issue_id: str,
+        head_sha: str,
+    ) -> bool:
+        """Whether an exact-head verify pass authorizes a zero-rollup merge."""
+        return binding.allow_unverified_merge or await db.issue_prs.has_verify_passed(
+            self._conn,
+            issue_id=issue_id,
+            github_repo=binding.github_repo,
+            head_sha=head_sha,
         )
 
     async def _gate_no_signal_merge_on_ci(
@@ -2398,13 +2434,12 @@ class _MergeMixin(_OrchestratorBase):
         # an operator instead of silently merging unverified code.
         check_state = _no_signal_head_check_state(view)
         if check_state == "none":
-            verified = await db.issue_prs.has_verify_passed(
-                self._conn,
+            zero_rollup_authorized = await self._zero_rollup_merge_authorized(
+                binding=binding,
                 issue_id=candidate.issue_id,
-                github_repo=binding.github_repo,
                 head_sha=head_sha,
             )
-            if not (binding.allow_unverified_merge or verified):
+            if not zero_rollup_authorized:
                 await self._mark_merge_needs_approval(
                     binding=binding,
                     issue=issue,
@@ -3143,6 +3178,7 @@ class _MergeMixin(_OrchestratorBase):
             premerge_view = await (await self._gh_client()).pr_view(
                 pr_number,
                 repo=binding.github_repo,
+                include_status_checks=True,
             )
         except Exception as e:  # noqa: BLE001
             log.warning(
@@ -3164,7 +3200,8 @@ class _MergeMixin(_OrchestratorBase):
             return False, None
 
         premerge_head_sha = str(premerge_view.get("headRefOid") or "")
-        if approved_head_sha and premerge_head_sha != approved_head_sha:
+        head_changed = bool(approved_head_sha and premerge_head_sha != approved_head_sha)
+        if head_changed:
             try:
                 verdict = await self._review_verdict_for_pr(
                     binding=binding,
@@ -3181,19 +3218,56 @@ class _MergeMixin(_OrchestratorBase):
                 )
                 verdict = None
             if verdict is None or verdict.kind is not VerdictKind.APPROVED:
-                reason = f"merge-agent pushed unreviewed HEAD {premerge_head_sha or '(unknown)'}"
                 await self._mark_merge_needs_approval(
                     binding=binding,
                     issue=issue,
                     pr_url=pr_url,
                     run_id=run_id,
-                    reason=reason,
+                    reason=(
+                        f"merge-agent pushed unreviewed HEAD {premerge_head_sha or '(unknown)'}"
+                    ),
                 )
                 state = await db.review_state.get(self._conn, storage_issue_id)
                 await self._retrigger_codex_review_unless_approved(
                     binding=binding,
                     issue=issue,
                     state=state,
+                )
+                return True, premerge_view
+        elif binding.required_status_checks:
+            try:
+                checks = await (await self._gh_client()).pr_checks(
+                    pr_number,
+                    repo=binding.github_repo,
+                    required_contexts=binding.required_status_checks,
+                )
+            except GitHubError as e:
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    reason=f"could not verify configured required checks: {e}",
+                    exc=e,
+                )
+                return True, premerge_view
+            premerge_checks_ready = checks.all_passed
+            if not premerge_checks_ready and _no_signal_head_check_state(premerge_view) == "none":
+                premerge_checks_ready = await self._zero_rollup_merge_authorized(
+                    binding=binding,
+                    issue_id=storage_issue_id,
+                    head_sha=premerge_head_sha,
+                )
+            if not premerge_checks_ready:
+                await self._mark_merge_needs_approval(
+                    binding=binding,
+                    issue=issue,
+                    pr_url=pr_url,
+                    run_id=run_id,
+                    reason=(
+                        "configured required checks are no longer green for HEAD "
+                        f"{premerge_head_sha or '(unknown)'}"
+                    ),
                 )
                 return True, premerge_view
 
@@ -3446,6 +3520,7 @@ class _MergeMixin(_OrchestratorBase):
             merged_at=ended_at,
         )
         await db.runs.update_status(self._conn, run_id, "done", ended_at=ended_at)
+        self._merged_linear_state_recheck_issue_ids.add(storage_issue_id)
         await self._clear_operator_wait(storage_issue_id, run_id)
         await self._notify_attention(
             event=EVENT_PR_MERGED,

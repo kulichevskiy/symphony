@@ -442,7 +442,9 @@ async def test_deliver_failed_retry_preserves_local_review_needs_approval_after_
             if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body")) == "@codex review"
         ]
         assert codex_calls == []
-        assert await db.operator_waits.get(conn, "iss-1") is None
+        parked = await db.operator_waits.get(conn, "iss-1")
+        assert parked is not None
+        assert parked.kind == db.operator_waits.KIND_REVIEW_FAILED
         move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
         assert "state-na" in move_targets
 
@@ -722,8 +724,12 @@ async def test_deliver_failed_reject_interrupts_live_review_monitor(
 
 
 @pytest.mark.asyncio
-async def test_hybrid_strategy_local_non_convergence_skips_remote_review(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    "local_outcome",
+    [LoopOutcome.EXHAUSTED, LoopOutcome.REVIEWER_FAILED],
+)
+async def test_hybrid_strategy_local_nonapproval_continues_to_remote_review(
+    tmp_path: Path, local_outcome: LoopOutcome
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
@@ -789,7 +795,7 @@ async def test_hybrid_strategy_local_non_convergence_skips_remote_review(
         )
         orch._run_local_review_phase = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
             return_value=LoopResult(
-                outcome=LoopOutcome.EXHAUSTED,
+                outcome=local_outcome,
                 iterations=2,
                 verdicts=(
                     LocalVerdict(
@@ -811,21 +817,17 @@ async def test_hybrid_strategy_local_non_convergence_skips_remote_review(
             for c in gh.pr_comment.await_args_list
             if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body")) == "@codex review"
         ]
-        assert codex_calls == []
+        assert len(codex_calls) == 1
         move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
-        assert "state-na" in move_targets
-        assert "state-review" not in move_targets
+        assert "state-na" not in move_targets
+        assert "state-review" in move_targets
 
         history = await db.runs.history_for_issue(conn, "iss-1")
         review_rows = [h for h in history if h.stage == "review"]
         assert len(review_rows) == 1
-        assert review_rows[0].status == "needs_approval"
-        assert "src/auth.py:12 missing token validation" in (review_rows[0].termination_detail)
-        wait = await db.operator_waits.get(conn, "iss-1")
-        assert wait is not None
-        assert wait.run_id == review_rows[0].id
-        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
-        assert review_rows[0].id in orch._operator_wait_run_ids  # noqa: SLF001
+        assert review_rows[0].status == "running"
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        assert review_rows[0].id not in orch._operator_wait_run_ids  # noqa: SLF001
     finally:
         await conn.close()
 
@@ -1321,7 +1323,25 @@ async def test_local_strategy_non_convergence_parks_pr_in_needs_approval(
         assert review_rows[0].status == "needs_approval"
         assert "src/auth.py:12 missing token validation" in review_rows[0].termination_detail
         wait = await db.operator_waits.get(conn, "iss-1")
-        assert wait is None
+        assert wait is not None
+        assert wait.run_id == review_rows[0].id
+        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+        assert orch._slash_command_run_eligible(wait.run_id)  # noqa: SLF001
+
+        # Linear's GitHub integration may react to the freshly opened PR after
+        # Symphony parks the issue and move it back to In Progress. The durable
+        # wait must make the next operator-command poll restore Needs Approval.
+        bounced = _issue()
+        bounced.state_id = "state-progress"
+        bounced.state_name = "In Progress"
+        bounced.state_type = "started"
+        linear.lookup_issue = AsyncMock(return_value=bounced)
+        linear.comments_since = AsyncMock(return_value=[])
+        linear.move_issue.reset_mock()
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        linear.move_issue.assert_awaited_once_with("iss-1", "state-na")
     finally:
         await conn.close()
 
