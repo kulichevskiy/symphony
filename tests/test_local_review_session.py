@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from symphony.agent.runner import RunnerEvent, RunnerSpec
+from symphony.bench.metrics import local_review_metrics
 from symphony.config import ResolvedRole
 from symphony.pipeline.local_review import (
     VERDICT_APPROVED_MARKER,
@@ -281,6 +282,17 @@ async def test_persists_transcripts_for_review_and_fix_iterations(
     assert (log_dir / "fix-0.err.log").read_text(encoding="utf-8") == fix_0_err
     assert (log_dir / "review-1.out.log").read_text(encoding="utf-8") == review_1_out
     assert (log_dir / "review-1.err.log").read_text(encoding="utf-8") == review_1_err
+    if reviewer_agent == "claude":
+        assert (log_dir / "review-0.last.txt").read_text(encoding="utf-8") == (
+            f"## Findings\n- [Major] bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+        )
+        assert (log_dir / "review-1.last.txt").read_text(encoding="utf-8") == (
+            f"looks good\n{VERDICT_APPROVED_MARKER}"
+        )
+        metrics = local_review_metrics(tmp_path / "logs")
+        assert metrics["local_review_rounds"] == 2
+        assert metrics["local_review_findings"] == 1
+        assert metrics["local_review_major"] == 1
 
 
 @pytest.mark.asyncio

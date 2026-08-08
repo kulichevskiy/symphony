@@ -105,6 +105,22 @@ def test_review_comment_fix_prompt_mandates_completion_marker_contract() -> None
     assert "SYMPHONY_ALREADY_DONE" in prompt
     assert "current-head-sha" in prompt
     assert "working tree is clean" in prompt
+    assert "Final closure audit" not in prompt
+
+
+def test_final_review_fix_prompt_requires_holistic_closure_audit() -> None:
+    prompt = review_comment_fix_prompt(
+        issue_title="Build support queue",
+        issue_body="Operators can create and filter tickets.",
+        labels=["feature"],
+        trigger="frontend/src/App.tsx:42 loses a successful create",
+        final_iteration=True,
+    )
+
+    assert "final allowed review-fix iteration" in prompt
+    assert "related failure modes" in prompt
+    assert "issue requirements" in prompt
+    assert "regression tests" in prompt
 
 
 def test_ci_review_fix_prompt_supports_verified_already_done_outcome() -> None:

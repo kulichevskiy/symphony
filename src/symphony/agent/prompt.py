@@ -198,10 +198,23 @@ def review_comment_fix_prompt(
     issue_body: str,
     labels: list[str],
     trigger: str,
+    final_iteration: bool = False,
 ) -> str:
     """Build the prompt for a Review-stage fix-run triggered by reviewer comments."""
     label_line = ", ".join(labels) if labels else "(no labels)"
     body = issue_body.strip() if issue_body else "(no description)"
+    closure_audit = ""
+    if final_iteration:
+        closure_audit = (
+            "# Final closure audit\n\n"
+            "This is the final allowed review-fix iteration. After resolving the "
+            "reported feedback, perform a holistic closure audit before committing:\n\n"
+            "- Re-check the changed feature against all issue requirements.\n"
+            "- Inspect related failure modes and symmetric cases, especially stale or "
+            "concurrent work, loading/error recovery, permissions, and filtered state.\n"
+            "- Add regression tests for the reported defect and any related defect you fix.\n"
+            "- Keep the audit within the issue scope; do not redesign unrelated code.\n\n"
+        )
     return (
         "You are Symphony's Review-stage fix-run agent.\n"
         "Address the reviewer feedback on the current branch.\n\n"
@@ -211,6 +224,7 @@ def review_comment_fix_prompt(
         f"## Title\n{issue_title}\n\n"
         f"## Labels\n{label_line}\n\n"
         f"## Description\n{body}\n\n"
+        f"{closure_audit}"
         "# Working agreement\n\n"
         "- Make the smallest change that addresses the reviewer feedback.\n"
         "- Commit your changes on the current branch (do not push).\n"

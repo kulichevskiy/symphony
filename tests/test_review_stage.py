@@ -6154,6 +6154,7 @@ async def test_codex_inline_comment_dispatches_fix_run_and_posts_linear_activity
             log_root=tmp_path / "logs",
             workspace_root=tmp_path / "ws",
             db_path=tmp_path / "s.sqlite",
+            review_iteration_cap=1,
         )
 
         linear = AsyncMock()
@@ -6204,6 +6205,7 @@ async def test_codex_inline_comment_dispatches_fix_run_and_posts_linear_activity
         prompt = runner.captured_spec.command[-1]
         assert "Mark dry-run items" in prompt
         assert "backend/app/routes/optimize.py" in prompt
+        assert "final allowed review-fix iteration" in prompt
 
         # Linear activity comments: one before dispatch, one after push.
         posted = [c.args[1] for c in linear.post_comment.await_args_list]

@@ -406,6 +406,17 @@ async def run_local_review_session(
             runner, spec, usage_handler=estimator.delta, log_path=log_path
         )
         _persist_runner_transcript(last_message_dir, attempt_stem, collected)
+        if agent != "codex":
+            extracted_message = extract_last_agent_message(
+                agent=agent,
+                stdout=collected.stdout,
+                last_message_file=None,
+            )
+            if extracted_message.strip():
+                try:
+                    last_message_path.write_text(extracted_message, encoding="utf-8")
+                except OSError:
+                    pass
         cost_delta = estimator.total_cost_usd
         input_delta = estimator.total_input_tokens
         output_delta = estimator.total_output_tokens
