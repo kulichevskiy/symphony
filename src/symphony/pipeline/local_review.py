@@ -414,6 +414,7 @@ class LocalVerdictKind(StrEnum):
 class LocalVerdict:
     kind: LocalVerdictKind
     findings: str = ""
+    severity_inferred: bool = False
     trigger_signature: str = ""
     raw_message: str = ""
     # Findings-only digest used by the local loop to detect non-convergence.
@@ -892,6 +893,7 @@ def merge_hybrid_review_messages(
     return LocalVerdict(
         kind=LocalVerdictKind.CHANGES_REQUESTED,
         findings=findings,
+        severity_inferred=spec.severity_inferred,
         trigger_signature=f"local_hybrid:{head_sha}:{digest}",
         findings_signature=f"local_hybrid_findings:{digest}",
         raw_message=f"SPEC:\n{spec_message}\n\nBUILTIN:\n{builtin_message}",
@@ -1189,20 +1191,22 @@ def _classify_message(*, message: str, head_sha: str) -> LocalVerdict:
             raw_message=message,
         )
     findings = _extract_findings(message=message, verdict_index=matches[-1].start())
-    normalized_findings = _normalize_findings_severity(findings)
-    if normalized_findings is None:
+    normalized = _normalize_findings_severity(findings)
+    if normalized is None:
         return LocalVerdict(kind=LocalVerdictKind.UNPARSEABLE, raw_message=message)
+    normalized_findings, severity_inferred = normalized
     digest = _stable_digest(normalized_findings)
     return LocalVerdict(
         kind=LocalVerdictKind.CHANGES_REQUESTED,
         findings=normalized_findings,
+        severity_inferred=severity_inferred,
         trigger_signature=f"local_review:{head_sha}:{digest}",
         raw_message=message,
         findings_signature=f"local_review_findings:{digest}",
     )
 
 
-def _normalize_findings_severity(findings: str) -> str | None:
+def _normalize_findings_severity(findings: str) -> tuple[str, bool] | None:
     """Keep actionable findings when a reviewer omits presentation tags.
 
     A missing tag is conservatively treated as Major and marked as inferred,
@@ -1213,6 +1217,7 @@ def _normalize_findings_severity(findings: str) -> str | None:
     bullets = _top_level_finding_bullets(normalized)
     if not bullets:
         return None
+    severity_inferred = False
     for position, (index, match) in enumerate(bullets):
         next_index = bullets[position + 1][0] if position + 1 < len(bullets) else len(normalized)
         block = "\n".join(normalized[index:next_index])
@@ -1220,11 +1225,12 @@ def _normalize_findings_severity(findings: str) -> str | None:
         if len(severities) > 1:
             return None
         if not severities:
+            severity_inferred = True
             normalized[index] = (
                 f"{match.group('indent')}{match.group('marker')}"
                 f"[Major] [severity inferred] {match.group('body')}"
             )
-    return "\n".join(normalized)
+    return "\n".join(normalized), severity_inferred
 
 
 def _top_level_finding_bullets(

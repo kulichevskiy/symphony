@@ -135,7 +135,69 @@ async def test_unclassified_finding_still_reaches_fixer() -> None:
 
     assert result.outcome == LoopOutcome.APPROVED
     assert len(fixer.received) == 1
+    assert fixer.received[0].severity_inferred is True
     assert "[Major] [severity inferred]" in fixer.received[0].findings
+
+
+@pytest.mark.asyncio
+async def test_unclassified_finding_retries_before_inferred_fallback() -> None:
+    reviewer = _ReviewerScript(
+        messages=[
+            (
+                "## Findings\n"
+                "- noisy suspicion without a severity tag\n"
+                "- real bug without a severity tag\n"
+                f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+            ),
+            f"## Findings\n- [Major] real bug\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"fixed and verified\n{VERDICT_APPROVED_MARKER}",
+        ],
+        head_shas=["sha-a", "sha-a", "sha-b"],
+        message_by_call=True,
+    )
+    fixer = _FixerScript()
+
+    result = await run_local_review_loop(
+        reviewer_agent="codex",
+        reviewer=reviewer,
+        fixer=fixer,
+        cap=1,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    assert reviewer.calls == [0, 0, 1]
+    assert len(fixer.received) == 1
+    assert "real bug" in fixer.received[0].findings
+    assert "noisy suspicion" not in fixer.received[0].findings
+    assert "[severity inferred]" not in fixer.received[0].findings
+
+
+@pytest.mark.asyncio
+async def test_severity_retry_is_independent_from_unparseable_retry() -> None:
+    reviewer = _ReviewerScript(
+        messages=[
+            "review output without a verdict marker",
+            f"## Findings\n- noisy ungraded bug\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"## Findings\n- [Major] precise bug\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"fixed and verified\n{VERDICT_APPROVED_MARKER}",
+        ],
+        head_shas=["sha-a", "sha-a", "sha-a", "sha-b"],
+        message_by_call=True,
+    )
+    fixer = _FixerScript()
+
+    result = await run_local_review_loop(
+        reviewer_agent="codex",
+        reviewer=reviewer,
+        fixer=fixer,
+        cap=1,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    assert reviewer.calls == [0, 0, 0, 1]
+    assert len(fixer.received) == 1
+    assert "precise bug" in fixer.received[0].findings
+    assert "noisy ungraded bug" not in fixer.received[0].findings
 
 
 @pytest.mark.asyncio

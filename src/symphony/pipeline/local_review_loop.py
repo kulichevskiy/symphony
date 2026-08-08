@@ -288,7 +288,9 @@ async def run_local_review_loop(
         # the generic marker message.
         stream_error: str | None = None
         last_failed_agent: str | None = None
-        for attempt in range(REVIEWER_FAILURE_RETRIES + 1):
+        reviewer_retries_used = 0
+        severity_retries_used = 0
+        while True:
             out = await reviewer(i)
             _record_usage(out)
             if out.agent_error:
@@ -302,7 +304,8 @@ async def run_local_review_loop(
             ledger.clear(*out.healthy_agents)
             if not out.ok:
                 reviewer_error = out.error or "reviewer failed"
-                if attempt < REVIEWER_FAILURE_RETRIES:
+                if reviewer_retries_used < REVIEWER_FAILURE_RETRIES:
+                    reviewer_retries_used += 1
                     continue
                 return _result(
                     outcome=LoopOutcome.REVIEWER_FAILED,
@@ -316,7 +319,15 @@ async def run_local_review_loop(
                 head_sha=out.head_sha,
                 last_message_file=out.last_message_file,
             )
-            if parsed.kind == LocalVerdictKind.UNPARSEABLE and attempt < REVIEWER_FAILURE_RETRIES:
+            if parsed.kind == LocalVerdictKind.UNPARSEABLE:
+                if reviewer_retries_used < REVIEWER_FAILURE_RETRIES:
+                    reviewer_retries_used += 1
+                    continue
+            elif (
+                parsed.severity_inferred
+                and severity_retries_used < REVIEWER_FAILURE_RETRIES
+            ):
+                severity_retries_used += 1
                 continue
             verdict = parsed
             break
