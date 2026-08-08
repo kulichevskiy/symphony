@@ -1058,7 +1058,9 @@ _VERDICT_LINE_RE = re.compile(
 )
 _FINDINGS_HEADING_RE = re.compile(r"(?im)^\s*#{1,6}\s*findings\b\s*$")
 _FINDING_BULLET_RE = re.compile(r"(?m)^[-*+]\s+(.+)$")
-_SEVERITY_PREFIX_RE = re.compile(r"^\[(?:Critical|Major|Minor)\]\s+")
+_SEVERITY_PREFIX_RE = re.compile(
+    r"^\*{0,2}`?\[(?:Critical|Major|Minor)\](?:`|\*{0,2})?\s+"
+)
 _BUILTIN_FINDING_RE = re.compile(
     r"(?ms)^(?:[-*+]\s*)?\[(P[0-3])\]\s+(.+?)"
     r"(?=^(?:[-*+]\s*)?\[P[0-3]\]\s+|\Z)"
@@ -1068,7 +1070,9 @@ _BUILTIN_CLEAN_RE = re.compile(
     r"\b(?:no findings|no actionable findings|did not find any findings|nothing to flag)\b",
     re.IGNORECASE,
 )
-_HYBRID_SEVERITY_RE = re.compile(r"^\[(Critical|Major|Minor)\]", re.IGNORECASE)
+_HYBRID_SEVERITY_RE = re.compile(
+    r"^\*{0,2}`?\[(Critical|Major|Minor)\]", re.IGNORECASE
+)
 
 
 def extract_last_agent_message(

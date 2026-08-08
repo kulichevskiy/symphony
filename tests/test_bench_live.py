@@ -312,6 +312,7 @@ def test_local_review_metrics_count_final_verdicts_and_severity(tmp_path: Path) 
         "- [Critical] `a.py:1`: data loss\n"
         "- **[Major]** `b.py:2`: requirement broken\n"
         "- [Minor] `c.py:3`: bounded defect\n"
+        "- `[Major] e.py:5`: null title is accepted\n"
         "- `d.py:4`: old-format finding\n\n"
         "<<<VERDICT:CHANGES_REQUESTED>>>\n",
         encoding="utf-8",
@@ -335,9 +336,9 @@ def test_local_review_metrics_count_final_verdicts_and_severity(tmp_path: Path) 
         "local_review_agent_launches": 4,
         "local_review_rounds": 3,
         "local_review_unparseable_rounds": 1,
-        "local_review_findings": 4,
+        "local_review_findings": 5,
         "local_review_critical": 1,
-        "local_review_major": 1,
+        "local_review_major": 2,
         "local_review_minor": 1,
         "local_review_unclassified": 1,
     }

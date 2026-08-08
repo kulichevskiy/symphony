@@ -555,6 +555,22 @@ def test_parse_local_review_output_changes_requested_extracts_findings() -> None
     assert verdict.findings_signature.startswith("local_review_findings:")
 
 
+def test_parse_local_review_output_accepts_code_wrapped_severity() -> None:
+    """Claude may render a required severity tag as inline Markdown code."""
+    message = (
+        "## Findings\n"
+        "- `[Major] support_queue/main.py:196-203` allows a null title.\n"
+        "- `[Minor] support_queue/db.py:52-53` leaks a connection.\n\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}\n"
+    )
+    stdout = json.dumps({"type": "result", "result": message})
+
+    verdict = parse_local_review_output(agent="claude", stdout=stdout, head_sha="abc123")
+
+    assert verdict.kind == LocalVerdictKind.CHANGES_REQUESTED
+    assert "null title" in verdict.findings
+
+
 def test_parse_local_review_output_rejects_unclassified_findings() -> None:
     message = (
         "## Findings\n"
