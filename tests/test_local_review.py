@@ -219,6 +219,40 @@ def test_merge_hybrid_review_messages_keeps_worst_duplicate_severity() -> None:
     assert "[Critical]" in merged.findings
 
 
+def test_merge_hybrid_review_messages_keeps_indented_spec_findings() -> None:
+    merged = merge_hybrid_review_messages(
+        spec_message=(
+            "## Findings\n"
+            "  - first unclassified finding\n"
+            "  - database transaction can interleave\n"
+            f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+        ),
+        builtin_message="No findings.",
+        head_sha="abc123",
+    )
+
+    assert merged.kind is LocalVerdictKind.CHANGES_REQUESTED
+    assert "first unclassified finding" in merged.findings
+    assert "database transaction can interleave" in merged.findings
+
+
+def test_parse_local_review_output_keeps_nested_bullet_with_parent_finding() -> None:
+    message = (
+        "## Findings\n"
+        "- [Major] parent finding\n"
+        "  - remediation example\n"
+        "- sibling without severity\n\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+    )
+    stdout = _codex_jsonl_with_final_message(message)
+
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc123")
+
+    assert verdict.kind is LocalVerdictKind.CHANGES_REQUESTED
+    assert "  - remediation example" in verdict.findings
+    assert verdict.findings.count("[severity inferred]") == 1
+
+
 # --- command builder -----------------------------------------------------
 
 
@@ -613,7 +647,7 @@ def test_parse_local_review_output_rejects_multiple_severities_per_finding() -> 
     assert verdict.kind == LocalVerdictKind.UNPARSEABLE
 
 
-def test_parse_local_review_output_rejects_unclassified_findings() -> None:
+def test_parse_local_review_output_conservatively_grades_unclassified_findings() -> None:
     message = (
         "## Findings\n"
         "- `a.py:42` swallows the wrong exception.\n\n"
@@ -623,17 +657,49 @@ def test_parse_local_review_output_rejects_unclassified_findings() -> None:
 
     verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc123")
 
-    assert verdict.kind == LocalVerdictKind.UNPARSEABLE
-    assert verdict.findings == ""
+    assert verdict.kind == LocalVerdictKind.CHANGES_REQUESTED
+    assert "[Major] [severity inferred] `a.py:42`" in verdict.findings
     assert verdict.raw_message == message
 
 
-def test_parse_local_review_output_rejects_partly_unclassified_findings() -> None:
+def test_parse_local_review_output_only_infers_missing_severities() -> None:
     message = (
         "## Findings\n"
         "- [Major] `a.py:42` swallows the wrong exception.\n"
         "- `b.py:7` also loses the error.\n\n"
         f"{VERDICT_CHANGES_REQUESTED_MARKER}\n"
+    )
+    stdout = _codex_jsonl_with_final_message(message)
+
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc123")
+
+    assert verdict.kind == LocalVerdictKind.CHANGES_REQUESTED
+    assert "- [Major] `a.py:42`" in verdict.findings
+    assert "- [Major] [severity inferred] `b.py:7`" in verdict.findings
+
+
+def test_parse_local_review_output_infers_severity_for_indented_markdown_bullet() -> None:
+    message = (
+        "## Findings\n"
+        "  - `a.py:42` swallows the wrong exception.\n"
+        "  - `b.py:7` also swallows the wrong exception.\n\n"
+        "<<<VERDICT:CHANGES_REQUESTED>>>"
+    )
+    stdout = _codex_jsonl_with_final_message(message)
+
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc123")
+
+    assert verdict.kind == LocalVerdictKind.CHANGES_REQUESTED
+    assert "- [Major] [severity inferred] `a.py:42`" in verdict.findings
+    assert "  - [Major] [severity inferred] `b.py:7`" in verdict.findings
+
+
+def test_parse_local_review_output_rejects_multiple_severities_across_one_bullet() -> None:
+    message = (
+        "## Findings\n"
+        "- [Major] `a.py:42` swallows the wrong exception.\n"
+        "  Follow-up impact is [Minor].\n\n"
+        "<<<VERDICT:CHANGES_REQUESTED>>>"
     )
     stdout = _codex_jsonl_with_final_message(message)
 

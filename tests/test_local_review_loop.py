@@ -116,6 +116,29 @@ async def test_fix_then_approve_runs_full_cycle() -> None:
 
 
 @pytest.mark.asyncio
+async def test_unclassified_finding_still_reaches_fixer() -> None:
+    reviewer = _ReviewerScript(
+        messages=[
+            f"## Findings\n- bug without a severity tag\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+            f"fixed and verified\n{VERDICT_APPROVED_MARKER}",
+        ],
+        head_shas=["sha-a", "sha-b"],
+    )
+    fixer = _FixerScript()
+
+    result = await run_local_review_loop(
+        reviewer_agent="codex",
+        reviewer=reviewer,
+        fixer=fixer,
+        cap=1,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    assert len(fixer.received) == 1
+    assert "[Major] [severity inferred]" in fixer.received[0].findings
+
+
+@pytest.mark.asyncio
 async def test_cap_counts_fix_rounds_and_verifies_the_last_fix() -> None:
     """A successful final fix must be reviewed before the loop exhausts.
 

@@ -857,7 +857,7 @@ def merge_hybrid_review_messages(
 
     candidates: list[str] = []
     if spec.kind is LocalVerdictKind.CHANGES_REQUESTED:
-        candidates.extend(_FINDING_BULLET_RE.findall(spec.findings))
+        candidates.extend(_finding_bodies(spec.findings))
     candidates.extend(_builtin_findings(builtin_message))
 
     deduped: list[str] = []
@@ -1064,7 +1064,9 @@ _VERDICT_LINE_RE = re.compile(
     rf"{re.escape(VERDICT_CHANGES_REQUESTED_MARKER)})"
 )
 _FINDINGS_HEADING_RE = re.compile(r"(?im)^\s*#{1,6}\s*findings\b\s*$")
-_FINDING_BULLET_RE = re.compile(r"(?m)^[-*+]\s+(.+)$")
+_FINDING_BULLET_LINE_RE = re.compile(
+    r"^(?P<indent>[ \t]{0,3})(?P<marker>[-*+]\s+)(?P<body>.+)$"
+)
 _SEVERITY_TAG_RE = re.compile(r"\[(Critical|Major|Minor)\]", re.IGNORECASE)
 _LEADING_SEVERITY_TAG_RE = re.compile(
     r"^\*{0,2}`?\[(Critical|Major|Minor)\]", re.IGNORECASE
@@ -1187,19 +1189,71 @@ def _classify_message(*, message: str, head_sha: str) -> LocalVerdict:
             raw_message=message,
         )
     findings = _extract_findings(message=message, verdict_index=matches[-1].start())
-    bullets = _FINDING_BULLET_RE.findall(findings)
-    if not bullets or any(
-        len(list(_SEVERITY_TAG_RE.finditer(bullet))) != 1 for bullet in bullets
-    ):
+    normalized_findings = _normalize_findings_severity(findings)
+    if normalized_findings is None:
         return LocalVerdict(kind=LocalVerdictKind.UNPARSEABLE, raw_message=message)
-    digest = _stable_digest(findings)
+    digest = _stable_digest(normalized_findings)
     return LocalVerdict(
         kind=LocalVerdictKind.CHANGES_REQUESTED,
-        findings=findings,
+        findings=normalized_findings,
         trigger_signature=f"local_review:{head_sha}:{digest}",
         raw_message=message,
         findings_signature=f"local_review_findings:{digest}",
     )
+
+
+def _normalize_findings_severity(findings: str) -> str | None:
+    """Keep actionable findings when a reviewer omits presentation tags.
+
+    A missing tag is conservatively treated as Major and marked as inferred,
+    so formatting drift cannot bypass the fix gate. Multiple tags remain
+    ambiguous and therefore unparseable.
+    """
+    normalized = findings.splitlines()
+    bullets = _top_level_finding_bullets(normalized)
+    if not bullets:
+        return None
+    for position, (index, match) in enumerate(bullets):
+        next_index = bullets[position + 1][0] if position + 1 < len(bullets) else len(normalized)
+        block = "\n".join(normalized[index:next_index])
+        severities = list(_SEVERITY_TAG_RE.finditer(block))
+        if len(severities) > 1:
+            return None
+        if not severities:
+            normalized[index] = (
+                f"{match.group('indent')}{match.group('marker')}"
+                f"[Major] [severity inferred] {match.group('body')}"
+            )
+    return "\n".join(normalized)
+
+
+def _top_level_finding_bullets(
+    lines: list[str],
+) -> list[tuple[int, re.Match[str]]]:
+    candidates = [
+        (index, match)
+        for index, line in enumerate(lines)
+        if (match := _FINDING_BULLET_LINE_RE.match(line)) is not None
+    ]
+    if not candidates:
+        return []
+    baseline = min(len(match.group("indent").expandtabs(4)) for _, match in candidates)
+    return [
+        (index, match)
+        for index, match in candidates
+        if len(match.group("indent").expandtabs(4)) == baseline
+    ]
+
+
+def _finding_bodies(findings: str) -> list[str]:
+    lines = findings.splitlines()
+    bullets = _top_level_finding_bullets(lines)
+    bodies: list[str] = []
+    for position, (index, match) in enumerate(bullets):
+        next_index = bullets[position + 1][0] if position + 1 < len(bullets) else len(lines)
+        block = [match.group("body"), *lines[index + 1 : next_index]]
+        bodies.append(" ".join("\n".join(block).split()))
+    return bodies
 
 
 def _extract_findings(*, message: str, verdict_index: int) -> str:
@@ -1212,8 +1266,8 @@ def _extract_findings(*, message: str, verdict_index: int) -> str:
     head = message[:verdict_index]
     m = _FINDINGS_HEADING_RE.search(head)
     if m is None:
-        return head.strip()
-    return head[m.end() :].strip()
+        return head.strip("\r\n")
+    return head[m.end() :].strip("\r\n")
 
 
 def _stable_digest(text: str) -> str:
