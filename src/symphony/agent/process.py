@@ -12,6 +12,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from .model_usage import parse_claude_model_usage
+
 
 @dataclass(frozen=True)
 class Usage:
@@ -73,6 +75,19 @@ def _usage_from_mapping(usage: object, *, cost_usd: float = 0.0) -> Usage | None
     )
 
 
+def _usage_from_claude_models(model_usage: object, *, cost_usd: float) -> Usage | None:
+    usages = parse_claude_model_usage(model_usage)
+    if not usages:
+        return None
+    return Usage(
+        cost_usd=cost_usd,
+        input_tokens=sum(usage.input_tokens for usage in usages),
+        output_tokens=sum(usage.output_tokens for usage in usages),
+        cache_write_tokens=sum(usage.cache_write_tokens for usage in usages),
+        cache_read_tokens=sum(usage.cache_read_tokens for usage in usages),
+    )
+
+
 def parse_event_line(line: str) -> Usage | None:
     """Return the usage encoded in a single stream-json event, or None
     if the line is non-JSON, isn't a usage event, or carries no usage."""
@@ -89,7 +104,9 @@ def parse_event_line(line: str) -> Usage | None:
         cost = _float_or_none(obj.get("total_cost_usd"))
         if cost is None:
             return None
-        return _usage_from_mapping(obj.get("usage"), cost_usd=cost)
+        return _usage_from_claude_models(obj.get("modelUsage"), cost_usd=cost) or (
+            _usage_from_mapping(obj.get("usage"), cost_usd=cost)
+        )
     if kind == "token_count":
         info = obj.get("info") or {}
         if not isinstance(info, dict):

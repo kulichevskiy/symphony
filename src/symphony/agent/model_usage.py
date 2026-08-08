@@ -77,6 +77,24 @@ def _codex_tokens(usage: dict[str, object]) -> tuple[int, int, int, int]:
     )
 
 
+def parse_claude_model_usage(model_usage: object) -> list[ModelUsage]:
+    """Return Claude's exact per-model split from one result event."""
+    if not isinstance(model_usage, dict):
+        return []
+    return [
+        ModelUsage(
+            provider=CLAUDE_PROVIDER,
+            model=str(model),
+            input_tokens=_int(usage.get("inputTokens")),
+            output_tokens=_int(usage.get("outputTokens")),
+            cache_write_tokens=_int(usage.get("cacheCreationInputTokens")),
+            cache_read_tokens=_int(usage.get("cacheReadInputTokens")),
+        )
+        for model, usage in model_usage.items()
+        if isinstance(usage, dict)
+    ]
+
+
 def parse_model_usage(lines: Iterable[str], *, codex_model: str | None) -> list[ModelUsage]:
     """Return per-(provider, model) usage for one run's stream-json log."""
     claude: dict[str, list[int]] = {}
@@ -97,16 +115,12 @@ def parse_model_usage(lines: Iterable[str], *, codex_model: str | None) -> list[
             continue
         kind = obj.get("type")
         if kind == "result":
-            model_usage = obj.get("modelUsage")
-            if isinstance(model_usage, dict):
-                for model, usage in model_usage.items():
-                    if not isinstance(usage, dict):
-                        continue
-                    acc = claude.setdefault(str(model), [0, 0, 0, 0])
-                    acc[0] += _int(usage.get("inputTokens"))
-                    acc[1] += _int(usage.get("outputTokens"))
-                    acc[2] += _int(usage.get("cacheCreationInputTokens"))
-                    acc[3] += _int(usage.get("cacheReadInputTokens"))
+            for usage in parse_claude_model_usage(obj.get("modelUsage")):
+                acc = claude.setdefault(usage.model, [0, 0, 0, 0])
+                acc[0] += usage.input_tokens
+                acc[1] += usage.output_tokens
+                acc[2] += usage.cache_write_tokens
+                acc[3] += usage.cache_read_tokens
         elif kind == "thread.started":
             commit_codex()
             codex_seen = True
@@ -154,5 +168,6 @@ __all__ = [
     "CODEX_PROVIDER",
     "UNKNOWN_MODEL",
     "ModelUsage",
+    "parse_claude_model_usage",
     "parse_model_usage",
 ]
