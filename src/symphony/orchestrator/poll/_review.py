@@ -2205,7 +2205,8 @@ class _ReviewMixin(_OrchestratorBase):
             issue_body=issue.description,
             labels=list(issue.labels),
             trigger=trigger,
-            final_iteration=iteration >= self.config.review_iteration_cap,
+            iteration=iteration,
+            iteration_cap=self.config.review_iteration_cap,
         )
         tracker = self.tracker(binding)
         branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"

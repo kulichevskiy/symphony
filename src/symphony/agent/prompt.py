@@ -198,16 +198,25 @@ def review_comment_fix_prompt(
     issue_body: str,
     labels: list[str],
     trigger: str,
-    final_iteration: bool = False,
+    iteration: int = 0,
+    iteration_cap: int = 0,
 ) -> str:
     """Build the prompt for a Review-stage fix-run triggered by reviewer comments."""
     label_line = ", ".join(labels) if labels else "(no labels)"
     body = issue_body.strip() if issue_body else "(no description)"
     closure_audit = ""
-    if final_iteration:
+    final_iteration = iteration_cap > 0 and iteration >= iteration_cap
+    closure_audit_start = max(1, iteration_cap - 2)
+    late_iteration = iteration_cap > 0 and iteration >= closure_audit_start
+    if late_iteration:
+        audit_timing = (
+            "This is the final allowed review-fix iteration."
+            if final_iteration
+            else "This is one of the last allowed review-fix iterations."
+        )
         closure_audit = (
             "# Final closure audit\n\n"
-            "This is the final allowed review-fix iteration. After resolving the "
+            f"{audit_timing} After resolving the "
             "reported feedback, perform a holistic closure audit before committing:\n\n"
             "- Re-check the changed feature against all issue requirements.\n"
             "- Inspect related failure modes and symmetric cases, especially stale or "
@@ -215,6 +224,10 @@ def review_comment_fix_prompt(
             "- Add regression tests for the reported defect and any related defect you fix.\n"
             "- Keep the audit within the issue scope; do not redesign unrelated code.\n\n"
         )
+        if not final_iteration:
+            closure_audit = closure_audit.replace(
+                "# Final closure audit", "# Late-stage closure audit", 1
+            )
     return (
         "You are Symphony's Review-stage fix-run agent.\n"
         "Address the reviewer feedback on the current branch.\n\n"

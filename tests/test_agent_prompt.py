@@ -108,13 +108,30 @@ def test_review_comment_fix_prompt_mandates_completion_marker_contract() -> None
     assert "Final closure audit" not in prompt
 
 
+def test_late_review_fix_prompt_starts_holistic_closure_audit_before_final_iteration() -> None:
+    prompt = review_comment_fix_prompt(
+        issue_title="Build support queue",
+        issue_body="Operators can create and filter tickets.",
+        labels=["feature"],
+        trigger="frontend/src/App.tsx:42 loses a successful create",
+        iteration=10,
+        iteration_cap=12,
+    )
+
+    assert "Late-stage closure audit" in prompt
+    assert "one of the last allowed review-fix iterations" in prompt
+    assert "final allowed review-fix iteration" not in prompt
+    assert "related failure modes" in prompt
+
+
 def test_final_review_fix_prompt_requires_holistic_closure_audit() -> None:
     prompt = review_comment_fix_prompt(
         issue_title="Build support queue",
         issue_body="Operators can create and filter tickets.",
         labels=["feature"],
         trigger="frontend/src/App.tsx:42 loses a successful create",
-        final_iteration=True,
+        iteration=12,
+        iteration_cap=12,
     )
 
     assert "final allowed review-fix iteration" in prompt
