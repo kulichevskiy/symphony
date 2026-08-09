@@ -40,6 +40,10 @@ services:
     # them from agent subprocess env (the daemon deploy posture must not leak
     # into an agent working on this repo — see app.py / runners/local.py).
     environment:
+      # Identity used for agent-created commits. Set these in `.env` to an
+      # email verified by the GitHub account that owns deployment access.
+      SYMPHONY_GIT_USER_NAME: ${SYMPHONY_GIT_USER_NAME:-Symphony}
+      SYMPHONY_GIT_USER_EMAIL: ${SYMPHONY_GIT_USER_EMAIL:-symphony@localhost}
       SYMPHONY_DB_PATH: /data/db/state.sqlite
       SYMPHONY_LOG_ROOT: /data/logs
       SYMPHONY_WORKSPACE_ROOT: /data/workspaces

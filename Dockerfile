@@ -66,13 +66,6 @@ USER symphony
 ENV HOME=/home/symphony
 ENV PATH="/app/.venv/bin:$PATH"
 
-# Headless commits (agent runs, `git rebase --continue` in the merge path)
-# need a global git identity — there's no interactive `git config` step in
-# this container. /home/symphony isn't a mounted volume, so this survives
-# restarts.
-RUN git config --global user.name "Alexey Kulichevskiy" \
-    && git config --global user.email "alexey.kulichevskiy@gmail.com"
-
 # The orchestrator delivers via plain `git push`/`git fetch`, not `gh`. Wire
 # gh in as the HTTPS credential helper (what `gh auth setup-git` does) so those
 # raw git ops authenticate off the mounted gh_auth volume. Baked at build time,
@@ -80,8 +73,8 @@ RUN git config --global user.name "Alexey Kulichevskiy" \
 RUN git config --global credential."https://github.com".helper "!gh auth git-credential" \
     && git config --global credential."https://gist.github.com".helper "!gh auth git-credential"
 
-# No args: the bare `symphony` group runs the daemon. Config assembles from
-# env vars + the DB (Config v2 9/9) — paths come from SYMPHONY_DB_PATH etc.,
-# set in the compose `environment:` block.
-ENTRYPOINT ["uv", "run", "--frozen", "--no-sync", "--no-dev", "symphony"]
+# Headless commits need a global Git identity. Deployment operators supply it
+# via `SYMPHONY_GIT_USER_NAME` / `SYMPHONY_GIT_USER_EMAIL`; the fallback keeps
+# existing local installs working, but cannot pass deployment-provider checks.
+ENTRYPOINT ["sh", "-ec", "git config --global user.name \"${SYMPHONY_GIT_USER_NAME:-Symphony}\"; git config --global user.email \"${SYMPHONY_GIT_USER_EMAIL:-symphony@localhost}\"; exec uv run --frozen --no-sync --no-dev symphony \"$@\"", "--"]
 CMD []
