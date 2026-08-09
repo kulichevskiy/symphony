@@ -586,7 +586,7 @@ async def run_local_review_session(
             )
             merged = merge_hybrid_review_messages(
                 spec_message=spec_message,
-                builtin_message=bug_message,
+                bug_message=bug_message,
                 head_sha=head_sha,
                 builtin_bug_review=builtin_bug_review,
             )

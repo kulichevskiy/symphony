@@ -133,7 +133,7 @@ def test_merge_hybrid_review_messages_deduplicates_and_caps_p2() -> None:
 
     merged = merge_hybrid_review_messages(
         spec_message=spec,
-        builtin_message=bug,
+        bug_message=bug,
         head_sha="abc123",
         max_p2=5,
     )
@@ -162,7 +162,7 @@ def test_merge_hybrid_review_messages_caps_p2_across_both_axes() -> None:
 
     merged = merge_hybrid_review_messages(
         spec_message=spec,
-        builtin_message=bug,
+        bug_message=bug,
         head_sha="abc123",
         max_p2=5,
     )
@@ -175,7 +175,7 @@ def test_merge_hybrid_review_messages_caps_p2_across_both_axes() -> None:
 def test_merge_hybrid_review_messages_uses_builtin_canonical_severity() -> None:
     merged = merge_hybrid_review_messages(
         spec_message=f"All requirements hold.\n{VERDICT_APPROVED_MARKER}",
-        builtin_message=(
+        bug_message=(
             "[P2] Literal severity — parser.py:3 — Reject a literal [Major] tag."
         ),
         head_sha="abc123",
@@ -188,7 +188,7 @@ def test_merge_hybrid_review_messages_uses_builtin_canonical_severity() -> None:
 def test_merge_hybrid_review_messages_approves_when_both_axes_are_clean() -> None:
     merged = merge_hybrid_review_messages(
         spec_message=f"All requirements hold.\n{VERDICT_APPROVED_MARKER}",
-        builtin_message="No findings.",
+        bug_message="No findings.",
         head_sha="abc123",
     )
     assert merged.kind is LocalVerdictKind.APPROVED
@@ -197,7 +197,7 @@ def test_merge_hybrid_review_messages_approves_when_both_axes_are_clean() -> Non
 def test_merge_hybrid_review_messages_does_not_approve_unknown_builtin_output() -> None:
     merged = merge_hybrid_review_messages(
         spec_message=f"All requirements hold.\n{VERDICT_APPROVED_MARKER}",
-        builtin_message="I could not inspect the repository.",
+        bug_message="I could not inspect the repository.",
         head_sha="abc123",
     )
     assert merged.kind is LocalVerdictKind.UNPARSEABLE
@@ -210,7 +210,7 @@ def test_merge_hybrid_review_messages_keeps_worst_duplicate_severity() -> None:
             "- [Major] api.py:10 agents cannot create tickets. Allow agents.\n"
             f"{VERDICT_CHANGES_REQUESTED_MARKER}"
         ),
-        builtin_message=(
+        bug_message=(
             "[P0] Agents cannot create tickets — api.py:10 — Allow authenticated agents."
         ),
         head_sha="abc123",
@@ -227,7 +227,7 @@ def test_merge_hybrid_review_messages_keeps_indented_spec_findings() -> None:
             "  - database transaction can interleave\n"
             f"{VERDICT_CHANGES_REQUESTED_MARKER}"
         ),
-        builtin_message="No findings.",
+        bug_message="No findings.",
         head_sha="abc123",
     )
 
