@@ -368,20 +368,36 @@ class _HybridRunner:
 
 
 class _ClaudeHybridRunner:
-    def __init__(self) -> None:
+    def __init__(self, *, spec_requires_fix: bool = False) -> None:
         self.specs: list[RunnerSpec] = []
+        self.head = "implemented-head"
+        self.spec_round = 0
+        self.spec_requires_fix = spec_requires_fix
 
     def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
         self.specs.append(spec)
 
         async def gen() -> AsyncIterator[RunnerEvent]:
-            axis = "Spec and Standards" if spec.run_id.endswith("-spec") else "Bug"
+            if spec.stage == "local_review_fix":
+                self.head = "fixed-head"
+                text = "Fixed and committed."
+            elif spec.run_id.endswith("-spec"):
+                self.spec_round += 1
+                text = (
+                    "## Findings\n"
+                    "- [Major] api.py:7 required behavior is missing. Fix it.\n"
+                    f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+                    if self.spec_requires_fix and self.spec_round == 1
+                    else f"Spec and Standards review passed.\n{VERDICT_APPROVED_MARKER}"
+                )
+            else:
+                text = f"Bug review passed.\n{VERDICT_APPROVED_MARKER}"
             yield RunnerEvent(
                 kind="stdout",
                 line=json.dumps(
                     {
                         "type": "result",
-                        "result": f"{axis} review passed.\n{VERDICT_APPROVED_MARKER}",
+                        "result": text,
                     }
                 ),
             )
@@ -476,7 +492,7 @@ async def test_hybrid_session_runs_both_axes_with_claude_roles(tmp_path: Path) -
     runner = _ClaudeHybridRunner()
 
     async def head_sha(_: Path) -> str:
-        return "implemented-head"
+        return runner.head
 
     result = await run_local_review_session(
         runner=runner,
@@ -503,6 +519,37 @@ async def test_hybrid_session_runs_both_axes_with_claude_roles(tmp_path: Path) -
     prompts = [spec.command[-1] for spec in review_specs]
     assert "Spec and Standards reviewer" in prompts[0]
     assert "functional bugs" in prompts[1]
+
+
+@pytest.mark.asyncio
+async def test_claude_hybrid_keeps_spec_finding_when_bug_axis_approves(
+    tmp_path: Path,
+) -> None:
+    runner = _ClaudeHybridRunner(spec_requires_fix=True)
+
+    async def head_sha(_: Path) -> str:
+        return runner.head
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="r-claude-conflict",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="claude", model="claude-opus-5"),
+        verifier_role=ResolvedRole(agent="claude", model="claude-opus-5"),
+        fixer_role=ResolvedRole(agent="claude", model="claude-opus-5"),
+        cap=2,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        review_mode="hybrid",
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    assert len([spec for spec in runner.specs if spec.stage == "local_review_fix"]) == 1
 
 
 @pytest.mark.asyncio

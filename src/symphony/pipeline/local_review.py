@@ -879,6 +879,7 @@ def merge_hybrid_review_messages(
     builtin_message: str,
     head_sha: str,
     max_p2: int = 5,
+    builtin_bug_review: bool = True,
 ) -> LocalVerdict:
     """Combine both local axes into one deduplicated, bounded fix batch."""
     spec = _classify_message(message=spec_message, head_sha=head_sha)
@@ -888,17 +889,29 @@ def merge_hybrid_review_messages(
             raw_message=f"SPEC:\n{spec_message}\n\nBUILTIN:\n{builtin_message}",
         )
 
-    builtin_has_priority = _BUILTIN_FINDING_RE.search(builtin_message) is not None
-    if not builtin_has_priority and _BUILTIN_CLEAN_RE.search(builtin_message) is None:
-        return LocalVerdict(
-            kind=LocalVerdictKind.UNPARSEABLE,
-            raw_message=f"SPEC:\n{spec_message}\n\nBUILTIN:\n{builtin_message}",
-        )
+    bug: LocalVerdict | None = None
+    if builtin_bug_review:
+        builtin_has_priority = _BUILTIN_FINDING_RE.search(builtin_message) is not None
+        if not builtin_has_priority and _BUILTIN_CLEAN_RE.search(builtin_message) is None:
+            return LocalVerdict(
+                kind=LocalVerdictKind.UNPARSEABLE,
+                raw_message=f"SPEC:\n{spec_message}\n\nBUILTIN:\n{builtin_message}",
+            )
+    else:
+        bug = _classify_message(message=builtin_message, head_sha=head_sha)
+        if bug.kind is LocalVerdictKind.UNPARSEABLE:
+            return LocalVerdict(
+                kind=LocalVerdictKind.UNPARSEABLE,
+                raw_message=f"SPEC:\n{spec_message}\n\nBUG:\n{builtin_message}",
+            )
 
     candidates: list[str] = []
     if spec.kind is LocalVerdictKind.CHANGES_REQUESTED:
         candidates.extend(_finding_bodies(spec.findings))
-    candidates.extend(_builtin_findings(builtin_message))
+    if builtin_bug_review:
+        candidates.extend(_builtin_findings(builtin_message))
+    elif bug is not None and bug.kind is LocalVerdictKind.CHANGES_REQUESTED:
+        candidates.extend(_finding_bodies(bug.findings))
 
     deduped: list[str] = []
     for finding in candidates:
@@ -932,7 +945,7 @@ def merge_hybrid_review_messages(
     return LocalVerdict(
         kind=LocalVerdictKind.CHANGES_REQUESTED,
         findings=findings,
-        severity_inferred=spec.severity_inferred,
+        severity_inferred=spec.severity_inferred or bool(bug and bug.severity_inferred),
         trigger_signature=f"local_hybrid:{head_sha}:{digest}",
         findings_signature=f"local_hybrid_findings:{digest}",
         raw_message=f"SPEC:\n{spec_message}\n\nBUILTIN:\n{builtin_message}",

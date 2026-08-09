@@ -513,6 +513,7 @@ async def run_local_review_session(
                 hybrid_initial_head = head_sha
             comparison_ref = base_branch if iteration == 0 else hybrid_initial_head
             bug_role = verifier_role
+            builtin_bug_review = bug_role.agent == "codex"
 
             spec_prompt = local_review_spec_prompt(
                 issue_title=issue_title,
@@ -546,11 +547,11 @@ async def run_local_review_session(
                     effort=bug_role.effort,
                     # `codex exec review --base` owns its prompt; the CLI
                     # rejects a custom positional prompt in this mode.
-                    prompt="" if bug_role.agent == "codex" else bug_prompt,
+                    prompt="" if builtin_bug_review else bug_prompt,
                     stem=f"review-{iteration}-bug",
                     run_suffix=f"rev-{iteration}-bug",
                     head_sha=head_sha,
-                    builtin_review=bug_role.agent == "codex",
+                    builtin_review=builtin_bug_review,
                     comparison_ref=comparison_ref,
                 ),
             )
@@ -587,6 +588,7 @@ async def run_local_review_session(
                 spec_message=spec_message,
                 builtin_message=bug_message,
                 head_sha=head_sha,
+                builtin_bug_review=builtin_bug_review,
             )
             if merged.kind is LocalVerdictKind.APPROVED:
                 final_message = f"Hybrid local review passed.\n{VERDICT_APPROVED_MARKER}"
