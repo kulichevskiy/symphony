@@ -107,6 +107,16 @@ repos:
     assert secrets.jira_webhook_secret == "jira-webhook-secret"
 
 
+def test_secrets_read_deployment_git_identity(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("SYMPHONY_GIT_USER_NAME", "Deployment Bot")
+    monkeypatch.setenv("SYMPHONY_GIT_USER_EMAIL", "bot@example.com")
+
+    secrets = Secrets()
+
+    assert secrets.symphony_git_user_name == "Deployment Bot"
+    assert secrets.symphony_git_user_email == "bot@example.com"
+
+
 def test_jira_binding_can_use_env_base_url() -> None:
     """A jira binding without an explicit base_url picks up the deployment's
     JIRA_BASE_URL at assembly time (`apply_tracker_secret_defaults`, called by

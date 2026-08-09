@@ -66,19 +66,19 @@ USER symphony
 ENV HOME=/home/symphony
 ENV PATH="/app/.venv/bin:$PATH"
 
-# Headless commits (agent runs, `git rebase --continue` in the merge path)
-# need a global git identity — there's no interactive `git config` step in
-# this container. /home/symphony isn't a mounted volume, so this survives
-# restarts.
-RUN git config --global user.name "Symphony" \
-    && git config --global user.email "symphony@localhost"
-
 # The orchestrator delivers via plain `git push`/`git fetch`, not `gh`. Wire
 # gh in as the HTTPS credential helper (what `gh auth setup-git` does) so those
 # raw git ops authenticate off the mounted gh_auth volume. Baked at build time,
 # resolves the token from ~/.config/gh at runtime.
 RUN git config --global credential."https://github.com".helper "!gh auth git-credential" \
     && git config --global credential."https://gist.github.com".helper "!gh auth git-credential"
+
+# Headless commits (agent runs, `git rebase --continue` in the merge path)
+# need a global git identity — there's no interactive `git config` step in
+# this container. The daemon overrides it from the mounted `.env` when the
+# deployment configures SYMPHONY_GIT_USER_NAME / SYMPHONY_GIT_USER_EMAIL.
+RUN git config --global user.name "Symphony" \
+    && git config --global user.email "symphony@localhost"
 
 # No args: the bare `symphony` group runs the daemon. Config assembles from
 # env vars + the DB (Config v2 9/9) — paths come from SYMPHONY_DB_PATH etc.,

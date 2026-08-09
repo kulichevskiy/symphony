@@ -223,6 +223,11 @@ cp .env.example .env                        # fill in secrets (Auth0 triple + op
 docker compose up -d
 ```
 
+Set `SYMPHONY_GIT_USER_NAME` and `SYMPHONY_GIT_USER_EMAIL` in `.env` before
+using agent-created commits for a deployed project. The email must be verified
+by the GitHub account with deployment access; otherwise providers such as
+Vercel can block the deployment.
+
 Then open `https://localhost/ui/` (Caddy's internal cert — accept the warning
 or trust the CA once), log in via Auth0, and on the **Connections** page
 connect GitHub, Linear, Claude, and Codex. Add your bindings on the **Config**

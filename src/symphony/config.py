@@ -739,6 +739,10 @@ class Secrets(BaseSettings):
     symphony_oauth_public_origin: str = Field(
         default="", validation_alias="SYMPHONY_OAUTH_PUBLIC_ORIGIN"
     )
+    # Commit identity for headless agent runs. This is read from the mounted
+    # `.env`, because Coolify mounts that file only at runtime.
+    symphony_git_user_name: str = Field(default="", validation_alias="SYMPHONY_GIT_USER_NAME")
+    symphony_git_user_email: str = Field(default="", validation_alias="SYMPHONY_GIT_USER_EMAIL")
     # Telegram push for attention-needed events (SYM-171). Both must be set to
     # enable notifications; either unset makes the notifier a no-op.
     telegram_bot_token: str = Field(default="", validation_alias="TELEGRAM_BOT_TOKEN")
@@ -868,6 +872,8 @@ class Config(BaseModel):
     telegram_chat_id: str = ""
     symphony_encryption_key: str = ""
     symphony_oauth_public_origin: str = ""
+    symphony_git_user_name: str = ""
+    symphony_git_user_email: str = ""
 
     def _reject_legacy_matrix_conflicts(self, binding: RepoBinding) -> None:
         """Fail if a legacy field and its matrix cell are both set.
@@ -1057,5 +1063,7 @@ class Config(BaseModel):
                 "telegram_chat_id": secrets.telegram_chat_id,
                 "symphony_encryption_key": secrets.symphony_encryption_key,
                 "symphony_oauth_public_origin": secrets.symphony_oauth_public_origin,
+                "symphony_git_user_name": secrets.symphony_git_user_name,
+                "symphony_git_user_email": secrets.symphony_git_user_email,
             }
         )
