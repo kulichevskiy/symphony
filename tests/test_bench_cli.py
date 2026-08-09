@@ -1,5 +1,7 @@
+import asyncio
 import json
 from importlib.resources import files
+from pathlib import Path
 
 import httpx
 import pytest
@@ -12,7 +14,9 @@ from symphony.bench.cli import (
     _BenchSecrets,
     _cleanup_stale_grader_preflights,
     _prepare_harness_with_preflight,
+    _serve_with_profile,
 )
+from symphony.bench.models import Experiment, ExperimentCreate, Trial, TrialOutcome
 from symphony.cli import main
 
 
@@ -27,6 +31,115 @@ def test_packaged_bench_profile_keeps_review_limits_and_remote_gate() -> None:
 
     assert profile["knobs"]["local_review_iteration_cap"] == 5
     assert profile["binding"]["remote_review"] is True
+
+
+def test_serve_routes_single_lane_b_and_preflights_only_assigned_lane(
+    tmp_path: Path, monkeypatch
+) -> None:
+    captured: dict[str, object] = {}
+    calls: list[tuple[str, str]] = []
+
+    class FakeCommands:
+        def __init__(self, *, base_url: str, **_kwargs: object) -> None:
+            self.base_url = base_url
+
+    class FakeExecutor:
+        def __init__(self, *, config: object, **_kwargs: object) -> None:
+            self.lane = Path(config.root).name  # type: ignore[attr-defined]
+
+        async def __call__(self, trial: Trial) -> TrialOutcome:
+            calls.append(("execute", self.lane))
+            return TrialOutcome()
+
+        async def publish_interrupted(self, trial: Trial) -> None:
+            calls.append(("publish", self.lane))
+
+        async def recover_chronicle(self) -> None:
+            pass
+
+        async def start_experiment(self, _experiment: object) -> str:
+            return "project"
+
+        async def publish_failed_experiment(self, _experiment: object) -> None:
+            pass
+
+        async def resolve_revision(self, revision: str) -> str:
+            return revision
+
+    async def prepare(
+        _experiment_id: str, *, lanes: object, **_kwargs: object
+    ) -> str:
+        captured["lanes"] = [lane[0] for lane in lanes]  # type: ignore[union-attr]
+        return "harness"
+
+    async def snapshot(experiment_id: str, **_kwargs: object) -> str:
+        captured["snapshotted"] = experiment_id
+        return "harness"
+
+    def create_app(**kwargs: object) -> object:
+        captured.update(kwargs)
+        return object()
+
+    class FakeUvicorn:
+        @staticmethod
+        def run(_app: object, **_kwargs: object) -> None:
+            pass
+
+    profile = tmp_path / "profile.json"
+    profile.write_text("{}")
+    monkeypatch.setattr(cli_module, "RemoteCommands", FakeCommands)
+    monkeypatch.setattr(cli_module, "LiveTrialExecutor", FakeExecutor)
+    monkeypatch.setattr(cli_module, "create_bench_app", create_app)
+    monkeypatch.setattr(cli_module, "_preflight_harness", prepare)
+    monkeypatch.setattr(cli_module, "_snapshot_harness", snapshot)
+
+    _serve_with_profile(
+        profile,
+        db_path=tmp_path / "bench.sqlite",
+        root_a=tmp_path / "bench-a",
+        root_b=tmp_path / "bench-b",
+        private_root=tmp_path / "private",
+        controls_root=tmp_path / "controls",
+        api_token="api",
+        github_owner="owner",
+        linear_team_id="team",
+        linear_label_id="label",
+        linear_label_name="Bench",
+        symphony_repository="repo",
+        encryption_key="key",
+        executor_a_url="http://a",
+        executor_b_url="http://b",
+        executor_token="executor",
+        host="127.0.0.1",
+        port=8080,
+        uvicorn_module=FakeUvicorn,
+    )
+
+    trial = Trial(
+        experiment_id="EXP-1",
+        candidate="A",
+        repetition=1,
+        revision="sha",
+        execution_lane="B",
+    )
+    asyncio.run(captured["execute"](trial))  # type: ignore[operator]
+    asyncio.run(captured["publish_interrupted"](trial))  # type: ignore[operator]
+    asyncio.run(captured["snapshot_harness"]("EXP-1"))  # type: ignore[operator]
+    experiment = Experiment.queued(
+        experiment_id="EXP-1",
+        request=ExperimentCreate(
+            mode="single",
+            candidate_a="sha",
+            hypothesis="Hypothesis.",
+            design="Design.",
+            repetitions=1,
+        ),
+    ).model_copy(update={"execution_lane": "B"})
+    asyncio.run(captured["prepare_harness"](experiment))  # type: ignore[operator]
+
+    assert calls == [("execute", "bench-b"), ("publish", "bench-b")]
+    assert captured["snapshotted"] == "EXP-1"
+    assert captured["lanes"] == ["B"]
 
 
 @respx.mock

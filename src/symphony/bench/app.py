@@ -11,12 +11,10 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response, status
 
-from .grader import GraderInfrastructureError
 from .models import (
     BenchNotification,
     Experiment,
     ExperimentCreate,
-    ExperimentMode,
     ExperimentReport,
     Trial,
 )
@@ -36,7 +34,8 @@ def create_bench_app(
     default_profile: dict[str, object] | None = None,
     resolve_revision: Callable[[str], Awaitable[str]] | None = None,
     harness_version: str = "",
-    prepare_harness: Callable[[str, ExperimentMode], Awaitable[str]] | None = None,
+    snapshot_harness: Callable[[str], Awaitable[str]] | None = None,
+    prepare_harness: Callable[[Experiment], Awaitable[str]] | None = None,
     recover_execution: Callable[[], Awaitable[None]] | None = None,
     recover_chronicle: Callable[[], Awaitable[None]] | None = None,
     start_experiment: Callable[[Experiment], Awaitable[str]] | None = None,
@@ -145,6 +144,7 @@ def create_bench_app(
             execute=execute,
             publish=publish,
             publish_experiment=publish_experiment,
+            prepare_experiment=prepare_harness,
         )
 
         async def drain() -> None:
@@ -159,15 +159,13 @@ def create_bench_app(
                 if experiment_id is None:
                     await asyncio.sleep(idle_poll_seconds)
 
-        task = asyncio.create_task(drain())
+        tasks = [asyncio.create_task(drain()) for _ in range(2)]
         try:
             yield
         finally:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
             if recover_execution is not None:
                 await recover_execution()
 
@@ -217,14 +215,9 @@ def create_bench_app(
                 ) from exc
         experiment_id = f"EXP-{uuid4().hex[:12].upper()}"
         pinned_harness = harness_version
-        if prepare_harness is not None:
+        if snapshot_harness is not None:
             try:
-                pinned_harness = await prepare_harness(experiment_id, request.mode)
-            except GraderInfrastructureError as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail=f"infrastructure_failed: {exc}",
-                ) from exc
+                pinned_harness = await snapshot_harness(experiment_id)
             except Exception as exc:  # noqa: BLE001 - provider error becomes API failure
                 raise HTTPException(
                     status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -259,11 +252,6 @@ def create_bench_app(
     )
     async def submit(request: ExperimentCreate) -> Experiment:
         async with submission_lock:
-            if store.has_active():
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="another experiment is queued or running",
-                )
             return await submit_one(request)
 
     @app.get(

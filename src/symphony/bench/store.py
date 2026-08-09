@@ -41,6 +41,7 @@ class ExperimentStore:
                     executor_toolchain_version TEXT NOT NULL DEFAULT '',
                     harness_version TEXT NOT NULL DEFAULT '',
                     linear_project_id TEXT NOT NULL DEFAULT '',
+                    execution_lane TEXT NOT NULL DEFAULT '',
                     chronicle_recovery_pending INTEGER NOT NULL DEFAULT 0,
                     repetitions INTEGER NOT NULL,
                     created_at TEXT NOT NULL
@@ -56,6 +57,7 @@ class ExperimentStore:
                     revision TEXT NOT NULL,
                     profile TEXT NOT NULL DEFAULT '{}',
                     system_version TEXT NOT NULL DEFAULT '',
+                    execution_lane TEXT NOT NULL DEFAULT 'A',
                     status TEXT NOT NULL,
                     started_at TEXT NOT NULL,
                     ended_at TEXT,
@@ -103,6 +105,9 @@ class ExperimentStore:
                 conn, "bench_experiments", "linear_project_id", "TEXT NOT NULL DEFAULT ''"
             )
             self._ensure_column(
+                conn, "bench_experiments", "execution_lane", "TEXT NOT NULL DEFAULT ''"
+            )
+            self._ensure_column(
                 conn,
                 "bench_experiments",
                 "chronicle_recovery_pending",
@@ -110,6 +115,12 @@ class ExperimentStore:
             )
             self._ensure_column(conn, "bench_trials", "profile", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(conn, "bench_trials", "system_version", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(
+                conn, "bench_trials", "execution_lane", "TEXT NOT NULL DEFAULT 'A'"
+            )
+            conn.execute(
+                "UPDATE bench_trials SET execution_lane = 'B' WHERE candidate = 'B'"
+            )
             self._ensure_column(
                 conn,
                 "bench_trials",
@@ -168,8 +179,8 @@ class ExperimentStore:
                      candidate_a_profile,
                      candidate_b_profile, system_version_a, system_version_b,
                      executor_toolchain_version, harness_version, linear_project_id,
-                     repetitions, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     execution_lane, repetitions, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     experiment.id,
@@ -186,6 +197,7 @@ class ExperimentStore:
                     experiment.executor_toolchain_version,
                     experiment.harness_version,
                     experiment.linear_project_id,
+                    experiment.execution_lane or "",
                     experiment.repetitions,
                     experiment.created_at.isoformat(),
                 ),
@@ -200,7 +212,7 @@ class ExperimentStore:
                        candidate_a_profile,
                        candidate_b_profile, system_version_a, system_version_b,
                        executor_toolchain_version, harness_version, linear_project_id,
-                       repetitions, created_at
+                       execution_lane, repetitions, created_at
                 FROM bench_experiments WHERE id = ?
                 """,
                 (experiment_id,),
@@ -211,18 +223,34 @@ class ExperimentStore:
         payload["candidate_b"] = payload["candidate_b"] or None
         payload["candidate_a_profile"] = json.loads(payload["candidate_a_profile"])
         payload["candidate_b_profile"] = json.loads(payload["candidate_b_profile"])
+        payload["execution_lane"] = payload["execution_lane"] or None
         return Experiment.model_validate(payload)
 
     def claim_next(self) -> Experiment | None:
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
+            running = conn.execute(
+                """
+                SELECT mode, execution_lane FROM bench_experiments
+                WHERE status = 'running'
+                """
+            ).fetchall()
+            occupied: set[str] = set()
+            for active in running:
+                lane = str(active["execution_lane"])
+                if lane == "AB" or (not lane and active["mode"] == "paired"):
+                    occupied.update(("A", "B"))
+                elif lane in {"A", "B"}:
+                    occupied.add(lane)
+                elif not lane:
+                    occupied.add("A")
             row = conn.execute(
                 """
                 SELECT id, status, mode, candidate_a, candidate_b, hypothesis, design,
                        candidate_a_profile,
                        candidate_b_profile, system_version_a, system_version_b,
                        executor_toolchain_version, harness_version, linear_project_id,
-                       repetitions, created_at
+                       execution_lane, repetitions, created_at
                 FROM bench_experiments
                 WHERE status = 'queued'
                 ORDER BY created_at, id
@@ -231,27 +259,30 @@ class ExperimentStore:
             ).fetchone()
             if row is None:
                 return None
+            if row["mode"] == "paired":
+                if occupied:
+                    return None
+                execution_lane = "AB"
+            elif "A" not in occupied:
+                execution_lane = "A"
+            elif "B" not in occupied:
+                execution_lane = "B"
+            else:
+                return None
             conn.execute(
-                "UPDATE bench_experiments SET status = 'running' WHERE id = ?",
-                (row["id"],),
+                """
+                UPDATE bench_experiments SET status = 'running', execution_lane = ?
+                WHERE id = ?
+                """,
+                (execution_lane, row["id"]),
             )
         claimed = dict(row)
         claimed["candidate_b"] = claimed["candidate_b"] or None
         claimed["candidate_a_profile"] = json.loads(claimed["candidate_a_profile"])
         claimed["candidate_b_profile"] = json.loads(claimed["candidate_b_profile"])
         claimed["status"] = "running"
+        claimed["execution_lane"] = execution_lane
         return Experiment.model_validate(claimed)
-
-    def has_active(self) -> bool:
-        with self._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT 1 FROM bench_experiments
-                WHERE status IN ('preparing', 'queued', 'running')
-                LIMIT 1
-                """
-            ).fetchone()
-        return row is not None
 
     def preparing(self) -> list[Experiment]:
         with self._connect() as conn:
@@ -291,6 +322,15 @@ class ExperimentStore:
         if cursor.rowcount != 1:
             raise KeyError(experiment_id)
 
+    def set_harness_version(self, experiment_id: str, harness_version: str) -> None:
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE bench_experiments SET harness_version = ? WHERE id = ?",
+                (harness_version, experiment_id),
+            )
+        if cursor.rowcount != 1:
+            raise KeyError(experiment_id)
+
     def fail_interrupted(self) -> tuple[list[Trial], list[str]]:
         """Close orphaned running work before this process claims a new experiment."""
         ended_at = datetime.now(UTC).isoformat()
@@ -316,7 +356,8 @@ class ExperimentStore:
             trial_rows = conn.execute(
                 """
                 SELECT t.experiment_id, t.candidate, t.repetition, t.revision, t.profile,
-                       t.system_version, e.hypothesis, e.design, e.linear_project_id
+                       t.system_version, t.execution_lane, e.hypothesis, e.design,
+                       e.linear_project_id
                 FROM bench_trials AS t
                 JOIN bench_experiments AS e ON e.id = t.experiment_id
                 WHERE t.chronicle_recovery_pending = 1
@@ -366,8 +407,8 @@ class ExperimentStore:
                 """
                 INSERT INTO bench_trials (
                     experiment_id, candidate, repetition, revision, profile,
-                    system_version, status, started_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'running', ?)
+                    system_version, execution_lane, status, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', ?)
                 """,
                 (
                     trial.experiment_id,
@@ -376,6 +417,7 @@ class ExperimentStore:
                     trial.revision,
                     json.dumps(trial.profile, sort_keys=True),
                     trial.system_version,
+                    trial.execution_lane,
                     datetime.now(UTC).isoformat(),
                 ),
             )
@@ -419,7 +461,7 @@ class ExperimentStore:
             rows = conn.execute(
                 """
                 SELECT experiment_id, candidate, repetition, revision, profile,
-                       system_version, status,
+                       system_version, execution_lane, status,
                        started_at, ended_at, error, repository_url, issue_urls, metrics
                 FROM bench_trials
                 WHERE experiment_id = ?

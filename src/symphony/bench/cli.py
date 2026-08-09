@@ -23,7 +23,7 @@ from .grader import GraderInfrastructureError, SupportQueueGrader
 from .harness import load_harness, snapshot_harness
 from .live import LiveBenchConfig, LiveTrialExecutor
 from .metrics import snapshot_candidate
-from .models import Experiment, ExperimentMode, ExperimentReport, Trial, TrialOutcome
+from .models import Experiment, ExperimentReport, Trial, TrialOutcome
 from .report import render_markdown
 from .reviewer import cleanup_stale_reviewer_credentials
 
@@ -595,14 +595,57 @@ async def _prepare_harness_with_preflight(
     controls_root: Path,
     lanes: tuple[tuple[str, Path, RemoteCommands], ...],
 ) -> str:
-    started = time.monotonic()
+    version = await _snapshot_harness(
+        experiment_id,
+        private_root=private_root,
+        controls_root=controls_root,
+    )
+    try:
+        return await _preflight_harness(
+            experiment_id,
+            private_root=private_root,
+            lanes=lanes,
+            expected_version=version,
+        )
+    except BaseException:
+        await asyncio.to_thread(
+            shutil.rmtree,
+            private_root / experiment_id / "_harness",
+            ignore_errors=True,
+        )
+        raise
+
+
+async def _snapshot_harness(
+    experiment_id: str,
+    *,
+    private_root: Path,
+    controls_root: Path,
+) -> str:
     snapshot = private_root / experiment_id / "_harness"
     try:
         version = await asyncio.to_thread(snapshot_harness, snapshot, controls_root=controls_root)
-        frozen = load_harness(snapshot)
     except BaseException:
         await asyncio.to_thread(shutil.rmtree, snapshot, ignore_errors=True)
         raise
+    return version
+
+
+async def _preflight_harness(
+    experiment_id: str,
+    *,
+    private_root: Path,
+    lanes: tuple[tuple[str, Path, RemoteCommands], ...],
+    expected_version: str,
+) -> str:
+    started = time.monotonic()
+    snapshot = private_root / experiment_id / "_harness"
+    frozen = load_harness(snapshot)
+    if frozen.version != expected_version:
+        raise GraderInfrastructureError(
+            f"harness version changed: expected {expected_version}, got {frozen.version}"
+        )
+    version = frozen.version
 
     async def validate_lane(name: str, root: Path, commands: RemoteCommands) -> dict[str, object]:
         preflight = root / f".grader-preflight-{experiment_id}"
@@ -658,7 +701,6 @@ async def _prepare_harness_with_preflight(
     )
     if failures:
         detail = "; ".join(str(failure) for failure in failures)
-        await asyncio.to_thread(shutil.rmtree, snapshot, ignore_errors=True)
         raise GraderInfrastructureError(f"grader preflight failed on a lane: {detail}")
     return version
 
@@ -728,11 +770,11 @@ def _serve_with_profile(
     executor_b = live_executor(root_b, commands_b)
 
     async def execute(trial: Trial) -> TrialOutcome:
-        executor = executor_b if trial.candidate == "B" else executor_a
+        executor = executor_b if trial.execution_lane == "B" else executor_a
         return await executor(trial)
 
     async def publish_interrupted(trial: Trial) -> None:
-        executor = executor_b if trial.candidate == "B" else executor_a
+        executor = executor_b if trial.execution_lane == "B" else executor_a
         await executor.publish_interrupted(trial)
 
     async def start_experiment(experiment: Experiment) -> str:
@@ -744,15 +786,30 @@ def _serve_with_profile(
     async def resolve_revision(revision: str) -> str:
         return await executor_a.resolve_revision(revision)
 
-    async def prepare_harness(experiment_id: str, mode: ExperimentMode) -> str:
-        lanes: tuple[tuple[str, Path, RemoteCommands], ...] = (("A", root_a, commands_a),)
-        if mode == "paired":
-            lanes += (("B", root_b, commands_b),)
-        return await _prepare_harness_with_preflight(
+    async def prepare_harness(experiment: Experiment) -> str:
+        lane_by_name = {
+            "A": ("A", root_a, commands_a),
+            "B": ("B", root_b, commands_b),
+        }
+        lanes: tuple[tuple[str, Path, RemoteCommands], ...]
+        if experiment.execution_lane == "AB":
+            lanes = (lane_by_name["A"], lane_by_name["B"])
+        elif experiment.execution_lane in {"A", "B"}:
+            lanes = (lane_by_name[experiment.execution_lane],)
+        else:
+            raise RuntimeError("experiment has no execution lane")
+        return await _preflight_harness(
+            experiment.id,
+            private_root=private_root,
+            lanes=lanes,
+            expected_version=experiment.harness_version,
+        )
+
+    async def snapshot_experiment_harness(experiment_id: str) -> str:
+        return await _snapshot_harness(
             experiment_id,
             private_root=private_root,
             controls_root=controls_root,
-            lanes=lanes,
         )
 
     app = create_bench_app(
@@ -762,6 +819,7 @@ def _serve_with_profile(
         default_profile=default_profile,
         resolve_revision=resolve_revision,
         harness_version=harness_version(),
+        snapshot_harness=snapshot_experiment_harness,
         prepare_harness=prepare_harness,
         recover_execution=recover_execution,
         recover_chronicle=executor_a.recover_chronicle,

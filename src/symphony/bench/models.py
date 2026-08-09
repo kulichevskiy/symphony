@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, model_validator
 
 ExperimentStatus = Literal["preparing", "queued", "running", "completed", "failed"]
 ExperimentMode = Literal["paired", "single"]
+ExecutionLane = Literal["A", "B", "AB"]
 TrialStatus = Literal["running", "completed", "failed"]
 _TOOLCHAIN_RECEIPT = Path("/usr/local/share/symphony-bench-toolchain.txt")
 
@@ -61,6 +62,7 @@ class Experiment(ExperimentCreate):
     executor_toolchain_version: str = EXECUTOR_TOOLCHAIN_VERSION
     harness_version: str = ""
     linear_project_id: str = ""
+    execution_lane: ExecutionLane | None = None
 
     @classmethod
     def queued(
@@ -100,6 +102,7 @@ class Trial(BaseModel):
     linear_project_id: str = ""
     profile: dict[str, object] = Field(default_factory=dict)
     system_version: str = ""
+    execution_lane: Literal["A", "B"] = "A"
 
 
 class TrialOutcome(BaseModel):

@@ -16,6 +16,7 @@ from .store import ExperimentStore
 TrialExecutor = Callable[[Trial], Awaitable[TrialOutcome | None]]
 TrialPublisher = Callable[[Trial], Awaitable[None]]
 ExperimentPublisher = Callable[[str], Awaitable[None]]
+ExperimentPreparer = Callable[[Experiment], Awaitable[str]]
 
 
 class ExperimentRunner:
@@ -26,17 +27,23 @@ class ExperimentRunner:
         execute: TrialExecutor,
         publish: TrialPublisher | None = None,
         publish_experiment: ExperimentPublisher | None = None,
+        prepare_experiment: ExperimentPreparer | None = None,
     ) -> None:
         self._store = store
         self._execute = execute
         self._publish = publish
         self._publish_experiment = publish_experiment
+        self._prepare_experiment = prepare_experiment
 
     async def run_next(self) -> str | None:
         experiment = self._store.claim_next()
         if experiment is None:
             return None
         try:
+            if self._prepare_experiment is not None:
+                harness_version = await self._prepare_experiment(experiment)
+                self._store.set_harness_version(experiment.id, harness_version)
+                experiment = experiment.model_copy(update={"harness_version": harness_version})
             first_failure: BaseException | None = None
             for pair in _trial_plan(experiment):
                 tasks = [asyncio.create_task(self._run_trial(trial)) for trial in pair]
@@ -105,6 +112,8 @@ class ExperimentRunner:
 
 
 def _trial_plan(experiment: Experiment) -> list[tuple[Trial, ...]]:
+    if experiment.execution_lane is None:
+        raise ValueError("experiment has no execution lane")
     batches: list[tuple[Trial, ...]] = []
     for repetition in range(1, experiment.repetitions + 1):
         candidate_a = Trial(
@@ -117,6 +126,7 @@ def _trial_plan(experiment: Experiment) -> list[tuple[Trial, ...]]:
             linear_project_id=experiment.linear_project_id,
             profile=experiment.candidate_a_profile,
             system_version=experiment.system_version_a,
+            execution_lane="B" if experiment.execution_lane == "B" else "A",
         )
         if experiment.mode == "single":
             batches.append((candidate_a,))
@@ -136,6 +146,7 @@ def _trial_plan(experiment: Experiment) -> list[tuple[Trial, ...]]:
                         linear_project_id=experiment.linear_project_id,
                         profile=experiment.candidate_b_profile,
                         system_version=experiment.system_version_b,
+                        execution_lane="B",
                     ),
                 )
             )

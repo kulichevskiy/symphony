@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 from pathlib import Path
 
@@ -139,7 +140,7 @@ def test_submit_and_read_experiment_survives_restart(tmp_path: Path) -> None:
     assert status.json() == body
 
 
-def test_submit_pins_revision_profile_and_harness_version(tmp_path: Path) -> None:
+def test_submit_pins_revision_profile_and_defers_harness_preflight(tmp_path: Path) -> None:
     seen: list[str] = []
     prepared: list[str] = []
 
@@ -147,9 +148,17 @@ def test_submit_pins_revision_profile_and_harness_version(tmp_path: Path) -> Non
         seen.append(revision)
         return "a" * 40
 
-    async def prepare(experiment_id: str, _mode: str) -> str:
+    async def prepare(experiment: Experiment) -> str:
+        prepared.append(f"preflight:{experiment.id}")
+        return "snapshotted-harness"
+
+    async def snapshot(experiment_id: str) -> str:
         prepared.append(experiment_id)
         return "snapshotted-harness"
+
+    async def start(experiment: Experiment) -> str:
+        assert prepared == [experiment.id]
+        return "project-id"
 
     app = create_bench_app(
         db_path=tmp_path / "bench.sqlite",
@@ -157,7 +166,9 @@ def test_submit_pins_revision_profile_and_harness_version(tmp_path: Path) -> Non
         default_profile={"binding": {"local_review": True}},
         resolve_revision=resolve,
         harness_version="harness-v1",
+        snapshot_harness=snapshot,
         prepare_harness=prepare,
+        start_experiment=start,
     )
     with TestClient(app) as client:
         response = client.post(
@@ -177,20 +188,26 @@ def test_submit_pins_revision_profile_and_harness_version(tmp_path: Path) -> Non
     assert body["executor_toolchain_version"] == EXECUTOR_TOOLCHAIN_VERSION
     assert prepared == [body["id"]]
     assert body["harness_version"] == "snapshotted-harness"
+    assert body["linear_project_id"] == "project-id"
 
 
-def test_submit_rejects_broken_grader_preflight_without_queueing_experiment(
+def test_runner_fails_broken_grader_preflight_without_starting_trial(
     tmp_path: Path,
 ) -> None:
     db_path = tmp_path / "bench.sqlite"
 
-    async def prepare(_experiment_id: str, _mode: str) -> str:
+    async def prepare(_experiment: Experiment) -> str:
         raise GraderInfrastructureError("reference: expected 9 backend checks, got 0")
+
+    async def execute(_trial: Trial) -> TrialOutcome:
+        raise AssertionError("trial must not start after broken preflight")
 
     app = create_bench_app(
         db_path=db_path,
         api_token="token",
         prepare_harness=prepare,
+        execute=execute,
+        idle_poll_seconds=0.01,
     )
     with TestClient(app) as client:
         response = client.post(
@@ -199,16 +216,29 @@ def test_submit_rejects_broken_grader_preflight_without_queueing_experiment(
             json=_experiment_payload(candidate_a="sha", candidate_b="sha", repetitions=1),
         )
 
-    assert response.status_code == 500
-    assert response.json()["detail"].startswith("infrastructure_failed:")
-    assert ExperimentStore(db_path).claim_next() is None
+        assert response.status_code == 201
+        experiment_id = response.json()["id"]
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            current = client.get(
+                f"/experiments/{experiment_id}",
+                headers={"Authorization": "Bearer token"},
+            ).json()
+            if current["status"] == "failed":
+                break
+            time.sleep(0.01)
+
+    assert current["status"] == "failed"
+    report = ExperimentStore(db_path).report(experiment_id)
+    assert report is not None
+    assert report.trials == []
 
 
-def test_submit_does_not_run_preflight_while_an_experiment_is_active(tmp_path: Path) -> None:
+def test_submit_queues_multiple_experiments_without_using_executor_lanes(tmp_path: Path) -> None:
     prepared: list[str] = []
 
-    async def prepare(experiment_id: str, _mode: str) -> str:
-        prepared.append(experiment_id)
+    async def prepare(experiment: Experiment) -> str:
+        prepared.append(experiment.id)
         return "harness"
 
     app = create_bench_app(
@@ -223,22 +253,81 @@ def test_submit_does_not_run_preflight_while_an_experiment_is_active(tmp_path: P
             headers=headers,
             json=_experiment_payload(candidate_a="sha", candidate_b="sha", repetitions=1),
         )
-        second = client.post(
-            "/experiments",
-            headers=headers,
-            json=_experiment_payload(candidate_a="sha", candidate_b="sha", repetitions=1),
-        )
+        responses = [
+            client.post(
+                "/experiments",
+                headers=headers,
+                json=_experiment_payload(mode="single", candidate_a="sha", repetitions=1),
+            )
+            for _ in range(3)
+        ]
 
     assert first.status_code == 201
-    assert second.status_code == 409
-    assert second.json()["detail"] == "another experiment is queued or running"
-    assert len(prepared) == 1
+    assert [response.status_code for response in responses] == [201, 201, 201]
+    assert prepared == []
 
 
 def test_system_version_includes_executor_toolchain_identity() -> None:
     assert system_version("same-sha", {}, "toolchain-a") != system_version(
         "same-sha", {}, "toolchain-b"
     )
+
+
+def test_store_claims_two_single_experiments_on_distinct_lanes_and_queues_third(
+    tmp_path: Path,
+) -> None:
+    store = ExperimentStore(tmp_path / "bench.sqlite")
+    experiments = [
+        store.create(
+            _experiment_request(candidate_a=f"sha-{index}", repetitions=1, mode="single")
+        )
+        for index in range(3)
+    ]
+
+    first = store.claim_next()
+    second = store.claim_next()
+
+    assert first is not None
+    assert second is not None
+    assert (first.id, first.execution_lane) == (experiments[0].id, "A")
+    assert (second.id, second.execution_lane) == (experiments[1].id, "B")
+    assert store.claim_next() is None
+    assert store.get(experiments[2].id).status == "queued"  # type: ignore[union-attr]
+
+    store.set_status(first.id, "completed")
+    third = store.claim_next()
+
+    assert third is not None
+    assert (third.id, third.execution_lane) == (experiments[2].id, "A")
+
+
+def test_paired_experiment_waits_for_both_lanes_and_blocks_singles(tmp_path: Path) -> None:
+    store = ExperimentStore(tmp_path / "bench.sqlite")
+    single = store.create(
+        _experiment_request(candidate_a="single", repetitions=1, mode="single")
+    )
+    paired = store.create(
+        _experiment_request(candidate_a="a", candidate_b="b", repetitions=1)
+    )
+    later = store.create(
+        _experiment_request(candidate_a="later", repetitions=1, mode="single")
+    )
+
+    claimed_single = store.claim_next()
+    assert claimed_single is not None
+    assert claimed_single.id == single.id
+    assert store.claim_next() is None
+
+    store.set_status(single.id, "completed")
+    claimed_pair = store.claim_next()
+    assert claimed_pair is not None
+    assert (claimed_pair.id, claimed_pair.execution_lane) == (paired.id, "AB")
+    assert store.claim_next() is None
+
+    store.set_status(paired.id, "completed")
+    claimed_later = store.claim_next()
+    assert claimed_later is not None
+    assert claimed_later.id == later.id
 
 
 @pytest.mark.asyncio
@@ -305,15 +394,15 @@ async def test_runner_single_mode_executes_only_candidate_a(tmp_path: Path) -> N
             mode="single",
         )
     )
-    seen: list[str] = []
+    seen: list[tuple[str, str]] = []
 
     async def execute(trial: Trial) -> TrialOutcome:
-        seen.append(f"{trial.candidate}{trial.repetition}")
+        seen.append((f"{trial.candidate}{trial.repetition}", trial.execution_lane))
         return TrialOutcome()
 
     await ExperimentRunner(store=store, execute=execute).run_next()
 
-    assert seen == ["A1"]
+    assert seen == [("A1", "A")]
     persisted = store.get(experiment.id)
     assert persisted is not None
     assert persisted.mode == "single"
@@ -321,16 +410,16 @@ async def test_runner_single_mode_executes_only_candidate_a(tmp_path: Path) -> N
     assert [trial.candidate for trial in store.report(experiment.id).trials] == ["A"]  # type: ignore[union-attr]
 
 
-def test_submit_single_mode_does_not_resolve_or_preflight_candidate_b(tmp_path: Path) -> None:
+def test_submit_single_mode_resolves_only_candidate_a_and_defers_preflight(tmp_path: Path) -> None:
     resolved: list[str] = []
-    prepared: list[tuple[str, str]] = []
+    prepared: list[str] = []
 
     async def resolve(revision: str) -> str:
         resolved.append(revision)
         return "a" * 40
 
-    async def prepare(experiment_id: str, mode: str) -> str:
-        prepared.append((experiment_id, mode))
+    async def prepare(experiment: Experiment) -> str:
+        prepared.append(experiment.id)
         return "single-harness"
 
     with TestClient(
@@ -351,7 +440,7 @@ def test_submit_single_mode_does_not_resolve_or_preflight_candidate_b(tmp_path: 
     body = response.json()
     assert resolved == ["main"]
     assert body["candidate_b"] is None
-    assert prepared == [(body["id"], "single")]
+    assert prepared == []
 
 
 @pytest.mark.asyncio
@@ -411,7 +500,7 @@ async def test_runner_lets_sibling_finish_when_candidate_fails(
     ]
 
 
-def test_app_worker_drains_one_experiment_at_a_time(tmp_path: Path) -> None:
+def test_app_worker_drains_paired_experiment(tmp_path: Path) -> None:
     seen: list[str] = []
 
     async def execute(trial: Trial) -> None:
@@ -439,6 +528,75 @@ def test_app_worker_drains_one_experiment_at_a_time(tmp_path: Path) -> None:
 
     assert current["status"] == "completed"
     assert seen == ["A1", "B1"]
+
+
+def test_app_runs_two_single_experiments_concurrently_and_queues_third(
+    tmp_path: Path,
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    seen: dict[str, str] = {}
+    prepared: dict[str, str] = {}
+
+    async def prepare(experiment: Experiment) -> str:
+        assert experiment.execution_lane in {"A", "B"}
+        prepared[experiment.id] = experiment.execution_lane
+        return f"harness-{experiment.execution_lane}"
+
+    async def execute(trial: Trial) -> TrialOutcome:
+        seen[trial.experiment_id] = trial.execution_lane
+        if len(seen) == 2:
+            started.set()
+        await asyncio.to_thread(release.wait)
+        return TrialOutcome()
+
+    app = create_bench_app(
+        db_path=tmp_path / "bench.sqlite",
+        api_token="test-token",
+        execute=execute,
+        prepare_harness=prepare,
+        idle_poll_seconds=0.01,
+    )
+    headers = {"Authorization": "Bearer test-token"}
+    with TestClient(app) as client:
+        try:
+            submitted = [
+                client.post(
+                    "/experiments",
+                    headers=headers,
+                    json=_experiment_payload(
+                        mode="single", candidate_a=f"sha-{index}", repetitions=1
+                    ),
+                ).json()
+                for index in range(3)
+            ]
+            assert started.wait(timeout=2)
+            states = [
+                client.get(f"/experiments/{item['id']}", headers=headers).json()
+                for item in submitted
+            ]
+            assert [state["status"] for state in states] == ["running", "running", "queued"]
+            assert [state["execution_lane"] for state in states] == ["A", "B", None]
+            assert prepared == {
+                submitted[0]["id"]: "A",
+                submitted[1]["id"]: "B",
+            }
+            release.set()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                states = [
+                    client.get(f"/experiments/{item['id']}", headers=headers).json()
+                    for item in submitted
+                ]
+                if all(state["status"] == "completed" for state in states):
+                    break
+                time.sleep(0.01)
+        finally:
+            release.set()
+
+    assert all(state["status"] == "completed" for state in states)
+    assert set(seen.values()) == {"A", "B"}
+    assert prepared == seen
 
 
 def test_completed_trial_persists_report_and_notification_until_ack(tmp_path: Path) -> None:
@@ -639,6 +797,81 @@ def test_restart_publishes_interrupted_trial_to_project_chronicle(tmp_path: Path
         (experiment.id, _HYPOTHESIS, _DESIGN)
     ]
     assert [(item.id, item.status) for item in failed] == [(experiment.id, "failed")]
+
+
+def test_restart_fails_both_running_lanes_and_releases_capacity(tmp_path: Path) -> None:
+    db_path = tmp_path / "bench.sqlite"
+    store = ExperimentStore(db_path)
+    experiments = [
+        store.create(
+            _experiment_request(candidate_a=f"sha-{index}", repetitions=1, mode="single")
+        )
+        for index in range(2)
+    ]
+    claimed = [store.claim_next(), store.claim_next()]
+    assert all(item is not None for item in claimed)
+    for item in claimed:
+        assert item is not None
+        store.start_trial(
+            Trial(
+                experiment_id=item.id,
+                candidate="A",
+                repetition=1,
+                revision=item.candidate_a,
+                execution_lane=item.execution_lane,  # type: ignore[arg-type]
+            )
+        )
+    published: list[Trial] = []
+
+    async def publish_interrupted(trial: Trial) -> None:
+        published.append(trial)
+
+    with TestClient(
+        create_bench_app(
+            db_path=db_path,
+            api_token="token",
+            publish_interrupted=publish_interrupted,
+        )
+    ):
+        pass
+
+    assert [(trial.experiment_id, trial.execution_lane) for trial in published] == [
+        (experiments[0].id, "A"),
+        (experiments[1].id, "B"),
+    ]
+    assert [store.get(item.id).status for item in experiments] == [  # type: ignore[union-attr]
+        "failed",
+        "failed",
+    ]
+    replacement = store.create(
+        _experiment_request(candidate_a="replacement", repetitions=1, mode="single")
+    )
+    next_experiment = store.claim_next()
+    assert next_experiment is not None
+    assert (next_experiment.id, next_experiment.execution_lane) == (replacement.id, "A")
+
+
+def test_store_backfills_legacy_candidate_b_execution_lane(tmp_path: Path) -> None:
+    db_path = tmp_path / "bench.sqlite"
+    store = ExperimentStore(db_path)
+    experiment = store.create(
+        _experiment_request(candidate_a="a", candidate_b="b", repetitions=1)
+    )
+    assert store.claim_next() is not None
+    store.start_trial(
+        Trial(
+            experiment_id=experiment.id,
+            candidate="B",
+            repetition=1,
+            revision="b",
+            execution_lane="A",
+        )
+    )
+
+    migrated = ExperimentStore(db_path).report(experiment.id)
+
+    assert migrated is not None
+    assert migrated.trials[0].execution_lane == "B"
 
 
 def test_failed_experiment_publishes_terminal_project_update(tmp_path: Path) -> None:
