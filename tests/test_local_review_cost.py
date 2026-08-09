@@ -367,6 +367,32 @@ class _HybridRunner:
         pass
 
 
+class _ClaudeHybridRunner:
+    def __init__(self) -> None:
+        self.specs: list[RunnerSpec] = []
+
+    def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+        self.specs.append(spec)
+
+        async def gen() -> AsyncIterator[RunnerEvent]:
+            axis = "Spec and Standards" if spec.run_id.endswith("-spec") else "Bug"
+            yield RunnerEvent(
+                kind="stdout",
+                line=json.dumps(
+                    {
+                        "type": "result",
+                        "result": f"{axis} review passed.\n{VERDICT_APPROVED_MARKER}",
+                    }
+                ),
+            )
+            yield RunnerEvent(kind="exit", returncode=0)
+
+        return gen()
+
+    async def kill(self, run_id: str) -> None:
+        pass
+
+
 @pytest.mark.asyncio
 async def test_session_total_cost_reflects_codex_token_pricing(
     tmp_path: Path,
@@ -443,6 +469,40 @@ async def test_hybrid_session_runs_two_axes_and_stops_after_first_clean_closure(
     assert bug_specs[1].command[bug_specs[1].command.index("--base") + 1] == "implemented-head"
     assert "remaining defect" not in " ".join(bug_specs[1].command).lower()
     assert bug_specs[1].command[-2] == "-o"
+
+
+@pytest.mark.asyncio
+async def test_hybrid_session_runs_both_axes_with_claude_roles(tmp_path: Path) -> None:
+    runner = _ClaudeHybridRunner()
+
+    async def head_sha(_: Path) -> str:
+        return "implemented-head"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="r-claude-hybrid",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="claude", model="claude-opus-5"),
+        verifier_role=ResolvedRole(agent="claude", model="claude-opus-5"),
+        fixer_role=ResolvedRole(agent="claude", model="claude-opus-5"),
+        cap=3,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        review_mode="hybrid",
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    review_specs = [spec for spec in runner.specs if spec.stage == "local_review"]
+    assert [spec.run_id.rsplit("-", 1)[-1] for spec in review_specs] == ["spec", "bug"]
+    assert all(spec.command[0] == "claude" for spec in review_specs)
+    prompts = [spec.command[-1] for spec in review_specs]
+    assert "Spec and Standards reviewer" in prompts[0]
+    assert "functional bugs" in prompts[1]
 
 
 @pytest.mark.asyncio

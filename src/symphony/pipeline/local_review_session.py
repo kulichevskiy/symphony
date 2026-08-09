@@ -66,6 +66,7 @@ from .local_review import (
     extract_last_agent_message,
     is_auth_api_error,
     is_small_diff,
+    local_review_bug_prompt,
     local_review_finder_prompt,
     local_review_prompt,
     local_review_spec_prompt,
@@ -511,16 +512,16 @@ async def run_local_review_session(
             if hybrid_initial_head is None:
                 hybrid_initial_head = head_sha
             comparison_ref = base_branch if iteration == 0 else hybrid_initial_head
-            bug_role = verifier_role if verifier_role.agent == "codex" else reviewer_role
-            if bug_role.agent != "codex":
-                return ReviewerOutput(
-                    stdout="",
-                    head_sha=head_sha,
-                    ok=False,
-                    error="hybrid local review requires a Codex review role",
-                )
+            bug_role = verifier_role
 
             spec_prompt = local_review_spec_prompt(
+                issue_title=issue_title,
+                issue_body=issue_body,
+                labels=labels,
+                comparison_ref=comparison_ref,
+                previous_findings=hybrid_previous_findings,
+            )
+            bug_prompt = local_review_bug_prompt(
                 issue_title=issue_title,
                 issue_body=issue_body,
                 labels=labels,
@@ -539,17 +540,17 @@ async def run_local_review_session(
                     head_sha=head_sha,
                 ),
                 _run_reviewer_pass(
-                    agent="codex",
+                    agent=bug_role.agent,
                     codex_model=bug_role.codex_model_arg(),
-                    claude_model=None,
+                    claude_model=bug_role.claude_model_arg(),
                     effort=bug_role.effort,
                     # `codex exec review --base` owns its prompt; the CLI
                     # rejects a custom positional prompt in this mode.
-                    prompt="",
+                    prompt="" if bug_role.agent == "codex" else bug_prompt,
                     stem=f"review-{iteration}-bug",
                     run_suffix=f"rev-{iteration}-bug",
                     head_sha=head_sha,
-                    builtin_review=True,
+                    builtin_review=bug_role.agent == "codex",
                     comparison_ref=comparison_ref,
                 ),
             )
@@ -578,7 +579,7 @@ async def run_local_review_session(
                 last_message_file=spec_out.last_message_file,
             )
             bug_message = extract_last_agent_message(
-                agent="codex",
+                agent=bug_role.agent,
                 stdout=bug_out.stdout,
                 last_message_file=bug_out.last_message_file,
             )

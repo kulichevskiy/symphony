@@ -650,7 +650,7 @@ def test_local_review_mode_defaults_legacy_and_accepts_hybrid() -> None:
     assert _review_binding(local_review_mode="hybrid").local_review_mode == "hybrid"
 
 
-def test_hybrid_local_review_requires_a_codex_review_role(
+def test_hybrid_local_review_accepts_claude_for_both_review_axes(
     tmp_path: Path, monkeypatch
 ) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("LINEAR_API_KEY", "x")
@@ -668,8 +668,12 @@ repos:
 {_BINDING_STATES}
 """
 
-    with pytest.raises(ValueError, match="hybrid local review requires a Codex review role"):
-        Config.model_validate(yaml.safe_load(raw))
+    with pytest.warns(UserWarning):
+        cfg = Config.model_validate(yaml.safe_load(raw))
+
+    binding = cfg.repos[0]
+    assert binding.resolved_role("review_find", cfg.roles).agent == "claude"
+    assert binding.resolved_role("review_verify", cfg.roles).agent == "claude"
 
 
 def test_local_review_iteration_cap_per_binding_override(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]

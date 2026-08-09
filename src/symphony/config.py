@@ -974,16 +974,6 @@ class Config(BaseModel):
                 # posture isn't the operator's to fix here.
                 continue
             implement = binding.resolved_role("implement", self.roles)
-            if binding.local_review and binding.local_review_mode == "hybrid":
-                hybrid_review_agents = {
-                    binding.resolved_role("review_find", self.roles).agent,
-                    binding.resolved_role("review_verify", self.roles).agent,
-                }
-                if "codex" not in hybrid_review_agents:
-                    raise ValueError(
-                        f"binding {binding.project_key}/{binding.github_repo}: "
-                        "hybrid local review requires a Codex review role"
-                    )
             for review_name in ("review_find",):
                 review = binding.resolved_role(review_name, self.roles)
                 if review.agent == implement.agent:

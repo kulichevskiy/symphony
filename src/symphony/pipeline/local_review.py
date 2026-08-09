@@ -753,6 +753,45 @@ def local_review_spec_prompt(
     )
 
 
+def local_review_bug_prompt(
+    *,
+    issue_title: str,
+    issue_body: str,
+    labels: list[str],
+    comparison_ref: str,
+    previous_findings: str = "",
+) -> str:
+    """Read-only functional-bug axis for non-Codex hybrid reviewers."""
+    obligations = ""
+    if previous_findings.strip():
+        obligations = (
+            "# Previous findings to verify\n\n"
+            "This is a closure review. Verify every finding below, its fix, "
+            "related failure modes, and regression coverage:\n\n"
+            f"{previous_findings.strip()}\n\n"
+        )
+    return (
+        "You are Symphony's local functional bugs reviewer. Review the "
+        "current branch independently, but do not fix it.\n\n"
+        "# What to read\n\n"
+        f"1. Read `git diff {comparison_ref}...HEAD` (fall back to "
+        f"`git diff {comparison_ref}..HEAD` when needed).\n"
+        "2. Read changed code in context, including callers, sibling "
+        "implementations, data contracts, and relevant tests.\n"
+        "3. Re-read the issue below so behavior at integration boundaries "
+        "is checked against the intended workflow.\n\n"
+        "# What to find\n\n"
+        "Find concrete correctness, state, concurrency, error-handling, "
+        "security, accessibility, and regression bugs. Focus on failures "
+        "that tests or users can observe. Do not duplicate Spec or style "
+        "review unless it exposes a functional defect.\n\n"
+        + obligations
+        + _VERDICT_CONTRACT_BLOCK
+        + _NO_MUTATION_BLOCK
+        + _issue_block(issue_title, issue_body, labels)
+    )
+
+
 def build_builtin_codex_review_command(
     *,
     comparison_ref: str,
