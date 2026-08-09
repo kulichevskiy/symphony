@@ -356,6 +356,50 @@ async def test_fix_then_approve_dispatches_fix_run_in_correct_workspace(
 
 
 @pytest.mark.asyncio
+async def test_final_local_review_fix_receives_holistic_closure_audit(
+    tmp_path: Path,
+) -> None:
+    runner = _ScriptedRunner(
+        scripts=[
+            _codex_message_stream(
+                f"## Findings\n- [Major] bug in foo.py:10\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+            ),
+            _ok_fix_stream(),
+            _codex_message_stream(f"fixed\n{VERDICT_APPROVED_MARKER}"),
+        ]
+    )
+
+    head_calls = 0
+
+    async def head_sha(_: Path) -> str:
+        nonlocal head_calls
+        head_calls += 1
+        return f"sha-{head_calls}"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "workspace",
+        base_branch="main",
+        parent_run_id="run-final-local-audit",
+        issue_title="Build support queue",
+        issue_body="Operators can create and filter tickets.",
+        labels=["feature"],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=1,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    fix_prompt = runner.specs[1].command[-1]
+    assert "final allowed review-fix iteration" in fix_prompt
+    assert "related failure modes" in fix_prompt
+
+
+@pytest.mark.asyncio
 async def test_local_review_claude_model_injected_into_reviewer_and_fixer(
     tmp_path: Path,
 ) -> None:

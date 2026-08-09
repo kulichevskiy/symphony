@@ -848,6 +848,8 @@ async def run_local_review_session(
             issue_body=issue_body,
             labels=labels,
             trigger=verdict.findings,
+            iteration=iteration + 1,
+            iteration_cap=cap,
         )
         command = _build_fix_command(
             agent=fixer_role.agent,
