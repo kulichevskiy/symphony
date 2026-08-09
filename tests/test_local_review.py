@@ -114,6 +114,20 @@ def test_local_review_spec_prompt_checks_issue_and_repository_standards() -> Non
     assert VERDICT_APPROVED_MARKER in prompt
 
 
+def test_local_review_spec_prompt_protects_inherited_contracts() -> None:
+    prompt = local_review_spec_prompt(
+        issue_title="Add workflow permissions",
+        issue_body="Agents may comment, self-assign, and transition tickets.",
+        labels=["backend"],
+        comparison_ref="main",
+    )
+
+    lower = prompt.lower()
+    assert "inherited requirements" in lower
+    assert "deleted or weakened existing tests" in lower
+    assert "explicitly authorizes" in lower
+
+
 def test_merge_hybrid_review_messages_deduplicates_and_caps_p2() -> None:
     spec = (
         "## Findings\n"
