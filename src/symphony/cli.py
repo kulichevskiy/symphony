@@ -16,7 +16,6 @@ import logging
 import os
 import re
 import signal
-import subprocess
 import sys
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -411,23 +410,6 @@ def _enforce_require_auth0(cfg: Config) -> None:
         sys.exit(2)
 
 
-def _configure_git_identity(secrets: Secrets) -> None:
-    """Apply the optional deployment-scoped Git identity for agent commits."""
-    name = secrets.symphony_git_user_name.strip()
-    email = secrets.symphony_git_user_email.strip()
-    if not name and not email:
-        return
-    if not name or not email:
-        raise click.ClickException(
-            "SYMPHONY_GIT_USER_NAME and SYMPHONY_GIT_USER_EMAIL must be set together"
-        )
-    try:
-        subprocess.run(["git", "config", "--global", "user.name", name], check=True)
-        subprocess.run(["git", "config", "--global", "user.email", email], check=True)
-    except subprocess.CalledProcessError as exc:
-        raise click.ClickException("failed to configure the Git commit identity") from exc
-
-
 async def _run(*, once: bool) -> None:
     conn = await db.connect(Config.db_path_from_env())
     try:
@@ -436,7 +418,6 @@ async def _run(*, once: bool) -> None:
         # adds them in the UI). The tick-boundary reload (SYM-189) is always on.
         db_owns_topology = True
         base = Config.from_env()
-        _configure_git_identity(Secrets())
         try:
             cfg = await assemble_effective_config(conn, base)
         except ConfigBootError as e:

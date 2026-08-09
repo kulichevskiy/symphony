@@ -58,6 +58,8 @@ class Workspace:
         root: Path,
         clone_fn: CloneFn,
         fetch_fn: FetchFn | None = None,
+        git_user_name: str = "",
+        git_user_email: str = "",
         ttl_secs: int = DEFAULT_TTL_SECS,
     ) -> None:
         self._root = root
@@ -69,6 +71,8 @@ class Workspace:
         # dispatch. `None` (tests, no DB resolver wired up) keeps the plain
         # unauthenticated fetch below.
         self._fetch_fn = fetch_fn
+        self._git_user_name = git_user_name
+        self._git_user_email = git_user_email
         self._ttl_secs = ttl_secs
         # Per-path lock serializes sweep_ttl against acquire/cleanup so
         # the sweeper can't rmtree a dir between an acquire's mtime read
@@ -142,10 +146,21 @@ class Workspace:
                     await asyncio.to_thread(shutil.rmtree, path)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 await self._clone_fn(binding.github_repo, path)
+            await self._configure_git_identity(path)
             await self._ensure_branch(path, branch)
             path.touch(exist_ok=True)
             self._in_use.add(path)
         return path
+
+    async def _configure_git_identity(self, path: Path) -> None:
+        if not self._git_user_name and not self._git_user_email:
+            return
+        if not self._git_user_name or not self._git_user_email:
+            raise WorkspaceError(
+                "SYMPHONY_GIT_USER_NAME and SYMPHONY_GIT_USER_EMAIL must be set together"
+            )
+        await self._git(path, "config", "user.name", self._git_user_name)
+        await self._git(path, "config", "user.email", self._git_user_email)
 
     def release(self, binding: RepoBinding, issue: Issue) -> None:
         """Mark a workspace no longer in active use (eligible for sweep)."""

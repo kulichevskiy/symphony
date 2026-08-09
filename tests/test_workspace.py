@@ -127,6 +127,32 @@ async def test_acquire_clones_and_checks_out_branch(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_acquire_configures_local_git_identity(tmp_path: Path) -> None:
+    remote = await _make_remote(tmp_path)
+    ws = Workspace(
+        root=tmp_path / "ws",
+        clone_fn=_make_clone_fn(remote),
+        git_user_name="Deployment Bot",
+        git_user_email="bot@example.com",
+    )
+
+    path = await ws.acquire(_binding(), _issue("ENG-123"))
+
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "config",
+        "--local",
+        "--get-regexp",
+        "^user\\.(name|email)$",
+        cwd=path,
+        stdout=asyncio.subprocess.PIPE,
+    )
+    out, _ = await proc.communicate()
+    assert proc.returncode == 0
+    assert out.decode().splitlines() == ["user.name Deployment Bot", "user.email bot@example.com"]
+
+
+@pytest.mark.asyncio
 async def test_acquire_is_idempotent(tmp_path: Path) -> None:
     remote = await _make_remote(tmp_path)
     calls: list[Path] = []

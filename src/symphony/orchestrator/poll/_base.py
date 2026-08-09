@@ -577,6 +577,8 @@ class _OrchestratorBase:
                 root=config.workspace_root,
                 clone_fn=self._clone_with_resolved_auth,
                 fetch_fn=self._fetch_with_resolved_auth,
+                git_user_name=config.symphony_git_user_name,
+                git_user_email=config.symphony_git_user_email,
             )
         )
         # Wrapped so every push call site — delivery, review re-push,

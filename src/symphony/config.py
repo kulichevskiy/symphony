@@ -872,6 +872,8 @@ class Config(BaseModel):
     telegram_chat_id: str = ""
     symphony_encryption_key: str = ""
     symphony_oauth_public_origin: str = ""
+    symphony_git_user_name: str = ""
+    symphony_git_user_email: str = ""
 
     def _reject_legacy_matrix_conflicts(self, binding: RepoBinding) -> None:
         """Fail if a legacy field and its matrix cell are both set.
@@ -1061,5 +1063,7 @@ class Config(BaseModel):
                 "telegram_chat_id": secrets.telegram_chat_id,
                 "symphony_encryption_key": secrets.symphony_encryption_key,
                 "symphony_oauth_public_origin": secrets.symphony_oauth_public_origin,
+                "symphony_git_user_name": secrets.symphony_git_user_name,
+                "symphony_git_user_email": secrets.symphony_git_user_email,
             }
         )
