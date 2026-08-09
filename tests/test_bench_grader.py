@@ -11,6 +11,7 @@ from symphony.bench.grader import (
     load_hidden_manifest,
     parse_junit_report,
     parse_vitest_report,
+    regression_commands,
     validate_control_result,
 )
 
@@ -73,6 +74,31 @@ class CrashingGraderCommands(GraderCommands):
         return result
 
 
+class FailingRegressionCommands(GraderCommands):
+    async def run(
+        self,
+        argv: list[str],
+        *,
+        cwd: Path,
+        env: dict[str, str] | None = None,
+        stdin: str | None = None,
+    ) -> str:
+        result = await super().run(argv, cwd=cwd, env=env, stdin=stdin)
+        if argv == ["uv", "run", "--frozen", "--no-sync", "pytest", "-q"]:
+            raise CommandError(
+                "uv run pytest exited 1: FAILED tests/test_api.py::test_contract "
+                "expected 422, received 201\n    at internal runner"
+            )
+        return result
+
+
+def test_regression_commands_are_reproducible_from_the_frozen_repository() -> None:
+    commands = regression_commands()
+
+    assert "frontend_audit" not in commands
+    assert commands["frontend_build"] == ["npm", "run", "build"]
+
+
 def test_parse_junit_report_counts_outcomes(tmp_path: Path) -> None:
     report = tmp_path / "report.xml"
     report.write_text(
@@ -80,8 +106,12 @@ def test_parse_junit_report_counts_outcomes(tmp_path: Path) -> None:
         <testsuites tests="7" failures="2" errors="1" skipped="1">
           <testsuite name="hidden" tests="7" failures="2" errors="1" skipped="1">
             <testcase classname="bench" name="passes" />
-            <testcase classname="bench" name="fails"><failure /></testcase>
-            <testcase classname="bench" name="also fails"><failure /></testcase>
+            <testcase classname="bench" name="fails">
+              <failure message="expected 200, received 409" />
+            </testcase>
+            <testcase classname="bench" name="also fails">
+              <failure>AssertionError: missing comment_count\ntraceback</failure>
+            </testcase>
             <testcase classname="bench" name="errors"><error /></testcase>
             <testcase classname="bench" name="skips"><skipped /></testcase>
           </testsuite>
@@ -97,6 +127,13 @@ def test_parse_junit_report_counts_outcomes(tmp_path: Path) -> None:
         "hidden_checks_errors": 1,
         "hidden_checks_skipped": 1,
         "hidden_failed_test_ids": ["also fails", "fails"],
+        "hidden_failure_details": [
+            {
+                "test_id": "also fails",
+                "message": "AssertionError: missing comment_count traceback",
+            },
+            {"test_id": "fails", "message": "expected 200, received 409"},
+        ],
     }
 
 
@@ -116,7 +153,9 @@ def test_parse_vitest_report_counts_outcomes(tmp_path: Path) -> None:
         '{"numTotalTests":5,"numPassedTests":3,"numFailedTests":1,'
         '"numPendingTests":1,"numTodoTests":0,"testResults":['
         '{"assertionResults":[{"fullName":"suite passes","status":"passed"},'
-        '{"fullName":"suite fails","status":"failed"}]}]}',
+        '{"fullName":"suite fails","status":"failed","failureMessages":['
+        '"Error: expected an accessible conflict\\nExpected: changed\\nReceived: moved\\n'
+        '    at App.test.tsx:10:2"]}]}]}',
         encoding="utf-8",
     )
 
@@ -127,6 +166,14 @@ def test_parse_vitest_report_counts_outcomes(tmp_path: Path) -> None:
         "hidden_checks_errors": 0,
         "hidden_checks_skipped": 1,
         "hidden_failed_test_ids": ["suite fails"],
+        "hidden_failure_details": [
+            {
+                "test_id": "suite fails",
+                "message": (
+                    "Error: expected an accessible conflict Expected: changed Received: moved"
+                ),
+            }
+        ],
     }
 
 
@@ -290,6 +337,7 @@ def test_parse_junit_report_sums_pytest_suites_when_parent_has_no_counts(
         "hidden_checks_errors": 1,
         "hidden_checks_skipped": 0,
         "hidden_failed_test_ids": ["test_hidden"],
+        "hidden_failure_details": [{"test_id": "test_hidden", "message": "unknown failure"}],
     }
 
 
@@ -315,6 +363,38 @@ async def test_grader_injects_collectable_hidden_name_then_removes_it(tmp_path: 
     assert commands.hidden_env is not None
     assert commands.hidden_env["SUPPORT_QUEUE_DB_PATH"].endswith("hidden-support.sqlite")
     assert all(not path.exists() for path in commands.hidden_paths)
+
+
+@pytest.mark.asyncio
+async def test_grader_preserves_a_concise_regression_failure_reason(tmp_path: Path) -> None:
+    backend_hidden = tmp_path / "backend.py"
+    frontend_hidden = tmp_path / "frontend.tsx"
+    backend_hidden.write_text("# hidden")
+    frontend_hidden.write_text("// hidden")
+
+    metrics = await SupportQueueGrader(FailingRegressionCommands()).grade(
+        repository_slug="kulichevskiy/trial",
+        destination=tmp_path,
+        github_token="token",
+        backend_hidden_test=backend_hidden,
+        frontend_hidden_test=frontend_hidden,
+        manifest=HiddenManifest(9, 7, 1, 1),
+    )
+
+    assert metrics["regression_results"] == {
+        "backend_tests": "failed",
+        "mypy": "passed",
+        "ruff": "passed",
+        "frontend_install": "passed",
+        "frontend_tests": "passed",
+        "frontend_build": "passed",
+    }
+    assert metrics["regression_failure_details"] == {
+        "backend_tests": (
+            "uv run pytest exited 1: FAILED tests/test_api.py::test_contract "
+            "expected 422, received 201"
+        )
+    }
 
 
 @pytest.mark.asyncio

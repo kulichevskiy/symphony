@@ -137,3 +137,60 @@ def test_render_trial_markdown_preserves_unavailable_raw_tokens() -> None:
 
     assert "raw_tokens: `null`" in rendered
     assert "token_metrics_unavailable: `True`" in rendered
+
+
+def test_render_trial_markdown_explains_backend_and_frontend_grades() -> None:
+    trial = _trial("A", 1, 100, 7).model_copy(
+        update={
+            "metrics": {
+                "backend_hidden_checks_passed": 13,
+                "backend_hidden_checks_total": 16,
+                "backend_hidden_failure_details": [
+                    {
+                        "test_id": "test_detail_contract",
+                        "message": "missing comment_count",
+                    }
+                ],
+                "frontend_hidden_checks_passed": 10,
+                "frontend_hidden_checks_total": 13,
+                "frontend_hidden_failure_details": [
+                    {
+                        "test_id": "supports workflow",
+                        "message": "button name did not match",
+                    }
+                ],
+                "regression_checks_passed": 6,
+                "regression_checks_total": 7,
+                "regression_results": {
+                    "backend_tests": "passed",
+                    "frontend_audit": "failed",
+                },
+                "regression_failure_details": {
+                    "frontend_audit": "npm audit exited 1: high severity vulnerability",
+                },
+            }
+        }
+    )
+    report = ExperimentReport(
+        experiment=_experiment(
+            id="EXP-1",
+            status="completed",
+            candidate_a="same-sha",
+            repetitions=1,
+            mode="single",
+            created_at=datetime(2026, 8, 1, tzinfo=UTC),
+        ),
+        trials=[trial],
+    )
+
+    rendered = render_trial_markdown(report, trial)
+
+    assert "## Grader" in rendered
+    assert "### Backend — 13/16" in rendered
+    assert "`test_detail_contract`: missing comment_count" in rendered
+    assert "### Frontend — 10/13" in rendered
+    assert "`supports workflow`: button name did not match" in rendered
+    assert "### Regression checks — 6/7" in rendered
+    assert (
+        "`frontend_audit`: npm audit exited 1: high severity vulnerability" in rendered
+    )

@@ -66,6 +66,64 @@ def _number(value: float | None, *, signed: bool = False) -> str:
     return f"{prefix}{value:.2f}"
 
 
+def _append_grader(lines: list[str], record: TrialRecord, *, level: int) -> None:
+    metrics = record.metrics
+    components = []
+    for component in ("backend", "frontend"):
+        passed = metrics.get(f"{component}_hidden_checks_passed")
+        total = metrics.get(f"{component}_hidden_checks_total")
+        if isinstance(passed, int) and isinstance(total, int):
+            components.append((component, passed, total))
+    regression_passed = metrics.get("regression_checks_passed")
+    regression_total = metrics.get("regression_checks_total")
+    if not components and not (
+        isinstance(regression_passed, int) and isinstance(regression_total, int)
+    ):
+        return
+
+    lines.extend(["", f"{'#' * level} Grader"])
+    for component, passed, total in components:
+        lines.extend(["", f"{'#' * (level + 1)} {component.title()} — {passed}/{total}"])
+        details = metrics.get(f"{component}_hidden_failure_details")
+        if not isinstance(details, list) or not details:
+            lines.extend(["", "- No hidden-check failures."])
+            continue
+        lines.append("")
+        for detail in details:
+            if not isinstance(detail, dict):
+                continue
+            test_id = str(detail.get("test_id", "unknown test")).replace("`", "'")
+            message = str(detail.get("message", "unknown failure")).replace("\n", " ")
+            lines.append(f"- `{test_id}`: {message}")
+
+    if isinstance(regression_passed, int) and isinstance(regression_total, int):
+        lines.extend(
+            [
+                "",
+                f"{'#' * (level + 1)} Regression checks — "
+                f"{regression_passed}/{regression_total}",
+            ]
+        )
+        results = metrics.get("regression_results")
+        failed = (
+            sorted(name for name, status in results.items() if status == "failed")
+            if isinstance(results, dict)
+            else []
+        )
+        details = metrics.get("regression_failure_details")
+        lines.append("")
+        if not failed:
+            lines.append("- Failed: none")
+        else:
+            for name in failed:
+                reason = (
+                    details.get(name, "failure reason unavailable")
+                    if isinstance(details, dict)
+                    else "failure reason unavailable"
+                )
+                lines.append(f"- `{name}`: {str(reason).replace(chr(10), ' ')}")
+
+
 def render_markdown(report: ExperimentReport) -> str:
     experiment = report.experiment
     completed_by_candidate: dict[str, dict[int, TrialRecord]] = defaultdict(dict)
@@ -157,6 +215,7 @@ def render_markdown(report: ExperimentReport) -> str:
         )
         if trial.error:
             lines.append(f"Error: `{trial.error}`")
+        _append_grader(lines, trial, level=4)
         for lens in ("spec", "standards"):
             raw_findings = trial.metrics.get(f"{lens}_findings")
             if not isinstance(raw_findings, list) or not raw_findings:
@@ -188,8 +247,11 @@ def render_trial_markdown(report: ExperimentReport, record: TrialRecord) -> str:
     ]
     if record.error:
         lines.append(f"Error: `{record.error}`")
+    _append_grader(lines, record, level=2)
     lines.extend(["", "## Metrics", ""])
     for key in sorted(record.metrics):
+        if key.endswith("_hidden_failure_details"):
+            continue
         value = record.metrics[key]
         rendered = (
             json.dumps(value, sort_keys=True)

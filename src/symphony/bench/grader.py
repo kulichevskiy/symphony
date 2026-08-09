@@ -10,6 +10,9 @@ from xml.etree import ElementTree
 
 from .github import CommandError, Commands
 
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_FAILURE_SUMMARY_LIMIT = 500
+
 
 class GraderInfrastructureError(RuntimeError):
     """The hidden checks did not execute reliably enough to score a product."""
@@ -116,7 +119,6 @@ def regression_commands() -> dict[str, list[str]]:
         "frontend_install": ["npm", "ci"],
         "frontend_tests": ["npm", "test", "--", "--run"],
         "frontend_build": ["npm", "run", "build"],
-        "frontend_audit": ["npm", "audit", "--audit-level=high"],
     }
 
 
@@ -132,6 +134,19 @@ def parse_junit_report(path: Path) -> dict[str, object]:
     skipped = sum(int(suite.attrib.get("skipped", 0)) for suite in suites)
     if min(total, failures, errors, skipped) < 0 or failures + errors + skipped > total:
         raise GraderInfrastructureError("invalid JUnit test accounting")
+    failure_details = sorted(
+        (
+            {
+                "test_id": testcase.attrib.get("name", ""),
+                "message": _failure_summary(
+                    failure.attrib.get("message") or failure.text or ""
+                ),
+            }
+            for testcase in root.iter("testcase")
+            if (failure := testcase.find("failure")) is not None
+        ),
+        key=lambda item: item["test_id"],
+    )
     return {
         "hidden_checks_total": total,
         "hidden_checks_passed": max(0, total - failures - errors - skipped),
@@ -143,6 +158,7 @@ def parse_junit_report(path: Path) -> dict[str, object]:
             for testcase in root.iter("testcase")
             if testcase.find("failure") is not None
         ),
+        "hidden_failure_details": failure_details,
     }
 
 
@@ -162,7 +178,7 @@ def parse_vitest_report(path: Path) -> dict[str, object]:
         raise GraderInfrastructureError(f"invalid Vitest result counters: {exc}") from exc
     if min(total, passed, failed, skipped) < 0 or passed + failed + skipped != total:
         raise GraderInfrastructureError("invalid Vitest test accounting")
-    failed_test_ids: list[str] = []
+    failure_details: list[dict[str, str]] = []
     raw_results = payload.get("testResults", [])
     if not isinstance(raw_results, list):
         raise GraderInfrastructureError("invalid Vitest test results")
@@ -179,17 +195,44 @@ def parse_vitest_report(path: Path) -> dict[str, object]:
                 name = assertion.get("fullName")
                 if not isinstance(name, str) or not name:
                     raise GraderInfrastructureError("failed Vitest assertion has no name")
-                failed_test_ids.append(name)
-    if len(failed_test_ids) != failed:
+                messages = assertion.get("failureMessages", [])
+                raw_message = messages[0] if isinstance(messages, list) and messages else ""
+                failure_details.append(
+                    {
+                        "test_id": name,
+                        "message": _failure_summary(
+                            raw_message if isinstance(raw_message, str) else ""
+                        ),
+                    }
+                )
+    if len(failure_details) != failed:
         raise GraderInfrastructureError("Vitest failed test identities do not match counters")
+    failure_details.sort(key=lambda item: item["test_id"])
     return {
         "hidden_checks_total": total,
         "hidden_checks_passed": passed,
         "hidden_checks_failed": failed,
         "hidden_checks_errors": max(0, total - passed - failed - skipped),
         "hidden_checks_skipped": skipped,
-        "hidden_failed_test_ids": sorted(failed_test_ids),
+        "hidden_failed_test_ids": [item["test_id"] for item in failure_details],
+        "hidden_failure_details": failure_details,
     }
+
+
+def _failure_summary(raw: str) -> str:
+    """Keep the useful assertion without persisting terminal dumps or tracebacks."""
+    lines: list[str] = []
+    for source in _ANSI_ESCAPE.sub("", raw).splitlines():
+        line = " ".join(source.split())
+        if not line:
+            continue
+        if line == "Ignored nodes: comments, script, style" or line.startswith("at "):
+            break
+        lines.append(line)
+        if len(" ".join(lines)) >= _FAILURE_SUMMARY_LIMIT:
+            break
+    summary = " ".join(lines) or "unknown failure"
+    return summary[:_FAILURE_SUMMARY_LIMIT].rstrip()
 
 
 def validate_control_result(
@@ -266,6 +309,7 @@ class SupportQueueGrader:
             manifest=manifest,
         )
         results: dict[str, str] = {}
+        failure_details: dict[str, str] = {}
         for name, argv in (checks or regression_commands()).items():
             if name == "frontend_install":
                 results[name] = "passed"
@@ -274,13 +318,15 @@ class SupportQueueGrader:
             try:
                 await self._commands.run(argv, cwd=cwd)
                 results[name] = "passed"
-            except CommandError:
+            except CommandError as exc:
                 results[name] = "failed"
+                failure_details[name] = _failure_summary(str(exc))
         metrics.update(
             regression_checks_total=len(results),
             regression_checks_passed=sum(value == "passed" for value in results.values()),
             regression_checks_failed=sum(value == "failed" for value in results.values()),
             regression_results=results,
+            regression_failure_details=failure_details,
         )
         return metrics
 
