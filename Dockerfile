@@ -70,8 +70,8 @@ ENV PATH="/app/.venv/bin:$PATH"
 # need a global git identity — there's no interactive `git config` step in
 # this container. /home/symphony isn't a mounted volume, so this survives
 # restarts.
-RUN git config --global user.name "Symphony" \
-    && git config --global user.email "symphony@localhost"
+RUN git config --global user.name "Alexey Kulichevskiy" \
+    && git config --global user.email "alexey.kulichevskiy@gmail.com"
 
 # The orchestrator delivers via plain `git push`/`git fetch`, not `gh`. Wire
 # gh in as the HTTPS credential helper (what `gh auth setup-git` does) so those
