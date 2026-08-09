@@ -739,6 +739,10 @@ class Secrets(BaseSettings):
     symphony_oauth_public_origin: str = Field(
         default="", validation_alias="SYMPHONY_OAUTH_PUBLIC_ORIGIN"
     )
+    # Commit identity for headless agent runs. This is read from the mounted
+    # `.env`, because Coolify mounts that file only at runtime.
+    symphony_git_user_name: str = Field(default="", validation_alias="SYMPHONY_GIT_USER_NAME")
+    symphony_git_user_email: str = Field(default="", validation_alias="SYMPHONY_GIT_USER_EMAIL")
     # Telegram push for attention-needed events (SYM-171). Both must be set to
     # enable notifications; either unset makes the notifier a no-op.
     telegram_bot_token: str = Field(default="", validation_alias="TELEGRAM_BOT_TOKEN")

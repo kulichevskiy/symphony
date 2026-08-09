@@ -63,10 +63,6 @@ services:
       - apparmor=unconfined
       - seccomp=unconfined
     environment:
-      # Set these non-secret values in Coolify to the GitHub identity that has
-      # deployment access for agent-authored commits.
-      SYMPHONY_GIT_USER_NAME: ${SYMPHONY_GIT_USER_NAME:-Symphony}
-      SYMPHONY_GIT_USER_EMAIL: ${SYMPHONY_GIT_USER_EMAIL:-symphony@localhost}
       # Fail closed at boot when AUTH0_* is not configured — this stack is
       # publicly routed (see header). Non-secret flag; safe in os.environ.
       SYMPHONY_REQUIRE_AUTH0: "1"

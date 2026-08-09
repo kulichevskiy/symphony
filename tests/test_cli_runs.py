@@ -9,6 +9,7 @@ path the poll loop uses (run row + announce comment).
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,8 @@ from click.testing import CliRunner
 
 from symphony import db
 from symphony.agent.runner import RunnerEvent, RunnerSpec
-from symphony.cli import main
+from symphony.cli import _configure_git_identity, main
+from symphony.config import Secrets
 from symphony.linear.client import LinearIssue
 
 
@@ -87,6 +89,33 @@ def _use_db(monkeypatch, db_path: Path) -> None:  # type: ignore[no-untyped-def]
     monkeypatch.setenv("SYMPHONY_DB_PATH", str(db_path))
     monkeypatch.setenv("SYMPHONY_LOG_ROOT", str(db_path.parent / "logs"))
     monkeypatch.setenv("SYMPHONY_WORKSPACE_ROOT", str(db_path.parent / "workspaces"))
+
+
+def test_configure_git_identity_uses_deployment_settings(tmp_path: Path, monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("SYMPHONY_GIT_USER_NAME", "Deployment Bot")
+    monkeypatch.setenv("SYMPHONY_GIT_USER_EMAIL", "bot@example.com")
+
+    _configure_git_identity(Secrets())
+
+    assert (
+        subprocess.run(
+            ["git", "config", "--global", "user.name"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "Deployment Bot"
+    )
+    assert (
+        subprocess.run(
+            ["git", "config", "--global", "user.email"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        == "bot@example.com"
+    )
 
 
 def _install_fake_runtime(monkeypatch) -> None:  # type: ignore[no-untyped-def]
