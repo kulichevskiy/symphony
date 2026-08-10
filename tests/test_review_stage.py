@@ -791,7 +791,7 @@ async def test_red_ci_fix_syncs_current_pr_base_before_agent(
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_active_review(conn)
-        binding = _binding(remote_review=False, base_branch="release/1.2")
+        binding = _binding(remote_review=False, base_branch="main")
         cfg = Config(
             repos=[binding],
             log_root=tmp_path / "logs",
@@ -826,6 +826,12 @@ async def test_red_ci_fix_syncs_current_pr_base_before_agent(
 
         gh = MagicMock()
         gh.check_log_tail = AsyncMock(return_value="prospective merge tests failed")
+        gh.pr_view = AsyncMock(
+            return_value={
+                "baseRefName": "release/1.2",
+                "headRefOid": "head-sha",
+            }
+        )
         push_fn = AsyncMock()
         orch = Orchestrator(
             cfg,
@@ -859,7 +865,161 @@ async def test_red_ci_fix_syncs_current_pr_base_before_agent(
         )
 
         assert dispatched is True
+        gh.pr_view.assert_awaited_once_with(42, repo="org/repo")
         push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_red_ci_base_sync_abort_failure_parks_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed merge abort must not leave a silently retryable workspace."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        binding = _binding(remote_review=False, base_branch="main")
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        monkeypatch.setattr(review_module, "_git_merge", AsyncMock(return_value=False))
+        monkeypatch.setattr(
+            review_module,
+            "_git_conflicted_files",
+            AsyncMock(return_value=["src/app.py"]),
+        )
+        monkeypatch.setattr(
+            review_module,
+            "_git_abort_merge",
+            AsyncMock(side_effect=RuntimeError("abort refused")),
+        )
+
+        gh = MagicMock()
+        gh.check_log_tail = AsyncMock(return_value="prospective merge tests failed")
+        gh.pr_view = AsyncMock(return_value={"baseRefName": "main"})
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        run = next(
+            r for r in await db.runs.history_for_issue(conn, "iss-1") if r.id == "review-run"
+        )
+
+        dispatched = await orch._dispatch_ci_fix_run(  # noqa: SLF001
+            run=run,
+            binding=binding,
+            issue=_issue_in_progress(),
+            checks=_failing_ci_checks(),
+            verdict=_failing_ci_verdict(),
+            iteration=1,
+        )
+
+        assert dispatched is False
+        monitor = next(
+            r for r in await db.runs.history_for_issue(conn, "iss-1") if r.id == "review-run"
+        )
+        assert monitor.status == "failed"
+        assert "abort refused" in monitor.termination_detail
+        wait = await db.operator_waits.get(conn, "iss-1")
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_red_ci_base_sync_non_conflict_failure_parks_review(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-conflict merge failure must surface its workspace diagnostics."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        binding = _binding(remote_review=False, base_branch="main")
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        monkeypatch.setattr(review_module, "_git_merge", AsyncMock(return_value=False))
+        monkeypatch.setattr(
+            review_module,
+            "_git_conflicted_files",
+            AsyncMock(return_value=[]),
+        )
+        monkeypatch.setattr(
+            review_module,
+            "_git_status_short",
+            AsyncMock(return_value="M src/app.py"),
+        )
+        abort_merge = AsyncMock()
+        monkeypatch.setattr(review_module, "_git_abort_merge", abort_merge)
+
+        gh = MagicMock()
+        gh.check_log_tail = AsyncMock(return_value="prospective merge tests failed")
+        gh.pr_view = AsyncMock(return_value={"baseRefName": "main"})
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        run = next(
+            r for r in await db.runs.history_for_issue(conn, "iss-1") if r.id == "review-run"
+        )
+
+        dispatched = await orch._dispatch_ci_fix_run(  # noqa: SLF001
+            run=run,
+            binding=binding,
+            issue=_issue_in_progress(),
+            checks=_failing_ci_checks(),
+            verdict=_failing_ci_verdict(),
+            iteration=1,
+        )
+
+        assert dispatched is False
+        abort_merge.assert_not_awaited()
+        monitor = next(
+            r for r in await db.runs.history_for_issue(conn, "iss-1") if r.id == "review-run"
+        )
+        assert monitor.status == "failed"
+        assert "no unresolved paths" in monitor.termination_detail
+        assert "M src/app.py" in monitor.termination_detail
     finally:
         await conn.close()
 

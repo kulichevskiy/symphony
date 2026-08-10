@@ -1751,31 +1751,47 @@ class _ReviewMixin(_OrchestratorBase):
             try:
                 github_token = await self._resolve_github_token(repo=binding.github_repo)
                 await _git_fetch_branch(workspace_path, branch, github_token=github_token)
+                state = await db.review_state.get(self._conn, run.issue_id)
+                view: dict[str, object] | None = None
+                if state.pr_number is not None:
+                    try:
+                        result: object = (await self._gh_client()).pr_view(
+                            state.pr_number,
+                            repo=binding.github_repo,
+                        )
+                        if inspect.isawaitable(result):
+                            result = await result
+                        if isinstance(result, dict):
+                            view = result
+                    except (GitHubError, AttributeError, TypeError) as e:
+                        log.warning(
+                            "could not read PR base before CI fix for %s; "
+                            "falling back to configured/default base: %s",
+                            issue.identifier,
+                            e,
+                        )
                 base_ref = await self._resolve_pr_base_ref(
                     binding=binding,
                     issue=issue,
-                    # Symphony-created PRs always target the binding's base
-                    # branch (or the repository default), so no extra PR read
-                    # is needed at this hot retry boundary.
-                    view=None,
+                    view=view,
                 )
                 await _git_fetch(workspace_path, github_token=github_token)
                 if not await _git_merge(workspace_path, f"origin/{base_ref}"):
-                    try:
+                    conflicted_files = await _git_conflicted_files(workspace_path)
+                    if conflicted_files:
                         await _git_abort_merge(workspace_path)
-                    except Exception as abort_error:  # noqa: BLE001
                         log.warning(
-                            "could not abort base sync merge for %s: %s",
+                            "base %s conflicted while preparing CI fix for %s; "
+                            "deferring to merge-conflict handling",
+                            base_ref,
                             issue.identifier,
-                            abort_error,
                         )
-                    log.warning(
-                        "base %s conflicted while preparing CI fix for %s; "
-                        "deferring to merge-conflict handling",
-                        base_ref,
-                        issue.identifier,
-                    )
-                    return False
+                        return False
+                    status_short = await _git_status_short(workspace_path)
+                    error = "base sync merge failed with no unresolved paths"
+                    if status_short:
+                        error += f"; git status: {status_short}"
+                    raise RuntimeError(error)
             except Exception as e:  # noqa: BLE001
                 await self._fail_review_run(
                     run=run,
