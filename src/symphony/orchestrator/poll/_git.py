@@ -368,6 +368,43 @@ async def _git_rebase(workspace_path: Path, upstream: str) -> bool:
     return proc.returncode == 0
 
 
+async def _git_merge(workspace_path: Path, upstream: str) -> bool:
+    """Merge *upstream* into the checked-out branch without rewriting it.
+
+    Returns ``True`` when the merge completes, ``False`` when Git stops for
+    conflicts. Review-fix callers use this to reproduce GitHub's prospective
+    merge checkout while keeping the feature branch push fast-forwardable.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "merge",
+        "--no-edit",
+        upstream,
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    await proc.communicate()
+    return proc.returncode == 0
+
+
+async def _git_abort_merge(workspace_path: Path) -> None:
+    """Abort an in-progress merge in *workspace_path*."""
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "merge",
+        "--abort",
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"git merge --abort failed: {stderr.decode(errors='replace').strip()}")
+
+
 async def _git_abort_rebase(workspace_path: Path) -> None:
     """Abort an in-progress rebase in *workspace_path*."""
     proc = await asyncio.create_subprocess_exec(

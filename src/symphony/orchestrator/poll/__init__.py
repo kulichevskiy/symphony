@@ -85,6 +85,9 @@ from ._git import (
     _default_push as _default_push,
 )
 from ._git import (
+    _git_abort_merge as _git_abort_merge,
+)
+from ._git import (
     _git_abort_rebase as _git_abort_rebase,
 )
 from ._git import (
@@ -98,6 +101,9 @@ from ._git import (
 )
 from ._git import (
     _git_fetch_branch as _git_fetch_branch,
+)
+from ._git import (
+    _git_merge as _git_merge,
 )
 from ._git import (
     _git_rebase as _git_rebase,

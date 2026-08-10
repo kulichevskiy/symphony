@@ -117,11 +117,13 @@ from ._base import (
     _tracker_context_for_binding,
 )
 from ._git import (
+    _git_abort_merge,
     _git_abort_rebase,
     _git_add_and_continue_rebase,
     _git_conflicted_files,
     _git_fetch,
     _git_fetch_branch,
+    _git_merge,
     _git_rebase,
     _git_status_short,
     _sync_workspace_to_remote,
@@ -512,6 +514,14 @@ class _ReviewMixin(_OrchestratorBase):
         async def _move_issue_to_review_state(
             self, *, binding: RepoBinding, issue: LinearIssue
         ) -> None: ...
+
+        async def _resolve_pr_base_ref(
+            self,
+            *,
+            binding: RepoBinding,
+            issue: LinearIssue,
+            view: dict[str, object] | None,
+        ) -> str: ...
 
         async def _park_local_only_review_needs_approval(
             self,
@@ -1741,12 +1751,37 @@ class _ReviewMixin(_OrchestratorBase):
             try:
                 github_token = await self._resolve_github_token(repo=binding.github_repo)
                 await _git_fetch_branch(workspace_path, branch, github_token=github_token)
+                base_ref = await self._resolve_pr_base_ref(
+                    binding=binding,
+                    issue=issue,
+                    # Symphony-created PRs always target the binding's base
+                    # branch (or the repository default), so no extra PR read
+                    # is needed at this hot retry boundary.
+                    view=None,
+                )
+                await _git_fetch(workspace_path, github_token=github_token)
+                if not await _git_merge(workspace_path, f"origin/{base_ref}"):
+                    try:
+                        await _git_abort_merge(workspace_path)
+                    except Exception as abort_error:  # noqa: BLE001
+                        log.warning(
+                            "could not abort base sync merge for %s: %s",
+                            issue.identifier,
+                            abort_error,
+                        )
+                    log.warning(
+                        "base %s conflicted while preparing CI fix for %s; "
+                        "deferring to merge-conflict handling",
+                        base_ref,
+                        issue.identifier,
+                    )
+                    return False
             except Exception as e:  # noqa: BLE001
                 await self._fail_review_run(
                     run=run,
                     binding=binding,
                     issue=issue,
-                    error=f"could not fetch review fix-run remote HEAD for {branch}: {e}",
+                    error=f"could not synchronize review fix-run workspace for {branch}: {e}",
                     last_log=str(e),
                     auto_retry=False,
                     operator_wait=True,

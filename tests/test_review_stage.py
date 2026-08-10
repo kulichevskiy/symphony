@@ -150,6 +150,7 @@ def _binding(
     local_review: bool = False,
     remote_review: bool = True,
     required_status_checks: tuple[str, ...] = (),
+    base_branch: str | None = None,
 ) -> RepoBinding:
     # `codex_model=None` leaves the legacy field unset (out of model_fields_set)
     # so a binding can pair `agent` with a `roles:` model cell without tripping
@@ -163,6 +164,7 @@ def _binding(
         local_review=local_review,
         remote_review=remote_review,
         required_status_checks=required_status_checks,
+        base_branch=base_branch,
         linear_states=LinearStates(ready="Todo", code_review="Needs Approval"),
     )
     if codex_model is not None:
@@ -302,10 +304,18 @@ def _default_workspace_head_sha(monkeypatch: pytest.MonkeyPatch) -> None:
     async def fake_git_fetch_branch(_workspace_path: Path, _branch: str, **_kwargs: object) -> None:
         return None
 
+    async def fake_git_fetch(_workspace_path: Path, **_kwargs: object) -> None:
+        return None
+
+    async def fake_git_merge(_workspace_path: Path, _upstream: str) -> bool:
+        return True
+
     for module in (poll_module, review_module):
         monkeypatch.setattr(module, "_workspace_head_sha", fake_workspace_head_sha)
         monkeypatch.setattr(module, "_workspace_ref_sha", fake_workspace_ref_sha)
         monkeypatch.setattr(module, "_git_fetch_branch", fake_git_fetch_branch)
+        monkeypatch.setattr(module, "_git_fetch", fake_git_fetch)
+        monkeypatch.setattr(module, "_git_merge", fake_git_merge)
     # SYM-150: the implement/deliver stages read these from `poll._lifecycle`.
     monkeypatch.setattr(poll_module._lifecycle, "_workspace_head_sha", fake_workspace_head_sha)
 
@@ -762,6 +772,94 @@ async def test_red_ci_dispatches_fix_run_with_log_tail_and_retriggers_review(
         assert fix_runs[0].status == "completed"
         assert fix_runs[0].pid == 999
         assert fix_runs[0].cost_usd == pytest.approx(0.011025)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_red_ci_fix_syncs_current_pr_base_before_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fix agent must reproduce GitHub's prospective-merge checkout.
+
+    A sibling PR can advance the base branch after this issue's local branch
+    was created. GitHub runs required checks against the prospective merge,
+    so reviewing only the stale feature branch can repeatedly miss the same
+    failure.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_active_review(conn)
+        binding = _binding(remote_review=False, base_branch="release/1.2")
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        events: list[str] = []
+
+        async def fetch_branch(*_args: object, **_kwargs: object) -> None:
+            events.append("feature")
+
+        async def fetch_all(*_args: object, **_kwargs: object) -> None:
+            events.append("base")
+
+        async def merge_base(_path: Path, upstream: str) -> bool:
+            events.append(f"merge:{upstream}")
+            return True
+
+        monkeypatch.setattr(review_module, "_git_fetch_branch", fetch_branch)
+        monkeypatch.setattr(review_module, "_git_fetch", fetch_all)
+        monkeypatch.setattr(review_module, "_git_merge", merge_base, raising=False)
+
+        gh = MagicMock()
+        gh.check_log_tail = AsyncMock(return_value="prospective merge tests failed")
+        push_fn = AsyncMock()
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        async def fix_agent(**_kwargs: object) -> tuple[UsageDelta, str, int]:
+            assert events == ["feature", "base", "merge:origin/release/1.2"]
+            return (UsageDelta(cost_usd=0.01), "exit", 0)
+
+        orch._run_fix_agent = AsyncMock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=fix_agent
+        )
+        run = next(
+            r for r in await db.runs.history_for_issue(conn, "iss-1") if r.id == "review-run"
+        )
+
+        dispatched = await orch._dispatch_ci_fix_run(  # noqa: SLF001
+            run=run,
+            binding=binding,
+            issue=_issue_in_progress(),
+            checks=_failing_ci_checks(),
+            verdict=_failing_ci_verdict(),
+            iteration=1,
+        )
+
+        assert dispatched is True
+        push_fn.assert_awaited_once_with(workspace_path, "symphony/eng-1")
     finally:
         await conn.close()
 
