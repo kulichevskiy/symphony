@@ -1601,6 +1601,76 @@ async def test_review_fix_dirty_tree_commit_turn_no_op_escalates_with_uncommitte
 
 
 @pytest.mark.asyncio
+async def test_review_fix_dirty_tree_cleanup_without_commit_is_resolved_no_op(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dirty-tree fix may only remove a runtime artifact.
+
+    If that cleanup leaves the workspace clean without changing HEAD, the
+    original review fix is already resolved. It must re-arm review instead of
+    falsely parking the issue as still dirty.
+    """
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        orch = _validate_orch(conn, tmp_path)
+        await db.issues.upsert(
+            conn, id="iss-1", identifier="ENG-1", title="Add auth", team_key="ENG"
+        )
+        await db.runs.create(
+            conn,
+            id="review-fix",
+            issue_id="iss-1",
+            stage="review_fix",
+            status="running",
+            pid=None,
+            started_at=datetime.now(UTC).isoformat(),
+        )
+
+        cleaned = False
+
+        async def fake_dirty_files(_ws: Path) -> list[str]:
+            return [] if cleaned else ["?? support_queue.sqlite.lock"]
+
+        async def fake_head_sha(_ws: Path) -> str:
+            return "before-fix-sha"
+
+        monkeypatch.setattr(review_module, "_workspace_dirty_files", fake_dirty_files)
+        monkeypatch.setattr(review_module, "_workspace_head_sha", fake_head_sha)
+
+        async def fake_cleanup_turn(**_kwargs: object) -> None:
+            nonlocal cleaned
+            cleaned = True
+
+        cleanup_turn = AsyncMock(side_effect=fake_cleanup_turn)
+        monkeypatch.setattr(orch, "_run_dirty_tree_fix_turn", cleanup_turn)
+        fail = AsyncMock()
+        monkeypatch.setattr(orch, "_fail_review_run", fail)
+
+        run = MagicMock()
+        run.id = "review-run"
+        run.issue_id = "iss-1"
+
+        result = await orch._validate_review_fix_advanced(  # noqa: SLF001
+            run=run,
+            fix_run_id="review-fix",
+            binding=_binding(),
+            issue=_issue_in_progress(),
+            workspace_path=tmp_path,
+            branch="symphony/eng-1",
+            start_sha="before-fix-sha",
+        )
+
+        assert result is not None
+        assert result.sha == "before-fix-sha"
+        assert result.changed is False
+        cleanup_turn.assert_awaited_once()
+        fail.assert_not_awaited()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_review_fix_clean_tree_no_op_unchanged(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

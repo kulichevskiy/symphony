@@ -3043,13 +3043,17 @@ class _ReviewMixin(_OrchestratorBase):
                         dirty_files=dirty_files,
                     )
                     current_sha = await _workspace_head_sha(workspace_path)
-                    remaining_dirty = (
-                        await _workspace_dirty_files(workspace_path)
-                        if current_sha and current_sha != start_sha
-                        else dirty_files
-                    )
+                    remaining_dirty = await _workspace_dirty_files(workspace_path)
                     if current_sha and current_sha != start_sha and not remaining_dirty:
                         return _ReviewFixAdvance(sha=current_sha, changed=True)
+                    if current_sha and current_sha == start_sha and not remaining_dirty:
+                        log.info(
+                            "review fix-run cleanup for %s left clean unchanged HEAD %s; "
+                            "treating the signal as already resolved",
+                            issue.identifier,
+                            current_sha[:12],
+                        )
+                        return _ReviewFixAdvance(sha=current_sha, changed=False)
                     short_sha = (current_sha or start_sha)[:12] or "(unknown)"
                     status_short = await _git_status_short(workspace_path)
                     last_log = f"git status --short:\n{status_short}" if status_short else ""
