@@ -20,8 +20,8 @@ def build_codex_workspace_write_command(
     *,
     prompt: str,
     codex_model: str,
+    workspace_path: Path,
     effort: str | None = None,
-    workspace_path: Path | None = None,
 ) -> list[str]:
     """Build `codex exec` argv for agents that must modify and commit.
 
@@ -41,8 +41,7 @@ def build_codex_workspace_write_command(
         "--json",
         "--dangerously-bypass-approvals-and-sandbox",
     ]
-    if workspace_path is not None:
-        command += ["--cd", str(workspace_path)]
+    command += ["--cd", str(workspace_path)]
     if effort is not None:
         command += ["--config", codex_reasoning_effort_config(effort)]
     command += ["--model", codex_model, prompt]

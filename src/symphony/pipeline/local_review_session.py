@@ -169,6 +169,7 @@ def _build_fix_command(
     agent: ImplementerAgent,
     codex_model: str,
     prompt: str,
+    workspace_path: Path,
     claude_model: str | None = None,
     effort: str | None = None,
     mcp_servers: Mapping[str, Any] | None = None,
@@ -215,6 +216,7 @@ def _build_fix_command(
             prompt=prompt,
             codex_model=codex_model,
             effort=effort,
+            workspace_path=workspace_path,
         )
     raise ValueError(f"unknown implementer agent {agent!r}")
 
@@ -858,6 +860,7 @@ async def run_local_review_session(
             agent=fixer_role.agent,
             codex_model=fixer_role.codex_model_arg(),
             prompt=prompt,
+            workspace_path=workspace_path,
             claude_model=fixer_role.claude_model_arg(),
             effort=fixer_role.effort,
             mcp_servers=mcp_servers,

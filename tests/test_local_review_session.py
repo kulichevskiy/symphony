@@ -533,6 +533,7 @@ async def test_codex_fix_run_allows_git_writes(tmp_path: Path) -> None:
     assert "--dangerously-bypass-approvals-and-sandbox" in fix_argv
     assert "--sandbox" not in fix_argv
     assert "workspace-write" not in fix_argv
+    assert fix_argv[fix_argv.index("--cd") + 1] == str(workspace)
     # Permissions/approval --config knobs are gone (superseded by the bypass).
     assert not any("default_permissions" in a or "approval_policy" in a for a in fix_argv)
 
