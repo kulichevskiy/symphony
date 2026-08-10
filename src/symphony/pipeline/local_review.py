@@ -857,15 +857,11 @@ def _same_root_cause(left: str, right: str) -> bool:
 def _severity_rank(text: str) -> int:
     canonical = _LEADING_SEVERITY_TAG_RE.match(text)
     if canonical is not None:
-        return {"critical": 3, "major": 2, "minor": 1}[
-            canonical.group(1).casefold()
-        ]
+        return {"critical": 3, "major": 2, "minor": 1}[canonical.group(1).casefold()]
     matches = list(_SEVERITY_TAG_RE.finditer(text))
     if len(matches) != 1:
         return 0
-    return {"critical": 3, "major": 2, "minor": 1}[
-        matches[0].group(1).casefold()
-    ]
+    return {"critical": 3, "major": 2, "minor": 1}[matches[0].group(1).casefold()]
 
 
 def _builtin_findings(message: str) -> list[str]:
@@ -1126,13 +1122,9 @@ _VERDICT_LINE_RE = re.compile(
     rf"{re.escape(VERDICT_CHANGES_REQUESTED_MARKER)})"
 )
 _FINDINGS_HEADING_RE = re.compile(r"(?im)^\s*#{1,6}\s*findings\b\s*$")
-_FINDING_BULLET_LINE_RE = re.compile(
-    r"^(?P<indent>[ \t]{0,3})(?P<marker>[-*+]\s+)(?P<body>.+)$"
-)
+_FINDING_BULLET_LINE_RE = re.compile(r"^(?P<indent>[ \t]{0,3})(?P<marker>[-*+]\s+)(?P<body>.+)$")
 _SEVERITY_TAG_RE = re.compile(r"\[(Critical|Major|Minor)\]", re.IGNORECASE)
-_LEADING_SEVERITY_TAG_RE = re.compile(
-    r"^\*{0,2}`?\[(Critical|Major|Minor)\]", re.IGNORECASE
-)
+_LEADING_SEVERITY_TAG_RE = re.compile(r"^\*{0,2}`?\[(Critical|Major|Minor)\]", re.IGNORECASE)
 _BUILTIN_FINDING_RE = re.compile(
     r"(?ms)^(?:[-*+]\s*)?\[(P[0-3])\]\s+(.+?)"
     r"(?=^(?:[-*+]\s*)?\[P[0-3]\]\s+|\Z)"
@@ -1142,6 +1134,8 @@ _BUILTIN_CLEAN_RE = re.compile(
     r"\b(?:no findings|no actionable findings|did not find any findings|nothing to flag)\b",
     re.IGNORECASE,
 )
+
+
 def extract_last_agent_message(
     *, agent: ReviewerAgent, stdout: str, last_message_file: str | None = None
 ) -> str:

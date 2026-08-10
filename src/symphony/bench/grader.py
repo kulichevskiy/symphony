@@ -138,9 +138,7 @@ def parse_junit_report(path: Path) -> dict[str, object]:
         (
             {
                 "test_id": testcase.attrib.get("name", ""),
-                "message": _failure_summary(
-                    failure.attrib.get("message") or failure.text or ""
-                ),
+                "message": _failure_summary(failure.attrib.get("message") or failure.text or ""),
             }
             for testcase in root.iter("testcase")
             if (failure := testcase.find("failure")) is not None

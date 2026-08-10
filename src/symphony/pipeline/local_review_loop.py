@@ -323,10 +323,7 @@ async def run_local_review_loop(
                 if reviewer_retries_used < REVIEWER_FAILURE_RETRIES:
                     reviewer_retries_used += 1
                     continue
-            elif (
-                parsed.severity_inferred
-                and severity_retries_used < REVIEWER_FAILURE_RETRIES
-            ):
+            elif parsed.severity_inferred and severity_retries_used < REVIEWER_FAILURE_RETRIES:
                 severity_retries_used += 1
                 continue
             verdict = parsed

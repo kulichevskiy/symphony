@@ -185,9 +185,7 @@ async def test_linear_sandbox_reconciles_durable_project_chronicle_marker() -> N
             200,
             json={
                 "data": {
-                    "project": {
-                        "projectUpdates": {"nodes": [{"body": f"Started.\n\n{marker}"}]}
-                    }
+                    "project": {"projectUpdates": {"nodes": [{"body": f"Started.\n\n{marker}"}]}}
                 }
             },
         )

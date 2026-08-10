@@ -84,9 +84,7 @@ def create_bench_app(
                     await publish_failed_experiment(interrupted_experiment)
                     store.acknowledge_experiment_chronicle_recovery(experiment_id)
                 except Exception:  # noqa: BLE001 - recovery must not block the worker restart
-                    log.exception(
-                        "could not publish interrupted experiment %s", experiment_id
-                    )
+                    log.exception("could not publish interrupted experiment %s", experiment_id)
         if interrupted_experiments:
             log.error(
                 "marked %d interrupted experiment(s) failed on startup",

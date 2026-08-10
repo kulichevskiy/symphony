@@ -163,15 +163,11 @@ def test_merge_hybrid_review_messages_deduplicates_and_caps_p2() -> None:
 def test_merge_hybrid_review_messages_caps_p2_across_both_axes() -> None:
     spec = (
         "## Findings\n"
-        + "\n".join(
-            f"- [Minor] spec.py:{index} missing case {index}."
-            for index in range(1, 5)
-        )
+        + "\n".join(f"- [Minor] spec.py:{index} missing case {index}." for index in range(1, 5))
         + f"\n{VERDICT_CHANGES_REQUESTED_MARKER}"
     )
     bug = "\n".join(
-        f"[P2] Bug {index} — bug.py:{index} — Guard case {index}."
-        for index in range(1, 5)
+        f"[P2] Bug {index} — bug.py:{index} — Guard case {index}." for index in range(1, 5)
     )
 
     merged = merge_hybrid_review_messages(
@@ -189,9 +185,7 @@ def test_merge_hybrid_review_messages_caps_p2_across_both_axes() -> None:
 def test_merge_hybrid_review_messages_uses_builtin_canonical_severity() -> None:
     merged = merge_hybrid_review_messages(
         spec_message=f"All requirements hold.\n{VERDICT_APPROVED_MARKER}",
-        bug_message=(
-            "[P2] Literal severity — parser.py:3 — Reject a literal [Major] tag."
-        ),
+        bug_message=("[P2] Literal severity — parser.py:3 — Reject a literal [Major] tag."),
         head_sha="abc123",
         max_p2=0,
     )
@@ -224,9 +218,7 @@ def test_merge_hybrid_review_messages_keeps_worst_duplicate_severity() -> None:
             "- [Major] api.py:10 agents cannot create tickets. Allow agents.\n"
             f"{VERDICT_CHANGES_REQUESTED_MARKER}"
         ),
-        bug_message=(
-            "[P0] Agents cannot create tickets — api.py:10 — Allow authenticated agents."
-        ),
+        bug_message=("[P0] Agents cannot create tickets — api.py:10 — Allow authenticated agents."),
         head_sha="abc123",
     )
     assert merged.findings.count("api.py:10") == 1

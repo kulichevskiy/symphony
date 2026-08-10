@@ -127,14 +127,14 @@ def parse_model_usage(lines: Iterable[str], *, codex_model: str | None) -> list[
         elif kind == "token_count":
             codex_seen = True
             info = obj.get("info")
-            usage = info.get("total_token_usage") if isinstance(info, dict) else None
-            if isinstance(usage, dict):
-                codex_current = _codex_tokens(usage)
+            usage_data = info.get("total_token_usage") if isinstance(info, dict) else None
+            if isinstance(usage_data, dict):
+                codex_current = _codex_tokens(usage_data)
         elif kind == "turn.completed":
             codex_seen = True
-            usage = obj.get("usage")
-            if isinstance(usage, dict):
-                codex_current = _codex_tokens(usage)
+            usage_data = obj.get("usage")
+            if isinstance(usage_data, dict):
+                codex_current = _codex_tokens(usage_data)
 
     commit_codex()
 

@@ -16,9 +16,7 @@ _LOCAL_REVIEW_MARKERS = (
 )
 _LOCAL_FINDING_RE = re.compile(r"(?m)^[ \t]{0,3}[-*][ \t]+(.+)$")
 _LOCAL_SEVERITY_RE = re.compile(r"\[(Critical|Major|Minor)\]", re.IGNORECASE)
-_LOCAL_LEADING_SEVERITY_RE = re.compile(
-    r"^\*{0,2}`?\[(Critical|Major|Minor)\]", re.IGNORECASE
-)
+_LOCAL_LEADING_SEVERITY_RE = re.compile(r"^\*{0,2}`?\[(Critical|Major|Minor)\]", re.IGNORECASE)
 _LOCAL_AUXILIARY_FILE_RE = re.compile(r"^review-\d+-(?:find|spec|bug)(?:-attempt-\d+)?\.last\.txt$")
 
 

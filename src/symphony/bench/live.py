@@ -677,9 +677,7 @@ class LiveTrialExecutor:
         await self._publish_chronicle(
             linear=linear,
             project_id=project_id,
-            event_key=(
-                f"{trial.experiment_id}:{trial.candidate}{trial.repetition}:{event}"
-            ),
+            event_key=(f"{trial.experiment_id}:{trial.candidate}{trial.repetition}:{event}"),
             health="offTrack",
             body=failed_run_update(trial, error, outcome),
             metrics=outcome.metrics,

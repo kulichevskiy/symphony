@@ -530,9 +530,7 @@ async def test_live_trial_provisions_runs_and_returns_traceable_outcome(
     assert (private_root / "EXP-1/A1/receipt-manifest.json").exists()
     assert github.archived == ["kulichevskiy/EXP-1-A1"]
     assert "## Hypothesis" in str(linear.campaign_calls[0]["project_description"])
-    assert linear.project_updates == [
-        ("onTrack", linear.project_updates[0][1])
-    ]
+    assert linear.project_updates == [("onTrack", linear.project_updates[0][1])]
     assert "finished successfully" in linear.project_updates[0][1]
     assert "version a, run 1 finished successfully" in linear.project_updates[0][1].lower()
     assert "hidden checks" in linear.project_updates[0][1].lower()
@@ -1041,9 +1039,7 @@ async def test_terminal_update_waits_for_pending_launch_update(
         linear=FailingChronicleLinear(),
     )
     project_id = await launch.start_experiment(experiment)
-    failed = experiment.model_copy(
-        update={"status": "failed", "linear_project_id": project_id}
-    )
+    failed = experiment.model_copy(update={"status": "failed", "linear_project_id": project_id})
     delivered = FakeLinear()
     terminal = LiveTrialExecutor(
         config=config,

@@ -100,8 +100,7 @@ def _append_grader(lines: list[str], record: TrialRecord, *, level: int) -> None
         lines.extend(
             [
                 "",
-                f"{'#' * (level + 1)} Regression checks — "
-                f"{regression_passed}/{regression_total}",
+                f"{'#' * (level + 1)} Regression checks — {regression_passed}/{regression_total}",
             ]
         )
         results = metrics.get("regression_results")

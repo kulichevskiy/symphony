@@ -191,6 +191,4 @@ def test_render_trial_markdown_explains_backend_and_frontend_grades() -> None:
     assert "### Frontend — 10/13" in rendered
     assert "`supports workflow`: button name did not match" in rendered
     assert "### Regression checks — 6/7" in rendered
-    assert (
-        "`frontend_audit`: npm audit exited 1: high severity vulnerability" in rendered
-    )
+    assert "`frontend_audit`: npm audit exited 1: high severity vulnerability" in rendered

@@ -66,9 +66,7 @@ def test_serve_routes_single_lane_b_and_preflights_only_assigned_lane(
         async def resolve_revision(self, revision: str) -> str:
             return revision
 
-    async def prepare(
-        _experiment_id: str, *, lanes: object, **_kwargs: object
-    ) -> str:
+    async def prepare(_experiment_id: str, *, lanes: object, **_kwargs: object) -> str:
         captured["lanes"] = [lane[0] for lane in lanes]  # type: ignore[union-attr]
         return "harness"
 

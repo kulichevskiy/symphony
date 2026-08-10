@@ -71,15 +71,9 @@ class ExperimentStore:
                 )
                 """
             )
-            self._ensure_column(
-                conn, "bench_experiments", "mode", "TEXT NOT NULL DEFAULT 'paired'"
-            )
-            self._ensure_column(
-                conn, "bench_experiments", "hypothesis", "TEXT NOT NULL DEFAULT ''"
-            )
-            self._ensure_column(
-                conn, "bench_experiments", "design", "TEXT NOT NULL DEFAULT ''"
-            )
+            self._ensure_column(conn, "bench_experiments", "mode", "TEXT NOT NULL DEFAULT 'paired'")
+            self._ensure_column(conn, "bench_experiments", "hypothesis", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column(conn, "bench_experiments", "design", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column(
                 conn, "bench_experiments", "candidate_a_profile", "TEXT NOT NULL DEFAULT '{}'"
             )
@@ -115,12 +109,8 @@ class ExperimentStore:
             )
             self._ensure_column(conn, "bench_trials", "profile", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column(conn, "bench_trials", "system_version", "TEXT NOT NULL DEFAULT ''")
-            self._ensure_column(
-                conn, "bench_trials", "execution_lane", "TEXT NOT NULL DEFAULT 'A'"
-            )
-            conn.execute(
-                "UPDATE bench_trials SET execution_lane = 'B' WHERE candidate = 'B'"
-            )
+            self._ensure_column(conn, "bench_trials", "execution_lane", "TEXT NOT NULL DEFAULT 'A'")
+            conn.execute("UPDATE bench_trials SET execution_lane = 'B' WHERE candidate = 'B'")
             self._ensure_column(
                 conn,
                 "bench_trials",

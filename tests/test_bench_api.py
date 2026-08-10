@@ -112,18 +112,14 @@ def test_submit_and_read_experiment_survives_restart(tmp_path: Path) -> None:
     with TestClient(create_bench_app(db_path=db_path, api_token="test-token")) as client:
         unauthorized = client.post(
             "/experiments",
-            json=_experiment_payload(
-                candidate_a="ee195f4", candidate_b="ee195f4", repetitions=3
-            ),
+            json=_experiment_payload(candidate_a="ee195f4", candidate_b="ee195f4", repetitions=3),
         )
         assert unauthorized.status_code == 401
 
         submitted = client.post(
             "/experiments",
             headers=headers,
-            json=_experiment_payload(
-                candidate_a="ee195f4", candidate_b="ee195f4", repetitions=3
-            ),
+            json=_experiment_payload(candidate_a="ee195f4", candidate_b="ee195f4", repetitions=3),
         )
         assert submitted.status_code == 201
         body = submitted.json()
@@ -278,9 +274,7 @@ def test_store_claims_two_single_experiments_on_distinct_lanes_and_queues_third(
 ) -> None:
     store = ExperimentStore(tmp_path / "bench.sqlite")
     experiments = [
-        store.create(
-            _experiment_request(candidate_a=f"sha-{index}", repetitions=1, mode="single")
-        )
+        store.create(_experiment_request(candidate_a=f"sha-{index}", repetitions=1, mode="single"))
         for index in range(3)
     ]
 
@@ -303,15 +297,9 @@ def test_store_claims_two_single_experiments_on_distinct_lanes_and_queues_third(
 
 def test_paired_experiment_waits_for_both_lanes_and_blocks_singles(tmp_path: Path) -> None:
     store = ExperimentStore(tmp_path / "bench.sqlite")
-    single = store.create(
-        _experiment_request(candidate_a="single", repetitions=1, mode="single")
-    )
-    paired = store.create(
-        _experiment_request(candidate_a="a", candidate_b="b", repetitions=1)
-    )
-    later = store.create(
-        _experiment_request(candidate_a="later", repetitions=1, mode="single")
-    )
+    single = store.create(_experiment_request(candidate_a="single", repetitions=1, mode="single"))
+    paired = store.create(_experiment_request(candidate_a="a", candidate_b="b", repetitions=1))
+    later = store.create(_experiment_request(candidate_a="later", repetitions=1, mode="single"))
 
     claimed_single = store.claim_next()
     assert claimed_single is not None
@@ -472,9 +460,7 @@ async def test_runner_lets_sibling_finish_when_candidate_fails(
     tmp_path: Path,
 ) -> None:
     store = ExperimentStore(tmp_path / "bench.sqlite")
-    experiment = store.create(
-        _experiment_request(candidate_a="a", candidate_b="b", repetitions=2)
-    )
+    experiment = store.create(_experiment_request(candidate_a="a", candidate_b="b", repetitions=2))
 
     async def execute(trial: Trial) -> TrialOutcome:
         if trial.candidate == "A" and trial.repetition == 1:
@@ -803,9 +789,7 @@ def test_restart_fails_both_running_lanes_and_releases_capacity(tmp_path: Path) 
     db_path = tmp_path / "bench.sqlite"
     store = ExperimentStore(db_path)
     experiments = [
-        store.create(
-            _experiment_request(candidate_a=f"sha-{index}", repetitions=1, mode="single")
-        )
+        store.create(_experiment_request(candidate_a=f"sha-{index}", repetitions=1, mode="single"))
         for index in range(2)
     ]
     claimed = [store.claim_next(), store.claim_next()]
@@ -854,9 +838,7 @@ def test_restart_fails_both_running_lanes_and_releases_capacity(tmp_path: Path) 
 def test_store_backfills_legacy_candidate_b_execution_lane(tmp_path: Path) -> None:
     db_path = tmp_path / "bench.sqlite"
     store = ExperimentStore(db_path)
-    experiment = store.create(
-        _experiment_request(candidate_a="a", candidate_b="b", repetitions=1)
-    )
+    experiment = store.create(_experiment_request(candidate_a="a", candidate_b="b", repetitions=1))
     assert store.claim_next() is not None
     store.start_trial(
         Trial(
