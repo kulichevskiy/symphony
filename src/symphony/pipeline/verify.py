@@ -189,6 +189,7 @@ async def run_verify_session(
             agent=fixer_role.agent,
             codex_model=fixer_role.codex_model_arg(),
             prompt=prompt,
+            workspace_path=workspace_path,
             claude_model=fixer_role.claude_model_arg(),
             effort=fixer_role.effort,
         ),

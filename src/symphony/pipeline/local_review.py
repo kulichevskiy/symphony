@@ -31,6 +31,7 @@ import json
 import re
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Literal
 
 from ..agent.codex_cli import codex_reasoning_effort_config
@@ -966,6 +967,7 @@ def build_local_review_command(
     effort: str | None = None,
     last_message_path: str | None = None,
     pass_two: bool = False,
+    workspace_path: Path | None = None,
 ) -> list[str]:
     """argv for the local reviewer subprocess.
 
@@ -995,6 +997,8 @@ def build_local_review_command(
     """
     _ = base_branch
     if agent == "codex":
+        if pass_two and workspace_path is None:
+            raise ValueError("workspace_path is required for writable codex review passes")
         command = [
             "codex",
             "exec",
@@ -1005,6 +1009,8 @@ def build_local_review_command(
             "--dangerously-bypass-approvals-and-sandbox",
             "--json",
         ]
+        if workspace_path is not None:
+            command.extend(["--cd", str(workspace_path)])
         if effort is not None:
             command.extend(["--config", codex_reasoning_effort_config(effort)])
         command.extend(["--model", codex_model])

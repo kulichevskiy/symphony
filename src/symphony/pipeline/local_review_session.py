@@ -169,7 +169,7 @@ def _build_fix_command(
     agent: ImplementerAgent,
     codex_model: str,
     prompt: str,
-    workspace_path: Path,
+    workspace_path: Path | None = None,
     claude_model: str | None = None,
     effort: str | None = None,
     mcp_servers: Mapping[str, Any] | None = None,
@@ -212,6 +212,8 @@ def _build_fix_command(
         command.extend(["--", prompt])
         return command
     if agent == "codex":
+        if workspace_path is None:
+            raise ValueError("workspace_path is required for codex write runs")
         return build_codex_workspace_write_command(
             prompt=prompt,
             codex_model=codex_model,
@@ -389,6 +391,7 @@ async def run_local_review_session(
                 effort=effort,
                 last_message_path=(str(last_message_path) if agent == "codex" else None),
                 pass_two=pass_two,
+                workspace_path=workspace_path,
             )
         spec = RunnerSpec(
             run_id=_safe_run_id(parent_run_id, run_suffix),

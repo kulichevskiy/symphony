@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -427,7 +428,9 @@ def test_build_local_review_command_codex_ignores_claude_model() -> None:
     assert "claude-sonnet-4-6" not in argv
 
 
-def test_build_local_review_command_codex_pass_two_uses_workspace_write() -> None:
+def test_build_local_review_command_codex_pass_two_uses_workspace_write(
+    tmp_path: Path,
+) -> None:
     """Tier B (pass 2 only): codex switches to a writable sandbox so the
     verifier can write a throwaway test and run it."""
     argv = build_local_review_command(
@@ -437,6 +440,7 @@ def test_build_local_review_command_codex_pass_two_uses_workspace_write() -> Non
         codex_model="gpt-5.1-codex",
         last_message_path="/tmp/last.txt",
         pass_two=True,
+        workspace_path=tmp_path,
     )
     assert argv[:2] == ["codex", "exec"]
     # codex no longer nests a sandbox (bypassed); pass 2's write/execute intent
@@ -445,6 +449,7 @@ def test_build_local_review_command_codex_pass_two_uses_workspace_write() -> Non
     assert "--sandbox" not in argv
     assert "workspace-write" not in argv
     assert "read-only" not in argv
+    assert argv[argv.index("--cd") + 1] == str(tmp_path)
 
 
 def test_build_local_review_command_claude_pass_two_grants_tier_b_tools() -> None:
