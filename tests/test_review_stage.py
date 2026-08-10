@@ -3269,6 +3269,7 @@ def test_build_fix_runner_command_uses_codex_when_binding_is_codex(
     assert "workspace-write" not in argv
     assert "--config" not in argv
     assert argv[argv.index("--model") + 1] == "gpt-5.1-codex-max"
+    assert argv[argv.index("--cd") + 1] == str(tmp_path)
     assert "fix this" in argv
 
 

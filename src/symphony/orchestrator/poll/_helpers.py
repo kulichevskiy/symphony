@@ -186,6 +186,7 @@ def build_runner_command(
             prompt=prompt,
             codex_model=codex_model,
             effort=effort,
+            workspace_path=workspace_path,
         )
     raise ValueError(f"unknown agent {agent!r}")
 
