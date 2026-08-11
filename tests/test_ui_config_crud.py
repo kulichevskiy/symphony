@@ -1262,7 +1262,6 @@ async def test_options_payload(tmp_path: Path, monkeypatch) -> None:  # type: ig
         assert body["agent_families"] == ["claude", "codex"]
         assert body["merge_strategies"] == ["squash", "merge", "rebase"]
         assert set(body["claude_aliases"]) == {"opus", "sonnet", "haiku"}
-        assert "gpt-5.1-codex" in body["codex_models"]
         assert {"gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"} <= set(body["codex_models"])
         assert body["codex_efforts_by_model"]["gpt-5.6-sol"] == [
             "low",

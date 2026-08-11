@@ -52,114 +52,73 @@ const ROLE_ORDER = [
   "accept",
 ] as const;
 
-// Which cells of a role are actually threaded into a dispatched command — the
-// rest validate/display but never affect a runtime dispatch, so exposing them
-// as editable would offer a knob that silently does nothing:
-//  * `effort` only ever reaches a subprocess flag for `implement`
-//    (`build_runner_command`); `review_find`/`fix`'s command builders take no
-//    `effort` param, and `review_verify`/`accept` are never resolved on any
-//    dispatch path.
-//  * `review_verify.agent` never picks the verifier's own CLI — the verifier
-//    pass always reuses the legacy `binding.agent` (`_lifecycle.py` passes it
-//    through as `implementer_agent`). It must still be editable: `resolved_
-//    role("review_verify", ...).model` only reaches the verifier's `--model`
-//    when the *resolved* agent is `claude`
-//    (`effective_config._synthesize_legacy_role_fields`), and that agent
-//    defaults to the implementer-opposite family
-//    (`resolved_reviewer_agent()`) — so for the common claude implementer, a
-//    `review_verify.model` override silently drops unless `agent` is also
-//    pinned to `claude`. When the row's own `agent` cell is explicitly
-//    `codex`, the model cell is hidden outright (see `modelWired` below): the
-//    verifier's codex model always comes from the legacy `binding.codex_model`
-//    (`implementer_codex_model`), never from `resolved_role("review_verify",
-//    ...).model`, so a codex-resolved override is *always* a no-op, not just
-//    the claude-default case above.
-//  * `fix.agent` is NOT wired: `_run_fix_agent` picks its CLI from the legacy
-//    `binding.agent`, never from `resolved_role("fix", ...).agent`
-//    (`orchestrator/poll/_base.py`/`_helpers.build_fix_runner_command`). Its
-//    hidden cell is kept in lockstep with `implement.agent` (see `cellChange`)
-//    so `_synthesize_legacy_role_fields` can still sync `binding.agent` for
-//    the legacy readers (completion parsing, activity, cost) when an operator
-//    picks codex for `implement`.
-//    `fix.model` IS live *only for a claude-resolved fix role*:
-//    `_fix_claude_model` reads `resolved_role("fix", ...).model` and threads
-//    it into the fixer's `--model`. `_run_fix_agent` always passes
-//    `codex_model=binding.codex_model` — never `resolved_role("fix",
-//    ...).model` — so a codex-resolved fix role's model cell (see
-//    `modelWired`) is hidden the same way as `review_verify`'s.
-//  * `accept.agent`/`accept.model` are NOT wired: `build_acceptance_command`
-//    hardcodes the `claude` CLI and takes no model param at all
-//    (`agent/runners/acceptance.py`).
-const ROLE_FIELDS: Record<string, { agent: boolean; model: boolean; effort: boolean }> = {
-  implement: { agent: true, model: true, effort: true },
-  review_find: { agent: true, model: true, effort: false },
-  review_verify: { agent: true, model: true, effort: false },
-  fix: { agent: false, model: true, effort: false },
-  accept: { agent: false, model: false, effort: false },
-};
-
-/** Muted placeholder for a cell whose field the runtime never reads. */
-function UnusedCell() {
-  return <span className="text-xs text-muted-foreground">not used</span>;
-}
-
 // --- Role matrix editing (SYM-191) -------------------------------------------
+//
+// Every (role × agent/model/effort) cell is threaded into that role's dispatched
+// command, so all 15 are editable — none is a decorative knob:
+//  * `implement` → `build_runner_command` (`poll/_base.py`),
+//  * `review_find`/`review_verify` → `_run_reviewer_pass`'s
+//    `build_local_review_command` (`pipeline/local_review_session.py`),
+//  * `fix` → `build_fix_runner_command` (`_base.py`, `_merge.py`, `_review.py`),
+//  * `accept` → `build_acceptance_command` for the verdict run
+//    (`poll/_acceptance.py`) and `build_fix_runner_command` for acceptance-fix.
+// All of them take the role's `agent`, `model` (via `role_codex_model`/
+// `role_claude_model`) and `effort`.
 
-/** Models offered for an (agent) pick. An inherited (empty) agent leaves the
- *  family unknown client-side, so the model cell offers the union of both
- *  families (mirroring `effortsFor`'s inherited-agent fallback) — an operator
- *  can still override just the model without first pinning an agent; the
- *  server family-checks the resolved pair at save. */
+/** Models offered for a family. Cells follow the family the role *resolves* to
+ *  (see `effectiveAgent`) rather than offering the union of both, so an
+ *  inherited row never lists a model the server's family check would reject. */
 function modelsFor(options: ConfigOptions, agent: string): string[] {
-  if (agent === "codex") return options.codex_models;
-  if (agent === "claude") return options.claude_aliases;
-  return [...new Set([...options.claude_aliases, ...options.codex_models])].sort();
+  return agent === "codex" ? options.codex_models : options.claude_aliases;
 }
 
-/** Best-effort resolved agent family for `role`, used only to decide whether
- *  a dead model cell should be hidden — NOT a full inheritance resolution.
- *  An explicit binding cell wins, then the global matrix's cell for the same
- *  role (so a binding that leaves `implement.agent` inherited still resolves
- *  to a global `codex` default instead of silently falling through to the
- *  hardcoded `claude` guess below); otherwise `fix` mirrors `implement`
- *  (kept in lockstep by `cellChange`).
+/** The family `role` resolves to when its own `agent` cell is left inherited —
+ *  mirrors the server's `RepoBinding._default_role_agent` (`config.py`):
  *
- *  `review_verify` does NOT mirror `implement` here: server-side,
- *  `resolved_role`'s fallback for a non-builder role is
- *  `resolved_reviewer_agent()` (`config.py`), which reads only the binding's
- *  legacy top-level `agent`/`reviewer_agent` fields — never `implement`'s
- *  resolved matrix value. Every DB-managed binding has those legacy fields at
- *  their pydantic defaults (the CRUD API rejects them outright, and the
- *  importer strips them into explicit matrix cells instead), so an inherited
- *  `review_verify` always resolves to the fixed opposite of the default
- *  `"claude"`, i.e. `"codex"` — regardless of what `implement.agent` is
- *  pinned to. Deriving it from `implement` here would disagree with the
- *  server whenever `implement.agent` is pinned via the matrix (binding or
- *  global) but `review_verify.agent` is left inherited (SYM-191 review). */
-function effectiveAgent(
-  role: string,
-  roles: RolesMatrix,
-  globalRoles: RolesMatrix,
-): string {
+ *   * builder roles (`implement`/`fix`/`accept`) fall back to the binding's
+ *     legacy top-level `agent`, which is always the `"claude"` pydantic
+ *     default for a DB-managed binding (the CRUD API rejects that field, and
+ *     the importer strips it into explicit matrix cells);
+ *   * `review_verify` falls back to the *resolved* `implement` family (the
+ *     adversarial verifier runs the implementer's family);
+ *   * `review_find` falls back to the opposite of the resolved `implement`
+ *     family (`resolved_reviewer_agent`), keeping the two-pass review loop
+ *     cross-family.
+ *
+ *  An explicit binding cell wins, then the global matrix's cell for the same
+ *  role, so a binding that leaves a cell inherited still tracks the global
+ *  default instead of the hardcoded fallback. */
+function effectiveAgent(role: string, roles: RolesMatrix, globalRoles: RolesMatrix): string {
   const own = String(roles[role]?.agent ?? globalRoles[role]?.agent ?? "");
   if (own) return own;
-  if (role === "review_verify") return "codex";
-  if (role === "fix") return effectiveAgent("implement", roles, globalRoles);
+  if (role === "review_verify") return effectiveAgent("implement", roles, globalRoles);
+  if (role === "review_find") {
+    return effectiveAgent("implement", roles, globalRoles) === "claude" ? "codex" : "claude";
+  }
   return "claude";
 }
 
-/** Efforts offered for an (agent, model) pick. Claude efforts are per model
- *  (the live capability set); an inherited agent offers the union so an effort
- *  override over an inherited model is still selectable — the server
- *  family-checks it against the resolved role. */
+/** The model a cell resolves to when left inherited: the global matrix's cell
+ *  for the same role, else none (the CLI default). */
+function effectiveModel(role: string, roles: RolesMatrix, globalRoles: RolesMatrix): string {
+  return String(roles[role]?.model ?? globalRoles[role]?.model ?? "");
+}
+
+/** Efforts offered for an (agent, model) pick — the live per-model capability
+ *  set, falling back to the family-wide union when no model is pinned (an
+ *  unpinned model means the CLI default, whose efforts we can't name here). */
 function effortsFor(options: ConfigOptions, agent: string, model: string): string[] {
   if (agent === "codex") {
     return options.codex_efforts_by_model[model] ?? options.codex_efforts;
   }
-  if (agent === "claude") {
-    return options.claude_efforts_by_model[model] ?? options.claude_efforts;
-  }
-  return [...new Set([...options.claude_efforts, ...options.codex_efforts])].sort();
+  return options.claude_efforts_by_model[model] ?? options.claude_efforts;
+}
+
+/** Label for a cell's empty option: `inherit`, plus what it actually resolves
+ *  to when that's knowable client-side — an inherited row shouldn't read as a
+ *  blank. */
+function inheritLabel(resolved: string): string {
+  return resolved ? `inherit (${resolved})` : "inherit";
 }
 
 /** The 5-role × (agent, model, effort) matrix editor. Every cell offers an
@@ -179,11 +138,8 @@ export function RoleMatrixEditor({
   options: ConfigOptions;
   onChange: (next: RolesMatrix) => void;
 }) {
-  /** Set a single role's single field within `next`, in place. Factored out
-   *  of `cellChange` so a builder-agent change can apply the same
-   *  clear-on-family-switch logic to `fix`/`accept` as it does to the row the
-   *  operator actually touched. */
-  function setCell(next: RolesMatrix, role: string, field: keyof RoleCell, value: string) {
+  function cellChange(role: string, field: keyof RoleCell, value: string) {
+    const next: RolesMatrix = { ...roles };
     const cell: RoleCell = { ...(next[role] ?? {}) };
     if (value === "") delete cell[field];
     else cell[field] = value;
@@ -197,44 +153,13 @@ export function RoleMatrixEditor({
     // (e.g. sonnet has no "high") — drop it so the Select never holds a
     // stored value with no matching <option>.
     if (field === "model" && cell.effort) {
-      const agentForEfforts = String(cell.agent ?? "");
-      if (!effortsFor(options, agentForEfforts, value).includes(cell.effort)) {
+      const family = effectiveAgent(role, { ...next, [role]: cell }, globalRoles);
+      if (!effortsFor(options, family, value).includes(cell.effort)) {
         delete cell.effort;
       }
     }
     if (Object.keys(cell).length === 0) delete next[role];
     else next[role] = cell;
-  }
-
-  function cellChange(role: string, field: keyof RoleCell, value: string) {
-    const next: RolesMatrix = { ...roles };
-    setCell(next, role, field, value);
-    // `implement`/`fix`/`accept` share dispatch's builder-agent identity:
-    // `_synthesize_legacy_role_fields` only bridges the legacy `binding.agent`
-    // field (read by completion parsing, activity, and cost attribution) back
-    // to the daemon's other builder-role readers when all three resolve to
-    // the same family. `fix`/`accept`'s agent cell is hidden (never wired to
-    // their own dispatch — see `ROLE_FIELDS`), so keep it locked to
-    // `implement`'s here rather than letting it silently diverge and leave
-    // those legacy readers on a stale family (SYM-191 review).
-    if (role === "implement" && field === "agent") {
-      setCell(next, "fix", "agent", value);
-      setCell(next, "accept", "agent", value);
-    }
-    // `_synthesize_legacy_role_fields` only derives the legacy `codex_model`
-    // (what a codex-resolved `fix`/`accept` actually dispatch with — their
-    // own model cell is a no-op for codex, see `modelWired`) when
-    // `impl.model == fix.model == acc.model`. Keep those two cells mirroring
-    // `implement`'s model whenever the (possibly just-changed) family is
-    // codex, in whichever order agent/model are set, or a picked non-default
-    // model silently never reaches `fix`/`accept` (SYM-191 review).
-    if (role === "implement" && (field === "agent" || field === "model")) {
-      if (effectiveAgent("implement", next, globalRoles) === "codex") {
-        const implModel = String(next.implement?.model ?? "");
-        setCell(next, "fix", "model", implModel);
-        setCell(next, "accept", "model", implModel);
-      }
-    }
     onChange(next);
   }
 
@@ -251,99 +176,94 @@ export function RoleMatrixEditor({
         </thead>
         <tbody>
           {ROLE_ORDER.map((role) => {
-            const fields = ROLE_FIELDS[role];
             const cell = roles[role] ?? {};
             const agent = String(cell.agent ?? "");
             const model = String(cell.model ?? "");
             const effort = String(cell.effort ?? "");
-            // `review_verify`/`fix` resolve their codex model from the legacy
-            // `binding.codex_model`, never from this cell — once the row's
-            // agent (explicit, propagated, or the resolved-default family —
-            // see `effectiveAgent`) is codex, editing it here is always a
-            // no-op, so hide it rather than offer a dead knob. This also
-            // covers the common case of a default Claude implementer, whose
-            // `review_verify` inherits Codex with an empty (not `"codex"`)
-            // agent cell.
-            const modelWired =
-              fields.model &&
-              !(
-                (role === "review_verify" || role === "fix") &&
-                effectiveAgent(role, roles, globalRoles) === "codex"
-              );
+            // Cells offer the family/model the role *resolves* to, not just
+            // what its own cells pin, so an inherited row lists the options
+            // that will actually apply (and never ones the server's family
+            // check would reject at save). `inheritedFamily` resolves with
+            // this row's own agent cell masked out — what picking "inherit"
+            // would actually land on.
+            const inheritedFamily = effectiveAgent(
+              role,
+              { ...roles, [role]: { ...cell, agent: undefined } },
+              globalRoles,
+            );
+            const family = agent || inheritedFamily;
+            const resolvedModel = effectiveModel(role, roles, globalRoles);
             // Include a stored effort not in the current option list (e.g.
             // loaded before a model change tightened the set) so the Select
             // never renders a value with no matching <option>.
-            const effortOptions = effortsFor(options, agent, model);
+            const effortOptions = effortsFor(options, family, resolvedModel);
             const effortChoices =
               effort && !effortOptions.includes(effort)
                 ? [...effortOptions, effort]
                 : effortOptions;
             // Same fallback for the model cell: a stored model may be absent
-            // from `modelsFor` either because the agent is inherited (family
-            // unknown client-side) or because it's a full `claude-*` ID not in
-            // the alias list — surface it as a selected option either way
-            // instead of silently rendering "inherit".
-            const modelOptions = modelsFor(options, agent);
+            // from `modelsFor` because it's a full `claude-*` ID not in the
+            // alias list, or a codex model the live catalog no longer
+            // entitles — surface it as a selected option either way instead
+            // of silently rendering "inherit".
+            const modelOptions = modelsFor(options, family);
             const modelChoices =
               model && !modelOptions.includes(model)
                 ? [...modelOptions, model]
                 : modelOptions;
+            // Only advertise an inherited value the cell would actually take:
+            // a global cell from the other family is dropped server-side when
+            // this row pins a different agent (`resolved_role`'s family
+            // boundary), so hinting it would lie.
+            const inheritedModelHint =
+              !model && modelChoices.includes(resolvedModel) ? resolvedModel : "";
+            const inheritedEffort = String(globalRoles[role]?.effort ?? "");
+            const inheritedEffortHint =
+              !effort && effortChoices.includes(inheritedEffort) ? inheritedEffort : "";
             return (
               <tr key={role} className="border-b border-border/70 last:border-0">
                 <td className="px-3 py-2 font-mono text-xs">{role}</td>
                 <td className="px-3 py-2">
-                  {fields.agent ? (
-                    <Select
-                      value={agent}
-                      onChange={(e) => cellChange(role, "agent", e.target.value)}
-                      aria-label={`${scope} ${role} agent`}
-                    >
-                      <option value="">inherit</option>
-                      {options.agent_families.map((a) => (
-                        <option key={a} value={a}>
-                          {a}
-                        </option>
-                      ))}
-                    </Select>
-                  ) : (
-                    <UnusedCell />
-                  )}
+                  <Select
+                    value={agent}
+                    onChange={(e) => cellChange(role, "agent", e.target.value)}
+                    aria-label={`${scope} ${role} agent`}
+                  >
+                    <option value="">{inheritLabel(inheritedFamily)}</option>
+                    {options.agent_families.map((a) => (
+                      <option key={a} value={a}>
+                        {a}
+                      </option>
+                    ))}
+                  </Select>
                 </td>
                 <td className="px-3 py-2">
-                  {modelWired ? (
-                    <Select
-                      value={model}
-                      onChange={(e) => cellChange(role, "model", e.target.value)}
-                      aria-label={`${scope} ${role} model`}
-                    >
-                      <option value="">inherit</option>
-                      {modelChoices.map((m) => (
-                        <option key={m} value={m}>
-                          {m}
-                        </option>
-                      ))}
-                    </Select>
-                  ) : (
-                    <UnusedCell />
-                  )}
+                  <Select
+                    value={model}
+                    onChange={(e) => cellChange(role, "model", e.target.value)}
+                    aria-label={`${scope} ${role} model`}
+                  >
+                    <option value="">{inheritLabel(inheritedModelHint)}</option>
+                    {modelChoices.map((m) => (
+                      <option key={m} value={m}>
+                        {m}
+                      </option>
+                    ))}
+                  </Select>
                 </td>
                 <td className="px-3 py-2">
-                  {fields.effort ? (
-                    <Select
-                      value={effort}
-                      onChange={(e) => cellChange(role, "effort", e.target.value)}
-                      aria-label={`${scope} ${role} effort`}
-                    >
-                      <option value="">inherit</option>
-                      {effortChoices.map((ef) => (
-                        <option key={ef} value={ef}>
-                          {ef}
-                        </option>
-                      ))}
-                    </Select>
-                  ) : (
-                    <UnusedCell />
-                  )}
+                  <Select
+                    value={effort}
+                    onChange={(e) => cellChange(role, "effort", e.target.value)}
+                    aria-label={`${scope} ${role} effort`}
+                  >
+                    <option value="">{inheritLabel(inheritedEffortHint)}</option>
+                    {effortChoices.map((ef) => (
+                      <option key={ef} value={ef}>
+                        {ef}
+                      </option>
+                    ))}
+                  </Select>
                 </td>
               </tr>
             );

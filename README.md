@@ -122,7 +122,7 @@ Notes:
 - **State names must match your Linear workflow exactly.** Every binding must
   declare which state issues are picked up from (`ready`); there is no default.
 - Using `agent: codex` on a binding? Set its `codex_model` (e.g.
-  `gpt-5.1-codex`). `preflight` sets up and verifies the Codex permissions
+  `gpt-5.6-sol`). `preflight` sets up and verifies the Codex permissions
   profile needed for unattended commits — no manual TOML editing.
   **Requires Codex CLI 0.136+:** the profile grants workspace + `.git` writes
   via the `:workspace_roots` filesystem token. Older builds used `:project_roots`,
