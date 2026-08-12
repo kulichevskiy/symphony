@@ -1,0 +1,210 @@
+{
+  "errors": [],
+  "mutations": [
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 6.651359334000517,
+      "mutant_id": "python:boolean_connector:support_queue/main.py:113:3a2477c1",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 3.0277586250012973,
+      "mutant_id": "python:boolean_literal:support_queue/main.py:79:803fd505",
+      "status": "survived"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 5.192752749999272,
+      "mutant_id": "python:comparison:support_queue/main.py:113:4dbff7bd",
+      "status": "survived"
+    },
+    {
+      "detail": "oBe(\"\"));\n       |                                                        ^\n    156|     expect(replaceState).toHaveBeenCalledWith({}, \"\", \"/\");\n    157|     expect(pushState).not.toHaveBeenCalled();\n \u276f runWithExpensiveErrorDiagnosticsDisabled node_modules/@testing-library/dom/dist/config.js:47:12\n \u276f checkCallback node_modules/@testing-library/dom/dist/wait-for.js:124:77\n \u276f Timeout.checkRealTimersCallback node_modules/@testing-library/dom/dist/wait-for.js:118:16\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[3/3]\u23af",
+      "duration_seconds": 9.227215291997709,
+      "mutant_id": "typescript:boolean_connector:frontend/src/App.tsx:43:a85da0ce",
+      "status": "killed"
+    },
+    {
+      "detail": "> support-queue-frontend@0.1.0 test\n> vitest --run\n\n\n RUN  v4.1.10 /private/var/folders/s_/t8ytmm9940j564xd698kgmm00000gn/T/symphony-maintainability-_h0f_b00/checkout/frontend\n\n\n Test Files  1 passed (1)\n      Tests  25 passed (25)\n   Start at  23:07:10\n   Duration  1.17s (transform 52ms, setup 55ms, import 65ms, tests 632ms, environment 334ms)",
+      "duration_seconds": 1.5195576669993898,
+      "mutant_id": "typescript:boolean_literal:frontend/src/App.tsx:70:b1f7cb03",
+      "status": "survived"
+    },
+    {
+      "detail": "node_modules/@testing-library/dom/dist/wait-for.js:163:27\n \u276f node_modules/@testing-library/dom/dist/query-helpers.js:86:33\n \u276f src/App.test.tsx:488:34\n    486|     render(<App />);\n    487|\n    488|     fireEvent.click(await screen.findByRole(\"button\", { name: \"Printer\u2026\n       |                                  ^\n    489|     await screen.findByRole(\"heading\", { name: \"Comments\" });\n    490|     fireEvent.change(screen.getByLabelText(\"Add a comment\"), { target:\u2026\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[16/16]\u23af",
+      "duration_seconds": 34.7296616249987,
+      "mutant_id": "typescript:comparison:frontend/src/App.tsx:86:8b789973",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 3.431863625000915,
+      "mutant_id": "python:boolean_connector:support_queue/main.py:178:3cd1d2d6",
+      "status": "survived"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 2.335221459001332,
+      "mutant_id": "python:boolean_literal:support_queue/main.py:90:27ec33c6",
+      "status": "survived"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 3.226000208000187,
+      "mutant_id": "python:comparison:support_queue/main.py:178:6d93a70f",
+      "status": "survived"
+    },
+    {
+      "detail": "xpected: \"{\"title\":\"New ticket\",\"description\":null,\"priority\":\"high\"}\"\nReceived: \"{\"title\":\"New ticket\",\"description\":\"\",\"priority\":\"high\"}\"\n\n \u276f src/App.test.tsx:400:45\n    398|\n    399|     expect(fetchMock).toHaveBeenCalledTimes(4);\n    400|     expect(fetchMock.mock.calls[2][1].body).toBe(JSON.stringify({ titl\u2026\n       |                                             ^\n    401|     expect(fetchMock.mock.calls[2][1].headers[\"Idempotency-Key\"]).toBe\u2026\n    402|   });\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[1/1]\u23af",
+      "duration_seconds": 3.1517973329991946,
+      "mutant_id": "typescript:boolean_connector:frontend/src/App.tsx:150:cb6f47c4",
+      "status": "killed"
+    },
+    {
+      "detail": "> support-queue-frontend@0.1.0 test\n> vitest --run\n\n\n RUN  v4.1.10 /private/var/folders/s_/t8ytmm9940j564xd698kgmm00000gn/T/symphony-maintainability-_h0f_b00/checkout/frontend\n\n\n Test Files  1 passed (1)\n      Tests  25 passed (25)\n   Start at  23:07:58\n   Duration  1.04s (transform 42ms, setup 43ms, import 54ms, tests 574ms, environment 283ms)",
+      "duration_seconds": 1.3744811660017149,
+      "mutant_id": "typescript:boolean_literal:frontend/src/App.tsx:107:185195b0",
+      "status": "survived"
+    },
+    {
+      "detail": "per node_modules/@testing-library/dom/dist/wait-for.js:163:27\n \u276f node_modules/@testing-library/dom/dist/query-helpers.js:86:33\n \u276f src/App.test.tsx:334:25\n    332|     render(<App />);\n    333|\n    334|     expect(await screen.findByText(/Unable to load tickets/)).toBeInTh\u2026\n       |                         ^\n    335|     expect(screen.queryByText(\"No tickets found.\")).not.toBeInTheDocum\u2026\n    336|     fireEvent.click(screen.getByRole(\"button\", { name: \"Retry\" }));\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[1/1]\u23af",
+      "duration_seconds": 4.806571208000605,
+      "mutant_id": "typescript:comparison:frontend/src/App.tsx:89:83b21758",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 6.002223833000244,
+      "mutant_id": "python:boolean_connector:support_queue/main.py:272:647094a1",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 2.497991791999084,
+      "mutant_id": "python:boolean_literal:support_queue/main.py:209:1806b3d3",
+      "status": "survived"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 6.3155967490019975,
+      "mutant_id": "python:comparison:support_queue/main.py:197:105305db",
+      "status": "killed"
+    },
+    {
+      "detail": "> support-queue-frontend@0.1.0 test\n> vitest --run\n\n\n RUN  v4.1.10 /private/var/folders/s_/t8ytmm9940j564xd698kgmm00000gn/T/symphony-maintainability-_h0f_b00/checkout/frontend\n\n\n Test Files  1 passed (1)\n      Tests  25 passed (25)\n   Start at  23:08:20\n   Duration  1.19s (transform 46ms, setup 49ms, import 61ms, tests 680ms, environment 308ms)",
+      "duration_seconds": 1.5318880830000126,
+      "mutant_id": "typescript:boolean_connector:frontend/src/App.tsx:160:34905bea",
+      "status": "survived"
+    },
+    {
+      "detail": "^\n    134|     window.history.pushState({}, \"\", \"/?priority=urgent\");\n    135|     act(() => window.dispatchEvent(new PopStateEvent(\"popstate\")));\n \u276f runWithExpensiveErrorDiagnosticsDisabled node_modules/@testing-library/dom/dist/config.js:47:12\n \u276f checkCallback node_modules/@testing-library/dom/dist/wait-for.js:124:77\n \u276f Timeout.checkRealTimersCallback node_modules/@testing-library/dom/dist/wait-for.js:118:16\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[3/3]\u23af",
+      "duration_seconds": 9.121776125999531,
+      "mutant_id": "typescript:comparison:frontend/src/App.tsx:103:9f73150e",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 5.4694234159996995,
+      "mutant_id": "python:boolean_connector:support_queue/main.py:398:fc982574",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 5.251376000998789,
+      "mutant_id": "python:boolean_literal:support_queue/main.py:395:3be561db",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 6.024980041000163,
+      "mutant_id": "python:comparison:support_queue/main.py:203:62a810aa",
+      "status": "killed"
+    },
+    {
+      "detail": "> support-queue-frontend@0.1.0 test\n> vitest --run\n\n\n RUN  v4.1.10 /private/var/folders/s_/t8ytmm9940j564xd698kgmm00000gn/T/symphony-maintainability-_h0f_b00/checkout/frontend\n\n\n Test Files  1 passed (1)\n      Tests  25 passed (25)\n   Start at  23:08:47\n   Duration  1.31s (transform 45ms, setup 78ms, import 63ms, tests 608ms, environment 476ms)",
+      "duration_seconds": 1.687723916998948,
+      "mutant_id": "typescript:boolean_connector:frontend/src/App.tsx:167:6146f5a8",
+      "status": "survived"
+    },
+    {
+      "detail": "oBe(\"\"));\n       |                                                        ^\n    156|     expect(replaceState).toHaveBeenCalledWith({}, \"\", \"/\");\n    157|     expect(pushState).not.toHaveBeenCalled();\n \u276f runWithExpensiveErrorDiagnosticsDisabled node_modules/@testing-library/dom/dist/config.js:47:12\n \u276f checkCallback node_modules/@testing-library/dom/dist/wait-for.js:124:77\n \u276f Timeout.checkRealTimersCallback node_modules/@testing-library/dom/dist/wait-for.js:118:16\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[1/1]\u23af",
+      "duration_seconds": 4.981501541999023,
+      "mutant_id": "typescript:comparison:frontend/src/App.tsx:121:8451723b",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 5.492592500000683,
+      "mutant_id": "python:boolean_connector:support_queue/main.py:400:07466b37",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 1.4127217910008767,
+      "mutant_id": "python:comparison:support_queue/main.py:309:a3c9e4d1",
+      "status": "killed"
+    }
+  ],
+  "probe": {
+    "changed_files": 5,
+    "changed_lines": 404,
+    "cost_usd": 2.285085,
+    "detail": "",
+    "raw_tokens": 2189355,
+    "repetitions": 1,
+    "status": "passed",
+    "successful_repetitions": 1,
+    "wall_seconds": 342.91831935895607
+  },
+  "repository": "kulichevskiy/EXP-A105BD7797F3-A1",
+  "schema_version": 1,
+  "static": {
+    "complexity_max": 91,
+    "complexity_median": 2.0,
+    "complexity_p95": 15,
+    "duplicated_blocks": 20,
+    "files": [
+      {
+        "complexity_max": 91,
+        "function_lines_max": 216,
+        "functions": 6,
+        "language": "typescript",
+        "lines": 261,
+        "path": "frontend/src/App.tsx"
+      },
+      {
+        "complexity_max": 0,
+        "function_lines_max": 0,
+        "functions": 0,
+        "language": "typescript",
+        "lines": 11,
+        "path": "frontend/src/main.tsx"
+      },
+      {
+        "complexity_max": 0,
+        "function_lines_max": 0,
+        "functions": 0,
+        "language": "python",
+        "lines": 1,
+        "path": "support_queue/__init__.py"
+      },
+      {
+        "complexity_max": 15,
+        "function_lines_max": 98,
+        "functions": 28,
+        "language": "python",
+        "lines": 544,
+        "path": "support_queue/main.py"
+      }
+    ],
+    "function_count": 34,
+    "import_cycles": [],
+    "large_files": 1,
+    "large_functions": 2,
+    "max_file_lines": 544,
+    "max_function_lines": 216,
+    "source_files": 4,
+    "source_lines": 817
+  }
+}

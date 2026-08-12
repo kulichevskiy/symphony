@@ -1,0 +1,210 @@
+{
+  "errors": [],
+  "mutations": [
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 5.35995529200045,
+      "mutant_id": "python:boolean_connector:support_queue/main.py:105:14afcdd3",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 4.973102916997959,
+      "mutant_id": "python:boolean_literal:support_queue/main.py:47:139cd514",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 5.110819792000257,
+      "mutant_id": "python:comparison:support_queue/main.py:105:729282b2",
+      "status": "killed"
+    },
+    {
+      "detail": "Text(\"Priority filter\")).toHaveValue(\"\");\n    525|     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(\"/ticke\u2026\n       |                                           ^\n    526|   });\n    527|\n \u276f runWithExpensiveErrorDiagnosticsDisabled node_modules/@testing-library/dom/dist/config.js:47:12\n \u276f checkCallback node_modules/@testing-library/dom/dist/wait-for.js:124:77\n \u276f Timeout.checkRealTimersCallback node_modules/@testing-library/dom/dist/wait-for.js:118:16\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[1/1]\u23af",
+      "duration_seconds": 5.246811000000889,
+      "mutant_id": "typescript:boolean_connector:frontend/src/App.tsx:80:01cdc8b7",
+      "status": "killed"
+    },
+    {
+      "detail": "AssertionError: expected \"pushState\" to not be called at all, but actually been called 1 times\n\nReceived:\n\n  1st pushState call:\n\n    Array [\n      null,\n      \"\",\n      \"/?status=resolved&priority=urgent\",\n    ]\n\n\nNumber of calls: 1\n\n \u276f src/App.test.tsx:513:27\n    511|\n    512|     await screen.findByText(\"No tickets match the selected filters.\");\n    513|     expect(pushState).not.toHaveBeenCalled();\n       |                           ^\n    514|   });\n    515|\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[1/1]\u23af",
+      "duration_seconds": 3.1398605419999512,
+      "mutant_id": "typescript:boolean_literal:frontend/src/App.tsx:94:4b1afbc5",
+      "status": "killed"
+    },
+    {
+      "detail": "history, and follows browser history\nError: expect(element).toHaveValue(resolved)\n\nExpected the element to have value:\n  resolved\nReceived:\n\n \u276f src/App.test.tsx:475:52\n    473|     render(<App />);\n    474|\n    475|     expect(screen.getByLabelText(\"Status filter\")).toHaveValue(\"resolv\u2026\n       |                                                    ^\n    476|     expect(screen.getByLabelText(\"Priority filter\")).toHaveValue(\"urge\u2026\n    477|     await waitFor(() => {\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[1/1]\u23af",
+      "duration_seconds": 3.1065970829986327,
+      "mutant_id": "typescript:comparison:frontend/src/App.tsx:80:cfff83d8",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 5.6054982079986075,
+      "mutant_id": "python:boolean_connector:support_queue/main.py:107:0bab69e0",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 5.115294958999584,
+      "mutant_id": "python:boolean_literal:support_queue/main.py:50:0ad2c3ab",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 4.952986917000089,
+      "mutant_id": "python:comparison:support_queue/main.py:107:21492696",
+      "status": "killed"
+    },
+    {
+      "detail": "Text(\"Priority filter\")).toHaveValue(\"\");\n    525|     await waitFor(() => expect(fetchMock).toHaveBeenCalledWith(\"/ticke\u2026\n       |                                           ^\n    526|   });\n    527|\n \u276f runWithExpensiveErrorDiagnosticsDisabled node_modules/@testing-library/dom/dist/config.js:47:12\n \u276f checkCallback node_modules/@testing-library/dom/dist/wait-for.js:124:77\n \u276f Timeout.checkRealTimersCallback node_modules/@testing-library/dom/dist/wait-for.js:118:16\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[1/1]\u23af",
+      "duration_seconds": 5.269661917000121,
+      "mutant_id": "typescript:boolean_connector:frontend/src/App.tsx:84:804afea9",
+      "status": "killed"
+    },
+    {
+      "detail": "> support-queue-frontend@0.1.0 test\n> vitest --run\n\n\n RUN  v4.1.10 /private/var/folders/s_/t8ytmm9940j564xd698kgmm00000gn/T/symphony-maintainability-2gqaeps8/checkout/frontend\n\n\n Test Files  1 passed (1)\n      Tests  22 passed (22)\n   Start at  23:11:41\n   Duration  1.26s (transform 48ms, setup 46ms, import 63ms, tests 786ms, environment 284ms)",
+      "duration_seconds": 1.5886815419999039,
+      "mutant_id": "typescript:boolean_literal:frontend/src/App.tsx:95:0951b6d7",
+      "status": "survived"
+    },
+    {
+      "detail": "rowser history\nError: expect(element).toHaveValue(urgent)\n\nExpected the element to have value:\n  urgent\nReceived:\n\n \u276f src/App.test.tsx:476:54\n    474|\n    475|     expect(screen.getByLabelText(\"Status filter\")).toHaveValue(\"resolv\u2026\n    476|     expect(screen.getByLabelText(\"Priority filter\")).toHaveValue(\"urge\u2026\n       |                                                      ^\n    477|     await waitFor(() => {\n    478|       expect(fetchMock).toHaveBeenCalledWith(\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[1/1]\u23af",
+      "duration_seconds": 3.2066602090017113,
+      "mutant_id": "typescript:comparison:frontend/src/App.tsx:84:9cf36571",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 5.326670168000419,
+      "mutant_id": "python:boolean_connector:support_queue/main.py:109:df34352b",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 4.871886500000983,
+      "mutant_id": "python:boolean_literal:support_queue/main.py:54:99eae4f4",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 5.198692540998309,
+      "mutant_id": "python:comparison:support_queue/main.py:109:45ddf723",
+      "status": "killed"
+    },
+    {
+      "detail": "> support-queue-frontend@0.1.0 test\n> vitest --run\n\n\n RUN  v4.1.10 /private/var/folders/s_/t8ytmm9940j564xd698kgmm00000gn/T/symphony-maintainability-2gqaeps8/checkout/frontend\n\n\n Test Files  1 passed (1)\n      Tests  22 passed (22)\n   Start at  23:12:01\n   Duration  1.28s (transform 47ms, setup 46ms, import 61ms, tests 808ms, environment 288ms)",
+      "duration_seconds": 1.6072249999997439,
+      "mutant_id": "typescript:boolean_connector:frontend/src/App.tsx:161:dbd873cf",
+      "status": "survived"
+    },
+    {
+      "detail": "lpers.js:95:19\n \u276f src/App.test.tsx:716:34\n    714|     const title = within(form).getByLabelText(\"Title\");\n    715|     fireEvent.change(title, { target: { value: \"First ticket\" } });\n    716|     fireEvent.click(within(form).getByRole(\"button\", { name: \"Create t\u2026\n       |                                  ^\n    717|     const firstAnnouncement = await screen.findByRole(\"status\", { name\u2026\n    718|     expect(firstAnnouncement).toHaveTextContent(\"Ticket created.\");\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[3/3]\u23af",
+      "duration_seconds": 3.180334791999485,
+      "mutant_id": "typescript:boolean_literal:frontend/src/App.tsx:102:5dc51014",
+      "status": "killed"
+    },
+    {
+      "detail": "> support-queue-frontend@0.1.0 test\n> vitest --run\n\n\n RUN  v4.1.10 /private/var/folders/s_/t8ytmm9940j564xd698kgmm00000gn/T/symphony-maintainability-2gqaeps8/checkout/frontend\n\n\n Test Files  1 passed (1)\n      Tests  22 passed (22)\n   Start at  23:12:06\n   Duration  1.31s (transform 48ms, setup 45ms, import 62ms, tests 822ms, environment 297ms)",
+      "duration_seconds": 1.6490891249995911,
+      "mutant_id": "typescript:comparison:frontend/src/App.tsx:161:dc4b6be7",
+      "status": "survived"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 2.5972784999994474,
+      "mutant_id": "python:boolean_connector:support_queue/main.py:188:b568a107",
+      "status": "survived"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 2.4850187080010073,
+      "mutant_id": "python:boolean_literal:support_queue/main.py:156:d0df3ed9",
+      "status": "survived"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 2.6445937499993306,
+      "mutant_id": "python:comparison:support_queue/main.py:188:7d7aac19",
+      "status": "survived"
+    },
+    {
+      "detail": "iginated in \"src/App.test.tsx\" test file. It doesn't mean the error was thrown inside the file itself, but while it was running.\nThe latest test that might've caused the error is \"reloads a stale ticket, preserves context, and waits for an explicit retry\". It might mean one of the following:\n- The error was thrown, while Vitest was running this test.\n- If the error occurred after the test had been completed, this was the last documented test before it was thrown.\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af",
+      "duration_seconds": 10.780694167000547,
+      "mutant_id": "typescript:boolean_connector:frontend/src/App.tsx:223:2eb1cf57",
+      "status": "killed"
+    },
+    {
+      "detail": "text content:\n  Could not load the support queue.\nReceived:\n  Could not create the ticket. Check the fields and try again.\n \u276f src/App.test.tsx:458:46\n    456|\n    457|     fireEvent.change(screen.getByLabelText(\"Status filter\"), { target:\u2026\n    458|     expect(await screen.findByRole(\"alert\")).toHaveTextContent(\"Could \u2026\n       |                                              ^\n    459|\n    460|     fireEvent.click(screen.getByRole(\"button\", { name: \"Close ticket d\u2026\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[2/2]\u23af",
+      "duration_seconds": 3.1512342919995717,
+      "mutant_id": "typescript:boolean_literal:frontend/src/App.tsx:103:868c66e7",
+      "status": "killed"
+    },
+    {
+      "detail": "> support-queue-frontend@0.1.0 test\n> vitest --run\n\n\n RUN  v4.1.10 /private/var/folders/s_/t8ytmm9940j564xd698kgmm00000gn/T/symphony-maintainability-2gqaeps8/checkout/frontend\n\n\n Test Files  1 passed (1)\n      Tests  22 passed (22)\n   Start at  23:12:29\n   Duration  1.25s (transform 52ms, setup 45ms, import 65ms, tests 778ms, environment 286ms)",
+      "duration_seconds": 1.5769746669993765,
+      "mutant_id": "typescript:comparison:frontend/src/App.tsx:162:6b9d2e79",
+      "status": "survived"
+    }
+  ],
+  "probe": {
+    "changed_files": 4,
+    "changed_lines": 384,
+    "cost_usd": 2.4477550000000003,
+    "detail": "",
+    "raw_tokens": 2441803,
+    "repetitions": 1,
+    "status": "passed",
+    "successful_repetitions": 1,
+    "wall_seconds": 338.31064842408523
+  },
+  "repository": "kulichevskiy/EXP-BAC81AD7F9F8-A1",
+  "schema_version": 1,
+  "static": {
+    "complexity_max": 83,
+    "complexity_median": 2.0,
+    "complexity_p95": 30,
+    "duplicated_blocks": 7,
+    "files": [
+      {
+        "complexity_max": 83,
+        "function_lines_max": 544,
+        "functions": 12,
+        "language": "typescript",
+        "lines": 633,
+        "path": "frontend/src/App.tsx"
+      },
+      {
+        "complexity_max": 0,
+        "function_lines_max": 0,
+        "functions": 0,
+        "language": "typescript",
+        "lines": 11,
+        "path": "frontend/src/main.tsx"
+      },
+      {
+        "complexity_max": 0,
+        "function_lines_max": 0,
+        "functions": 0,
+        "language": "python",
+        "lines": 1,
+        "path": "support_queue/__init__.py"
+      },
+      {
+        "complexity_max": 30,
+        "function_lines_max": 280,
+        "functions": 25,
+        "language": "python",
+        "lines": 608,
+        "path": "support_queue/main.py"
+      }
+    ],
+    "function_count": 37,
+    "import_cycles": [],
+    "large_files": 2,
+    "large_functions": 4,
+    "max_file_lines": 633,
+    "max_function_lines": 544,
+    "source_files": 4,
+    "source_lines": 1253
+  }
+}

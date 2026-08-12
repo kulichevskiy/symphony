@@ -1,0 +1,44 @@
+{
+  "baseline_sha": "7a5f20a5ae8d3743485bd7d8a453fd3c4facdd96",
+  "changed_files": 7,
+  "changed_lines": 155,
+  "checkout": "/data/bench-a/maintenance-probes/EXP-0DAD486744C0-A1-1786480827",
+  "checks": {
+    "hidden accessible-frontend probe": "passed",
+    "hidden workflow probe": "passed",
+    "npm ci": "passed",
+    "npm run build": "passed",
+    "npm test -- --run": "passed",
+    "uv run --frozen --no-sync mypy support_queue": "passed",
+    "uv run --frozen --no-sync pytest -q": "passed",
+    "uv run --frozen --no-sync ruff check .": "passed",
+    "uv sync --locked": "passed"
+  },
+  "claude_expires_at": "2026-08-12T04:34:43Z",
+  "cost_usd": 1.7838884999999998,
+  "coverage": {
+    "backend_product": true,
+    "backend_tests": true,
+    "frontend_product": true,
+    "frontend_tests": true
+  },
+  "lane": "A",
+  "probe": "waiting_on_customer",
+  "probe_outcome": {
+    "changed_files": 7,
+    "changed_lines": 155,
+    "cost_usd": 1.7838884999999998,
+    "detail": "",
+    "raw_tokens": 1496297,
+    "repetitions": 1,
+    "status": "passed",
+    "successful_repetitions": 1,
+    "wall_seconds": 234.51386134605855
+  },
+  "profile": "Claude Opus 5 medium",
+  "raw_tokens": 1496297,
+  "repository": "kulichevskiy/EXP-0DAD486744C0-A1",
+  "schema_version": 1,
+  "status": "passed",
+  "wall_seconds": 234.51386134605855
+}

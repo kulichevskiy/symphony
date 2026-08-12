@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import subprocess
+import tempfile
 import time
 from importlib.resources import as_file, files
 from pathlib import Path
@@ -22,6 +24,18 @@ from .executor import RemoteCommands, create_executor_app
 from .grader import GraderInfrastructureError, SupportQueueGrader
 from .harness import load_harness, snapshot_harness
 from .live import LiveBenchConfig, LiveTrialExecutor
+from .maintainability import (
+    ClaudeOpusMediumProbeAgent,
+    SubprocessMutationRunner,
+    WaitingOnCustomerVerifier,
+    analyze_static,
+    discover_mutants,
+    load_existing_results,
+    load_probe_receipt,
+    run_maintenance_probe,
+    run_mutation_pack,
+    write_reports,
+)
 from .metrics import snapshot_candidate
 from .models import Experiment, ExperimentReport, Trial, TrialOutcome
 from .report import render_markdown
@@ -415,6 +429,145 @@ def sync_connections(db_path: Path, control_db: Path) -> None:
 def snapshot(db_path: Path) -> None:
     """Emit metrics with the harness-owned, read-only measurement engine."""
     click.echo(json.dumps(asyncio.run(_snapshot(db_path)), separators=(",", ":")))
+
+
+@bench.command("maintainability")
+@click.option("--repository", required=True, help="Local checkout path or GitHub owner/repo.")
+@click.option(
+    "--output",
+    type=click.Path(path_type=Path, file_okay=False),
+    required=True,
+)
+@click.option(
+    "--static-only",
+    is_flag=True,
+    help="Write deterministic static diagnostics without mutation tests or a maintenance probe.",
+)
+@click.option("--mutations", is_flag=True, help="Run the fixed mutation-operator pack.")
+@click.option("--mutation-timeout", type=click.FloatRange(min=1), default=300, show_default=True)
+@click.option(
+    "--probe",
+    is_flag=True,
+    help="Run the waiting_on_customer change with Claude Opus medium.",
+)
+@click.option(
+    "--probe-receipt",
+    type=click.Path(path_type=Path, dir_okay=False, exists=True),
+    help="Import a production probe receipt into the canonical report.",
+)
+@click.option("--probe-timeout", type=click.FloatRange(min=60), default=7200, show_default=True)
+def maintainability(
+    repository: str,
+    output: Path,
+    static_only: bool,
+    mutations: bool,
+    mutation_timeout: float,
+    probe: bool,
+    probe_receipt: Path | None,
+    probe_timeout: float,
+) -> None:
+    """Grade maintainability separately from the benchmark's functional score."""
+
+    selected = sum((static_only, mutations, probe, probe_receipt is not None))
+    if selected != 1:
+        raise click.ClickException(
+            "choose exactly one of --static-only, --mutations, --probe, or --probe-receipt"
+        )
+    existing_mutations, existing_probe, existing_errors = load_existing_results(output)
+    local = Path(repository).expanduser()
+    if local.exists() and static_only:
+        checkout = local.resolve()
+        write_reports(
+            output=output,
+            repository=repository,
+            static=analyze_static(checkout),
+            mutations=existing_mutations,
+            probe=existing_probe,
+            errors=existing_errors,
+        )
+    else:
+        with tempfile.TemporaryDirectory(prefix="symphony-maintainability-") as temporary:
+            checkout = Path(temporary) / "checkout"
+            if local.exists():
+                shutil.copytree(local.resolve(), checkout, ignore=shutil.ignore_patterns(".git"))
+            else:
+                try:
+                    subprocess.run(
+                        ["gh", "repo", "clone", repository, str(checkout), "--", "--depth=1"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                except (OSError, subprocess.CalledProcessError) as exc:
+                    raise click.ClickException(f"could not clone {repository}: {exc}") from exc
+            mutation_outcomes = existing_mutations
+            errors = existing_errors
+            probe_outcome = existing_probe
+            if mutations:
+                try:
+                    subprocess.run(
+                        ["uv", "sync", "--locked"],
+                        cwd=checkout,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                    subprocess.run(
+                        ["npm", "ci"],
+                        cwd=checkout / "frontend",
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    )
+                except (OSError, subprocess.CalledProcessError) as exc:
+                    raise click.ClickException(f"could not prepare mutation tests: {exc}") from exc
+                try:
+                    mutation_outcomes = run_mutation_pack(
+                        checkout,
+                        mutants=discover_mutants(checkout, limit=24),
+                        runner=SubprocessMutationRunner(),
+                        timeout_seconds=mutation_timeout,
+                    )
+                except RuntimeError as exc:
+                    mutation_outcomes = ()
+                    errors = (str(exc),)
+            if probe:
+                probe_outcome = run_maintenance_probe(
+                    checkout,
+                    agent=ClaudeOpusMediumProbeAgent(),
+                    verifier=WaitingOnCustomerVerifier(),
+                    timeout_seconds=probe_timeout,
+                )
+            if probe_receipt is not None:
+                try:
+                    identity_checkout = local.resolve() if local.exists() else checkout
+                    baseline_sha = subprocess.run(
+                        ["git", "rev-parse", "HEAD"],
+                        cwd=identity_checkout,
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                    ).stdout.strip()
+                    probe_outcome = load_probe_receipt(
+                        probe_receipt,
+                        repository=repository,
+                        baseline_sha=baseline_sha,
+                    )
+                except (OSError, ValueError, json.JSONDecodeError, TypeError) as exc:
+                    raise click.ClickException(f"invalid probe receipt: {exc}") from exc
+                except subprocess.CalledProcessError as exc:
+                    raise click.ClickException(
+                        "could not resolve repository baseline for probe receipt"
+                    ) from exc
+            write_reports(
+                output=output,
+                repository=repository,
+                static=analyze_static(checkout),
+                mutations=mutation_outcomes,
+                probe=probe_outcome,
+                errors=errors,
+            )
+    click.echo(f"wrote {output / 'MAINTAINABILITY.json'} and MAINTAINABILITY.md")
 
 
 async def _snapshot(db_path: Path) -> dict[str, object]:
