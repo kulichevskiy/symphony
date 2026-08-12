@@ -180,6 +180,11 @@ Review is controlled per binding with two booleans:
 | `true` | `true` | Sequential: local reviewer first, then PR and `@codex review`. |
 | `false` | `false` | No review: implement, open PR, pass CI, merge. |
 
+In sequential mode, hitting the local iteration cap after a successful final
+fix hands the branch to `@codex review`; it does not require a human merely to
+continue the next configured review gate. A repeated-finding `stuck_loop` and
+reviewer/fixer failures still stop for operator input.
+
 `agent` is the builder: it handles implementation and any fix rounds requested
 by the local reviewer. `reviewer_agent` selects that local reviewer; if omitted,
 it defaults to the opposite agent family from `agent`.
@@ -259,6 +264,9 @@ Coolify's env-vars UI) and the "Connect To Predefined Network" toggle. After
 the first deploy, log in and connect the four providers on the UI Connections
 page, then point the Linear/GitHub webhooks and the Auth0
 callback/logout/origin URLs at the new domain.
+
+The isolated live E2E benchmark is a separate Coolify application. See
+[Verification kit](VERIFICATION_KIT.md) for its lifecycle, secrets, and A–A commands.
 
 ---
 

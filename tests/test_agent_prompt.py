@@ -8,6 +8,7 @@ from symphony.agent.prompt import (
     merge_prompt,
     merge_required_check_fix_prompt,
     review_comment_fix_prompt,
+    review_fix_prompt,
 )
 
 
@@ -98,9 +99,60 @@ def test_review_comment_fix_prompt_mandates_completion_marker_contract() -> None
     assert "SYMPHONY_DONE" in prompt
     assert "SYMPHONY_BLOCKED:" in prompt
     assert "final message" in prompt.lower()
-    # Fix runs do NOT implement the already-done no-op outcome, so the marker
-    # must not be advertised here (a fix-run completion path would mishandle it).
-    assert "SYMPHONY_ALREADY_DONE" not in prompt
+    # A delayed/duplicate review signal can already be resolved by another fix.
+    # The marker binds that claim to the clean current HEAD instead of requiring
+    # an empty commit or parking the pipeline.
+    assert "SYMPHONY_ALREADY_DONE" in prompt
+    assert "current-head-sha" in prompt
+    assert "working tree is clean" in prompt
+    assert "Final closure audit" not in prompt
+
+
+def test_late_review_fix_prompt_starts_holistic_closure_audit_before_final_iteration() -> None:
+    prompt = review_comment_fix_prompt(
+        issue_title="Build support queue",
+        issue_body="Operators can create and filter tickets.",
+        labels=["feature"],
+        trigger="frontend/src/App.tsx:42 loses a successful create",
+        iteration=10,
+        iteration_cap=12,
+    )
+
+    assert "Late-stage closure audit" in prompt
+    assert "one of the last allowed review-fix iterations" in prompt
+    assert "final allowed review-fix iteration" not in prompt
+    assert "related failure modes" in prompt
+
+
+def test_final_review_fix_prompt_requires_holistic_closure_audit() -> None:
+    prompt = review_comment_fix_prompt(
+        issue_title="Build support queue",
+        issue_body="Operators can create and filter tickets.",
+        labels=["feature"],
+        trigger="frontend/src/App.tsx:42 loses a successful create",
+        iteration=12,
+        iteration_cap=12,
+    )
+
+    assert "final allowed review-fix iteration" in prompt
+    assert "related failure modes" in prompt
+    assert "issue requirements" in prompt
+    assert "regression tests" in prompt
+
+
+def test_ci_review_fix_prompt_supports_verified_already_done_outcome() -> None:
+    prompt = review_fix_prompt(
+        issue_title="Fix CI",
+        issue_body="The workflow must install uv.",
+        labels=["ci"],
+        trigger="frontend failed",
+        failing_check_log_tail="uv: command not found",
+    )
+
+    assert "SYMPHONY_DONE" in prompt
+    assert "SYMPHONY_BLOCKED:" in prompt
+    assert "SYMPHONY_ALREADY_DONE" in prompt
+    assert "current-head-sha" in prompt
 
 
 def test_acceptance_fix_prompt_frames_product_mismatch_not_code_review() -> None:

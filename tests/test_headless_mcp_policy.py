@@ -387,7 +387,7 @@ class _FixerSpecCapturingRunner:
     async def _reviewer_changes_requested(self):
         message = (
             "## Findings\n\n"
-            "- file.py:1 — schema drift; regenerate types.\n\n"
+            "- [Major] file.py:1 — schema drift; regenerate types.\n\n"
             f"{VERDICT_CHANGES_REQUESTED_MARKER}"
         )
         yield RunnerEvent(kind="started", pid=1)
@@ -433,8 +433,9 @@ async def test_local_review_fixer_spawn_injects_binding_env(
         head_sha_provider=head_sha,
     )
 
-    # cap=1: reviewer requests changes → fixer runs once → loop exhausts.
-    assert result.outcome is LoopOutcome.EXHAUSTED
+    # cap=1: reviewer requests changes → fixer runs once → closure review sees
+    # the same unresolved finding and reports non-convergence.
+    assert result.outcome is LoopOutcome.STUCK_LOOP
     spec = runner.fixer_spec
     assert spec is not None
     assert spec.stage == "local_review_fix"

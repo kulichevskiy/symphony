@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from symphony.agent.runner import RunnerEvent, RunnerSpec
+from symphony.bench.metrics import local_review_metrics
 from symphony.config import ResolvedRole
 from symphony.pipeline.local_review import (
     VERDICT_APPROVED_MARKER,
@@ -195,7 +196,7 @@ async def test_allow_fixes_false_fails_without_local_review_fix_turn(
     runner = _ScriptedRunner(
         scripts=[
             _codex_message_stream(
-                f"## Findings\n- bug in foo.py:10\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+                f"## Findings\n- [Major] bug in foo.py:10\n{VERDICT_CHANGES_REQUESTED_MARKER}"
             ),
         ]
     )
@@ -234,7 +235,7 @@ async def test_persists_transcripts_for_review_and_fix_iterations(
 ) -> None:
     review_0, review_0_out, review_0_err = _review_stream_with_transcript(
         agent=reviewer_agent,
-        message=f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+        message=f"## Findings\n- [Major] bug\n{VERDICT_CHANGES_REQUESTED_MARKER}",
         prefix="reviewer-zero-started",
         stderr="reviewer-zero-warning",
     )
@@ -281,6 +282,17 @@ async def test_persists_transcripts_for_review_and_fix_iterations(
     assert (log_dir / "fix-0.err.log").read_text(encoding="utf-8") == fix_0_err
     assert (log_dir / "review-1.out.log").read_text(encoding="utf-8") == review_1_out
     assert (log_dir / "review-1.err.log").read_text(encoding="utf-8") == review_1_err
+    if reviewer_agent == "claude":
+        assert (log_dir / "review-0.last.txt").read_text(encoding="utf-8") == (
+            f"## Findings\n- [Major] bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+        )
+        assert (log_dir / "review-1.last.txt").read_text(encoding="utf-8") == (
+            f"looks good\n{VERDICT_APPROVED_MARKER}"
+        )
+        metrics = local_review_metrics(tmp_path / "logs")
+        assert metrics["local_review_rounds"] == 2
+        assert metrics["local_review_findings"] == 1
+        assert metrics["local_review_major"] == 1
 
 
 @pytest.mark.asyncio
@@ -290,7 +302,7 @@ async def test_fix_then_approve_dispatches_fix_run_in_correct_workspace(
     runner = _ScriptedRunner(
         scripts=[
             _codex_message_stream(
-                f"## Findings\n- bug in foo.py:10\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+                f"## Findings\n- [Major] bug in foo.py:10\n{VERDICT_CHANGES_REQUESTED_MARKER}"
             ),
             _ok_fix_stream(),
             _codex_message_stream(f"fixed\n{VERDICT_APPROVED_MARKER}"),
@@ -344,6 +356,50 @@ async def test_fix_then_approve_dispatches_fix_run_in_correct_workspace(
 
 
 @pytest.mark.asyncio
+async def test_final_local_review_fix_receives_holistic_closure_audit(
+    tmp_path: Path,
+) -> None:
+    runner = _ScriptedRunner(
+        scripts=[
+            _codex_message_stream(
+                f"## Findings\n- [Major] bug in foo.py:10\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+            ),
+            _ok_fix_stream(),
+            _codex_message_stream(f"fixed\n{VERDICT_APPROVED_MARKER}"),
+        ]
+    )
+
+    head_calls = 0
+
+    async def head_sha(_: Path) -> str:
+        nonlocal head_calls
+        head_calls += 1
+        return f"sha-{head_calls}"
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "workspace",
+        base_branch="main",
+        parent_run_id="run-final-local-audit",
+        issue_title="Build support queue",
+        issue_body="Operators can create and filter tickets.",
+        labels=["feature"],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="claude"),
+        fixer_role=ResolvedRole(agent="claude"),
+        cap=1,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    fix_prompt = runner.specs[1].command[-1]
+    assert "final allowed review-fix iteration" in fix_prompt
+    assert "related failure modes" in fix_prompt
+
+
+@pytest.mark.asyncio
 async def test_local_review_claude_model_injected_into_reviewer_and_fixer(
     tmp_path: Path,
 ) -> None:
@@ -355,7 +411,7 @@ async def test_local_review_claude_model_injected_into_reviewer_and_fixer(
         scripts=[
             _message_stream(
                 "claude",
-                f"## Findings\n- bug in foo.py:10\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+                f"## Findings\n- [Major] bug in foo.py:10\n{VERDICT_CHANGES_REQUESTED_MARKER}",
             ),
             _ok_fix_stream(),
             _message_stream("claude", f"fixed\n{VERDICT_APPROVED_MARKER}"),
@@ -402,7 +458,7 @@ async def test_local_review_claude_model_unset_omits_model_flag(
         scripts=[
             _message_stream(
                 "claude",
-                f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+                f"## Findings\n- [Major] bug\n{VERDICT_CHANGES_REQUESTED_MARKER}",
             ),
             _ok_fix_stream(),
             _message_stream("claude", f"fixed\n{VERDICT_APPROVED_MARKER}"),
@@ -441,7 +497,7 @@ async def test_codex_fix_run_allows_git_writes(tmp_path: Path) -> None:
     runner = _ScriptedRunner(
         scripts=[
             _codex_message_stream(
-                f"## Findings\n- bug in foo.py:10\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+                f"## Findings\n- [Major] bug in foo.py:10\n{VERDICT_CHANGES_REQUESTED_MARKER}"
             ),
             _ok_fix_stream(),
             _codex_message_stream(f"fixed\n{VERDICT_APPROVED_MARKER}"),
@@ -477,6 +533,7 @@ async def test_codex_fix_run_allows_git_writes(tmp_path: Path) -> None:
     assert "--dangerously-bypass-approvals-and-sandbox" in fix_argv
     assert "--sandbox" not in fix_argv
     assert "workspace-write" not in fix_argv
+    assert fix_argv[fix_argv.index("--cd") + 1] == str(workspace)
     # Permissions/approval --config knobs are gone (superseded by the bypass).
     assert not any("default_permissions" in a or "approval_policy" in a for a in fix_argv)
 
@@ -686,7 +743,9 @@ async def test_claude_transient_api_error_surfaces_as_reviewer_failed(
 async def test_fix_run_stall_returns_fix_run_failed(tmp_path: Path) -> None:
     runner = _ScriptedRunner(
         scripts=[
-            _codex_message_stream(f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"),
+            _codex_message_stream(
+                f"## Findings\n- [Major] bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+            ),
             [RunnerEvent(kind="stall_timeout")],
         ],
     )
@@ -734,7 +793,7 @@ async def test_blocked_fix_run_halts_session_as_blocked(tmp_path: Path) -> None:
     runner = _ScriptedRunner(
         scripts=[
             _codex_message_stream(
-                f"## Findings\n- bug in foo.py:10\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+                f"## Findings\n- [Major] bug in foo.py:10\n{VERDICT_CHANGES_REQUESTED_MARKER}"
             ),
             _claude_result_stream(
                 "I need you to authorize the Supabase OAuth URL before I can "
@@ -849,7 +908,7 @@ async def test_stale_last_message_does_not_smuggle_into_next_iteration(
             if "-o" in spec.command:
                 last_path = spec.command[spec.command.index("-o") + 1]
                 Path(last_path).write_text(
-                    f"## Findings\n- real-bug\n{VERDICT_CHANGES_REQUESTED_MARKER}",
+                    f"## Findings\n- [Major] real-bug\n{VERDICT_CHANGES_REQUESTED_MARKER}",
                     encoding="utf-8",
                 )
 
@@ -881,7 +940,7 @@ async def test_stale_last_message_does_not_smuggle_into_next_iteration(
         head_sha_provider=head_sha,
     )
     # If the stale file had leaked through we'd have gotten APPROVED.
-    assert result.outcome == LoopOutcome.EXHAUSTED
+    assert result.outcome == LoopOutcome.STUCK_LOOP
     assert result.last_verdict is not None
     assert "real-bug" in result.last_verdict.findings
 
@@ -896,7 +955,7 @@ async def test_large_diff_runs_two_passes_with_per_pass_families(
 ) -> None:
     """A large diff spawns pass-1 finder (reviewer/opposite family, no
     marker) then pass-2 verifier (implementer family, emits marker)."""
-    finder_text = "## Findings\n- suspicion at foo.py:1"
+    finder_text = "## Findings\n- [Major] suspicion at foo.py:1"
     verifier_text = f"tried to break it, held\n{VERDICT_APPROVED_MARKER}"
     runner = _ScriptedRunner(
         scripts=[
@@ -952,12 +1011,135 @@ async def test_large_diff_runs_two_passes_with_per_pass_families(
 
 
 @pytest.mark.asyncio
+async def test_two_pass_retry_reuses_finder_and_preserves_incomplete_verifier_notes(
+    tmp_path: Path,
+) -> None:
+    """A no-verdict verifier retry must not redo pass 1 or lose discoveries.
+
+    Production BENCH-59 confirmed a SQLite overflow, then ended without the
+    required verdict marker. The retry rebuilt its prompt from a new finder
+    run and silently dropped that confirmed defect.
+    """
+
+    class _RetryRunner:
+        def __init__(self) -> None:
+            self.specs: list[RunnerSpec] = []
+            self.find_calls = 0
+            self.verify_calls = 0
+
+        def run(self, spec: RunnerSpec) -> AsyncIterator[RunnerEvent]:
+            self.specs.append(spec)
+
+            async def gen() -> AsyncIterator[RunnerEvent]:
+                if spec.run_id.endswith("-find"):
+                    self.find_calls += 1
+                    events = _codex_message_stream(
+                        "## Findings\n- [Major] recursive decoder is slow"
+                    )
+                else:
+                    self.verify_calls += 1
+                    if self.verify_calls == 1:
+                        events = [
+                            *_codex_message_stream(
+                                "Confirmed SQLite OverflowError on oversized event id"
+                            )[:-1],
+                            *_codex_message_stream("I ran out of time before emitting a verdict"),
+                        ]
+                    else:
+                        events = _codex_message_stream(
+                            f"rechecked prior notes\n{VERDICT_APPROVED_MARKER}"
+                        )
+                for event in events:
+                    yield event
+
+            return gen()
+
+        async def kill(self, run_id: str) -> None:
+            pass
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=500, changed_files=10)
+
+    runner = _RetryRunner()
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-retry-notes",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        fixer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        cap=1,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    assert runner.find_calls == 1
+    assert runner.verify_calls == 2
+    retry_prompt = [spec.command[-1] for spec in runner.specs if spec.run_id.endswith("-verify")][1]
+    assert "Confirmed SQLite OverflowError" in retry_prompt
+    assert (tmp_path / "last/review-0-verify.out.log").exists()
+    assert (tmp_path / "last/review-0-verify-attempt-2.out.log").exists()
+
+
+@pytest.mark.asyncio
+async def test_two_pass_retry_reruns_an_error_only_finder(tmp_path: Path) -> None:
+    api_error = "The server encountered a temporary problem. Please retry."
+    finder_text = "## Findings\n- [Major] suspicion at foo.py:1"
+    runner = _ScriptedRunner(
+        scripts=[
+            _turn_failed_stream(api_error),
+            _message_stream("codex", finder_text),
+            _message_stream("codex", f"held\n{VERDICT_APPROVED_MARKER}"),
+        ]
+    )
+
+    async def head_sha(_: Path) -> str:
+        return "sha-1"
+
+    async def diff_size(_: Path) -> DiffSize:
+        return DiffSize(changed_lines=500, changed_files=10)
+
+    result = await run_local_review_session(
+        runner=runner,
+        workspace_path=tmp_path / "ws",
+        base_branch="main",
+        parent_run_id="run-finder-retry",
+        issue_title="t",
+        issue_body="b",
+        labels=[],
+        reviewer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        verifier_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        fixer_role=ResolvedRole(agent="codex", model="gpt-5.1-codex"),
+        cap=1,
+        stall_secs=300,
+        last_message_dir=tmp_path / "last",
+        head_sha_provider=head_sha,
+        diff_size_provider=diff_size,
+    )
+
+    assert result.outcome == LoopOutcome.APPROVED
+    assert [spec.run_id for spec in runner.specs].count("run-finder-retry-rev-0-find") == 2
+    assert (tmp_path / "last/review-0-find.out.log").exists()
+    assert (tmp_path / "last/review-0-find-attempt-2.out.log").exists()
+
+
+@pytest.mark.asyncio
 async def test_two_pass_finder_and_verifier_reflect_per_role_model_effort(
     tmp_path: Path,
 ) -> None:
     """review_find and review_verify each drive their own pass's argv — model
     and reasoning effort per role (SYM-192)."""
-    finder_text = "## Findings\n- suspicion at foo.py:1"
+    finder_text = "## Findings\n- [Major] suspicion at foo.py:1"
     verifier_text = f"held\n{VERDICT_APPROVED_MARKER}"
     runner = _ScriptedRunner(
         scripts=[
@@ -1060,7 +1242,7 @@ async def test_two_pass_finder_with_findings_and_stray_error_still_verifies(
     """A finder that produced usable findings is not dropped just because the
     stream also carried an error event — only an error-only (empty-findings)
     finder fails. The verifier still runs."""
-    finder_text = "## Findings\n- suspicion at foo.py:1"
+    finder_text = "## Findings\n- [Major] suspicion at foo.py:1"
     # A stray error event early in the stream, then the finder's real findings
     # as the final agent message — extract_last_agent_message still returns them.
     finder_stream = [
@@ -1134,14 +1316,18 @@ async def test_two_pass_finder_401_survives_merge_when_verifier_stalls(
             line=json.dumps(
                 {
                     "type": "item.completed",
-                    "item": {"id": "i", "type": "agent_message", "text": "## Findings\n- x"},
+                    "item": {
+                        "id": "i",
+                        "type": "agent_message",
+                        "text": "## Findings\n- [Major] x",
+                    },
                 }
             ),
         ),
         RunnerEvent(kind="exit", returncode=0),
     ]
     verifier_stall = [RunnerEvent(kind="stall_timeout")]
-    runner = _ScriptedRunner(scripts=[finder_stream, verifier_stall, finder_stream, verifier_stall])
+    runner = _ScriptedRunner(scripts=[finder_stream, verifier_stall, verifier_stall])
 
     async def head_sha(_: Path) -> str:
         return "sha-1"
@@ -1182,7 +1368,7 @@ async def test_finder_uses_sonnet_verifier_stays_on_opus(
     pass-2 verifier keeps the CLI default (Opus) unless its own override
     is set. Finder argv carries `--model <sonnet>`; verifier argv has no
     `--model`."""
-    finder_text = "## Findings\n- suspicion at foo.py:1"
+    finder_text = "## Findings\n- [Major] suspicion at foo.py:1"
     verifier_text = f"tried to break it, held\n{VERDICT_APPROVED_MARKER}"
     runner = _ScriptedRunner(
         scripts=[
@@ -1228,7 +1414,7 @@ async def test_verifier_claude_model_override_runs_verifier_on_it(
 ) -> None:
     """The verifier override is independently selectable: when set, the
     pass-2 verifier argv carries it while the finder keeps its own model."""
-    finder_text = "## Findings\n- suspicion at foo.py:1"
+    finder_text = "## Findings\n- [Major] suspicion at foo.py:1"
     verifier_text = f"held\n{VERDICT_APPROVED_MARKER}"
     runner = _ScriptedRunner(
         scripts=[
@@ -1274,13 +1460,17 @@ async def test_two_pass_merged_verdict_is_pass_twos(tmp_path: Path) -> None:
     """The loop receives pass-2's merged findings, not pass-1's raw
     suspicions. Pass 2 requests changes, so the loop dispatches a fixer
     with pass-2's findings as the trigger."""
-    finder_text = "## Findings\n- suspicion at foo.py:1"
-    verifier_text = f"## Findings\n- confirmed bug at foo.py:1\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+    finder_text = "## Findings\n- [Major] suspicion at foo.py:1"
+    verifier_text = (
+        f"## Findings\n- [Major] confirmed bug at foo.py:1\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+    )
     runner = _ScriptedRunner(
         scripts=[
             _message_stream("codex", finder_text),  # pass 1 (reviewer)
             _message_stream("claude", verifier_text),  # pass 2 (implementer)
             _ok_fix_stream(),  # fixer dispatched on CHANGES_REQUESTED
+            _message_stream("codex", finder_text),
+            _message_stream("claude", f"fixed and rechecked\n{VERDICT_APPROVED_MARKER}"),
         ]
     )
 
@@ -1308,15 +1498,15 @@ async def test_two_pass_merged_verdict_is_pass_twos(tmp_path: Path) -> None:
         diff_size_provider=diff_size,
     )
 
-    assert result.outcome == LoopOutcome.EXHAUSTED  # cap=1, CHANGES_REQUESTED
-    # First two specs are the reviewer passes; third is the fixer.
+    assert result.outcome == LoopOutcome.APPROVED
+    # First two specs are the reviewer passes; third is the fixer. The final
+    # two specs are the mandatory closure review after the last permitted fix.
     assert runner.specs[0].run_id == "run-merge-rev-0-find"
     assert runner.specs[1].run_id == "run-merge-rev-0-verify"
     assert runner.specs[2].stage == "local_review_fix"
     # Merged verdict is pass-2's, not pass-1's.
-    assert result.last_verdict is not None
-    assert "confirmed bug at foo.py:1" in result.last_verdict.findings
-    assert "suspicion at foo.py:1" not in result.last_verdict.findings
+    assert "confirmed bug at foo.py:1" in result.verdicts[0].findings
+    assert "suspicion at foo.py:1" not in result.verdicts[0].findings
     # The fixer trigger is pass-2's findings.
     assert "confirmed bug at foo.py:1" in runner.specs[2].command[-1]
 
@@ -1341,7 +1531,7 @@ async def test_small_diff_collapses_to_single_pass(
         scripts = [_message_stream("codex", f"ok\n{VERDICT_APPROVED_MARKER}")]
     else:
         scripts = [
-            _message_stream("codex", "## Findings\n- s at a.py:1"),
+            _message_stream("codex", "## Findings\n- [Major] s at a.py:1"),
             _message_stream("claude", f"ok\n{VERDICT_APPROVED_MARKER}"),
         ]
     runner = _ScriptedRunner(scripts=scripts)
@@ -1419,7 +1609,7 @@ async def test_pass_two_verifier_gets_tier_b_command(
     """The pass-2 verifier (implementer family) runs with Tier B exec/write
     grants; pass-1 finder stays read-only."""
     reviewer_agent = "codex" if implementer_agent == "claude" else "claude"
-    finder_text = "## Findings\n- suspicion at foo.py:1"
+    finder_text = "## Findings\n- [Major] suspicion at foo.py:1"
     verifier_text = f"held\n{VERDICT_APPROVED_MARKER}"
     runner = _ScriptedRunner(
         scripts=[
@@ -1494,11 +1684,11 @@ async def test_workspace_scrubbed_after_pass_two_before_fixer(
     finder_line = json.dumps(
         {
             "type": "item.completed",
-            "item": {"id": "i", "type": "agent_message", "text": "## Findings\n- s"},
+            "item": {"id": "i", "type": "agent_message", "text": "## Findings\n- [Major] s"},
         }
     )
     verifier_text = (
-        f"## Findings\n- confirmed bug at foo.py:1 (test failed)\n"
+        f"## Findings\n- [Major] confirmed bug at foo.py:1 (test failed)\n"
         f"{VERDICT_CHANGES_REQUESTED_MARKER}"
     )
     verifier_line = json.dumps({"type": "result", "result": verifier_text})
@@ -1558,7 +1748,7 @@ async def test_workspace_scrubbed_after_pass_two_before_fixer(
         workspace_scrubber=scrubber,
     )
 
-    assert result.outcome == LoopOutcome.EXHAUSTED  # cap=1, CHANGES_REQUESTED
+    assert result.outcome == LoopOutcome.STUCK_LOOP
     kinds = [e[0] for e in events]
     assert ("verify_wrote", True) in events
     assert "scrub" in kinds
@@ -1662,7 +1852,7 @@ async def test_wall_clock_secs_wired_to_specs_and_distinguishes_error(
     """wall_clock_secs must be threaded into every RunnerSpec (reviewer and
     fixer), and a wall_clock_timeout terminal event must produce
     "fix-run exceeded wall-clock cap" — not the stall message."""
-    changes_text = f"bug found\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+    changes_text = f"## Findings\n- [Major] bug found\n{VERDICT_CHANGES_REQUESTED_MARKER}"
     runner = _ScriptedRunner(
         scripts=[
             _message_stream("codex", changes_text),
@@ -1704,7 +1894,7 @@ async def test_two_pass_verifier_401_tags_verifier_agent(tmp_path: Path) -> None
     finder and returns a 401 must attribute the failure to the *verifier's*
     agent — a codex finder must not expire a claude verifier's provider (and
     vice versa). Regression for `api_error_agent` only ever being the finder."""
-    finder_text = "## Findings\n- suspicion at foo.py:1"
+    finder_text = "## Findings\n- [Major] suspicion at foo.py:1"
     # Finder (codex) succeeds with findings; verifier (claude) exits 0 with only
     # a 401 and no verdict. The loop retries the whole two-pass once.
     runner = _ScriptedRunner(
@@ -1754,7 +1944,9 @@ async def test_fixer_deterministic_401_surfaces_as_fix_run_failed(tmp_path: Path
     Only transient statuses were preserved before; a 401 was dropped."""
     runner = _ScriptedRunner(
         scripts=[
-            _codex_message_stream(f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"),
+            _codex_message_stream(
+                f"## Findings\n- [Major] bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+            ),
             _claude_api_error_stream(401),
         ]
     )
@@ -1880,7 +2072,9 @@ async def test_fixer_stall_with_auth_stderr_tags_fixer_agent(tmp_path: Path) -> 
     already succeeded this iteration."""
     runner = _ScriptedRunner(
         scripts=[
-            _codex_message_stream(f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"),
+            _codex_message_stream(
+                f"## Findings\n- [Major] bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+            ),
             [
                 RunnerEvent(kind="stderr", line="Not logged in. Please run /login."),
                 RunnerEvent(kind="stall_timeout"),
@@ -1923,7 +2117,9 @@ async def test_fixer_nonzero_exit_with_auth_stderr_tags_fixer_agent(tmp_path: Pa
     never expired."""
     runner = _ScriptedRunner(
         scripts=[
-            _codex_message_stream(f"## Findings\n- bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"),
+            _codex_message_stream(
+                f"## Findings\n- [Major] bug\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+            ),
             [
                 RunnerEvent(kind="stderr", line="Not logged in. Please run /login."),
                 RunnerEvent(kind="exit", returncode=1),
@@ -1977,7 +2173,7 @@ async def test_reviewer_stall_after_auth_prose_does_not_flag_auth_failure(
                         "id": "i",
                         "type": "agent_message",
                         "text": (
-                            "## Findings\n- The refresh path returns 200 where it should "
+                            "## Findings\n- [Major] The refresh path returns 200 where it should "
                             "return 401 Unauthorized once the refresh token expired."
                         ),
                     },

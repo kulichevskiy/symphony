@@ -16,18 +16,10 @@ Callers inject two async callbacks:
 - `fixer(findings) -> FixerOutput` — runs a fix-run that produces a new
   commit addressing `findings`. Returns whether the fix-run succeeded.
 
-The loop:
-
-  for i in range(cap):
-      out = await reviewer(prompt)
-      if reviewer failed              → retry once, then reviewer_failed
-      verdict = parse(out)
-      if UNPARSEABLE                  → retry once, then reviewer_failed
-      if APPROVED                     → approved
-      if findings identical to prev   → stuck_loop  (dedup gate)
-      fix_ok = await fixer(findings)
-      if not fix_ok                   → fix_run_failed
-  → exhausted (cap hit)
+The loop reviews, fixes, and then always verifies the final permitted fix.
+`cap` limits change-driving fixer turns; the closure review is read-only and
+does not consume another fix allowance. Earlier confirmed findings are carried
+into later fixer prompts as regression obligations.
 
 `approved` / `exhausted` / `stuck_loop` are operationally meaningful for
 the caller: approved → push and merge; exhausted → push but escalate to
@@ -38,7 +30,7 @@ exhausted but with a clearer telemetry signal.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 
 from .local_review import (
@@ -225,9 +217,10 @@ async def run_local_review_loop(
     forwarded so the fixer can use `verdict.findings` as the trigger
     text for `review_comment_fix_prompt`.
 
-    `cap` must be at least 1 — a zero or negative cap returns `EXHAUSTED`
-    immediately with no work, which is almost certainly a configuration
-    bug worth surfacing rather than silently approving.
+    `cap` is the maximum number of fixer turns. One closure review runs after
+    the final permitted fix. A zero or negative cap returns `EXHAUSTED`
+    immediately with no work, which is almost certainly a configuration bug
+    worth surfacing rather than silently approving.
     """
     if cap < 1:
         return LoopResult(
@@ -283,7 +276,10 @@ async def run_local_review_loop(
             cache_read_tokens=total_cache_read_tokens,
         )
 
-    for i in range(cap):
+    i = 0
+    fixes_used = 0
+    prior_findings: list[str] = []
+    while True:
         verdict: LocalVerdict | None = None
         reviewer_error: str | None = None
         # The real stream error (an API/config failure) can surface on one
@@ -292,7 +288,9 @@ async def run_local_review_loop(
         # the generic marker message.
         stream_error: str | None = None
         last_failed_agent: str | None = None
-        for attempt in range(REVIEWER_FAILURE_RETRIES + 1):
+        reviewer_retries_used = 0
+        severity_retries_used = 0
+        while True:
             out = await reviewer(i)
             _record_usage(out)
             if out.agent_error:
@@ -306,7 +304,8 @@ async def run_local_review_loop(
             ledger.clear(*out.healthy_agents)
             if not out.ok:
                 reviewer_error = out.error or "reviewer failed"
-                if attempt < REVIEWER_FAILURE_RETRIES:
+                if reviewer_retries_used < REVIEWER_FAILURE_RETRIES:
+                    reviewer_retries_used += 1
                     continue
                 return _result(
                     outcome=LoopOutcome.REVIEWER_FAILED,
@@ -320,7 +319,12 @@ async def run_local_review_loop(
                 head_sha=out.head_sha,
                 last_message_file=out.last_message_file,
             )
-            if parsed.kind == LocalVerdictKind.UNPARSEABLE and attempt < REVIEWER_FAILURE_RETRIES:
+            if parsed.kind == LocalVerdictKind.UNPARSEABLE:
+                if reviewer_retries_used < REVIEWER_FAILURE_RETRIES:
+                    reviewer_retries_used += 1
+                    continue
+            elif parsed.severity_inferred and severity_retries_used < REVIEWER_FAILURE_RETRIES:
+                severity_retries_used += 1
                 continue
             verdict = parsed
             break
@@ -378,7 +382,32 @@ async def run_local_review_loop(
             )
         prev_findings_signature = findings_signature
 
-        fix = await fixer(i, verdict)
+        # The cap limits change-driving fix turns. After the final permitted
+        # fix we still run one read-only review; only an unresolved verdict on
+        # that closure review is EXHAUSTED.
+        if fixes_used >= cap:
+            return _result(
+                outcome=LoopOutcome.EXHAUSTED,
+                iterations=i + 1,
+                prefer_agent=last_failed_agent,
+            )
+
+        # Preserve earlier confirmed findings as regression obligations. A
+        # fixer that sees only the newest item can solve it by reintroducing a
+        # defect fixed one round earlier (the production BENCH-59 failure).
+        current_findings = verdict.findings.strip()
+        if prior_findings:
+            fixer_findings = (
+                "# Current findings\n\n"
+                f"{current_findings}\n\n"
+                "# Regression obligations from earlier review rounds\n\n"
+                + "\n\n".join(prior_findings)
+            )
+            fixer_verdict = replace(verdict, findings=fixer_findings)
+        else:
+            fixer_verdict = verdict
+
+        fix = await fixer(i, fixer_verdict)
         _record_usage(fix)
         # Whatever the fixer reports goes on the ledger; a clean run clears its
         # provider, since completing proves that credential works.
@@ -402,10 +431,10 @@ async def run_local_review_loop(
                 error=fix.error or "fix-run failed",
                 prefer_agent=fixer_agent if fix.api_error else last_failed_agent,
             )
-
-    # Anything still on the ledger when the cap is hit is unresolved by
-    # definition, so EXHAUSTED surfaces it like any other outcome.
-    return _result(outcome=LoopOutcome.EXHAUSTED, iterations=cap)
+        if current_findings:
+            prior_findings.append(current_findings)
+        fixes_used += 1
+        i += 1
 
 
 __all__ = [

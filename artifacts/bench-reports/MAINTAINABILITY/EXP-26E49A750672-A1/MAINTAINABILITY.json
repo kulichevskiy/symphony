@@ -1,0 +1,210 @@
+{
+  "errors": [],
+  "mutations": [
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 3.11548808400039,
+      "mutant_id": "python:boolean_connector:support_queue/main.py:79:dcca25b6",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 3.15443091599991,
+      "mutant_id": "python:boolean_literal:support_queue/main.py:136:107aae0b",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 2.5480199579997134,
+      "mutant_id": "python:comparison:support_queue/main.py:93:d45763fb",
+      "status": "killed"
+    },
+    {
+      "detail": "ect(element).not.toBeInTheDocument()\n\nexpected document not to contain element, found <button\n  type=\"button\"\n>\n  Retry \n  start progress\n</button> instead\n \u276f src/App.test.tsx:211:80\n    209|\n    210|     expect(await screen.findByText(\"Unassigned\")).toBeInTheDocument();\n    211|     expect(screen.queryByRole(\"button\", { name: \"Retry start progress\"\u2026\n       |                                                                                ^\n    212|   });\n    213|\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[5/5]\u23af",
+      "duration_seconds": 3.7275712919999933,
+      "mutant_id": "typescript:boolean_connector:frontend/src/App.tsx:45:9e9f4768",
+      "status": "killed"
+    },
+    {
+      "detail": "st/wait-for.js:163:27\n \u276f node_modules/@testing-library/dom/dist/query-helpers.js:86:33\n \u276f src/App.test.tsx:449:32\n    447|\n    448|     fireEvent.click(await screen.findByRole(\"button\", { name: \"View Pr\u2026\n    449|     const alert = await screen.findByRole(\"alert\");\n       |                                ^\n    450|     expect(alert).toHaveTextContent(\"Could not load ticket details\");\n    451|     expect(screen.getByRole(\"region\", { name: \"Ticket details\" })).toC\u2026\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[18/18]\u23af",
+      "duration_seconds": 33.06792054199832,
+      "mutant_id": "typescript:boolean_literal:frontend/src/App.tsx:77:d2d579f5",
+      "status": "killed"
+    },
+    {
+      "detail": "163:27\n \u276f node_modules/@testing-library/dom/dist/query-helpers.js:86:33\n \u276f src/App.test.tsx:275:25\n    273|     fireEvent.click(await screen.findByRole(\"button\", { name: \"View Pr\u2026\n    274|     fireEvent.click(await screen.findByRole(\"button\", { name: \"Claim t\u2026\n    275|     expect(await screen.findByRole(\"button\", { name: \"Retry claim tick\u2026\n       |                         ^\n    276|\n    277|     fireEvent.click(screen.getByRole(\"button\", { name: \"View Email una\u2026\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[3/3]\u23af",
+      "duration_seconds": 7.9040000419990974,
+      "mutant_id": "typescript:comparison:frontend/src/App.tsx:38:8234ec4b",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 2.5206898340002226,
+      "mutant_id": "python:boolean_connector:support_queue/main.py:93:c9c272e5",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 2.138813166997352,
+      "mutant_id": "python:comparison:support_queue/main.py:128:e965a1bd",
+      "status": "killed"
+    },
+    {
+      "detail": "> support-queue-frontend@0.1.0 test\n> vitest --run\n\n\n RUN  v4.1.10 /private/var/folders/s_/t8ytmm9940j564xd698kgmm00000gn/T/symphony-maintainability-r3nkjs8c/checkout/frontend\n\n\n Test Files  1 passed (1)\n      Tests  20 passed (20)\n   Start at  23:03:15\n   Duration  1.41s (transform 47ms, setup 47ms, import 61ms, tests 928ms, environment 293ms)",
+      "duration_seconds": 1.733247833999485,
+      "mutant_id": "typescript:boolean_connector:frontend/src/App.tsx:45:c309d8ed",
+      "status": "survived"
+    },
+    {
+      "detail": "st/wait-for.js:163:27\n \u276f node_modules/@testing-library/dom/dist/query-helpers.js:86:33\n \u276f src/App.test.tsx:449:32\n    447|\n    448|     fireEvent.click(await screen.findByRole(\"button\", { name: \"View Pr\u2026\n    449|     const alert = await screen.findByRole(\"alert\");\n       |                                ^\n    450|     expect(alert).toHaveTextContent(\"Could not load ticket details\");\n    451|     expect(screen.getByRole(\"region\", { name: \"Ticket details\" })).toC\u2026\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[18/18]\u23af",
+      "duration_seconds": 34.844065375000355,
+      "mutant_id": "typescript:boolean_literal:frontend/src/App.tsx:82:d0747917",
+      "status": "killed"
+    },
+    {
+      "detail": "pect(element).not.toBeInTheDocument()\n\nexpected document not to contain element, found <button\n  type=\"button\"\n>\n  Retry \n  start progress\n</button> instead\n \u276f src/App.test.tsx:192:80\n    190|\n    191|     expect(await screen.findByText(\"Version 3\")).toBeInTheDocument();\n    192|     expect(screen.queryByRole(\"button\", { name: \"Retry start progress\"\u2026\n       |                                                                                ^\n    193|   });\n    194|\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[4/4]\u23af",
+      "duration_seconds": 3.531988042001103,
+      "mutant_id": "typescript:comparison:frontend/src/App.tsx:44:44a11c6d",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 2.4475697920024686,
+      "mutant_id": "python:boolean_connector:support_queue/main.py:93:f082835d",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 2.740525917000923,
+      "mutant_id": "python:comparison:support_queue/main.py:136:63c9935e",
+      "status": "killed"
+    },
+    {
+      "detail": "or: expect(element).not.toBeInTheDocument()\n\nexpected document not to contain element, found <button\n  type=\"button\"\n>\n  Retry \n  claim ticket\n</button> instead\n \u276f src/App.test.tsx:252:78\n    250|\n    251|     expect(await screen.findByText(\"agent-2\")).toBeInTheDocument();\n    252|     expect(screen.queryByRole(\"button\", { name: \"Retry claim ticket\" }\u2026\n       |                                                                              ^\n    253|   });\n    254|\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[2/2]\u23af",
+      "duration_seconds": 3.3031370000007882,
+      "mutant_id": "typescript:boolean_connector:frontend/src/App.tsx:47:37bebac6",
+      "status": "killed"
+    },
+    {
+      "detail": "st/wait-for.js:163:27\n \u276f node_modules/@testing-library/dom/dist/query-helpers.js:86:33\n \u276f src/App.test.tsx:449:32\n    447|\n    448|     fireEvent.click(await screen.findByRole(\"button\", { name: \"View Pr\u2026\n    449|     const alert = await screen.findByRole(\"alert\");\n       |                                ^\n    450|     expect(alert).toHaveTextContent(\"Could not load ticket details\");\n    451|     expect(screen.getByRole(\"region\", { name: \"Ticket details\" })).toC\u2026\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[18/18]\u23af",
+      "duration_seconds": 34.70403837500089,
+      "mutant_id": "typescript:boolean_literal:frontend/src/App.tsx:83:db0dc3db",
+      "status": "killed"
+    },
+    {
+      "detail": "ect(element).not.toBeInTheDocument()\n\nexpected document not to contain element, found <button\n  type=\"button\"\n>\n  Retry \n  start progress\n</button> instead\n \u276f src/App.test.tsx:211:80\n    209|\n    210|     expect(await screen.findByText(\"Unassigned\")).toBeInTheDocument();\n    211|     expect(screen.queryByRole(\"button\", { name: \"Retry start progress\"\u2026\n       |                                                                                ^\n    212|   });\n    213|\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[1/1]\u23af",
+      "duration_seconds": 3.5608427499992104,
+      "mutant_id": "typescript:comparison:frontend/src/App.tsx:45:e3657b45",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 2.835441876000914,
+      "mutant_id": "python:boolean_connector:support_queue/main.py:120:f1c24f6b",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 1.2070778750003228,
+      "mutant_id": "python:comparison:support_queue/main.py:184:23048df3",
+      "status": "killed"
+    },
+    {
+      "detail": "163:27\n \u276f node_modules/@testing-library/dom/dist/query-helpers.js:86:33\n \u276f src/App.test.tsx:275:25\n    273|     fireEvent.click(await screen.findByRole(\"button\", { name: \"View Pr\u2026\n    274|     fireEvent.click(await screen.findByRole(\"button\", { name: \"Claim t\u2026\n    275|     expect(await screen.findByRole(\"button\", { name: \"Retry claim tick\u2026\n       |                         ^\n    276|\n    277|     fireEvent.click(screen.getByRole(\"button\", { name: \"View Email una\u2026\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[3/3]\u23af",
+      "duration_seconds": 7.434971957998641,
+      "mutant_id": "typescript:boolean_connector:frontend/src/App.tsx:47:999c20af",
+      "status": "killed"
+    },
+    {
+      "detail": "L  src/App.test.tsx > Support Queue > clears an unsent comment draft when selecting another ticket\nError: expect(element).toHaveValue()\n\nExpected the element to have value:\n\nReceived:\n  Unsent draft\n \u276f src/App.test.tsx:438:46\n    436|\n    437|     expect(await screen.findByRole(\"heading\", { name: \"Email unavailab\u2026\n    438|     expect(screen.getByLabelText(\"Comment\")).toHaveValue(\"\");\n       |                                              ^\n    439|   });\n    440|\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[2/2]\u23af",
+      "duration_seconds": 3.3576253749997704,
+      "mutant_id": "typescript:boolean_literal:frontend/src/App.tsx:130:a14651d2",
+      "status": "killed"
+    },
+    {
+      "detail": "163:27\n \u276f node_modules/@testing-library/dom/dist/query-helpers.js:86:33\n \u276f src/App.test.tsx:275:25\n    273|     fireEvent.click(await screen.findByRole(\"button\", { name: \"View Pr\u2026\n    274|     fireEvent.click(await screen.findByRole(\"button\", { name: \"Claim t\u2026\n    275|     expect(await screen.findByRole(\"button\", { name: \"Retry claim tick\u2026\n       |                         ^\n    276|\n    277|     fireEvent.click(screen.getByRole(\"button\", { name: \"View Email una\u2026\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[5/5]\u23af",
+      "duration_seconds": 7.4648912499997095,
+      "mutant_id": "typescript:comparison:frontend/src/App.tsx:47:934e9fb6",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 2.2658801670004323,
+      "mutant_id": "python:boolean_connector:support_queue/main.py:128:93bfaea8",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 1.0904037079999398,
+      "mutant_id": "python:comparison:support_queue/main.py:187:48969336",
+      "status": "killed"
+    },
+    {
+      "detail": "> support-queue-frontend@0.1.0 test\n> vitest --run\n\n\n RUN  v4.1.10 /private/var/folders/s_/t8ytmm9940j564xd698kgmm00000gn/T/symphony-maintainability-r3nkjs8c/checkout/frontend\n\n\n Test Files  1 passed (1)\n      Tests  20 passed (20)\n   Start at  23:05:07\n   Duration  1.34s (transform 43ms, setup 45ms, import 57ms, tests 872ms, environment 290ms)",
+      "duration_seconds": 1.6624489170008019,
+      "mutant_id": "typescript:boolean_connector:frontend/src/App.tsx:52:d7d6c583",
+      "status": "survived"
+    }
+  ],
+  "probe": {
+    "changed_files": 6,
+    "changed_lines": 306,
+    "cost_usd": 2.34164,
+    "detail": "",
+    "raw_tokens": 2277496,
+    "repetitions": 1,
+    "status": "passed",
+    "successful_repetitions": 1,
+    "wall_seconds": 330.28036131476983
+  },
+  "repository": "kulichevskiy/EXP-26E49A750672-A1",
+  "schema_version": 1,
+  "static": {
+    "complexity_max": 62,
+    "complexity_median": 2.0,
+    "complexity_p95": 27,
+    "duplicated_blocks": 2,
+    "files": [
+      {
+        "complexity_max": 62,
+        "function_lines_max": 243,
+        "functions": 7,
+        "language": "typescript",
+        "lines": 309,
+        "path": "frontend/src/App.tsx"
+      },
+      {
+        "complexity_max": 0,
+        "function_lines_max": 0,
+        "functions": 0,
+        "language": "typescript",
+        "lines": 11,
+        "path": "frontend/src/main.tsx"
+      },
+      {
+        "complexity_max": 0,
+        "function_lines_max": 0,
+        "functions": 0,
+        "language": "python",
+        "lines": 1,
+        "path": "support_queue/__init__.py"
+      },
+      {
+        "complexity_max": 27,
+        "function_lines_max": 252,
+        "functions": 24,
+        "language": "python",
+        "lines": 386,
+        "path": "support_queue/main.py"
+      }
+    ],
+    "function_count": 31,
+    "import_cycles": [],
+    "large_files": 0,
+    "large_functions": 2,
+    "max_file_lines": 386,
+    "max_function_lines": 252,
+    "source_files": 4,
+    "source_lines": 707
+  }
+}

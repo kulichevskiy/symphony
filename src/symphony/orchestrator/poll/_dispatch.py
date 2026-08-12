@@ -133,6 +133,15 @@ class _DispatchMixin(_OrchestratorBase):
         except LinearError as e:
             log.warning("scan failed for %s: %s", binding.linear_team_key, e)
             return scheduled
+        if binding.issue_title_prefix:
+            issues = [
+                issue for issue in issues if issue.title.startswith(binding.issue_title_prefix)
+            ]
+            waiting_issues = [
+                issue
+                for issue in waiting_issues
+                if issue.title.startswith(binding.issue_title_prefix)
+            ]
         log.info(
             "scan %s: %d issue(s) in %s%s",
             binding.linear_team_key,

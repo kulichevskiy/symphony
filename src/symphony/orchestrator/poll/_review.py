@@ -29,6 +29,7 @@ from collections.abc import (
     Callable,
 )
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import (
@@ -116,11 +117,13 @@ from ._base import (
     _tracker_context_for_binding,
 )
 from ._git import (
+    _git_abort_merge,
     _git_abort_rebase,
     _git_add_and_continue_rebase,
     _git_conflicted_files,
     _git_fetch,
     _git_fetch_branch,
+    _git_merge,
     _git_rebase,
     _git_status_short,
     _sync_workspace_to_remote,
@@ -173,6 +176,12 @@ def _local_review_infra_failed(result: LoopResult | None) -> bool:
 def _local_review_permits_remote(result: LoopResult | None) -> bool:
     return result is not None and result.outcome in {
         LoopOutcome.APPROVED,
+        # Non-convergence or a reviewer-infrastructure failure can still hand
+        # off to a configured independent remote reviewer. FIX_RUN_FAILED and
+        # STUCK_LOOP remain blocked: the former may have partial edits, while
+        # the latter is a proven code-quality non-convergence signal.
+        LoopOutcome.EXHAUSTED,
+        LoopOutcome.REVIEWER_FAILED,
     }
 
 
@@ -287,6 +296,25 @@ _CODEX_REVIEWED_COMMIT_RE = re.compile(
     r"reviewed\s+commit:\s*\**\s*`?\s*([0-9a-fA-F]{7,40})",
     re.IGNORECASE,
 )
+
+_COMMIT_SHA_RE = re.compile(r"\b[0-9a-fA-F]{7,40}\b")
+
+
+@dataclass(frozen=True)
+class _ReviewFixAdvance:
+    sha: str
+    changed: bool
+
+
+def _review_fix_claim_sha(ref: str) -> str:
+    match = _COMMIT_SHA_RE.search(ref)
+    return match.group(0) if match else ""
+
+
+def _sha_matches(left: str, right: str) -> bool:
+    left = left.strip().lower()
+    right = right.strip().lower()
+    return bool(left and right and (left.startswith(right) or right.startswith(left)))
 
 
 def _codex_lgtm_reactions_from_issue_comments(
@@ -486,6 +514,14 @@ class _ReviewMixin(_OrchestratorBase):
         async def _move_issue_to_review_state(
             self, *, binding: RepoBinding, issue: LinearIssue
         ) -> None: ...
+
+        async def _resolve_pr_base_ref(
+            self,
+            *,
+            binding: RepoBinding,
+            issue: LinearIssue,
+            view: dict[str, object] | None,
+        ) -> str: ...
 
         async def _park_local_only_review_needs_approval(
             self,
@@ -833,9 +869,18 @@ class _ReviewMixin(_OrchestratorBase):
         task.add_done_callback(partial(self._review_poll_done, run_id=run.id, issue_id=issue.id))
         return task
 
-    async def _mark_review_rearm_retry(self, run_id: str) -> None:
+    async def _mark_review_rearm_retry(
+        self,
+        run_id: str,
+        *,
+        force_retrigger: bool = False,
+    ) -> None:
         self._review_rearm_retry_run_ids.add(run_id)
-        await db.runs.mark_review_rearm_retry(self._conn, run_id)
+        await db.runs.mark_review_rearm_retry(
+            self._conn,
+            run_id,
+            force_retrigger=force_retrigger,
+        )
 
     async def _clear_review_rearm_retry(self, run_id: str) -> None:
         self._review_rearm_retry_run_ids.discard(run_id)
@@ -959,6 +1004,11 @@ class _ReviewMixin(_OrchestratorBase):
             return
         current_binding, current_issue = current
         rearm_retry_pending = await self._review_rearm_retry_pending(run.id)
+        force_retrigger = (
+            await db.runs.review_rearm_retry_is_forced(self._conn, run.id)
+            if rearm_retry_pending
+            else False
+        )
         if await self._review_poll_deferred_by_deliver_failed_wait(run.issue_id, run.id):
             return
         rearm_done = True
@@ -968,14 +1018,14 @@ class _ReviewMixin(_OrchestratorBase):
                 binding=current_binding,
                 issue=current_issue,
                 state=state,
-                require_no_signal=True,
+                require_no_signal=not force_retrigger,
             )
             if rearm_done:
                 await self._clear_review_rearm_retry(run.id)
         if await self._review_poll_deferred_by_deliver_failed_wait(run.issue_id, run.id):
             return
         handled_feedback = await self._poll_review_run(run, current_binding, current_issue)
-        if rearm_retry_pending and not rearm_done and handled_feedback:
+        if rearm_retry_pending and not force_retrigger and not rearm_done and handled_feedback:
             await self._clear_review_rearm_retry(run.id)
 
     async def _refresh_review_poll_candidate(
@@ -1313,7 +1363,15 @@ class _ReviewMixin(_OrchestratorBase):
         """
         storage_issue_id = run.issue_id
         try:
-            checks = await (await self._gh_client()).pr_checks(pr_number, repo=binding.github_repo)
+            gh = await self._gh_client()
+            if binding.required_status_checks:
+                checks = await gh.pr_checks(
+                    pr_number,
+                    repo=binding.github_repo,
+                    required_contexts=binding.required_status_checks,
+                )
+            else:
+                checks = await gh.pr_checks(pr_number, repo=binding.github_repo)
         except GitHubError as e:
             failures = await db.review_state.bump_ci_fetch_failures(self._conn, storage_issue_id)
             log.warning(
@@ -1693,12 +1751,53 @@ class _ReviewMixin(_OrchestratorBase):
             try:
                 github_token = await self._resolve_github_token(repo=binding.github_repo)
                 await _git_fetch_branch(workspace_path, branch, github_token=github_token)
+                state = await db.review_state.get(self._conn, run.issue_id)
+                view: dict[str, object] | None = None
+                if state.pr_number is not None:
+                    try:
+                        result: object = (await self._gh_client()).pr_view(
+                            state.pr_number,
+                            repo=binding.github_repo,
+                        )
+                        if inspect.isawaitable(result):
+                            result = await result
+                        if isinstance(result, dict):
+                            view = result
+                    except (GitHubError, AttributeError, TypeError) as e:
+                        log.warning(
+                            "could not read PR base before CI fix for %s; "
+                            "falling back to configured/default base: %s",
+                            issue.identifier,
+                            e,
+                        )
+                base_ref = await self._resolve_pr_base_ref(
+                    binding=binding,
+                    issue=issue,
+                    view=view,
+                )
+                await _git_fetch(workspace_path, github_token=github_token)
+                if not await _git_merge(workspace_path, f"origin/{base_ref}"):
+                    conflicted_files = await _git_conflicted_files(workspace_path)
+                    if conflicted_files:
+                        await _git_abort_merge(workspace_path)
+                        log.warning(
+                            "base %s conflicted while preparing CI fix for %s; "
+                            "deferring to merge-conflict handling",
+                            base_ref,
+                            issue.identifier,
+                        )
+                        return False
+                    status_short = await _git_status_short(workspace_path)
+                    error = "base sync merge failed with no unresolved paths"
+                    if status_short:
+                        error += f"; git status: {status_short}"
+                    raise RuntimeError(error)
             except Exception as e:  # noqa: BLE001
                 await self._fail_review_run(
                     run=run,
                     binding=binding,
                     issue=issue,
-                    error=f"could not fetch review fix-run remote HEAD for {branch}: {e}",
+                    error=f"could not synchronize review fix-run workspace for {branch}: {e}",
                     last_log=str(e),
                     auto_retry=False,
                     operator_wait=True,
@@ -1802,7 +1901,7 @@ class _ReviewMixin(_OrchestratorBase):
                 )
                 return False
 
-            pushed_sha = await self._validate_review_fix_advanced(
+            advance = await self._validate_review_fix_advanced(
                 run=run,
                 fix_run_id=fix_run_id,
                 binding=binding,
@@ -1811,8 +1910,9 @@ class _ReviewMixin(_OrchestratorBase):
                 branch=branch,
                 start_sha=start_sha,
             )
-            if not pushed_sha:
+            if advance is None:
                 return False
+            pushed_sha = advance.sha
 
             await db.runs.update_status(
                 self._conn,
@@ -1820,6 +1920,19 @@ class _ReviewMixin(_OrchestratorBase):
                 "completed",
                 ended_at=self._now().isoformat(),
             )
+
+            if not advance.changed:
+                log.info(
+                    "review fix signal was already resolved on %s for %s",
+                    pushed_sha[:12],
+                    issue.identifier,
+                )
+                await self._rearm_after_already_resolved_fix(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                )
+                return True
 
             local_review_result: LoopResult | None = None
             local_only_review = (
@@ -1869,6 +1982,7 @@ class _ReviewMixin(_OrchestratorBase):
                             pr_url=state.pr_url,
                         ),
                         result=local_review_result,
+                        operator_wait=True,
                     )
                     return True
                 if (
@@ -2001,6 +2115,24 @@ class _ReviewMixin(_OrchestratorBase):
         )
         return posted
 
+    async def _rearm_after_already_resolved_fix(
+        self,
+        *,
+        run: db.runs.Run,
+        binding: RepoBinding,
+        issue: LinearIssue,
+    ) -> None:
+        state = await db.review_state.get(self._conn, run.issue_id)
+        rearmed = await self._retrigger_codex_review_unless_approved(
+            binding=binding,
+            issue=issue,
+            state=state,
+        )
+        if not rearmed:
+            # The old signal is now deduplicated, so persist a forced re-arm.
+            # Otherwise a transient GitHub failure could strand the AFK flow.
+            await self._mark_review_rearm_retry(run.id, force_retrigger=True)
+
     async def _review_verdict_and_head_for_pr(
         self,
         *,
@@ -2124,6 +2256,8 @@ class _ReviewMixin(_OrchestratorBase):
             issue_body=issue.description,
             labels=list(issue.labels),
             trigger=trigger,
+            iteration=iteration,
+            iteration_cap=self.config.review_iteration_cap,
         )
         tracker = self.tracker(binding)
         branch = f"{binding.branch_prefix}/{issue.identifier.lower()}"
@@ -2271,7 +2405,7 @@ class _ReviewMixin(_OrchestratorBase):
                 )
                 return False
 
-            pushed_sha = await self._validate_review_fix_advanced(
+            advance = await self._validate_review_fix_advanced(
                 run=run,
                 fix_run_id=fix_run_id,
                 binding=binding,
@@ -2280,8 +2414,9 @@ class _ReviewMixin(_OrchestratorBase):
                 branch=branch,
                 start_sha=start_sha,
             )
-            if not pushed_sha:
+            if advance is None:
                 return False
+            pushed_sha = advance.sha
 
             await db.runs.update_status(
                 self._conn,
@@ -2289,6 +2424,19 @@ class _ReviewMixin(_OrchestratorBase):
                 "completed",
                 ended_at=self._now().isoformat(),
             )
+
+            if not advance.changed:
+                log.info(
+                    "review feedback was already resolved on %s for %s",
+                    pushed_sha[:12],
+                    issue.identifier,
+                )
+                await self._rearm_after_already_resolved_fix(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                )
+                return True
 
             try:
                 await self._push_fn(workspace_path, branch)
@@ -2482,6 +2630,7 @@ class _ReviewMixin(_OrchestratorBase):
                 )
                 return False
 
+            had_conflicts = not rebase_clean
             conflicted_files: list[str] = []
             if not rebase_clean:
                 conflicted_files = await _git_conflicted_files(workspace_path)
@@ -2683,10 +2832,28 @@ class _ReviewMixin(_OrchestratorBase):
                         )
                         return False
 
+            if not had_conflicts and await _workspace_head_sha(workspace_path) == start_sha:
+                # GitHub mergeability is eventually consistent after a force-push.
+                # A later poll can therefore still report CONFLICTING even though
+                # the synchronized branch is already based on the latest upstream.
+                # This is a stale trigger, not a broken fix-run or operator wait.
+                drop_dispatch_id()
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "completed",
+                    ended_at=self._now().isoformat(),
+                )
+                log.info(
+                    "merge-conflict trigger was stale for %s; branch already rebased",
+                    issue.identifier,
+                )
+                return False
+
             drop_dispatch_id()
             await _add_run_usage(self._conn, fix_run_id, cumulative_usage)
 
-            pushed_sha = await self._validate_review_fix_advanced(
+            advance = await self._validate_review_fix_advanced(
                 run=run,
                 fix_run_id=fix_run_id,
                 binding=binding,
@@ -2695,8 +2862,9 @@ class _ReviewMixin(_OrchestratorBase):
                 branch=branch,
                 start_sha=start_sha,
             )
-            if not pushed_sha:
+            if advance is None:
                 return False
+            pushed_sha = advance.sha
 
             await db.runs.update_status(
                 self._conn,
@@ -2775,10 +2943,10 @@ class _ReviewMixin(_OrchestratorBase):
         workspace_path: Path,
         branch: str,
         start_sha: str,
-    ) -> str:
+    ) -> _ReviewFixAdvance | None:
         current_sha = await _workspace_head_sha(workspace_path)
         if current_sha and current_sha != start_sha:
-            return current_sha
+            return _ReviewFixAdvance(sha=current_sha, changed=True)
 
         short_sha = (current_sha or start_sha)[:12] or "(unknown)"
         status_short = await _git_status_short(workspace_path)
@@ -2812,7 +2980,31 @@ class _ReviewMixin(_OrchestratorBase):
             # via _fail_run; just clear review rearm state and return.
             await self._clear_review_rearm_retry(run.id)
             self._clear_review_no_signal_rearm_heads(run.id)
-            return ""
+            return None
+        role = binding.resolved_role("fix", self.config.roles)
+        final_message = _read_run_final_message(log_path, agent=role.agent)
+        marker = parse_completion_marker(final_message)
+        if marker.kind == "already_done":
+            claimed_sha = _review_fix_claim_sha(marker.already_done_ref)
+            dirty_files = await _workspace_dirty_files(workspace_path)
+            if (
+                current_sha
+                and not dirty_files
+                and _sha_matches(claimed_sha, current_sha)
+                and _sha_matches(current_sha, start_sha)
+            ):
+                log.info(
+                    "review fix-run for %s verified delayed/duplicate signal "
+                    "already resolved on %s",
+                    issue.identifier,
+                    current_sha[:12],
+                )
+                return _ReviewFixAdvance(sha=current_sha, changed=False)
+            reason = (
+                f"review fix-run claimed SYMPHONY_ALREADY_DONE but could not verify "
+                f"current clean HEAD {short_sha} from marker: "
+                f"{marker.already_done_ref or '(missing ref)'}"
+            )
         # SYM-223: a clean rc=0 exit (no transient API error) that left the
         # worktree dirty without advancing HEAD means the fixer made edits and
         # ended its turn without committing — e.g. it backgrounded a long check
@@ -2824,9 +3016,6 @@ class _ReviewMixin(_OrchestratorBase):
         if api_error is None:
             dirty_files = await _workspace_dirty_files(workspace_path)
             if dirty_files:
-                role = binding.resolved_role("fix", self.config.roles)
-                final_message = _read_run_final_message(log_path, agent=role.agent)
-                marker = parse_completion_marker(final_message)
                 if marker.kind == "blocked":
                     # The fixer explicitly ended SYMPHONY_BLOCKED on a human
                     # action rather than forgetting to commit. Forcing a
@@ -2854,13 +3043,17 @@ class _ReviewMixin(_OrchestratorBase):
                         dirty_files=dirty_files,
                     )
                     current_sha = await _workspace_head_sha(workspace_path)
-                    remaining_dirty = (
-                        await _workspace_dirty_files(workspace_path)
-                        if current_sha and current_sha != start_sha
-                        else dirty_files
-                    )
+                    remaining_dirty = await _workspace_dirty_files(workspace_path)
                     if current_sha and current_sha != start_sha and not remaining_dirty:
-                        return current_sha
+                        return _ReviewFixAdvance(sha=current_sha, changed=True)
+                    if current_sha and current_sha == start_sha and not remaining_dirty:
+                        log.info(
+                            "review fix-run cleanup for %s left clean unchanged HEAD %s; "
+                            "treating the signal as already resolved",
+                            issue.identifier,
+                            current_sha[:12],
+                        )
+                        return _ReviewFixAdvance(sha=current_sha, changed=False)
                     short_sha = (current_sha or start_sha)[:12] or "(unknown)"
                     status_short = await _git_status_short(workspace_path)
                     last_log = f"git status --short:\n{status_short}" if status_short else ""
@@ -2894,7 +3087,7 @@ class _ReviewMixin(_OrchestratorBase):
             auto_retry=False,
             operator_wait=True,
         )
-        return ""
+        return None
 
     async def _failing_check_log_tail(
         self,
@@ -3822,7 +4015,15 @@ class _ReviewMixin(_OrchestratorBase):
         if not head_sha:
             raise GitHubError(f"pr view missing headRefOid for {binding.github_repo}#{pr_number}")
 
-        checks = await (await self._gh_client()).pr_checks(pr_number, repo=binding.github_repo)
+        gh = await self._gh_client()
+        if binding.required_status_checks:
+            checks = await gh.pr_checks(
+                pr_number,
+                repo=binding.github_repo,
+                required_contexts=binding.required_status_checks,
+            )
+        else:
+            checks = await gh.pr_checks(pr_number, repo=binding.github_repo)
         ci = [_review_check_from_github(run) for run in checks.runs]
         if not binding.resolved_remote_review():
             human_reviews = tuple(

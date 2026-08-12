@@ -36,6 +36,44 @@ def test_parses_claude_result_event() -> None:
     )
 
 
+def test_claude_result_counts_all_models_used_by_the_session() -> None:
+    line = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "total_cost_usd": 0.42,
+            "usage": {
+                "input_tokens": 33,
+                "output_tokens": 11933,
+                "cache_creation_input_tokens": 38767,
+                "cache_read_input_tokens": 528020,
+            },
+            "modelUsage": {
+                "claude-opus-5": {
+                    "inputTokens": 33,
+                    "outputTokens": 11933,
+                    "cacheCreationInputTokens": 38767,
+                    "cacheReadInputTokens": 528020,
+                },
+                "claude-haiku-4-5-20251001": {
+                    "inputTokens": 1489,
+                    "outputTokens": 13,
+                    "cacheCreationInputTokens": 0,
+                    "cacheReadInputTokens": 0,
+                },
+            },
+        }
+    )
+
+    assert parse_event_line(line) == Usage(
+        cost_usd=0.42,
+        input_tokens=1522,
+        output_tokens=11946,
+        cache_write_tokens=38767,
+        cache_read_tokens=528020,
+    )
+
+
 def test_returns_none_on_non_usage_lines() -> None:
     assert parse_event_line(json.dumps({"type": "system", "subtype": "init"})) is None
     assert parse_event_line(json.dumps({"type": "assistant"})) is None

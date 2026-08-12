@@ -233,6 +233,7 @@ class RepoBinding(BaseModel):
     agent: Literal["claude", "codex"] = "claude"
     codex_model: str = DEFAULT_CODEX_MODEL
     issue_label: str | None = None
+    issue_title_prefix: str | None = None
     branch_prefix: str = "symphony"
     base_branch: str | None = None
     merge_strategy: MergeStrategy = "squash"
@@ -251,6 +252,11 @@ class RepoBinding(BaseModel):
     # See `docs/local-review-flow.md`.
     local_review: bool = False
     remote_review: bool = True
+    # `legacy` keeps the finder -> verifier loop. `hybrid` runs two isolated
+    # local axes (Spec/Standards + Codex built-in bug review), merges their
+    # findings into a fix batch, and repeats targeted closure reviews up to
+    # the configured local-review fixer cap.
+    local_review_mode: Literal["legacy", "hybrid"] = "legacy"
     # Reviewer agent for local/hybrid strategies. `None` picks the opposite
     # family of `agent` (claude ↔ codex) so the reviewer has independent
     # blind spots from the implementer.
@@ -299,6 +305,10 @@ class RepoBinding(BaseModel):
     # Wall-clock cap for one `verify_cmd` invocation. `None` falls back to
     # `Config.command_timeout_secs`.
     verify_timeout_secs: int | None = Field(default=None, ge=1)
+    # Explicit CI contexts that gate review/merge when GitHub branch
+    # protection is unavailable (for example private personal repositories on
+    # GitHub Free). Empty keeps GitHub's branch-protection-required contexts.
+    required_status_checks: tuple[str, ...] = ()
     # Extra env injected into this binding's agent subprocesses. Values name
     # keys in symphony's `.env` (or the process env) — the secrets themselves
     # are never stored on the binding. `assemble_effective_config` replaces
@@ -813,9 +823,10 @@ class Config(BaseModel):
     repos: list[RepoBinding] = Field(default_factory=list)
 
     review_iteration_cap: int = 12
-    # Local-review converges fast or it doesn't. The right cap is well
-    # below `review_iteration_cap`: more rounds means the in-workspace
-    # reviewer is stuck. Per-binding overrides live on `RepoBinding`.
+    # Maximum local-review fixer turns. A read-only closure review runs after
+    # the final permitted fix, so observed verdict rounds can be cap + 1. Keep
+    # this below `review_iteration_cap`; per-binding overrides live on
+    # `RepoBinding`.
     local_review_iteration_cap: int = Field(default=3, ge=1)
     # Soft per-issue *effective-token* budget. Off by default (`None`): no
     # behavior change. When set, an issue whose cumulative effective tokens

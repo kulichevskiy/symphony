@@ -10,9 +10,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+from collections.abc import Awaitable, Callable
+from functools import partial
 from pathlib import Path
 
 from ...pipeline.local_review import DiffSize, parse_diff_numstat
+from ._helpers import _retry_transient_delivery
 
 _DEFAULT_PUSH_AUTH_HOST = "github.com"
 
@@ -165,6 +168,15 @@ async def _clear_git_push_auth(workspace_path: Path) -> None:
     no header to clear either way.
     """
     _push_auth_env.pop(workspace_path, None)
+
+
+async def _retry_transient_push(
+    push_fn: Callable[[Path, str], Awaitable[None]],
+    workspace_path: Path,
+    branch: str,
+) -> None:
+    """Retry idempotent pushes after short-lived network/server failures."""
+    await _retry_transient_delivery(partial(push_fn, workspace_path, branch))
 
 
 async def _default_push(workspace_path: Path, branch: str) -> None:
@@ -354,6 +366,43 @@ async def _git_rebase(workspace_path: Path, upstream: str) -> bool:
     )
     await proc.communicate()
     return proc.returncode == 0
+
+
+async def _git_merge(workspace_path: Path, upstream: str) -> bool:
+    """Merge *upstream* into the checked-out branch without rewriting it.
+
+    Returns ``True`` when the merge completes, ``False`` when Git stops for
+    conflicts. Review-fix callers use this to reproduce GitHub's prospective
+    merge checkout while keeping the feature branch push fast-forwardable.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "merge",
+        "--no-edit",
+        upstream,
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    await proc.communicate()
+    return proc.returncode == 0
+
+
+async def _git_abort_merge(workspace_path: Path) -> None:
+    """Abort an in-progress merge in *workspace_path*."""
+    proc = await asyncio.create_subprocess_exec(
+        "git",
+        "merge",
+        "--abort",
+        cwd=str(workspace_path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        stdin=asyncio.subprocess.DEVNULL,
+    )
+    _, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        raise RuntimeError(f"git merge --abort failed: {stderr.decode(errors='replace').strip()}")
 
 
 async def _git_abort_rebase(workspace_path: Path) -> None:

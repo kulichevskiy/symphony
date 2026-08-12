@@ -56,12 +56,10 @@ COMPLETION_CONTRACT = (
     "you are actually waiting on a human.\n"
 )
 
-# Implement-only addendum to the completion contract. The already-done no-op
-# outcome is wired solely into the Implement completion gate
-# (`classify_implement_completion` + the already-satisfied close path in
-# poll.py). The review / acceptance fix-run gates do NOT implement it, so
-# advertising `SYMPHONY_ALREADY_DONE` to a fix run would invite a marker its
-# completion path silently mishandles. Appended only by `implement_prompt`.
+# Implement addendum to the completion contract. Implement validates the named
+# delivering commit through `classify_implement_completion`; review fix-runs
+# have their own current-HEAD contract below. Acceptance fix-runs do not support
+# this marker and therefore do not advertise it.
 COMPLETION_CONTRACT_ALREADY_DONE = (
     "- `SYMPHONY_ALREADY_DONE: <commit-sha> (<PR/issue ref>)` — every "
     "acceptance criterion is ALREADY satisfied in the current tree by work "
@@ -71,6 +69,14 @@ COMPLETION_CONTRACT_ALREADY_DONE = (
     "already part of the target branch's history — it is verified before the "
     "issue is auto-closed. Do not use this when you simply chose not to make "
     "changes.\n"
+)
+
+REVIEW_FIX_COMPLETION_CONTRACT_ALREADY_DONE = (
+    "- `SYMPHONY_ALREADY_DONE: <current-head-sha> (<evidence>)` — the review "
+    "signal is delayed or duplicated and the current HEAD already resolves it, "
+    "so there is nothing to commit. Use this ONLY after verifying the feedback "
+    "against the current tree and confirming the working tree is clean. Name the "
+    "current HEAD SHA and concise evidence.\n"
 )
 
 
@@ -180,6 +186,8 @@ def review_fix_prompt(
         "- Make the smallest change that resolves the failing review signal.\n"
         "- Commit your changes on the current branch (do not push).\n"
         "- Do not edit unrelated files.\n"
+        f"{COMPLETION_CONTRACT}"
+        f"{REVIEW_FIX_COMPLETION_CONTRACT_ALREADY_DONE}"
         f"{HEADLESS_RULES}"
     )
 
@@ -190,10 +198,36 @@ def review_comment_fix_prompt(
     issue_body: str,
     labels: list[str],
     trigger: str,
+    iteration: int = 0,
+    iteration_cap: int = 0,
 ) -> str:
     """Build the prompt for a Review-stage fix-run triggered by reviewer comments."""
     label_line = ", ".join(labels) if labels else "(no labels)"
     body = issue_body.strip() if issue_body else "(no description)"
+    closure_audit = ""
+    final_iteration = iteration_cap > 0 and iteration >= iteration_cap
+    closure_audit_start = max(1, iteration_cap - 2)
+    late_iteration = iteration_cap > 0 and iteration >= closure_audit_start
+    if late_iteration:
+        audit_timing = (
+            "This is the final allowed review-fix iteration."
+            if final_iteration
+            else "This is one of the last allowed review-fix iterations."
+        )
+        closure_audit = (
+            "# Final closure audit\n\n"
+            f"{audit_timing} After resolving the "
+            "reported feedback, perform a holistic closure audit before committing:\n\n"
+            "- Re-check the changed feature against all issue requirements.\n"
+            "- Inspect related failure modes and symmetric cases, especially stale or "
+            "concurrent work, loading/error recovery, permissions, and filtered state.\n"
+            "- Add regression tests for the reported defect and any related defect you fix.\n"
+            "- Keep the audit within the issue scope; do not redesign unrelated code.\n\n"
+        )
+        if not final_iteration:
+            closure_audit = closure_audit.replace(
+                "# Final closure audit", "# Late-stage closure audit", 1
+            )
     return (
         "You are Symphony's Review-stage fix-run agent.\n"
         "Address the reviewer feedback on the current branch.\n\n"
@@ -203,11 +237,13 @@ def review_comment_fix_prompt(
         f"## Title\n{issue_title}\n\n"
         f"## Labels\n{label_line}\n\n"
         f"## Description\n{body}\n\n"
+        f"{closure_audit}"
         "# Working agreement\n\n"
         "- Make the smallest change that addresses the reviewer feedback.\n"
         "- Commit your changes on the current branch (do not push).\n"
         "- Do not edit unrelated files.\n\n"
         f"{COMPLETION_CONTRACT}"
+        f"{REVIEW_FIX_COMPLETION_CONTRACT_ALREADY_DONE}"
         f"{HEADLESS_RULES}"
     )
 

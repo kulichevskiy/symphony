@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -13,13 +14,16 @@ from symphony.pipeline.local_review import (
     VERDICT_CHANGES_REQUESTED_MARKER,
     DiffSize,
     LocalVerdictKind,
+    build_builtin_codex_review_command,
     build_local_review_command,
     default_reviewer_agent,
     extract_last_agent_message,
     is_small_diff,
     local_review_finder_prompt,
     local_review_prompt,
+    local_review_spec_prompt,
     local_review_verifier_prompt,
+    merge_hybrid_review_messages,
     parse_diff_numstat,
     parse_local_review_output,
 )
@@ -52,6 +56,9 @@ def test_local_review_prompt_demands_actionable_findings() -> None:
     prompt = local_review_prompt(issue_title="t", issue_body="b", labels=[], base_branch="main")
     # path:line example present.
     assert "file:line" in prompt or "foo.py:42" in prompt
+    assert "[Critical]" in prompt
+    assert "[Major]" in prompt
+    assert "[Minor]" in prompt
     # Junior-engineer framing forces concrete-edit-only findings.
     assert "junior engineer" in prompt.lower()
 
@@ -75,6 +82,11 @@ def test_local_review_prompt_is_adversarial_and_lensed() -> None:
     assert "tried to break" in lower
     # 4. Style nits stay explicitly non-blocking.
     assert "nit" in lower and "not blocking" in lower
+    # Security probes stay explicitly authorized, local, and bounded so a
+    # defensive code review is not mistaken for an external attack request.
+    assert "authorized defensive review" in lower
+    assert "isolated local workspace" in lower
+    assert "do not access external targets" in lower
 
 
 def test_local_review_prompt_handles_missing_origin_ref() -> None:
@@ -88,7 +100,183 @@ def test_local_review_prompt_handles_missing_origin_ref() -> None:
     assert "Do not narrate" in prompt or "do not narrate" in prompt
 
 
+def test_local_review_spec_prompt_checks_issue_and_repository_standards() -> None:
+    prompt = local_review_spec_prompt(
+        issue_title="Agents may create tickets",
+        issue_body="Creation is not admin-only.",
+        labels=["backend"],
+        comparison_ref="main",
+    )
+    assert "Spec" in prompt
+    assert "Standards" in prompt
+    assert "acceptance criteria" in prompt
+    assert "AGENTS.md" in prompt
+    assert "Agents may create tickets" in prompt
+    assert VERDICT_APPROVED_MARKER in prompt
+
+
+def test_local_review_spec_prompt_protects_inherited_contracts() -> None:
+    prompt = local_review_spec_prompt(
+        issue_title="Add workflow permissions",
+        issue_body="Agents may comment, self-assign, and transition tickets.",
+        labels=["backend"],
+        comparison_ref="main",
+    )
+
+    lower = prompt.lower()
+    assert "inherited requirements" in lower
+    assert "deleted or weakened existing tests" in lower
+    assert "explicitly authorizes" in lower
+
+
+def test_merge_hybrid_review_messages_deduplicates_and_caps_p2() -> None:
+    spec = (
+        "## Findings\n"
+        "- [Major] api.py:10 agents cannot create tickets. Allow authenticated agents.\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+    )
+    bug = "\n".join(
+        [
+            "[P1] Agents cannot create tickets — api.py:10 — Allow authenticated agents.",
+            *[
+                f"[P2] Race {index} — queue.py:{index} — Guard race {index}."
+                for index in range(1, 8)
+            ],
+            "[P3] Rename helper — queue.py:99 — Clearer name.",
+        ]
+    )
+
+    merged = merge_hybrid_review_messages(
+        spec_message=spec,
+        bug_message=bug,
+        head_sha="abc123",
+        max_p2=5,
+    )
+
+    assert merged.kind is LocalVerdictKind.CHANGES_REQUESTED
+    assert merged.findings.count("[Major]") == 1
+    assert merged.findings.count("[Minor]") == 5
+    assert "Race 5" in merged.findings
+    assert "Race 6" not in merged.findings
+    assert "Rename helper" not in merged.findings
+
+
+def test_merge_hybrid_review_messages_caps_p2_across_both_axes() -> None:
+    spec = (
+        "## Findings\n"
+        + "\n".join(f"- [Minor] spec.py:{index} missing case {index}." for index in range(1, 5))
+        + f"\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+    )
+    bug = "\n".join(
+        f"[P2] Bug {index} — bug.py:{index} — Guard case {index}." for index in range(1, 5)
+    )
+
+    merged = merge_hybrid_review_messages(
+        spec_message=spec,
+        bug_message=bug,
+        head_sha="abc123",
+        max_p2=5,
+    )
+
+    assert merged.findings.count("[Minor]") == 5
+    assert "Bug 1" in merged.findings
+    assert "Bug 2" not in merged.findings
+
+
+def test_merge_hybrid_review_messages_uses_builtin_canonical_severity() -> None:
+    merged = merge_hybrid_review_messages(
+        spec_message=f"All requirements hold.\n{VERDICT_APPROVED_MARKER}",
+        bug_message=("[P2] Literal severity — parser.py:3 — Reject a literal [Major] tag."),
+        head_sha="abc123",
+        max_p2=0,
+    )
+
+    assert merged.kind is LocalVerdictKind.APPROVED
+
+
+def test_merge_hybrid_review_messages_approves_when_both_axes_are_clean() -> None:
+    merged = merge_hybrid_review_messages(
+        spec_message=f"All requirements hold.\n{VERDICT_APPROVED_MARKER}",
+        bug_message="No findings.",
+        head_sha="abc123",
+    )
+    assert merged.kind is LocalVerdictKind.APPROVED
+
+
+def test_merge_hybrid_review_messages_does_not_approve_unknown_builtin_output() -> None:
+    merged = merge_hybrid_review_messages(
+        spec_message=f"All requirements hold.\n{VERDICT_APPROVED_MARKER}",
+        bug_message="I could not inspect the repository.",
+        head_sha="abc123",
+    )
+    assert merged.kind is LocalVerdictKind.UNPARSEABLE
+
+
+def test_merge_hybrid_review_messages_keeps_worst_duplicate_severity() -> None:
+    merged = merge_hybrid_review_messages(
+        spec_message=(
+            "## Findings\n"
+            "- [Major] api.py:10 agents cannot create tickets. Allow agents.\n"
+            f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+        ),
+        bug_message=("[P0] Agents cannot create tickets — api.py:10 — Allow authenticated agents."),
+        head_sha="abc123",
+    )
+    assert merged.findings.count("api.py:10") == 1
+    assert "[Critical]" in merged.findings
+
+
+def test_merge_hybrid_review_messages_keeps_indented_spec_findings() -> None:
+    merged = merge_hybrid_review_messages(
+        spec_message=(
+            "## Findings\n"
+            "  - first unclassified finding\n"
+            "  - database transaction can interleave\n"
+            f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+        ),
+        bug_message="No findings.",
+        head_sha="abc123",
+    )
+
+    assert merged.kind is LocalVerdictKind.CHANGES_REQUESTED
+    assert "first unclassified finding" in merged.findings
+    assert "database transaction can interleave" in merged.findings
+
+
+def test_parse_local_review_output_keeps_nested_bullet_with_parent_finding() -> None:
+    message = (
+        "## Findings\n"
+        "- [Major] parent finding\n"
+        "  - remediation example\n"
+        "- sibling without severity\n\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+    )
+    stdout = _codex_jsonl_with_final_message(message)
+
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc123")
+
+    assert verdict.kind is LocalVerdictKind.CHANGES_REQUESTED
+    assert "  - remediation example" in verdict.findings
+    assert verdict.findings.count("[severity inferred]") == 1
+
+
 # --- command builder -----------------------------------------------------
+
+
+def test_build_builtin_codex_review_command_uses_review_mode_and_base() -> None:
+    argv = build_builtin_codex_review_command(
+        comparison_ref="reviewed-head",
+        codex_model="gpt-5.6-sol",
+        effort="high",
+        last_message_path="/tmp/bug-review.txt",
+    )
+    assert argv[:3] == ["codex", "exec", "review"]
+    assert argv[argv.index("--base") + 1] == "reviewed-head"
+    assert argv[argv.index("--model") + 1] == "gpt-5.6-sol"
+    assert argv[argv.index("-o") + 1] == "/tmp/bug-review.txt"
+    assert "--json" in argv
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv
+    assert argv[-1] == "/tmp/bug-review.txt"
 
 
 def test_build_local_review_command_codex_uses_plain_exec_read_only() -> None:
@@ -240,7 +428,9 @@ def test_build_local_review_command_codex_ignores_claude_model() -> None:
     assert "claude-sonnet-4-6" not in argv
 
 
-def test_build_local_review_command_codex_pass_two_uses_workspace_write() -> None:
+def test_build_local_review_command_codex_pass_two_uses_workspace_write(
+    tmp_path: Path,
+) -> None:
     """Tier B (pass 2 only): codex switches to a writable sandbox so the
     verifier can write a throwaway test and run it."""
     argv = build_local_review_command(
@@ -250,6 +440,7 @@ def test_build_local_review_command_codex_pass_two_uses_workspace_write() -> Non
         codex_model="gpt-5.1-codex",
         last_message_path="/tmp/last.txt",
         pass_two=True,
+        workspace_path=tmp_path,
     )
     assert argv[:2] == ["codex", "exec"]
     # codex no longer nests a sandbox (bypassed); pass 2's write/execute intent
@@ -258,6 +449,7 @@ def test_build_local_review_command_codex_pass_two_uses_workspace_write() -> Non
     assert "--sandbox" not in argv
     assert "workspace-write" not in argv
     assert "read-only" not in argv
+    assert argv[argv.index("--cd") + 1] == str(tmp_path)
 
 
 def test_build_local_review_command_claude_pass_two_grants_tier_b_tools() -> None:
@@ -408,8 +600,8 @@ def test_parse_local_review_output_changes_requested_extracts_findings() -> None
     message = (
         "Reviewed.\n\n"
         "## Findings\n"
-        "- `a.py:42` swallows the wrong exception.\n"
-        "- Missing test for the empty-input case.\n\n"
+        "- [Major] `a.py:42` swallows the wrong exception.\n"
+        "- [Minor] `tests/test_a.py:7` misses the empty-input case.\n\n"
         f"{VERDICT_CHANGES_REQUESTED_MARKER}\n"
     )
     stdout = _codex_jsonl_with_final_message(message)
@@ -421,8 +613,114 @@ def test_parse_local_review_output_changes_requested_extracts_findings() -> None
     assert verdict.findings_signature.startswith("local_review_findings:")
 
 
+def test_parse_local_review_output_accepts_code_wrapped_severity() -> None:
+    """Claude may render a required severity tag as inline Markdown code."""
+    message = (
+        "## Findings\n"
+        "- `[Major] support_queue/main.py:196-203` allows a null title.\n"
+        "- `[Minor] support_queue/db.py:52-53` leaks a connection.\n\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}\n"
+    )
+    stdout = json.dumps({"type": "result", "result": message})
+
+    verdict = parse_local_review_output(agent="claude", stdout=stdout, head_sha="abc123")
+
+    assert verdict.kind == LocalVerdictKind.CHANGES_REQUESTED
+    assert "null title" in verdict.findings
+
+
+def test_parse_local_review_output_accepts_severity_after_location() -> None:
+    """Claude may put the required severity after its file:line citation."""
+    message = (
+        "## Findings\n"
+        "- `.gitignore:1` — [Critical] generated files can be committed.\n"
+        "- `support_queue/main.py:144` — [Major] null title returns 500.\n\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}\n"
+    )
+    stdout = json.dumps({"type": "result", "result": message})
+
+    verdict = parse_local_review_output(agent="claude", stdout=stdout, head_sha="abc123")
+
+    assert verdict.kind == LocalVerdictKind.CHANGES_REQUESTED
+    assert "null title" in verdict.findings
+
+
+def test_parse_local_review_output_rejects_multiple_severities_per_finding() -> None:
+    message = (
+        "## Findings\n"
+        "- [Major] `a.py:1` is actually [Minor] after all.\n\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}\n"
+    )
+    stdout = _codex_jsonl_with_final_message(message)
+
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc123")
+
+    assert verdict.kind == LocalVerdictKind.UNPARSEABLE
+
+
+def test_parse_local_review_output_conservatively_grades_unclassified_findings() -> None:
+    message = (
+        "## Findings\n"
+        "- `a.py:42` swallows the wrong exception.\n\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}\n"
+    )
+    stdout = _codex_jsonl_with_final_message(message)
+
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc123")
+
+    assert verdict.kind == LocalVerdictKind.CHANGES_REQUESTED
+    assert "[Major] [severity inferred] `a.py:42`" in verdict.findings
+    assert verdict.raw_message == message
+
+
+def test_parse_local_review_output_only_infers_missing_severities() -> None:
+    message = (
+        "## Findings\n"
+        "- [Major] `a.py:42` swallows the wrong exception.\n"
+        "- `b.py:7` also loses the error.\n\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}\n"
+    )
+    stdout = _codex_jsonl_with_final_message(message)
+
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc123")
+
+    assert verdict.kind == LocalVerdictKind.CHANGES_REQUESTED
+    assert "- [Major] `a.py:42`" in verdict.findings
+    assert "- [Major] [severity inferred] `b.py:7`" in verdict.findings
+
+
+def test_parse_local_review_output_infers_severity_for_indented_markdown_bullet() -> None:
+    message = (
+        "## Findings\n"
+        "  - `a.py:42` swallows the wrong exception.\n"
+        "  - `b.py:7` also swallows the wrong exception.\n\n"
+        "<<<VERDICT:CHANGES_REQUESTED>>>"
+    )
+    stdout = _codex_jsonl_with_final_message(message)
+
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc123")
+
+    assert verdict.kind == LocalVerdictKind.CHANGES_REQUESTED
+    assert "- [Major] [severity inferred] `a.py:42`" in verdict.findings
+    assert "  - [Major] [severity inferred] `b.py:7`" in verdict.findings
+
+
+def test_parse_local_review_output_rejects_multiple_severities_across_one_bullet() -> None:
+    message = (
+        "## Findings\n"
+        "- [Major] `a.py:42` swallows the wrong exception.\n"
+        "  Follow-up impact is [Minor].\n\n"
+        "<<<VERDICT:CHANGES_REQUESTED>>>"
+    )
+    stdout = _codex_jsonl_with_final_message(message)
+
+    verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc123")
+
+    assert verdict.kind == LocalVerdictKind.UNPARSEABLE
+
+
 def test_changes_requested_signature_changes_with_head_sha() -> None:
-    message = f"## Findings\n- bug\n\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+    message = f"## Findings\n- [Major] bug\n\n{VERDICT_CHANGES_REQUESTED_MARKER}"
     stdout = _codex_jsonl_with_final_message(message)
     v_a = parse_local_review_output(agent="codex", stdout=stdout, head_sha="aaa")
     v_b = parse_local_review_output(agent="codex", stdout=stdout, head_sha="bbb")
@@ -434,14 +732,14 @@ def test_changes_requested_signature_changes_with_findings() -> None:
     a = parse_local_review_output(
         agent="codex",
         stdout=_codex_jsonl_with_final_message(
-            f"## Findings\n- one\n\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+            f"## Findings\n- [Major] one\n\n{VERDICT_CHANGES_REQUESTED_MARKER}"
         ),
         head_sha=head,
     )
     b = parse_local_review_output(
         agent="codex",
         stdout=_codex_jsonl_with_final_message(
-            f"## Findings\n- two\n\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+            f"## Findings\n- [Minor] two\n\n{VERDICT_CHANGES_REQUESTED_MARKER}"
         ),
         head_sha=head,
     )
@@ -481,7 +779,10 @@ def test_parse_local_review_uses_last_marker_if_quoted_earlier() -> None:
 def test_parse_local_review_findings_falls_back_when_no_heading() -> None:
     # If the agent forgets the `## Findings` heading, we still feed the
     # body before the marker into the next fix-run prompt.
-    message = f"The new function ignores the timeout argument.\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+    message = (
+        "- [Major] The new function ignores the timeout argument.\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}"
+    )
     stdout = _codex_jsonl_with_final_message(message)
     verdict = parse_local_review_output(agent="codex", stdout=stdout, head_sha="abc")
     assert verdict.kind == LocalVerdictKind.CHANGES_REQUESTED

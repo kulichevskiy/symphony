@@ -1,0 +1,226 @@
+{
+  "errors": [],
+  "mutations": [
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 2.2381462909997936,
+      "mutant_id": "python:boolean_connector:support_queue/database.py:114:a33c57ba",
+      "status": "survived"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 29.539933625999765,
+      "mutant_id": "python:boolean_literal:support_queue/database.py:56:1f78c013",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 13.021870082999158,
+      "mutant_id": "python:comparison:support_queue/database.py:49:5bc521db",
+      "status": "killed"
+    },
+    {
+      "detail": "tTargetListeners): 0,\n        Symbol(events.maxEventTargetListenersWarned): false,\n\n \u276f src/App.test.tsx:144:23\n    142|     expect(screen.getByRole(\"combobox\", { name: \"Filter by status\" }))\u2026\n    143|     expect(screen.getByRole(\"combobox\", { name: \"Filter by priority\" }\u2026\n    144|     expect(fetchMock).toHaveBeenLastCalledWith(\n       |                       ^\n    145|       \"/tickets\",\n    146|       expect.objectContaining({ signal: expect.any(AbortSignal) }),\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[1/1]\u23af",
+      "duration_seconds": 6.265882917001363,
+      "mutant_id": "typescript:boolean_connector:frontend/src/App.tsx:60:82119eb7",
+      "status": "killed"
+    },
+    {
+      "detail": "> support-queue-frontend@0.1.0 test\n> vitest --run\n\n\n RUN  v4.1.10 /private/var/folders/s_/t8ytmm9940j564xd698kgmm00000gn/T/symphony-maintainability-imclm8t2/checkout/frontend\n\n\n Test Files  1 passed (1)\n      Tests  52 passed (52)\n   Start at  23:07:39\n   Duration  2.63s (transform 68ms, setup 50ms, import 84ms, tests 2.12s, environment 298ms)",
+      "duration_seconds": 2.978150999999343,
+      "mutant_id": "typescript:boolean_literal:frontend/src/App.tsx:137:f1c7f614",
+      "status": "survived"
+    },
+    {
+      "detail": "r(() => expect(screen.getByRole(\"heading\", { name: \"Ti\u2026\n       |                                                                                  ^\n    1276|     expect(patchCalls).toBe(1);\n    1277|\n \u276f runWithExpensiveErrorDiagnosticsDisabled node_modules/@testing-library/dom/dist/config.js:47:12\n \u276f checkCallback node_modules/@testing-library/dom/dist/wait-for.js:124:77\n \u276f Timeout.checkRealTimersCallback node_modules/@testing-library/dom/dist/wait-for.js:118:16\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[12/12]\u23af",
+      "duration_seconds": 26.93222516700007,
+      "mutant_id": "typescript:comparison:frontend/src/App.tsx:60:b3ec891b",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 7.744900209001571,
+      "mutant_id": "python:boolean_connector:support_queue/database.py:263:4bbd3511",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 2.019861000000674,
+      "mutant_id": "python:boolean_literal:support_queue/database.py:136:58751231",
+      "status": "survived"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 4.326355624998541,
+      "mutant_id": "python:comparison:support_queue/database.py:114:6b1055bc",
+      "status": "killed"
+    },
+    {
+      "detail": "tTargetListeners): 0,\n        Symbol(events.maxEventTargetListenersWarned): false,\n\n \u276f src/App.test.tsx:144:23\n    142|     expect(screen.getByRole(\"combobox\", { name: \"Filter by status\" }))\u2026\n    143|     expect(screen.getByRole(\"combobox\", { name: \"Filter by priority\" }\u2026\n    144|     expect(fetchMock).toHaveBeenLastCalledWith(\n       |                       ^\n    145|       \"/tickets\",\n    146|       expect.objectContaining({ signal: expect.any(AbortSignal) }),\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[1/1]\u23af",
+      "duration_seconds": 6.37356070900023,
+      "mutant_id": "typescript:boolean_connector:frontend/src/App.tsx:64:029de028",
+      "status": "killed"
+    },
+    {
+      "detail": "Wrapper node_modules/@testing-library/dom/dist/wait-for.js:163:27\n \u276f node_modules/@testing-library/dom/dist/query-helpers.js:86:33\n \u276f src/App.test.tsx:1351:25\n    1349|     fireEvent.click(await screen.findByRole(\"button\", { name: `View ti\u2026\n    1350|\n    1351|     expect(await screen.findByText(`Ticket #${largeTicketId}`)).toBeIn\u2026\n       |                         ^\n    1352|     expect(fetchMock).toHaveBeenCalledWith(\n    1353|       `/tickets/${largeTicketId}`,\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[1/1]\u23af",
+      "duration_seconds": 8.177872001000651,
+      "mutant_id": "typescript:boolean_literal:frontend/src/App.tsx:145:9364b18a",
+      "status": "killed"
+    },
+    {
+      "detail": "node_modules/@testing-library/dom/dist/wait-for.js:163:27\n \u276f node_modules/@testing-library/dom/dist/query-helpers.js:86:33\n \u276f src/App.test.tsx:1308:18\n    1306|     render(<App />);\n    1307|     fireEvent.click(await screen.findByRole(\"button\", { name: `View ti\u2026\n    1308|     await screen.findByRole(\"heading\", { name: ticket.title, level: 2 \u2026\n       |                  ^\n    1309|\n    1310|     fireEvent.click(screen.getByRole(\"button\", { name: \"Start progress\u2026\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[11/11]\u23af",
+      "duration_seconds": 24.113166291999732,
+      "mutant_id": "typescript:comparison:frontend/src/App.tsx:64:ec9074e5",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 4.501536916999612,
+      "mutant_id": "python:boolean_connector:support_queue/database.py:265:526ac5b3",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 4.168633208999381,
+      "mutant_id": "python:boolean_literal:support_queue/schemas.py:32:80fcbcd9",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 4.07685579200006,
+      "mutant_id": "python:comparison:support_queue/database.py:114:6b1055bc",
+      "status": "killed"
+    },
+    {
+      "detail": "node_modules/@testing-library/dom/dist/query-helpers.js:95:19\n \u276f src/App.test.tsx:1750:28\n    1748|     fireEvent.click(screen.getByRole(\"button\", { name: \"Add comment\" }\u2026\n    1749|     fireEvent.click(screen.getByRole(\"button\", { name: \"Back to suppor\u2026\n    1750|     fireEvent.click(screen.getByRole(\"button\", { name: `View ticket ${\u2026\n       |                            ^\n    1751|     await screen.findByRole(\"heading\", { name: secondTicket.title, lev\u2026\n    1752|\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[16/16]\u23af",
+      "duration_seconds": 22.58067333300096,
+      "mutant_id": "typescript:boolean_connector:frontend/src/App.tsx:99:6b041a6c",
+      "status": "killed"
+    },
+    {
+      "detail": "> support-queue-frontend@0.1.0 test\n> vitest --run\n\n\n RUN  v4.1.10 /private/var/folders/s_/t8ytmm9940j564xd698kgmm00000gn/T/symphony-maintainability-imclm8t2/checkout/frontend\n\n\n Test Files  1 passed (1)\n      Tests  52 passed (52)\n   Start at  23:09:37\n   Duration  2.73s (transform 68ms, setup 47ms, import 85ms, tests 2.21s, environment 304ms)",
+      "duration_seconds": 3.0665822500013746,
+      "mutant_id": "typescript:boolean_literal:frontend/src/App.tsx:189:df0ee3de",
+      "status": "survived"
+    },
+    {
+      "detail": "Type\": \"application/json\",\n    \"X-Actor\": \"agent@example.com\",\n    \"X-Role\": \"agent\",\n-   \"X-Ticket-Version\": \"3\",\n  }\n\n \u276f src/App.test.tsx:1390:8\n    1388|     expect(fetchMock.mock.calls.filter(([input]) => input === \"/ticket\u2026\n    1389|     expect(fetchMock.mock.calls.find(([input]) => input === \"/tickets/\u2026\n    1390|       .toEqual(expect.objectContaining({\n       |        ^\n    1391|         \"X-Actor\": \"agent@example.com\",\n    1392|         \"X-Role\": \"agent\",\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[1/1]\u23af",
+      "duration_seconds": 6.210108209001191,
+      "mutant_id": "typescript:comparison:frontend/src/App.tsx:82:71928508",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 4.076445291000709,
+      "mutant_id": "python:boolean_connector:support_queue/database.py:266:73fa7308",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 4.024992292001116,
+      "mutant_id": "python:boolean_literal:support_queue/schemas.py:40:09ecffeb",
+      "status": "killed"
+    },
+    {
+      "detail": "warning: `VIRTUAL_ENV=/Users/ak/Code/symphony/.venv` does not match the project environment path `.venv` and will be ignored; use `--active` to target the active environment instead",
+      "duration_seconds": 4.210461124999711,
+      "mutant_id": "python:comparison:support_queue/database.py:120:2eb31050",
+      "status": "killed"
+    },
+    {
+      "detail": "@testing-library/dom/dist/wait-for.js:163:27\n \u276f node_modules/@testing-library/dom/dist/query-helpers.js:86:33\n \u276f src/App.test.tsx:1273:25\n    1271|     fireEvent.click(screen.getByRole(\"button\", { name: \"Back to suppor\u2026\n    1272|\n    1273|     expect(await screen.findByText(\"No tickets match the selected filt\u2026\n       |                         ^\n    1274|       .toBeInTheDocument();\n    1275|     await waitFor(() => expect(screen.getByRole(\"heading\", { name: \"Ti\u2026\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[2/2]\u23af",
+      "duration_seconds": 10.298435208998853,
+      "mutant_id": "typescript:boolean_connector:frontend/src/App.tsx:100:2f274038",
+      "status": "killed"
+    },
+    {
+      "detail": "> support-queue-frontend@0.1.0 test\n> vitest --run\n\n\n RUN  v4.1.10 /private/var/folders/s_/t8ytmm9940j564xd698kgmm00000gn/T/symphony-maintainability-imclm8t2/checkout/frontend\n\n\n Test Files  1 passed (1)\n      Tests  52 passed (52)\n   Start at  23:10:09\n   Duration  2.61s (transform 65ms, setup 45ms, import 81ms, tests 2.11s, environment 289ms)",
+      "duration_seconds": 2.9360917499998322,
+      "mutant_id": "typescript:boolean_literal:frontend/src/App.tsx:190:9bbd9106",
+      "status": "survived"
+    },
+    {
+      "detail": "38\n \u276f node_modules/@testing-library/dom/dist/query-helpers.js:52:17\n \u276f node_modules/@testing-library/dom/dist/query-helpers.js:95:19\n \u276f src/App.test.tsx:1330:25\n    1328|\n    1329|     const card = await screen.findByRole(\"article\", { name: ticket.tit\u2026\n    1330|     expect(within(card).getByText(\"In progress\")).toBeInTheDocument();\n       |                         ^\n    1331|     expect(screen.queryByText(\"No tickets match the selected filters.\"\u2026\n    1332|   });\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[5/5]\u23af",
+      "duration_seconds": 5.7753301249995275,
+      "mutant_id": "typescript:comparison:frontend/src/App.tsx:91:aa2c3301",
+      "status": "killed"
+    }
+  ],
+  "probe": {
+    "changed_files": 5,
+    "changed_lines": 269,
+    "cost_usd": 2.594391500000001,
+    "detail": "",
+    "raw_tokens": 3024572,
+    "repetitions": 1,
+    "status": "passed",
+    "successful_repetitions": 1,
+    "wall_seconds": 376.99039966613054
+  },
+  "repository": "kulichevskiy/EXP-493920515424-A1",
+  "schema_version": 1,
+  "static": {
+    "complexity_max": 184,
+    "complexity_median": 2.0,
+    "complexity_p95": 16,
+    "duplicated_blocks": 7,
+    "files": [
+      {
+        "complexity_max": 184,
+        "function_lines_max": 1064,
+        "functions": 16,
+        "language": "typescript",
+        "lines": 1247,
+        "path": "frontend/src/App.tsx"
+      },
+      {
+        "complexity_max": 0,
+        "function_lines_max": 0,
+        "functions": 0,
+        "language": "typescript",
+        "lines": 11,
+        "path": "frontend/src/main.tsx"
+      },
+      {
+        "complexity_max": 0,
+        "function_lines_max": 0,
+        "functions": 0,
+        "language": "python",
+        "lines": 1,
+        "path": "support_queue/__init__.py"
+      },
+      {
+        "complexity_max": 16,
+        "function_lines_max": 71,
+        "functions": 17,
+        "language": "python",
+        "lines": 427,
+        "path": "support_queue/database.py"
+      },
+      {
+        "complexity_max": 3,
+        "function_lines_max": 120,
+        "functions": 13,
+        "language": "python",
+        "lines": 158,
+        "path": "support_queue/main.py"
+      },
+      {
+        "complexity_max": 8,
+        "function_lines_max": 11,
+        "functions": 2,
+        "language": "python",
+        "lines": 112,
+        "path": "support_queue/schemas.py"
+      }
+    ],
+    "function_count": 48,
+    "import_cycles": [],
+    "large_files": 2,
+    "large_functions": 5,
+    "max_file_lines": 1247,
+    "max_function_lines": 1064,
+    "source_files": 6,
+    "source_lines": 1956
+  }
+}

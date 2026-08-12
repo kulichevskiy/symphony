@@ -107,7 +107,8 @@ def test_dry_run_changes_requested_prints_findings(tmp_path: Path, monkeypatch) 
     workspace.mkdir()
     captured = _CapturedSpec()
     findings_body = (
-        f"## Findings\n- `add.py:6` - missing zero check.\n\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+        "## Findings\n- [Major] `add.py:6` - missing zero check.\n\n"
+        f"{VERDICT_CHANGES_REQUESTED_MARKER}"
     )
     monkeypatch.setattr(
         cli_module,

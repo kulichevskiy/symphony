@@ -1,0 +1,178 @@
+# Isolated Symphony verification kit. Deploy as a separate Coolify resource.
+# One public domain serves the existing Connections UI plus the token-gated
+# experiment API. The production Symphony resource and its volumes are never
+# mounted here.
+
+services:
+  init:
+    image: alpine:3.22
+    restart: "no"
+    command: ["sh", "-c", "chown -R 1000:1000 /data/db /data/bench-a /data/bench-b"]
+    volumes:
+      - bench_db:/data/db
+      - bench_runs_a:/data/bench-a
+      - bench_runs_b:/data/bench-b
+
+  worker:
+    build:
+      context: .
+      target: runtime
+    image: symphony-bench-control
+    restart: unless-stopped
+    stop_grace_period: 90s
+    command: ["bench", "serve"]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+      caddy:
+        condition: service_started
+      bench-a:
+        condition: service_healthy
+      bench-b:
+        condition: service_healthy
+    environment:
+      SYMPHONY_BENCH_DB_PATH: /data/db/bench-control.sqlite
+      SYMPHONY_BENCH_ROOT_A: /data/bench-a
+      SYMPHONY_BENCH_ROOT_B: /data/bench-b
+      SYMPHONY_BENCH_PRIVATE_ROOT: /data/db/bench-private
+      SYMPHONY_BENCH_CONTROLS_ROOT: /run/symphony-bench-controls
+      SYMPHONY_BENCH_EXECUTOR_A_URL: http://bench-a:8090
+      SYMPHONY_BENCH_EXECUTOR_B_URL: http://bench-b:8090
+      SYMPHONY_BENCH_EXECUTOR_TOKEN: ${SYMPHONY_BENCH_EXECUTOR_TOKEN:?required}
+    networks:
+      - control
+      - execution
+    volumes:
+      - /opt/symphony-bench/.env:/app/.env:ro
+      - bench_db:/data/db
+      - bench_runs_a:/data/bench-a
+      - bench_runs_b:/data/bench-b
+      - /opt/symphony-bench/controls-current:/run/symphony-bench-controls:ro
+
+  # A and B run concurrently in isolated containers and volumes. Each receives
+  # only per-command credentials, has no control DB/.env mount, and cannot reach
+  # the shared Coolify network. SYMPHONY_* is scrubbed from child processes.
+  bench-a:
+    build:
+      context: .
+      target: bench-executor
+    image: symphony-bench-executor-a
+    restart: unless-stopped
+    command: ["bench", "executor"]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      SYMPHONY_BENCH_ROOT: /data/bench-a
+      SYMPHONY_BENCH_EXECUTOR_TOKEN: ${SYMPHONY_BENCH_EXECUTOR_TOKEN:?required}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8090/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks:
+      - execution
+    volumes:
+      - bench_runs_a:/data/bench-a
+
+  bench-b:
+    build:
+      context: .
+      target: bench-executor
+    image: symphony-bench-executor-b
+    restart: unless-stopped
+    command: ["bench", "executor"]
+    depends_on:
+      init:
+        condition: service_completed_successfully
+    environment:
+      SYMPHONY_BENCH_ROOT: /data/bench-b
+      SYMPHONY_BENCH_EXECUTOR_TOKEN: ${SYMPHONY_BENCH_EXECUTOR_TOKEN:?required}
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8090/health"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks:
+      - execution
+    volumes:
+      - bench_runs_b:/data/bench-b
+
+  # Reuses Symphony's existing Auth0 + Connections UI. It has no bindings,
+  # so it never dispatches work; it only owns OAuth login/callback flows and
+  # stores encrypted connections in the worker's control DB.
+  connections:
+    image: symphony-bench-control
+    restart: unless-stopped
+    depends_on:
+      - worker
+      - caddy
+    network_mode: "service:caddy"
+    environment:
+      SYMPHONY_REQUIRE_AUTH0: "1"
+      SYMPHONY_DB_PATH: /data/db/bench-control.sqlite
+      SYMPHONY_LOG_ROOT: /data/connections-logs
+      SYMPHONY_WORKSPACE_ROOT: /data/connections-workspaces
+    volumes:
+      - /opt/symphony-bench/.env:/app/.env:ro
+      - bench_db:/data/db
+      - connection_logs:/data/connections-logs
+      - connection_workspaces:/data/connections-workspaces
+      - gh_auth:/home/symphony/.config/gh
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    labels:
+      - "traefik.docker.network=coolify"
+    extra_hosts:
+      - "connections:127.0.0.1"
+    environment:
+      SERVICE_FQDN_CADDY: ${SERVICE_FQDN_CADDY}
+    expose:
+      - "80"
+    networks:
+      - coolify
+      - control
+    volumes:
+      - type: bind
+        source: ./Caddyfile.bench.coolify
+        target: /etc/caddy/Caddyfile
+        read_only: true
+        content: |
+          {
+              auto_https off
+          }
+
+          :80 {
+              handle /health {
+                  reverse_proxy worker:8080
+              }
+              handle /experiments* {
+                  reverse_proxy worker:8080
+              }
+              handle /notifications* {
+                  reverse_proxy worker:8080
+              }
+              handle {
+                  reverse_proxy connections:8787
+              }
+          }
+      - caddy_data:/data
+      - caddy_config:/config
+
+networks:
+  coolify:
+    external: true
+  control:
+    internal: true
+  execution:
+
+volumes:
+  bench_db:
+  bench_runs_a:
+  bench_runs_b:
+  connection_logs:
+  connection_workspaces:
+  gh_auth:
+  caddy_data:
+  caddy_config:

@@ -8,6 +8,7 @@ the isolation boundary. No permissions profile is provisioned as a result.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 
 def codex_reasoning_effort_config(effort: str) -> str:
@@ -16,7 +17,11 @@ def codex_reasoning_effort_config(effort: str) -> str:
 
 
 def build_codex_workspace_write_command(
-    *, prompt: str, codex_model: str, effort: str | None = None
+    *,
+    prompt: str,
+    codex_model: str,
+    workspace_path: Path,
+    effort: str | None = None,
 ) -> list[str]:
     """Build `codex exec` argv for agents that must modify and commit.
 
@@ -36,6 +41,7 @@ def build_codex_workspace_write_command(
         "--json",
         "--dangerously-bypass-approvals-and-sandbox",
     ]
+    command += ["--cd", str(workspace_path)]
     if effort is not None:
         command += ["--config", codex_reasoning_effort_config(effort)]
     command += ["--model", codex_model, prompt]

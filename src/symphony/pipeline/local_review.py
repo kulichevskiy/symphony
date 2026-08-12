@@ -31,6 +31,7 @@ import json
 import re
 from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import Any, Literal
 
 from ..agent.codex_cli import codex_reasoning_effort_config
@@ -414,6 +415,7 @@ class LocalVerdictKind(StrEnum):
 class LocalVerdict:
     kind: LocalVerdictKind
     findings: str = ""
+    severity_inferred: bool = False
     trigger_signature: str = ""
     raw_message: str = ""
     # Findings-only digest used by the local loop to detect non-convergence.
@@ -430,6 +432,11 @@ class LocalVerdict:
 
 _STANCE_BLOCK = (
     "# Stance\n\n"
+    "This is an authorized defensive review of the current repository in an "
+    "isolated local workspace. Keep every probe local and bounded. Do not "
+    "access external targets, scan networks, retrieve real credentials, or "
+    "produce operational exploit instructions; reproduce only enough to "
+    "prove a concrete code defect.\n\n"
     "Be adversarial: assume a bug exists and your job is to find it. "
     "Actively try to break the change — feed it the edge cases, the "
     "empty inputs, the concurrent calls, the malformed rows the author "
@@ -494,9 +501,14 @@ _VERDICT_CONTRACT_BLOCK = (
     "list, no approval.\n\n"
     "If `CHANGES_REQUESTED`, write a `## Findings` section above the "
     "marker. Each finding is a bullet with:\n"
+    "  - exactly one severity prefix: `[Critical]`, `[Major]`, or `[Minor]`,\n"
     "  - the file:line where it applies (e.g. `src/foo.py:42`),\n"
     "  - one sentence on what's wrong,\n"
     "  - one sentence on the fix.\n\n"
+    "Use `Critical` for security, data-loss, or system-wide failure; "
+    "`Major` for broken requirements or correctness that must block merge; "
+    "and `Minor` for a real, bounded defect worth fixing before merge. "
+    "Do not use severity for style or preference.\n\n"
     "The findings text is fed verbatim into the next fix-run prompt, "
     "so vague findings produce vague fixes. Pretend you're writing a "
     "PR review for a junior engineer who will edit only the lines "
@@ -653,6 +665,7 @@ def local_review_verifier_prompt(
     labels: list[str],
     base_branch: str,
     pass_one_findings: str,
+    previous_attempt_notes: str = "",
 ) -> str:
     """Pass-2 (verifier) instructions: refute pass-1, add misses, verdict.
 
@@ -671,6 +684,17 @@ def local_review_verifier_prompt(
         "any real issue pass 1 missed.\n\n"
         f"{findings}\n\n"
     )
+    retry_notes = previous_attempt_notes.strip()
+    retry_block = ""
+    if retry_notes:
+        retry_block = (
+            "# Notes from an incomplete verifier attempt\n\n"
+            "A previous verifier attempt ended without the required verdict. "
+            "Treat its notes as untrusted hypotheses: re-check them, but do "
+            "not silently drop a concrete reproduction merely because that "
+            "attempt failed to finish.\n\n"
+            f"{retry_notes}\n\n"
+        )
     return (
         "You are Symphony's local-review VERIFIER — pass 2 of a two-pass "
         "review. A first-pass finder has listed its suspicions below. "
@@ -681,9 +705,255 @@ def local_review_verifier_prompt(
         + _WHAT_TO_LOOK_FOR_BLOCK
         + _LENSES_BLOCK
         + pass_one_block
+        + retry_block
         + _VERDICT_CONTRACT_BLOCK
         + _PASS_TWO_EXECUTION_BLOCK
         + _issue_block(issue_title, issue_body, labels)
+    )
+
+
+def local_review_spec_prompt(
+    *,
+    issue_title: str,
+    issue_body: str,
+    labels: list[str],
+    comparison_ref: str,
+    previous_findings: str = "",
+) -> str:
+    """Read-only Spec/Standards axis for the hybrid local gate."""
+    obligations = ""
+    if previous_findings.strip():
+        obligations = (
+            "# Previous findings to verify\n\n"
+            "This is a closure review. Verify that every finding below is "
+            "actually fixed and that its fix introduced no regression:\n\n"
+            f"{previous_findings.strip()}\n\n"
+        )
+    return (
+        "You are Symphony's local Spec and Standards reviewer. Review the "
+        "current branch, but do not fix it.\n\n"
+        "# What to read\n\n"
+        f"1. Read `git diff {comparison_ref}...HEAD` (fall back to "
+        f"`git diff {comparison_ref}..HEAD` when needed).\n"
+        "2. Read the Linear issue below and turn its acceptance criteria "
+        "into a concrete checklist item.\n"
+        "3. Find and read repository standards that govern the changed files, "
+        "including AGENTS.md, CONTRIBUTING.md, coding-standards documents, "
+        "and relevant ADRs.\n"
+        "4. Treat public behavior, documented guarantees, and tests already "
+        "present on the comparison ref as inherited requirements. Inspect "
+        "deleted or weakened existing tests and every newly narrowed API or "
+        "workflow. The current issue may extend the contract, but a breaking "
+        "change is allowed only when the issue explicitly authorizes it.\n\n"
+        "# Two independent axes\n\n"
+        "- **Spec:** missing or partial requirements, behavior not requested, "
+        "requirements implemented incorrectly, and regressions against the "
+        "inherited contract.\n"
+        "- **Standards:** violations of documented repository rules. Do not "
+        "report style that automated tooling already enforces.\n\n"
+        "A concrete Spec or Standards violation blocks approval. Keep the two "
+        "axes named in your explanation, but emit one combined Findings list.\n\n"
+        + obligations
+        + _VERDICT_CONTRACT_BLOCK
+        + _NO_MUTATION_BLOCK
+        + _issue_block(issue_title, issue_body, labels)
+    )
+
+
+def local_review_bug_prompt(
+    *,
+    issue_title: str,
+    issue_body: str,
+    labels: list[str],
+    comparison_ref: str,
+    previous_findings: str = "",
+) -> str:
+    """Read-only functional-bug axis for non-Codex hybrid reviewers."""
+    obligations = ""
+    if previous_findings.strip():
+        obligations = (
+            "# Previous findings to verify\n\n"
+            "This is a closure review. Verify every finding below, its fix, "
+            "related failure modes, and regression coverage:\n\n"
+            f"{previous_findings.strip()}\n\n"
+        )
+    return (
+        "You are Symphony's local functional bugs reviewer. Review the "
+        "current branch independently, but do not fix it.\n\n"
+        "# What to read\n\n"
+        f"1. Read `git diff {comparison_ref}...HEAD` (fall back to "
+        f"`git diff {comparison_ref}..HEAD` when needed).\n"
+        "2. Read changed code in context, including callers, sibling "
+        "implementations, data contracts, and relevant tests.\n"
+        "3. Re-read the issue below so behavior at integration boundaries "
+        "is checked against the intended workflow.\n\n"
+        "# What to find\n\n"
+        "Find concrete correctness, state, concurrency, error-handling, "
+        "security, accessibility, and regression bugs. Focus on failures "
+        "that tests or users can observe. Do not duplicate Spec or style "
+        "review unless it exposes a functional defect.\n\n"
+        + obligations
+        + _VERDICT_CONTRACT_BLOCK
+        + _NO_MUTATION_BLOCK
+        + _issue_block(issue_title, issue_body, labels)
+    )
+
+
+def build_builtin_codex_review_command(
+    *,
+    comparison_ref: str,
+    codex_model: str = DEFAULT_CODEX_MODEL,
+    effort: str | None = None,
+    last_message_path: str | None = None,
+) -> list[str]:
+    """Run the same built-in Codex review surface locally."""
+    command = [
+        "codex",
+        "exec",
+        "review",
+        "--base",
+        comparison_ref,
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--ephemeral",
+        "--ignore-user-config",
+        "--ignore-rules",
+        "--json",
+        "--model",
+        codex_model,
+    ]
+    if effort is not None:
+        command.extend(["--config", codex_reasoning_effort_config(effort)])
+    if last_message_path is not None:
+        command.extend(["-o", last_message_path])
+    return command
+
+
+def _finding_location(text: str) -> str:
+    location = _FINDING_LOCATION_RE.search(text)
+    if location is None:
+        return ""
+    return f"{location.group('path').casefold()}:{location.group('line')}"
+
+
+def _finding_terms(text: str) -> set[str]:
+    without_location = _FINDING_LOCATION_RE.sub(" ", text.casefold())
+    return {
+        term
+        for term in re.findall(r"[a-z0-9_]+", without_location)
+        if term not in {"critical", "major", "minor", "the", "a", "an", "to", "and"}
+    }
+
+
+def _same_root_cause(left: str, right: str) -> bool:
+    if _finding_location(left) != _finding_location(right):
+        return False
+    left_terms = _finding_terms(left)
+    right_terms = _finding_terms(right)
+    if not left_terms or not right_terms:
+        return left.casefold() == right.casefold()
+    overlap = len(left_terms & right_terms) / len(left_terms | right_terms)
+    return overlap >= 0.5
+
+
+def _severity_rank(text: str) -> int:
+    canonical = _LEADING_SEVERITY_TAG_RE.match(text)
+    if canonical is not None:
+        return {"critical": 3, "major": 2, "minor": 1}[canonical.group(1).casefold()]
+    matches = list(_SEVERITY_TAG_RE.finditer(text))
+    if len(matches) != 1:
+        return 0
+    return {"critical": 3, "major": 2, "minor": 1}[matches[0].group(1).casefold()]
+
+
+def _builtin_findings(message: str) -> list[str]:
+    findings: list[str] = []
+    for priority, raw_body in _BUILTIN_FINDING_RE.findall(message):
+        if priority == "P3":
+            continue
+        severity = {"P0": "Critical", "P1": "Major", "P2": "Minor"}[priority]
+        body = " ".join(raw_body.split())
+        findings.append(f"[{severity}] {body}")
+    return findings
+
+
+def merge_hybrid_review_messages(
+    *,
+    spec_message: str,
+    bug_message: str,
+    head_sha: str,
+    max_p2: int = 5,
+    builtin_bug_review: bool = True,
+) -> LocalVerdict:
+    """Combine both local axes into one deduplicated, bounded fix batch."""
+    spec = _classify_message(message=spec_message, head_sha=head_sha)
+    bug_label = "BUILTIN" if builtin_bug_review else "BUG"
+    raw_message = f"SPEC:\n{spec_message}\n\n{bug_label}:\n{bug_message}"
+    if spec.kind is LocalVerdictKind.UNPARSEABLE or not bug_message.strip():
+        return LocalVerdict(
+            kind=LocalVerdictKind.UNPARSEABLE,
+            raw_message=raw_message,
+        )
+
+    bug: LocalVerdict | None = None
+    if builtin_bug_review:
+        builtin_has_priority = _BUILTIN_FINDING_RE.search(bug_message) is not None
+        if not builtin_has_priority and _BUILTIN_CLEAN_RE.search(bug_message) is None:
+            return LocalVerdict(
+                kind=LocalVerdictKind.UNPARSEABLE,
+                raw_message=raw_message,
+            )
+    else:
+        bug = _classify_message(message=bug_message, head_sha=head_sha)
+        if bug.kind is LocalVerdictKind.UNPARSEABLE:
+            return LocalVerdict(
+                kind=LocalVerdictKind.UNPARSEABLE,
+                raw_message=raw_message,
+            )
+
+    candidates: list[str] = []
+    if spec.kind is LocalVerdictKind.CHANGES_REQUESTED:
+        candidates.extend(_finding_bodies(spec.findings))
+    if builtin_bug_review:
+        candidates.extend(_builtin_findings(bug_message))
+    elif bug is not None and bug.kind is LocalVerdictKind.CHANGES_REQUESTED:
+        candidates.extend(_finding_bodies(bug.findings))
+
+    deduped: list[str] = []
+    for finding in candidates:
+        duplicate_at = next(
+            (index for index, current in enumerate(deduped) if _same_root_cause(current, finding)),
+            None,
+        )
+        if duplicate_at is None:
+            deduped.append(finding)
+        elif _severity_rank(finding) > _severity_rank(deduped[duplicate_at]):
+            deduped[duplicate_at] = finding
+
+    bounded: list[str] = []
+    p2_used = 0
+    for finding in deduped:
+        if _severity_rank(finding) == 1:
+            if p2_used >= max_p2:
+                continue
+            p2_used += 1
+        bounded.append(finding)
+
+    if not bounded:
+        return LocalVerdict(
+            kind=LocalVerdictKind.APPROVED,
+            trigger_signature=f"local_hybrid_approved:{head_sha}",
+            raw_message=raw_message,
+        )
+
+    findings = "\n".join(f"- {finding}" for finding in bounded)
+    digest = _stable_digest(findings)
+    return LocalVerdict(
+        kind=LocalVerdictKind.CHANGES_REQUESTED,
+        findings=findings,
+        severity_inferred=spec.severity_inferred or bool(bug and bug.severity_inferred),
+        trigger_signature=f"local_hybrid:{head_sha}:{digest}",
+        findings_signature=f"local_hybrid_findings:{digest}",
+        raw_message=raw_message,
     )
 
 
@@ -697,6 +967,7 @@ def build_local_review_command(
     effort: str | None = None,
     last_message_path: str | None = None,
     pass_two: bool = False,
+    workspace_path: Path | None = None,
 ) -> list[str]:
     """argv for the local reviewer subprocess.
 
@@ -726,6 +997,8 @@ def build_local_review_command(
     """
     _ = base_branch
     if agent == "codex":
+        if pass_two and workspace_path is None:
+            raise ValueError("workspace_path is required for writable codex review passes")
         command = [
             "codex",
             "exec",
@@ -736,6 +1009,8 @@ def build_local_review_command(
             "--dangerously-bypass-approvals-and-sandbox",
             "--json",
         ]
+        if workspace_path is not None:
+            command.extend(["--cd", str(workspace_path)])
         if effort is not None:
             command.extend(["--config", codex_reasoning_effort_config(effort)])
         command.extend(["--model", codex_model])
@@ -853,6 +1128,18 @@ _VERDICT_LINE_RE = re.compile(
     rf"{re.escape(VERDICT_CHANGES_REQUESTED_MARKER)})"
 )
 _FINDINGS_HEADING_RE = re.compile(r"(?im)^\s*#{1,6}\s*findings\b\s*$")
+_FINDING_BULLET_LINE_RE = re.compile(r"^(?P<indent>[ \t]{0,3})(?P<marker>[-*+]\s+)(?P<body>.+)$")
+_SEVERITY_TAG_RE = re.compile(r"\[(Critical|Major|Minor)\]", re.IGNORECASE)
+_LEADING_SEVERITY_TAG_RE = re.compile(r"^\*{0,2}`?\[(Critical|Major|Minor)\]", re.IGNORECASE)
+_BUILTIN_FINDING_RE = re.compile(
+    r"(?ms)^(?:[-*+]\s*)?\[(P[0-3])\]\s+(.+?)"
+    r"(?=^(?:[-*+]\s*)?\[P[0-3]\]\s+|\Z)"
+)
+_FINDING_LOCATION_RE = re.compile(r"(?P<path>[A-Za-z0-9_./-]+):(?P<line>\d+)")
+_BUILTIN_CLEAN_RE = re.compile(
+    r"\b(?:no findings|no actionable findings|did not find any findings|nothing to flag)\b",
+    re.IGNORECASE,
+)
 
 
 def extract_last_agent_message(
@@ -964,14 +1251,75 @@ def _classify_message(*, message: str, head_sha: str) -> LocalVerdict:
             raw_message=message,
         )
     findings = _extract_findings(message=message, verdict_index=matches[-1].start())
-    digest = _stable_digest(findings)
+    normalized = _normalize_findings_severity(findings)
+    if normalized is None:
+        return LocalVerdict(kind=LocalVerdictKind.UNPARSEABLE, raw_message=message)
+    normalized_findings, severity_inferred = normalized
+    digest = _stable_digest(normalized_findings)
     return LocalVerdict(
         kind=LocalVerdictKind.CHANGES_REQUESTED,
-        findings=findings,
+        findings=normalized_findings,
+        severity_inferred=severity_inferred,
         trigger_signature=f"local_review:{head_sha}:{digest}",
         raw_message=message,
         findings_signature=f"local_review_findings:{digest}",
     )
+
+
+def _normalize_findings_severity(findings: str) -> tuple[str, bool] | None:
+    """Keep actionable findings when a reviewer omits presentation tags.
+
+    A missing tag is conservatively treated as Major and marked as inferred,
+    so formatting drift cannot bypass the fix gate. Multiple tags remain
+    ambiguous and therefore unparseable.
+    """
+    normalized = findings.splitlines()
+    bullets = _top_level_finding_bullets(normalized)
+    if not bullets:
+        return None
+    severity_inferred = False
+    for position, (index, match) in enumerate(bullets):
+        next_index = bullets[position + 1][0] if position + 1 < len(bullets) else len(normalized)
+        block = "\n".join(normalized[index:next_index])
+        severities = list(_SEVERITY_TAG_RE.finditer(block))
+        if len(severities) > 1:
+            return None
+        if not severities:
+            severity_inferred = True
+            normalized[index] = (
+                f"{match.group('indent')}{match.group('marker')}"
+                f"[Major] [severity inferred] {match.group('body')}"
+            )
+    return "\n".join(normalized), severity_inferred
+
+
+def _top_level_finding_bullets(
+    lines: list[str],
+) -> list[tuple[int, re.Match[str]]]:
+    candidates = [
+        (index, match)
+        for index, line in enumerate(lines)
+        if (match := _FINDING_BULLET_LINE_RE.match(line)) is not None
+    ]
+    if not candidates:
+        return []
+    baseline = min(len(match.group("indent").expandtabs(4)) for _, match in candidates)
+    return [
+        (index, match)
+        for index, match in candidates
+        if len(match.group("indent").expandtabs(4)) == baseline
+    ]
+
+
+def _finding_bodies(findings: str) -> list[str]:
+    lines = findings.splitlines()
+    bullets = _top_level_finding_bullets(lines)
+    bodies: list[str] = []
+    for position, (index, match) in enumerate(bullets):
+        next_index = bullets[position + 1][0] if position + 1 < len(bullets) else len(lines)
+        block = [match.group("body"), *lines[index + 1 : next_index]]
+        bodies.append(" ".join("\n".join(block).split()))
+    return bodies
 
 
 def _extract_findings(*, message: str, verdict_index: int) -> str:
@@ -984,8 +1332,8 @@ def _extract_findings(*, message: str, verdict_index: int) -> str:
     head = message[:verdict_index]
     m = _FINDINGS_HEADING_RE.search(head)
     if m is None:
-        return head.strip()
-    return head[m.end() :].strip()
+        return head.strip("\r\n")
+    return head[m.end() :].strip("\r\n")
 
 
 def _stable_digest(text: str) -> str:
@@ -1006,6 +1354,7 @@ __all__ = [
     "PLAINTEXT_AUTH_PHRASES",
     "VERDICT_APPROVED_MARKER",
     "VERDICT_CHANGES_REQUESTED_MARKER",
+    "build_builtin_codex_review_command",
     "build_local_review_command",
     "classify_json_field_auth_error",
     "classify_plaintext_auth_error",
@@ -1015,7 +1364,9 @@ __all__ = [
     "is_small_diff",
     "local_review_finder_prompt",
     "local_review_prompt",
+    "local_review_spec_prompt",
     "local_review_verifier_prompt",
+    "merge_hybrid_review_messages",
     "parse_diff_numstat",
     "parse_local_review_output",
 ]

@@ -736,7 +736,8 @@ async def test_verify_runs_after_local_review_fix_loop(tmp_path: Path) -> None:
                 "local_review": [
                     [
                         _codex_agent_message(
-                            f"## Findings\n- needs a tweak\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+                            f"## Findings\n- [Major] needs a tweak\n"
+                            f"{VERDICT_CHANGES_REQUESTED_MARKER}"
                         ),
                         RunnerEvent(kind="exit", returncode=0),
                     ],

@@ -32,6 +32,7 @@ Caller responsibilities outside this module:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 from collections.abc import Awaitable, Callable, Mapping
@@ -51,20 +52,26 @@ from ..agent.runner import Runner, RunnerSpec
 from ..config import ResolvedRole
 from .cost_guard import UsageCostEstimator
 from .local_review import (
+    VERDICT_APPROVED_MARKER,
+    VERDICT_CHANGES_REQUESTED_MARKER,
     DiffSize,
     LocalVerdict,
     LocalVerdictKind,
     ReviewerAgent,
     StreamApiError,
+    build_builtin_codex_review_command,
     build_local_review_command,
     classify_pass_api_error,
     classify_plaintext_auth_error,
     extract_last_agent_message,
     is_auth_api_error,
     is_small_diff,
+    local_review_bug_prompt,
     local_review_finder_prompt,
     local_review_prompt,
+    local_review_spec_prompt,
     local_review_verifier_prompt,
+    merge_hybrid_review_messages,
     parse_local_review_output,
 )
 from .local_review_io import CollectedRunnerOutput, collect_runner_output
@@ -99,6 +106,52 @@ WorkspaceScrubber = Callable[[Path, str], Awaitable[None]]
 # already uses UUIDs, but if a caller passes something weirder we still
 # want clean derived IDs.
 _RUN_ID_SAFE_RE = re.compile(r"[^a-zA-Z0-9_.\-]")
+_RETRY_NOTES_MAX_CHARS = 16_000
+
+
+def _retryable_agent_notes(
+    *, agent: ReviewerAgent, stdout: str, last_message_file: str | None
+) -> str:
+    """Collect agent prose from an incomplete verifier attempt.
+
+    `extract_last_agent_message` intentionally returns only the terminal
+    message for verdict parsing. Retry context is different: a verifier can
+    prove a defect in an earlier progress message and then terminate without a
+    marker. Preserve only agent-authored prose (never command/tool output) so
+    the retry can re-check those discoveries instead of silently losing them.
+    """
+    messages: list[str] = []
+    for raw_line in stdout.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if agent == "codex" and event.get("type") == "item.completed":
+            item = event.get("item") or {}
+            text = item.get("text") if item.get("type") == "agent_message" else None
+            if isinstance(text, str) and text.strip():
+                messages.append(text.strip())
+        elif agent == "claude":
+            if event.get("type") == "result":
+                text = event.get("result")
+                if isinstance(text, str) and text.strip():
+                    messages.append(text.strip())
+            elif event.get("type") == "assistant":
+                for block in (event.get("message") or {}).get("content") or []:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        text = block.get("text")
+                        if isinstance(text, str) and text.strip():
+                            messages.append(text.strip())
+    if last_message_file and last_message_file.strip():
+        messages.append(last_message_file.strip())
+    combined = "\n\n".join(dict.fromkeys(messages))
+    if len(combined) <= _RETRY_NOTES_MAX_CHARS:
+        return combined
+    half = _RETRY_NOTES_MAX_CHARS // 2
+    return combined[:half] + "\n\n[...truncated...]\n\n" + combined[-half:]
 
 
 def _safe_run_id(parent_run_id: str, suffix: str) -> str:
@@ -116,6 +169,7 @@ def _build_fix_command(
     agent: ImplementerAgent,
     codex_model: str,
     prompt: str,
+    workspace_path: Path | None = None,
     claude_model: str | None = None,
     effort: str | None = None,
     mcp_servers: Mapping[str, Any] | None = None,
@@ -158,10 +212,13 @@ def _build_fix_command(
         command.extend(["--", prompt])
         return command
     if agent == "codex":
+        if workspace_path is None:
+            raise ValueError("workspace_path is required for codex write runs")
         return build_codex_workspace_write_command(
             prompt=prompt,
             codex_model=codex_model,
             effort=effort,
+            workspace_path=workspace_path,
         )
     raise ValueError(f"unknown implementer agent {agent!r}")
 
@@ -238,6 +295,7 @@ async def run_local_review_session(
     on_iteration: IterationCallback | None = None,
     allow_fixes: bool = True,
     log_path: Path | None = None,
+    review_mode: Literal["legacy", "hybrid"] = "legacy",
 ) -> LoopResult:
     """Run the review→fix loop in-workspace; return the loop's outcome.
 
@@ -268,26 +326,17 @@ async def run_local_review_session(
         base_branch=base_branch,
     )
 
-    # One estimator per role — codex sums token deltas across calls, so it
-    # must persist across iterations. Sharing the reviewer estimator across
-    # all finder subprocess calls (and likewise the verifier / fixer) keeps
-    # the cumulative-token invariant intact. Each pass runs its own resolved
-    # role (review_find / review_verify / fix), which may differ in agent and
-    # model, so each needs its own estimator: feeding a separate codex token
-    # stream through another role's estimator would corrupt the cumulative-max
-    # bookkeeping.
-    reviewer_estimator = UsageCostEstimator(
-        agent=reviewer_role.agent,
-        codex_model=reviewer_role.codex_model_arg(),
-    )
-    verifier_estimator = UsageCostEstimator(
-        agent=verifier_role.agent,
-        codex_model=verifier_role.codex_model_arg(),
-    )
-    fixer_estimator = UsageCostEstimator(
-        agent=fixer_role.agent,
-        codex_model=fixer_role.codex_model_arg(),
-    )
+    # Every runner invocation is a separate provider process. Its cumulative
+    # token stream starts from zero, so the estimator must be scoped to that
+    # invocation; the loop sums the resulting subprocess deltas.
+    # A no-verdict verifier gets one retry. Reuse the successful finder for
+    # that retry and retain verifier-authored notes from the incomplete attempt
+    # so confirmed discoveries are not lost (production BENCH-59).
+    finder_cache: dict[int, tuple[str, ReviewerOutput, str]] = {}
+    verifier_retry_notes: dict[int, str] = {}
+    pass_attempts: dict[str, int] = {}
+    hybrid_initial_head: str | None = None
+    hybrid_previous_findings = ""
 
     async def _run_reviewer_pass(
         *,
@@ -298,9 +347,10 @@ async def run_local_review_session(
         prompt: str,
         stem: str,
         run_suffix: str,
-        estimator: UsageCostEstimator,
         head_sha: str,
         pass_two: bool = False,
+        builtin_review: bool = False,
+        comparison_ref: str | None = None,
     ) -> ReviewerOutput:
         """Run one reviewer subprocess and price its usage.
 
@@ -311,7 +361,10 @@ async def run_local_review_session(
         the Tier B exec/write surface (verifier only); pass 1 and the
         single-pass fallback stay read-only.
         """
-        last_message_path = last_message_dir / f"{stem}.last.txt"
+        attempt = pass_attempts.get(stem, 0) + 1
+        pass_attempts[stem] = attempt
+        attempt_stem = stem if attempt == 1 else f"{stem}-attempt-{attempt}"
+        last_message_path = last_message_dir / f"{attempt_stem}.last.txt"
         # Clear any previous iteration's leftover so a partial run
         # doesn't smuggle a stale "approved" into the next pass.
         if last_message_path.exists():
@@ -319,16 +372,27 @@ async def run_local_review_session(
                 last_message_path.unlink()
             except OSError:
                 pass
-        command = build_local_review_command(
-            agent=agent,
-            prompt=prompt,
-            base_branch=base_branch,
-            codex_model=codex_model or DEFAULT_CODEX_MODEL,
-            claude_model=claude_model,
-            effort=effort,
-            last_message_path=(str(last_message_path) if agent == "codex" else None),
-            pass_two=pass_two,
-        )
+        if builtin_review:
+            if agent != "codex" or comparison_ref is None:
+                raise ValueError("built-in review requires codex and a comparison ref")
+            command = build_builtin_codex_review_command(
+                comparison_ref=comparison_ref,
+                codex_model=codex_model or DEFAULT_CODEX_MODEL,
+                effort=effort,
+                last_message_path=str(last_message_path),
+            )
+        else:
+            command = build_local_review_command(
+                agent=agent,
+                prompt=prompt,
+                base_branch=base_branch,
+                codex_model=codex_model or DEFAULT_CODEX_MODEL,
+                claude_model=claude_model,
+                effort=effort,
+                last_message_path=(str(last_message_path) if agent == "codex" else None),
+                pass_two=pass_two,
+                workspace_path=workspace_path,
+            )
         spec = RunnerSpec(
             run_id=_safe_run_id(parent_run_id, run_suffix),
             workspace_path=workspace_path,
@@ -343,20 +407,27 @@ async def run_local_review_session(
             wall_clock_secs=wall_clock_secs,
             stage="local_review",
         )
-        cost_before = estimator.total_cost_usd
-        input_before = estimator.total_input_tokens
-        output_before = estimator.total_output_tokens
-        cache_write_before = estimator.total_cache_write_tokens
-        cache_read_before = estimator.total_cache_read_tokens
+        estimator = UsageCostEstimator(agent=agent, codex_model=codex_model)
         collected = await collect_runner_output(
             runner, spec, usage_handler=estimator.delta, log_path=log_path
         )
-        _persist_runner_transcript(last_message_dir, stem, collected)
-        cost_delta = estimator.total_cost_usd - cost_before
-        input_delta = estimator.total_input_tokens - input_before
-        output_delta = estimator.total_output_tokens - output_before
-        cache_write_delta = estimator.total_cache_write_tokens - cache_write_before
-        cache_read_delta = estimator.total_cache_read_tokens - cache_read_before
+        _persist_runner_transcript(last_message_dir, attempt_stem, collected)
+        if agent != "codex":
+            extracted_message = extract_last_agent_message(
+                agent=agent,
+                stdout=collected.stdout,
+                last_message_file=None,
+            )
+            if extracted_message.strip():
+                try:
+                    last_message_path.write_text(extracted_message, encoding="utf-8")
+                except OSError:
+                    pass
+        cost_delta = estimator.total_cost_usd
+        input_delta = estimator.total_input_tokens
+        output_delta = estimator.total_output_tokens
+        cache_write_delta = estimator.total_cache_write_tokens
+        cache_read_delta = estimator.total_cache_read_tokens
 
         last_message_text: str | None = None
         if last_message_path.exists():
@@ -438,7 +509,134 @@ async def run_local_review_session(
         )
 
     async def _reviewer(iteration: int) -> ReviewerOutput:
+        nonlocal hybrid_initial_head
+        nonlocal hybrid_previous_findings
         head_sha = await head_sha_provider(workspace_path)
+
+        if review_mode == "hybrid":
+            if hybrid_initial_head is None:
+                hybrid_initial_head = head_sha
+            comparison_ref = base_branch if iteration == 0 else hybrid_initial_head
+            bug_role = verifier_role
+            builtin_bug_review = bug_role.agent == "codex"
+
+            spec_prompt = local_review_spec_prompt(
+                issue_title=issue_title,
+                issue_body=issue_body,
+                labels=labels,
+                comparison_ref=comparison_ref,
+                previous_findings=hybrid_previous_findings,
+            )
+            bug_prompt = local_review_bug_prompt(
+                issue_title=issue_title,
+                issue_body=issue_body,
+                labels=labels,
+                comparison_ref=comparison_ref,
+                previous_findings=hybrid_previous_findings,
+            )
+            spec_out, bug_out = await asyncio.gather(
+                _run_reviewer_pass(
+                    agent=reviewer_role.agent,
+                    codex_model=reviewer_role.codex_model_arg(),
+                    claude_model=reviewer_role.claude_model_arg(),
+                    effort=reviewer_role.effort,
+                    prompt=spec_prompt,
+                    stem=f"review-{iteration}-spec",
+                    run_suffix=f"rev-{iteration}-spec",
+                    head_sha=head_sha,
+                ),
+                _run_reviewer_pass(
+                    agent=bug_role.agent,
+                    codex_model=bug_role.codex_model_arg(),
+                    claude_model=bug_role.claude_model_arg(),
+                    effort=bug_role.effort,
+                    # `codex exec review --base` owns its prompt; the CLI
+                    # rejects a custom positional prompt in this mode.
+                    prompt="" if builtin_bug_review else bug_prompt,
+                    stem=f"review-{iteration}-bug",
+                    run_suffix=f"rev-{iteration}-bug",
+                    head_sha=head_sha,
+                    builtin_review=builtin_bug_review,
+                    comparison_ref=comparison_ref,
+                ),
+            )
+            if workspace_scrubber is not None:
+                await workspace_scrubber(workspace_path, head_sha)
+
+            total_cost_usd = spec_out.cost_usd + bug_out.cost_usd
+            total_input_tokens = spec_out.input_tokens + bug_out.input_tokens
+            total_output_tokens = spec_out.output_tokens + bug_out.output_tokens
+            total_cache_write_tokens = spec_out.cache_write_tokens + bug_out.cache_write_tokens
+            total_cache_read_tokens = spec_out.cache_read_tokens + bug_out.cache_read_tokens
+            failed = spec_out if not spec_out.ok else bug_out if not bug_out.ok else None
+            if failed is not None:
+                return replace(
+                    failed,
+                    cost_usd=total_cost_usd,
+                    input_tokens=total_input_tokens,
+                    output_tokens=total_output_tokens,
+                    cache_write_tokens=total_cache_write_tokens,
+                    cache_read_tokens=total_cache_read_tokens,
+                )
+
+            spec_message = extract_last_agent_message(
+                agent=reviewer_role.agent,
+                stdout=spec_out.stdout,
+                last_message_file=spec_out.last_message_file,
+            )
+            bug_message = extract_last_agent_message(
+                agent=bug_role.agent,
+                stdout=bug_out.stdout,
+                last_message_file=bug_out.last_message_file,
+            )
+            merged = merge_hybrid_review_messages(
+                spec_message=spec_message,
+                bug_message=bug_message,
+                head_sha=head_sha,
+                builtin_bug_review=builtin_bug_review,
+            )
+            if merged.kind is LocalVerdictKind.APPROVED:
+                final_message = f"Hybrid local review passed.\n{VERDICT_APPROVED_MARKER}"
+            elif merged.kind is LocalVerdictKind.CHANGES_REQUESTED:
+                hybrid_previous_findings = merged.findings
+                final_message = (
+                    f"## Findings\n{merged.findings}\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+                )
+            else:
+                final_message = merged.raw_message
+            (last_message_dir / f"review-{iteration}-hybrid.last.txt").write_text(
+                final_message,
+                encoding="utf-8",
+            )
+            api_error, api_error_agent = _prefer_actionable_api_error(
+                primary=(spec_out.api_error, spec_out.api_error_agent),
+                secondary=(bug_out.api_error, bug_out.api_error_agent),
+            )
+            return ReviewerOutput(
+                stdout="",
+                head_sha=head_sha,
+                last_message_file=final_message,
+                api_error=api_error,
+                api_error_agent=api_error_agent,
+                extra_api_errors=_spare_auth_errors(
+                    chosen=api_error,
+                    candidates=(
+                        (spec_out.api_error, spec_out.api_error_agent),
+                        (bug_out.api_error, bug_out.api_error_agent),
+                    ),
+                ),
+                healthy_agents=tuple(
+                    {
+                        *spec_out.healthy_agents,
+                        *bug_out.healthy_agents,
+                    }
+                ),
+                cost_usd=total_cost_usd,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+                cache_write_tokens=total_cache_write_tokens,
+                cache_read_tokens=total_cache_read_tokens,
+            )
 
         # Small diffs collapse to a single direct review to save the
         # second subprocess. Without a provider we can't size the diff,
@@ -455,7 +653,6 @@ async def run_local_review_session(
                 prompt=review_prompt,
                 stem=f"review-{iteration}",
                 run_suffix=f"rev-{iteration}",
-                estimator=reviewer_estimator,
                 head_sha=head_sha,
             )
             # Reviewer is unsandboxed: discard anything it wrote/committed so it
@@ -468,32 +665,36 @@ async def run_local_review_session(
         # Pass 1 — finder, resolved from the `review_find` role (defaults to
         # the family opposite `implement`). Lists every suspicion, emits no
         # verdict marker; its findings feed pass 2.
-        finder_out = await _run_reviewer_pass(
-            agent=reviewer_role.agent,
-            codex_model=reviewer_role.codex_model_arg(),
-            claude_model=reviewer_role.claude_model_arg(),
-            effort=reviewer_role.effort,
-            prompt=finder_prompt,
-            stem=f"review-{iteration}-find",
-            run_suffix=f"rev-{iteration}-find",
-            estimator=reviewer_estimator,
-            head_sha=head_sha,
-        )
-        # Finder is unsandboxed: reset before the verifier sees the diff (and
-        # before delivery) so finder edits/commits never leak. Findings are
-        # already captured from the finder's stdout / last-message file.
-        if workspace_scrubber is not None:
-            await workspace_scrubber(workspace_path, head_sha)
+        cached_finder = finder_cache.get(iteration)
+        if cached_finder is not None and cached_finder[0] == head_sha:
+            finder_reused = True
+            _, finder_out, pass_one_findings = cached_finder
+        else:
+            finder_reused = False
+            finder_out = await _run_reviewer_pass(
+                agent=reviewer_role.agent,
+                codex_model=reviewer_role.codex_model_arg(),
+                claude_model=reviewer_role.claude_model_arg(),
+                effort=reviewer_role.effort,
+                prompt=finder_prompt,
+                stem=f"review-{iteration}-find",
+                run_suffix=f"rev-{iteration}-find",
+                head_sha=head_sha,
+            )
+            # Finder is unsandboxed: reset before the verifier sees the diff
+            # (and before delivery) so finder edits/commits never leak.
+            if workspace_scrubber is not None:
+                await workspace_scrubber(workspace_path, head_sha)
+            pass_one_findings = extract_last_agent_message(
+                agent=reviewer_role.agent,
+                stdout=finder_out.stdout,
+                last_message_file=finder_out.last_message_file,
+            )
         if not finder_out.ok:
             # Propagate the finder failure (with its cost) to the loop;
             # no point paying for a verifier with nothing to verify.
             return finder_out
 
-        pass_one_findings = extract_last_agent_message(
-            agent=reviewer_role.agent,
-            stdout=finder_out.stdout,
-            last_message_file=finder_out.last_message_file,
-        )
         if finder_out.agent_error and not pass_one_findings.strip():
             # Pass 1 exited 0 but emitted only a `turn.failed`/`error` (e.g. an
             # API 4xx) with no findings: surface it as a failure rather than
@@ -502,12 +703,15 @@ async def run_local_review_session(
             # findings alongside a stray event still proceeds normally — the
             # finder is instructed not to emit a verdict marker.
             return replace(finder_out, ok=False, error=finder_out.agent_error)
+        if not finder_reused:
+            finder_cache[iteration] = (head_sha, finder_out, pass_one_findings)
         verifier_prompt = local_review_verifier_prompt(
             issue_title=issue_title,
             issue_body=issue_body,
             labels=labels,
             base_branch=base_branch,
             pass_one_findings=pass_one_findings,
+            previous_attempt_notes=verifier_retry_notes.get(iteration, ""),
         )
         # Pass 2 — adversarial verifier, resolved from the `review_verify`
         # role (defaults to the implementer's family, kept opposite
@@ -522,7 +726,6 @@ async def run_local_review_session(
             prompt=verifier_prompt,
             stem=f"review-{iteration}-verify",
             run_suffix=f"rev-{iteration}-verify",
-            estimator=verifier_estimator,
             head_sha=head_sha,
             pass_two=True,
         )
@@ -571,6 +774,17 @@ async def run_local_review_session(
             head_sha=verifier_out.head_sha,
             last_message_file=verifier_message,
         )
+        if verifier_parsed.kind == LocalVerdictKind.UNPARSEABLE:
+            retry_notes = _retryable_agent_notes(
+                agent=verifier_role.agent,
+                stdout=verifier_out.stdout,
+                last_message_file=verifier_out.last_message_file,
+            )
+            if retry_notes:
+                verifier_retry_notes[iteration] = retry_notes
+        else:
+            finder_cache.pop(iteration, None)
+            verifier_retry_notes.pop(iteration, None)
         merged_healthy_agents = tuple(
             {
                 *(
@@ -601,11 +815,21 @@ async def run_local_review_session(
         return replace(
             verifier_out,
             last_message_file=verifier_message,
-            cost_usd=verifier_out.cost_usd + finder_out.cost_usd,
-            input_tokens=verifier_out.input_tokens + finder_out.input_tokens,
-            output_tokens=(verifier_out.output_tokens + finder_out.output_tokens),
-            cache_write_tokens=(verifier_out.cache_write_tokens + finder_out.cache_write_tokens),
-            cache_read_tokens=(verifier_out.cache_read_tokens + finder_out.cache_read_tokens),
+            cost_usd=(verifier_out.cost_usd + (0.0 if finder_reused else finder_out.cost_usd)),
+            input_tokens=(
+                verifier_out.input_tokens + (0 if finder_reused else finder_out.input_tokens)
+            ),
+            output_tokens=(
+                verifier_out.output_tokens + (0 if finder_reused else finder_out.output_tokens)
+            ),
+            cache_write_tokens=(
+                verifier_out.cache_write_tokens
+                + (0 if finder_reused else finder_out.cache_write_tokens)
+            ),
+            cache_read_tokens=(
+                verifier_out.cache_read_tokens
+                + (0 if finder_reused else finder_out.cache_read_tokens)
+            ),
             api_error=merged_api_error,
             api_error_agent=merged_api_error_agent,
             extra_api_errors=merged_extra_api_errors,
@@ -632,11 +856,14 @@ async def run_local_review_session(
             issue_body=issue_body,
             labels=labels,
             trigger=verdict.findings,
+            iteration=iteration + 1,
+            iteration_cap=cap,
         )
         command = _build_fix_command(
             agent=fixer_role.agent,
             codex_model=fixer_role.codex_model_arg(),
             prompt=prompt,
+            workspace_path=workspace_path,
             claude_model=fixer_role.claude_model_arg(),
             effort=fixer_role.effort,
             mcp_servers=mcp_servers,
@@ -658,20 +885,19 @@ async def run_local_review_session(
                 **(binding_env or {}),
             },
         )
-        cost_before = fixer_estimator.total_cost_usd
-        input_before = fixer_estimator.total_input_tokens
-        output_before = fixer_estimator.total_output_tokens
-        cache_write_before = fixer_estimator.total_cache_write_tokens
-        cache_read_before = fixer_estimator.total_cache_read_tokens
+        fixer_estimator = UsageCostEstimator(
+            agent=fixer_role.agent,
+            codex_model=fixer_role.codex_model_arg(),
+        )
         collected = await collect_runner_output(
             runner, spec, usage_handler=fixer_estimator.delta, log_path=log_path
         )
         _persist_runner_transcript(last_message_dir, f"fix-{iteration}", collected)
-        cost_delta = fixer_estimator.total_cost_usd - cost_before
-        input_delta = fixer_estimator.total_input_tokens - input_before
-        output_delta = fixer_estimator.total_output_tokens - output_before
-        cache_write_delta = fixer_estimator.total_cache_write_tokens - cache_write_before
-        cache_read_delta = fixer_estimator.total_cache_read_tokens - cache_read_before
+        cost_delta = fixer_estimator.total_cost_usd
+        input_delta = fixer_estimator.total_input_tokens
+        output_delta = fixer_estimator.total_output_tokens
+        cache_write_delta = fixer_estimator.total_cache_write_tokens
+        cache_read_delta = fixer_estimator.total_cache_read_tokens
         if collected.terminal_kind == "spawn_failed":
             # Classify this fix-run's own stdout+stderr so a FIX_RUN_FAILED
             # outcome carries the fixer's provider tag when the spawn itself

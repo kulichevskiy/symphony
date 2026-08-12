@@ -1,0 +1,67 @@
+{
+  "errors": [
+    "typescript mutation baseline failed on repetition 1/2: vents.maxEventTargetListenersWarned): false,\n+       Symbol(kHandlers): undefined,\n+       Symbol(kAborted): false,\n+       Symbol(kReason): undefined,\n+       Symbol(kComposite): false,\n+     },\n    },\n  ]\n\n \u276f src/App.test.tsx:1935:19\n    1933|\n    1934|     await waitFor(() => expect(patchRequests).toBe(3));\n    1935|     expect(fetch).toHaveBeenLastCalledWith(\n       |                   ^\n    1936|       \"/tickets/7\",\n    1937|       expect.objectContaining({\n\n\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af\u23af[2/2]\u23af"
+  ],
+  "mutations": [],
+  "probe": {
+    "changed_files": 6,
+    "changed_lines": 528,
+    "cost_usd": 3.1922815,
+    "detail": "",
+    "raw_tokens": 3278071,
+    "repetitions": 1,
+    "status": "passed",
+    "successful_repetitions": 1,
+    "wall_seconds": 401.0127020375803
+  },
+  "repository": "kulichevskiy/EXP-F68C91FA638A-A1",
+  "schema_version": 1,
+  "static": {
+    "complexity_max": 125,
+    "complexity_median": 3.0,
+    "complexity_p95": 41,
+    "duplicated_blocks": 22,
+    "files": [
+      {
+        "complexity_max": 125,
+        "function_lines_max": 674,
+        "functions": 27,
+        "language": "typescript",
+        "lines": 1192,
+        "path": "frontend/src/App.tsx"
+      },
+      {
+        "complexity_max": 0,
+        "function_lines_max": 0,
+        "functions": 0,
+        "language": "typescript",
+        "lines": 11,
+        "path": "frontend/src/main.tsx"
+      },
+      {
+        "complexity_max": 0,
+        "function_lines_max": 0,
+        "functions": 0,
+        "language": "python",
+        "lines": 1,
+        "path": "support_queue/__init__.py"
+      },
+      {
+        "complexity_max": 41,
+        "function_lines_max": 319,
+        "functions": 27,
+        "language": "python",
+        "lines": 639,
+        "path": "support_queue/main.py"
+      }
+    ],
+    "function_count": 54,
+    "import_cycles": [],
+    "large_files": 2,
+    "large_functions": 5,
+    "max_file_lines": 1192,
+    "max_function_lines": 674,
+    "source_files": 4,
+    "source_lines": 1843
+  }
+}
