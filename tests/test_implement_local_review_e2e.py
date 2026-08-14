@@ -442,7 +442,10 @@ async def test_deliver_failed_retry_preserves_local_review_needs_approval_after_
             if (c.args[1] if len(c.args) >= 2 else c.kwargs.get("body")) == "@codex review"
         ]
         assert codex_calls == []
-        assert await db.operator_waits.get(conn, "iss-1") is None
+        resumed_wait = await db.operator_waits.get(conn, "iss-1")
+        assert resumed_wait is not None
+        assert resumed_wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+        assert resumed_wait.run_id != run_id
         move_targets = [c.args[1] for c in linear.move_issue.await_args_list]
         assert "state-na" in move_targets
 
@@ -1321,7 +1324,9 @@ async def test_local_strategy_non_convergence_parks_pr_in_needs_approval(
         assert review_rows[0].status == "needs_approval"
         assert "src/auth.py:12 missing token validation" in review_rows[0].termination_detail
         wait = await db.operator_waits.get(conn, "iss-1")
-        assert wait is None
+        assert wait is not None
+        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+        assert wait.run_id == review_rows[0].id
     finally:
         await conn.close()
 

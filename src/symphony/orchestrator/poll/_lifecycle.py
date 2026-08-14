@@ -1438,7 +1438,7 @@ class _LifecycleMixin(_OrchestratorBase):
                 issue=issue,
                 pr_url=pr_url,
                 result=local_review_result,
-                operator_wait=binding.resolved_remote_review(),
+                operator_wait=True,
             )
             return run_id
         if (
