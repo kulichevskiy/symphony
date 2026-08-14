@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -241,9 +242,21 @@ async def _seed_implement_failed_wait(
         id=f"run-{issue_id}",
         issue_id=issue_id,
         stage="implement",
-        status="failed",
+        status="running",
         pid=None,
         started_at="2026-05-17T10:00:00Z",
+    )
+    # `_fail_run` (poll/_base.py) always stamps `ended_at` alongside a
+    # `failed` status — leaving it NULL here would make the `_supersede_run`
+    # "already terminal with its own recorded reason" branch unreachable, so
+    # the seeded run would test a shape production never produces.
+    await db.runs.update_status(
+        conn,
+        f"run-{issue_id}",
+        "failed",
+        ended_at="2026-05-17T10:30:00Z",
+        kind="agent_error",
+        detail="agent crashed",
     )
     await db.operator_waits.upsert(
         conn,
@@ -382,29 +395,22 @@ def test_classifies_all_drift_kinds() -> None:
 
     assert (
         classify_linear_drift(
-            has_operator_wait=True,
             state_name="Done",
             done_state_names={"Done"},
         )
         == DRIFT_LINEAR_STATE_DONE
     )
+    # A terminal drift is reported regardless of an operator wait — SYM-114's
+    # shape (wait already cleared, `needs_approval` runs left over) still needs
+    # to be retired once the tracker issue goes terminal, and the function no
+    # longer takes a `has_operator_wait` gate.
     assert (
         classify_linear_drift(
-            has_operator_wait=True,
             state_name="Canceled",
             state_type="canceled",
             done_state_names={"Done"},
         )
         == DRIFT_LINEAR_CANCELED
-    )
-    assert (
-        classify_linear_drift(
-            has_operator_wait=False,
-            state_name="Canceled",
-            state_type="canceled",
-            done_state_names={"Done"},
-        )
-        is None
     )
     assert classify_github_drift(has_merge_wait=True, prs=[merged_pr]) == DRIFT_MERGE_ZOMBIE
     assert classify_github_drift(has_merge_wait=True, prs=[closed_pr]) == DRIFT_PR_CLOSED_NO_MERGE
@@ -584,6 +590,68 @@ async def test_active_merge_zombie_clears_wait_and_marks_pr_merged(
     ]
     assert ("operator_waits", "kind", db.operator_waits.KIND_MERGE, None) in transitions
     assert ("issue_prs", "merged_at", None, merged_at) in transitions
+
+
+@pytest.mark.asyncio
+async def test_active_merge_zombie_retires_run_started_after_merge(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SYM-231 review: a merge zombie's wait can be parked *after* the PR was
+    actually merged externally — Symphony dispatched its own merge attempt
+    before observing the hand-merge, so the run it is parked on started after
+    `merged_at`. `_retire_merged_issue_bookkeeping`'s run sweep is bounded by
+    `merged_at`, so once the wait is deleted (unconditionally, here) nothing
+    else would ever retire that run. The run must retire alongside its wait
+    regardless of the bound."""
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    merged_at = "2026-05-17T10:00:00Z"
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-iss-1",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-17T11:00:00Z",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="run-iss-1",
+            kind=db.operator_waits.KIND_MERGE,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="symphony",
+            created_at="2026-05-17T11:01:00Z",
+        )
+        await _seed_pr(conn)
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "MERGED",
+                    "mergeable": "UNKNOWN",
+                    "mergedAt": merged_at,
+                    "url": "https://github.com/org/repo/pull/42",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        runs = {run.id: run.status for run in await db.runs.history_for_issue(conn, "iss-1")}
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert runs["run-iss-1"] == db.runs.SUPERSEDED_STATUS
 
 
 @pytest.mark.asyncio
@@ -782,6 +850,281 @@ async def test_active_pr_locally_merged_marks_pr_only(
 
 
 @pytest.mark.asyncio
+async def test_external_merge_clears_wait_and_retires_runs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SYM-231: a PR merged by hand outside Symphony finishes the issue, so the
+    bookkeeping the in-Symphony merge path would have retired — the parked wait
+    and every pre-merge parked/live run — has to be retired here instead."""
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    merged_at = "2026-05-17T11:59:00Z"
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        await _seed_pr(conn)
+        await db.runs.create(
+            conn,
+            id="run-iss-1-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-17T10:30:00Z",
+        )
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "MERGED",
+                    "mergeable": "UNKNOWN",
+                    "mergedAt": merged_at,
+                    "url": "https://github.com/org/repo/pull/42",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        stored_merged_at = await _merged_at(conn)
+        runs = {
+            run.id: (run.status, run.termination_kind)
+            for run in await db.runs.history_for_issue(conn, "iss-1")
+        }
+    finally:
+        await conn.close()
+
+    assert stored_merged_at == merged_at
+    assert wait is None
+    assert rows[1][1] == DRIFT_PR_LOCALLY_MERGED
+    assert rows[1][2] == ACTION_CLEARED
+    # `run-iss-1` is already terminal with its own recorded reason (a genuine
+    # `agent_error`, not this sweep's generic "pr_merged") — `_supersede_run`
+    # flips status only and preserves that kind. `run-iss-1-merge` has no
+    # `ended_at` yet, so it takes the generic "pr_merged" reason.
+    assert runs["run-iss-1"] == (db.runs.SUPERSEDED_STATUS, "agent_error")
+    assert runs["run-iss-1-merge"] == (db.runs.SUPERSEDED_STATUS, "pr_merged")
+
+
+@pytest.mark.asyncio
+async def test_external_merge_zombie_retires_needs_approval_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SYM-231/SYM-114: the merge-zombie clear cleared the wait but left the
+    `merge` run at `needs_approval`, so the issue kept showing as active."""
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    merged_at = "2026-05-17T11:59:00Z"
+    try:
+        await _seed_issue(conn)
+        await _seed_merge_wait(conn)
+        await _seed_pr(conn)
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "MERGED",
+                    "mergeable": "UNKNOWN",
+                    "mergedAt": merged_at,
+                    "url": "https://github.com/org/repo/pull/42",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        runs = {
+            run.id: (run.status, run.termination_kind)
+            for run in await db.runs.history_for_issue(conn, "iss-1")
+        }
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert runs["run-iss-1"] == (db.runs.SUPERSEDED_STATUS, "pr_merged")
+
+
+@pytest.mark.asyncio
+async def test_external_merge_keeps_bookkeeping_while_another_pr_is_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One merged PR does not finish an issue that still has another PR open —
+    the wait and its run belong to work that is still in flight."""
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    merged_at = "2026-05-17T11:59:00Z"
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        await _seed_pr(conn)
+        await _seed_pr(
+            conn,
+            github_repo="org/other",
+            binding_key='["ENG","org/other","symphony"]',
+            pr_number=99,
+        )
+        reconciler = Reconciler(
+            Config(repos=[_binding(), _binding(github_repo="org/other")]),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                views_by_repo={
+                    "org/repo": {
+                        "state": "MERGED",
+                        "mergeable": "UNKNOWN",
+                        "mergedAt": merged_at,
+                        "url": "https://github.com/org/repo/pull/42",
+                    },
+                    "org/other": {
+                        "state": "OPEN",
+                        "mergeable": "MERGEABLE",
+                        "mergedAt": None,
+                        "url": "https://github.com/org/other/pull/99",
+                    },
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        runs = {run.id: run.status for run in await db.runs.history_for_issue(conn, "iss-1")}
+    finally:
+        await conn.close()
+
+    assert wait is not None
+    assert runs["run-iss-1"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_external_merge_leaves_opted_out_sibling_wait_alone(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SYM-231 review: `_retire_merged_issue_bookkeeping`'s `_open_prs` guard
+    only covers a still-open PR row on the opted-out repo itself — a wait bound
+    to a `reconcile_enabled=False` repo with no PR row of its own must survive
+    a *sibling* enabled repo's PR merging, mirroring the `terminal_wait_eligible`
+    guard at the top of `_reconcile_issue`."""
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    merged_at = "2026-05-17T11:59:00Z"
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn, issue_label="symphony", github_repo="org/repo")
+        await _seed_pr(
+            conn,
+            github_repo="org/other",
+            binding_key='["ENG","org/other","frontend"]',
+            pr_number=99,
+        )
+        reconciler = Reconciler(
+            Config(
+                repos=[
+                    _binding(
+                        issue_label="symphony",
+                        github_repo="org/repo",
+                        reconcile_enabled=False,
+                    ),
+                    _binding(
+                        issue_label="frontend",
+                        github_repo="org/other",
+                        reconcile_enabled=True,
+                    ),
+                ]
+            ),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "MERGED",
+                    "mergeable": "UNKNOWN",
+                    "mergedAt": merged_at,
+                    "url": "https://github.com/org/other/pull/99",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        merged = await _merged_at(conn, github_repo="org/other")
+        runs = {run.id: run.status for run in await db.runs.history_for_issue(conn, "iss-1")}
+    finally:
+        await conn.close()
+
+    assert merged == merged_at
+    assert wait is not None
+    assert runs["run-iss-1"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_external_merge_leaves_sibling_repo_wait_alone_even_when_enabled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SYM-231 review: unlike the opted-out case above, both bindings here have
+    `reconcile_enabled=True` — the only thing protecting `org/repo`'s wait is
+    that the merged PR belongs to a different repo (`org/other`) and `org/repo`
+    has no PR row of its own to trip the `_open_prs` guard. Without checking
+    the merged PR's repo against the wait's own repo, `org/other`'s merge would
+    delete `org/repo`'s wait and supersede its run even though `org/repo`'s
+    work is untouched."""
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    merged_at = "2026-05-17T11:59:00Z"
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn, issue_label="symphony", github_repo="org/repo")
+        await _seed_pr(
+            conn,
+            github_repo="org/other",
+            binding_key='["ENG","org/other","frontend"]',
+            pr_number=99,
+        )
+        reconciler = Reconciler(
+            Config(
+                repos=[
+                    _binding(issue_label="symphony", github_repo="org/repo"),
+                    _binding(issue_label="frontend", github_repo="org/other"),
+                ]
+            ),
+            conn,
+            _FakeLinear(),  # type: ignore[arg-type]
+            _FakeGitHub(
+                view={
+                    "state": "MERGED",
+                    "mergeable": "UNKNOWN",
+                    "mergedAt": merged_at,
+                    "url": "https://github.com/org/other/pull/99",
+                }
+            ),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        merged = await _merged_at(conn, github_repo="org/other")
+        runs = {run.id: run.status for run in await db.runs.history_for_issue(conn, "iss-1")}
+    finally:
+        await conn.close()
+
+    assert merged == merged_at
+    assert wait is not None
+    assert runs["run-iss-1"] == "failed"
+
+
+@pytest.mark.asyncio
 async def test_auto_merge_false_parked_pr_external_merge_moves_issue_to_done(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -951,17 +1294,505 @@ async def test_active_linear_canceled_last_budget_slot_still_clears_pr(
 
 
 @pytest.mark.asyncio
-async def test_active_linear_done_notes_transition_without_clearing_wait(
+async def test_active_linear_done_clears_wait_and_retires_runs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """SYM-231: `Done` is terminal exactly like `Canceled`. An issue finished
+    outside Symphony (hand-merged PR, card dragged to Done) must not keep a
+    parked wait or a parked/live run behind, or the board stays dirty forever.
+    """
     monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
     conn = await db.connect(tmp_path / "state.sqlite")
     try:
         await _seed_issue(conn)
-        await _seed_merge_wait(conn)
+        await _seed_implement_failed_wait(conn)
+        await db.runs.create(
+            conn,
+            id="run-iss-1-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-17T10:30:00Z",
+        )
+        await db.runs.create(
+            conn,
+            id="run-iss-1-review",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-17T10:40:00Z",
+        )
+        fake = _FakeLinear(state_name="Done")
         reconciler = Reconciler(
             Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        rows = await _observation_rows(conn)
+        wait = await db.operator_waits.get(conn, "iss-1")
+        transitions = await _transition_rows(conn)
+        runs = {
+            run.id: (run.status, run.termination_kind)
+            for run in await db.runs.history_for_issue(conn, "iss-1")
+        }
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert rows[0][1] == DRIFT_LINEAR_STATE_DONE
+    assert rows[0][2] == ACTION_CLEARED
+    # `run-iss-1` is already terminal with its own recorded reason (a genuine
+    # `agent_error`) — `_supersede_run` preserves it instead of overwriting
+    # with this sweep's generic "tracker_done".
+    assert runs["run-iss-1"] == (db.runs.SUPERSEDED_STATUS, "agent_error")
+    for run_id in ("run-iss-1-merge", "run-iss-1-review"):
+        assert runs[run_id] == (db.runs.SUPERSEDED_STATUS, "tracker_done")
+    assert ("operator_waits", "__row__", "removed", None) in transitions
+    assert (
+        "external_observations",
+        "external_state_change",
+        "linear",
+        "linear:Done",
+    ) in transitions
+    assert fake.comments and "done" in fake.comments[0][1].lower()
+
+
+@pytest.mark.asyncio
+async def test_active_linear_done_leaves_live_pid_run_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_run_is_retirable` (SYM-231) widens the terminal clear to pidless
+    `running` rows, but only at the `review` stage — there is no pid check at
+    all, so an `implement` row survives purely because its stage is not
+    `review`, not because it happens to carry a live pid here. Only the
+    pidless `review` row should be superseded.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        await db.runs.create(
+            conn,
+            id="run-iss-1-review",
+            issue_id="iss-1",
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-05-17T10:30:00Z",
+        )
+        await db.runs.create(
+            conn,
+            id="run-iss-1-implement-live",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=os.getpid(),
+            started_at="2026-05-17T10:40:00Z",
+        )
+        fake = _FakeLinear(state_name="Done")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        runs = {
+            run.id: (run.status, run.termination_kind)
+            for run in await db.runs.history_for_issue(conn, "iss-1")
+        }
+    finally:
+        await conn.close()
+
+    assert wait is None
+    # `run-iss-1` already carries its own recorded reason (`agent_error`);
+    # `_supersede_run` preserves it rather than overwriting with "tracker_done".
+    assert runs["run-iss-1"] == (db.runs.SUPERSEDED_STATUS, "agent_error")
+    assert runs["run-iss-1-review"] == (db.runs.SUPERSEDED_STATUS, "tracker_done")
+    assert runs["run-iss-1-implement-live"] == ("running", "")
+
+
+@pytest.mark.asyncio
+async def test_active_linear_done_retires_needs_approval_runs_with_no_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SYM-114's exact shape: the operator wait is already gone, but an open
+    `issue_prs` row still makes the issue a reconcile candidate, and several
+    `merge`/`needs_approval` runs are left behind once the tracker issue goes
+    Done. These must be retired even though there is no wait to clear.
+    """
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(conn)
+        await db.runs.create(
+            conn,
+            id="run-iss-1-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-17T10:30:00Z",
+        )
+        fake = _FakeLinear(state_name="Done")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        await reconciler.tick()
+        wait = await db.operator_waits.get(conn, "iss-1")
+        runs = {
+            run.id: (run.status, run.termination_kind)
+            for run in await db.runs.history_for_issue(conn, "iss-1")
+        }
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert runs["run-iss-1-merge"] == (db.runs.SUPERSEDED_STATUS, "tracker_done")
+    assert len(fake.comments) == 1
+    assert "operator wait" not in fake.comments[0][1]
+
+
+@pytest.mark.asyncio
+async def test_active_linear_done_terminal_clear_is_idempotent_across_ticks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SYM-231 review: an unmerged `issue_prs` row keeps the issue a reconcile
+    candidate forever (nothing ever deletes it once its own merge path never
+    ran), so once the terminal clear has retired everything there is to retire,
+    it must stop firing — not re-post the auto-clear comment and re-append an
+    `external_state_change`/`cleared` observation on every subsequent tick."""
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(conn)
+        await db.runs.create(
+            conn,
+            id="run-iss-1-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-17T10:30:00Z",
+        )
+        fake = _FakeLinear(state_name="Done")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        for _ in range(3):
+            await reconciler.tick()
+        rows = await _observation_rows(conn)
+        cleared_rows = [row for row in rows if row[2] == ACTION_CLEARED]
+        transitions = await _transition_rows(conn)
+        cleared_transitions = [
+            t
+            for t in transitions
+            if t[0] == "external_observations" and t[1] == "external_state_change"
+        ]
+        runs = {
+            run.id: (run.status, run.termination_kind)
+            for run in await db.runs.history_for_issue(conn, "iss-1")
+        }
+    finally:
+        await conn.close()
+
+    assert runs["run-iss-1-merge"] == (db.runs.SUPERSEDED_STATUS, "tracker_done")
+    assert len(cleared_rows) == 1
+    assert len(cleared_transitions) == 1
+    assert len(fake.comments) == 1
+
+
+@pytest.mark.asyncio
+async def test_active_linear_done_leaves_run_started_after_terminal_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SYM-231 review: the terminal-clear path must bound its run sweep to the
+    generation that actually finished, the same way the merged-PR path bounds
+    on `merged_at`. `_FakeLinear` reports `updated_at="2026-05-17T11:58:00Z"` —
+    a run started after that (but before `NOW`) is a new cycle and must survive
+    even though the tracker issue is Done."""
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        await db.runs.create(
+            conn,
+            id="run-iss-1-late-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-17T11:59:00Z",
+        )
+        fake = _FakeLinear(state_name="Done")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        runs = {
+            run.id: (run.status, run.termination_kind)
+            for run in await db.runs.history_for_issue(conn, "iss-1")
+        }
+    finally:
+        await conn.close()
+
+    assert wait is None
+    # `run-iss-1` already carries its own recorded reason (`agent_error`);
+    # `_supersede_run` preserves it rather than overwriting with "tracker_done".
+    assert runs["run-iss-1"] == (db.runs.SUPERSEDED_STATUS, "agent_error")
+    assert runs["run-iss-1-late-merge"] == ("needs_approval", "")
+
+
+@pytest.mark.asyncio
+async def test_active_linear_done_leaves_wait_created_after_terminal_transition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SYM-231 review: a park created after the terminal transition (e.g. the
+    issue re-entered a merge cycle after the tracker went Done) must survive
+    together with the run it is parked on. The previous code deleted the wait
+    with no generation bound at all while the run sweep is correctly bounded
+    by `started_at_max` — that combination deletes the wait but leaves its
+    `needs_approval` run behind with nothing left to ever clear it, exactly
+    the SYM-114 residue this issue exists to remove."""
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-late-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-17T11:59:00Z",
+        )
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="run-late-merge",
+            kind=db.operator_waits.KIND_MERGE,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="symphony",
+            created_at="2026-05-17T11:59:30Z",
+        )
+        fake = _FakeLinear(state_name="Done")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        await reconciler.tick()
+        await reconciler.tick()
+        wait = await db.operator_waits.get(conn, "iss-1")
+        runs = {run.id: run.status for run in await db.runs.history_for_issue(conn, "iss-1")}
+        observations = await _observation_rows(conn)
+    finally:
+        await conn.close()
+
+    assert wait is not None
+    assert runs["run-late-merge"] == "needs_approval"
+    # SYM-231 review: an ineligible wait with nothing else to clear must not
+    # spend a budget slot or post a comment — it would otherwise repeat every
+    # tick forever, and against a real tracker each comment bumps the
+    # tracker's `updated_at`, moving `started_at_max` past the wait.
+    assert fake.comments == []
+    assert all(action != "cleared" for _source, _drift, action, _payload in observations)
+
+
+@pytest.mark.asyncio
+async def test_active_linear_canceled_retires_needs_approval_runs_with_no_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SYM-231 review: `DRIFT_LINEAR_CANCELED` with `wait is None` is eligible
+    for the terminal clear exactly like `DRIFT_LINEAR_STATE_DONE` — cover it so
+    a canceled issue whose wait was already cleared still gets its leftover
+    `needs_approval` runs retired."""
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_pr(conn)
+        await db.runs.create(
+            conn,
+            id="run-iss-1-merge",
+            issue_id="iss-1",
+            stage="merge",
+            status="needs_approval",
+            pid=None,
+            started_at="2026-05-17T10:30:00Z",
+        )
+        fake = _FakeLinear(state_name="Canceled", state_type="canceled")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        await reconciler.tick()
+        wait = await db.operator_waits.get(conn, "iss-1")
+        runs = {
+            run.id: (run.status, run.termination_kind)
+            for run in await db.runs.history_for_issue(conn, "iss-1")
+        }
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert runs["run-iss-1-merge"] == (db.runs.SUPERSEDED_STATUS, "tracker_canceled")
+    assert fake.comments and "canceled" in fake.comments[0][1].lower()
+
+
+@pytest.mark.asyncio
+async def test_active_linear_done_preserves_ended_at_of_already_ended_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SYM-231 review: `update_status`'s `ended_at = COALESCE(?, ended_at)`
+    overwrites a real historical end timestamp whenever a non-NULL `ts` is
+    passed — the terminal clear must only stamp `ts` on runs that never ended,
+    or ordinary Done issues corrupt run duration/attribution audit data for
+    every already-finished run in their history. `update_status` also always
+    stamps `termination_kind`/`termination_detail`, so an already-terminal run
+    must skip that call entirely (flip status only) or the sweep rewrites its
+    genuine failure reason (e.g. SYM-218's auth-failure attribution) to the
+    sweep's generic `tracker_done`."""
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        await db.runs.create(
+            conn,
+            id="run-iss-1-old-failure",
+            issue_id="iss-1",
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-10T09:00:00Z",
+        )
+        await db.runs.update_status(
+            conn,
+            "run-iss-1-old-failure",
+            db.runs.FAILED_STATUS,
+            ended_at="2026-05-10T09:30:00Z",
+            kind="agent_error",
+            detail="boom",
+        )
+        # A `failed` row with `ended_at` still NULL (e.g. a legacy row from
+        # before `_fail_run` always stamped it) is the shape that must get
+        # `ts` stamped on supersede rather than being skipped.
+        await db.runs.create(
+            conn,
+            id="run-iss-1-never-ended",
+            issue_id="iss-1",
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-05-10T09:00:00Z",
+        )
+        fake = _FakeLinear(state_name="Done")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        runs = {run.id: run for run in await db.runs.history_for_issue(conn, "iss-1")}
+    finally:
+        await conn.close()
+
+    assert runs["run-iss-1-old-failure"].status == db.runs.SUPERSEDED_STATUS
+    assert runs["run-iss-1-old-failure"].ended_at == "2026-05-10T09:30:00Z"
+    assert runs["run-iss-1-old-failure"].termination_kind == "agent_error"
+    assert runs["run-iss-1-old-failure"].termination_detail == "boom"
+    # `run-iss-1` (the seeded implement_failed wait's own run) already carries
+    # a recorded `ended_at`/kind, so it is preserved rather than re-stamped.
+    assert runs["run-iss-1"].status == db.runs.SUPERSEDED_STATUS
+    assert runs["run-iss-1"].ended_at == "2026-05-17T10:30:00Z"
+    assert runs["run-iss-1"].termination_kind == "agent_error"
+    assert runs["run-iss-1-never-ended"].status == db.runs.SUPERSEDED_STATUS
+    assert runs["run-iss-1-never-ended"].ended_at == NOW.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_active_linear_done_with_opted_out_wait_binding_only_notes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The wait's own binding opting out of reconcile still forbids clearing —
+    the Done observation is only noted, as before."""
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn, issue_label="symphony", github_repo="org/repo")
+        await _seed_pr(
+            conn,
+            github_repo="org/other",
+            binding_key='["ENG","org/other","frontend"]',
+            pr_number=99,
+        )
+        reconciler = Reconciler(
+            Config(
+                repos=[
+                    _binding(
+                        issue_label="symphony",
+                        github_repo="org/repo",
+                        reconcile_enabled=False,
+                    ),
+                    _binding(
+                        issue_label="frontend",
+                        github_repo="org/other",
+                        reconcile_enabled=True,
+                    ),
+                ]
+            ),
             conn,
             _FakeLinear(state_name="Done"),  # type: ignore[arg-type]
             _FakeGitHub(),  # type: ignore[arg-type]
@@ -2445,12 +3276,14 @@ async def test_orphan_open_pr_not_adopted_for_done_issue(
     finally:
         await conn.close()
 
-    assert ("symphony/eng-1", "org/repo") in fake_gh.head_calls
-    assert wait is not None
+    # A terminal tracker state wins over adoption, so the head probe is skipped
+    # entirely (SYM-231) — the wait is cleared instead of feeding a new cycle.
+    assert fake_gh.head_calls == []
+    assert wait is None
     assert pr is None
     assert linear.moves == []
     assert rows[0][1] == DRIFT_LINEAR_STATE_DONE
-    assert rows[0][2] == ACTION_NOTED
+    assert rows[0][2] == ACTION_CLEARED
     assert rows[1][1] is None
     assert rows[1][2] == ACTION_OBSERVED
 

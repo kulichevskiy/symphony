@@ -326,6 +326,23 @@ async def update_status(
         await conn.commit()
 
 
+async def supersede_preserving_termination(
+    conn: aiosqlite.Connection, run_id: str, *, commit: bool = True
+) -> None:
+    """Flip an already-terminal, already-ended run to `superseded` without
+    touching its recorded `termination_kind`/`termination_detail`/`ended_at`.
+
+    `update_status` always overwrites those fields (falling back to "unknown"/
+    "" when not given) — fine for a run that never had its own reason, but for
+    a run that already failed/interrupted on its own (e.g. an auth-failure
+    attribution) that would destroy the original audit trail just because a
+    reconcile sweep is superseding the row afterwards.
+    """
+    await conn.execute("UPDATE runs SET status = ? WHERE id = ?", (SUPERSEDED_STATUS, run_id))
+    if commit:
+        await conn.commit()
+
+
 def _truncate_termination_detail(
     detail: str,
     *,
@@ -483,6 +500,13 @@ async def supersede_orphaned_merge_needs_approval(
       in-flight guard ignores `review` runs — otherwise a live monitor would
       keep the zombie from ever being retired.
 
+    Both distinctions are deliberately kept (re-checked in SYM-231): loosening
+    them would retire a `$reject` park that is doing its job. They do exclude the
+    "PR merged externally, wait already cleared, runs left at `needs_approval`"
+    shape — but so does the `p.merged_at IS NULL` guard, and rightly so: a merged
+    PR has no merge candidacy left to re-open. `list_unretired_for_merged_prs`
+    (below) retires that residue instead.
+
     `before` (an ISO timestamp) gates on `ended_at < before` to avoid racing a
     freshly-created wait that has not yet committed. Returns the issue ids
     whose runs were superseded.
@@ -540,6 +564,53 @@ async def supersede_orphaned_merge_needs_approval(
         )
         issue_ids.append(str(row["issue_id"]))
     return issue_ids
+
+
+async def list_unretired_for_merged_prs(conn: aiosqlite.Connection) -> list[Run]:
+    """Runs left at `running`/`needs_approval` for an issue whose PR is merged.
+
+    A PR merged outside Symphony (by hand) skips the merge path that would have
+    retired these rows, so they keep showing a finished issue as active — the
+    residue SYM-231 sweeps at startup. Two guards keep live work out:
+
+    * only issues with no PR row still open — an open PR means work in flight;
+    * for a `running` row, only one started at or before the merge — a later
+      one is a new cycle's dead-pid run and must take the `$retry` path
+      instead of being swept here.
+
+    A `needs_approval` row has no such bound: once its PR is merged and no
+    other PR is open, nothing can ever act on it regardless of when it
+    started — Symphony can park a merge wait after the PR was already merged
+    externally (SYM-231 review), and that shape must still self-heal.
+
+    The caller must still skip runs whose pid is alive (a live subprocess is not
+    bookkeeping residue).
+    """
+    placeholders = ",".join("?" * (len(LIVE_STATUSES) + 1))
+    cur = await conn.execute(
+        f"""
+        SELECT id, issue_id, stage, status, pid, started_at, ended_at, cost_usd,
+               input_tokens, output_tokens, cache_write_tokens, cache_read_tokens,
+               termination_kind, termination_detail, exit_returncode
+        FROM runs r
+        WHERE r.status IN ({placeholders})
+          AND EXISTS (
+              SELECT 1 FROM issue_prs p
+              WHERE p.issue_id = r.issue_id
+                AND p.merged_at IS NOT NULL
+                AND (r.status = ? OR r.started_at <= p.merged_at)
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM issue_prs o
+              WHERE o.issue_id = r.issue_id
+                AND o.merged_at IS NULL
+          )
+        ORDER BY r.started_at ASC, r.id ASC
+        """,
+        (*LIVE_STATUSES, NEEDS_APPROVAL_STATUS, NEEDS_APPROVAL_STATUS),
+    )
+    rows = await cur.fetchall()
+    return [_row_to_run(r) for r in rows]
 
 
 async def interrupt_running_merge(conn: aiosqlite.Connection, run_id: str) -> int:
