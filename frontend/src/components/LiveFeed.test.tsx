@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { render, screen, waitFor, within } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   fetchRunEvents,
@@ -45,16 +45,18 @@ function neverResolves(): Promise<never> {
   return new Promise(() => undefined);
 }
 
-/** jsdom implements neither layout nor scrolling: `scrollHeight` is always 0
- *  and `scrollTop` is a no-op. Stub both on the shared prototype so the
- *  anchoring effect has real geometry to react to, and hand back a restore
- *  function so the stub doesn't leak into other tests. Row height is derived
- *  from the rendered `EventRow` count (each one is a ".py-1" div), so the
- *  fake height tracks history/tail growth the same way a real layout would. */
+/** jsdom implements neither layout nor scrolling: `scrollHeight`/`offsetTop`
+ *  are always 0 and `scrollTop` is a no-op. Stub all three on the shared
+ *  prototype so the anchoring effect has real geometry to react to, and hand
+ *  back a restore function so the stub doesn't leak into other tests. Row
+ *  height and position are derived from the rendered `EventRow`s (each one a
+ *  ".py-1" div within the ".divide-y" list), so the fake geometry tracks
+ *  history/tail growth the same way a real layout would. */
 function stubScrollGeometry(rowHeight: number): () => void {
   const scrollTops = new WeakMap<Element, number>();
   const heightDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollHeight");
   const topDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTop");
+  const offsetTopDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetTop");
 
   Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
     configurable: true,
@@ -71,10 +73,21 @@ function stubScrollGeometry(rowHeight: number): () => void {
       scrollTops.set(this, value);
     },
   });
+  Object.defineProperty(HTMLElement.prototype, "offsetTop", {
+    configurable: true,
+    get(this: HTMLElement) {
+      const list = this.closest(".divide-y");
+      if (!list) return 0;
+      const rowsEl = Array.from(list.querySelectorAll(".py-1"));
+      const index = rowsEl.indexOf(this);
+      return index < 0 ? 0 : index * rowHeight;
+    },
+  });
 
   return () => {
     if (heightDescriptor) Object.defineProperty(HTMLElement.prototype, "scrollHeight", heightDescriptor);
     if (topDescriptor) Object.defineProperty(HTMLElement.prototype, "scrollTop", topDescriptor);
+    if (offsetTopDescriptor) Object.defineProperty(HTMLElement.prototype, "offsetTop", offsetTopDescriptor);
   };
 }
 
@@ -83,6 +96,8 @@ beforeEach(() => {
   fetchRunEventsMock.mockReset();
   streamRunMock.mockImplementation(async () => await neverResolves());
 });
+
+afterEach(cleanup);
 
 describe("LiveFeed", () => {
   it("opens on the newest page, newest first, and tails from its offset", async () => {
@@ -123,6 +138,30 @@ describe("LiveFeed", () => {
     expect(text).toContain("page1");
     expect(text.indexOf("page1")).toBeLessThan(text.indexOf("page2"));
     expect(within(view.container).queryByRole("button", { name: "Загрузить ещё" })).toBeNull();
+  });
+
+  it("keeps the load-more action visible and retries with the same cursor after a failed page", async () => {
+    fetchRunEventsMock
+      .mockResolvedValueOnce(page({ events: [message("page1", { seq: 100 })], nextBefore: 100 }))
+      .mockRejectedValueOnce(new Error("boom"))
+      .mockResolvedValueOnce(page({ events: [message("page2", { seq: 99 })], nextBefore: null }));
+
+    const view = render(<LiveFeed runId="run-1" active live />);
+    const more = await waitFor(() =>
+      within(view.container).getByRole("button", { name: "Загрузить ещё" }),
+    );
+
+    more.click();
+    await waitFor(() => expect((more as HTMLButtonElement).disabled).toBe(false));
+    expect(within(view.container).queryByText("page2")).toBeNull();
+
+    more.click();
+    await waitFor(() =>
+      expect(within(view.container).getByText("page2")).toBeTruthy(),
+    );
+
+    expect(fetchRunEventsMock.mock.calls[1]?.[1]).toMatchObject({ before: 100 });
+    expect(fetchRunEventsMock.mock.calls[2]?.[1]).toMatchObject({ before: 100 });
   });
 
   it("does not offer the load-more action when the first page is the whole history", async () => {
@@ -202,8 +241,6 @@ describe("LiveFeed", () => {
       }),
     );
 
-    // Scoped to this render: the suite renders without auto-cleanup, so
-    // earlier feeds are still in `document.body`.
     const view = render(<LiveFeed runId="run-1" active live />);
     await screen.findByText("today event");
 

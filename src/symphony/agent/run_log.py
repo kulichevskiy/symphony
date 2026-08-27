@@ -51,7 +51,12 @@ class RunLogWriter:
     def open(self) -> RunLogWriter:
         """Open both files for append. Also the `with`-statement entry point."""
         self._log = self._log_path.open("a", encoding="utf-8")
-        self._receipts = receipts_path(self._log_path).open("a", encoding="utf-8")
+        try:
+            self._receipts = receipts_path(self._log_path).open("a", encoding="utf-8")
+        except BaseException:
+            self._log.close()
+            self._log = None
+            raise
         return self
 
     def close(self) -> None:

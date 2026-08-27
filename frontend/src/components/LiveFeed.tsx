@@ -66,6 +66,15 @@ function useActivityFeed(runId: string, enabled: boolean, live: boolean) {
   const [tailFrom, setTailFrom] = useState<{ runId: string; offset: number } | null>(null);
   const streamState = useRef({ runId: "", offset: 0 });
   const localKey = useRef(0);
+  // Owns the lifetime of `loadMore`'s in-flight request: recreated whenever
+  // `runId` changes, aborting whatever page fetch was still pending for the
+  // previous run.
+  const loadMoreControllerRef = useRef<AbortController | null>(null);
+  useEffect(() => {
+    const controller = new AbortController();
+    loadMoreControllerRef.current = controller;
+    return () => controller.abort();
+  }, [runId]);
 
   const entries = useCallback((events: FeedEvent[]): FeedEntry[] => {
     return events.map((event) => ({
@@ -81,6 +90,7 @@ function useActivityFeed(runId: string, enabled: boolean, live: boolean) {
     if (!enabled || !runId) return;
     if (streamState.current.runId === runId) return;
     let cancelled = false;
+    const controller = new AbortController();
     setHistory([]);
     setTailItems([]);
     setTokens(null);
@@ -89,7 +99,7 @@ function useActivityFeed(runId: string, enabled: boolean, live: boolean) {
 
     void (async () => {
       try {
-        const page = await fetchRunEvents(runId);
+        const page = await fetchRunEvents(runId, { signal: controller.signal });
         if (cancelled) return;
         setHistory(entries(page.events));
         setNextBefore(page.nextBefore);
@@ -104,6 +114,7 @@ function useActivityFeed(runId: string, enabled: boolean, live: boolean) {
 
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [runId, enabled, attempt, entries]);
 
@@ -174,7 +185,10 @@ function useActivityFeed(runId: string, enabled: boolean, live: boolean) {
     if (nextBefore === null || loadingMore) return;
     setLoadingMore(true);
     try {
-      const page = await fetchRunEvents(runId, { before: nextBefore });
+      const page = await fetchRunEvents(runId, {
+        before: nextBefore,
+        signal: loadMoreControllerRef.current?.signal,
+      });
       setHistory((prev) => [...prev, ...entries(page.events)]);
       setNextBefore(page.nextBefore);
     } catch {
@@ -243,9 +257,17 @@ function EventBody({ event }: { event: FeedEvent }) {
   );
 }
 
-function EventRow({ event, withDate }: { event: FeedEvent; withDate: boolean }) {
+function EventRow({
+  event,
+  withDate,
+  rowRef,
+}: {
+  event: FeedEvent;
+  withDate: boolean;
+  rowRef?: (el: HTMLDivElement | null) => void;
+}) {
   return (
-    <div className="flex gap-2 py-1">
+    <div ref={rowRef} className="flex gap-2 py-1">
       <span className="mt-0.5 shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">
         {formatEventTime(event.ts, withDate)}
       </span>
@@ -284,32 +306,58 @@ export function LiveFeed({
   // New tail events are prepended above whatever the operator is reading, so
   // restore their scroll offset after each insertion — relying on implicit
   // browser scroll anchoring here would break on browsers that don't
-  // implement it (e.g. Safari). Only `tailItems` (top inserts) trigger this;
-  // `loadMore`'s bottom appends need no compensation since they don't shift
-  // content already in view.
+  // implement it (e.g. Safari); native anchoring is disabled on the
+  // scrollable container below (`[overflow-anchor:none]`) so this manual
+  // compensation is the only mechanism in play. Only `tailItems` (top
+  // inserts) trigger this; `loadMore`'s bottom appends need no compensation
+  // since they don't shift content already in view.
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const prevScrollHeightRef = useRef<number | null>(null);
+  const rowRefs = useRef(new Map<string, HTMLDivElement>());
+  const setRowRef = useCallback(
+    (key: string) => (el: HTMLDivElement | null) => {
+      if (el) rowRefs.current.set(key, el);
+      else rowRefs.current.delete(key);
+    },
+    [],
+  );
+  // Tracks the row that was first before the latest commit, so the
+  // compensating scroll is derived from that single row's `offsetTop` shift
+  // — not the container's whole `scrollHeight` delta, which would also pick
+  // up an unrelated `loadMore` bottom append landing in the same commit.
+  const anchorKeyRef = useRef<string | null>(null);
+  const anchorOffsetRef = useRef<number | null>(null);
   const prevTailRef = useRef<typeof tailItems>(tailItems);
   useLayoutEffect(() => {
-    prevScrollHeightRef.current = null;
+    anchorKeyRef.current = null;
+    anchorOffsetRef.current = null;
     prevTailRef.current = tailItems;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId]);
   // Runs after every render (not just tail insertions), since `history`
-  // growing from a first page load or `loadMore` also changes `scrollHeight`
+  // growing from a first page load or `loadMore` also moves the anchor row
   // and must refresh the baseline — otherwise the next tail insertion
-  // compensates against a stale, too-small height and overshoots to the
-  // bottom. Only an actual top-prepend (a new `tailItems` identity) should
-  // apply the compensating scroll; `loadMore`'s bottom appends must not.
+  // compensates against a stale position and overshoots. Only an actual
+  // top-prepend (a new `tailItems` identity) applies the compensating
+  // scroll; `loadMore`'s bottom appends must not.
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (el === null) return;
-    const prevHeight = prevScrollHeightRef.current;
     const prepended = prevTailRef.current !== tailItems;
-    if (prepended && prevHeight !== null && el.scrollTop > 0) {
-      el.scrollTop += el.scrollHeight - prevHeight;
+    if (
+      prepended &&
+      anchorKeyRef.current !== null &&
+      anchorOffsetRef.current !== null &&
+      el.scrollTop > 0
+    ) {
+      const anchorEl = rowRefs.current.get(anchorKeyRef.current);
+      if (anchorEl) {
+        el.scrollTop += anchorEl.offsetTop - anchorOffsetRef.current;
+      }
     }
-    prevScrollHeightRef.current = el.scrollHeight;
+    const firstKey = items[0]?.key ?? null;
+    const firstEl = firstKey !== null ? (rowRefs.current.get(firstKey) ?? null) : null;
+    anchorKeyRef.current = firstKey;
+    anchorOffsetRef.current = firstEl ? firstEl.offsetTop : null;
     prevTailRef.current = tailItems;
   });
 
@@ -361,7 +409,7 @@ export function LiveFeed({
       </div>
       <div
         ref={scrollRef}
-        className="max-h-[420px] overflow-y-auto overscroll-contain rounded-md border border-border bg-secondary/20 px-3 py-2"
+        className="max-h-[420px] overflow-y-auto overscroll-contain [overflow-anchor:none] rounded-md border border-border bg-secondary/20 px-3 py-2"
       >
         {rows.length === 0 ? (
           <p className="py-6 text-center text-sm text-muted-foreground">
@@ -374,7 +422,7 @@ export function LiveFeed({
         ) : (
           <div className="divide-y divide-border/40">
             {rows.map(({ key, event, withDate }) => (
-              <EventRow key={key} event={event} withDate={withDate} />
+              <EventRow key={key} event={event} withDate={withDate} rowRef={setRowRef(key)} />
             ))}
           </div>
         )}
