@@ -29,12 +29,14 @@ from collections.abc import (
     Callable,
 )
 from contextlib import asynccontextmanager
+from datetime import datetime
 from functools import partial
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
-    Any,
 )
+
+import aiosqlite
 
 from ... import db
 from ...agent.prompt import (
@@ -105,6 +107,7 @@ from ...tracker import (
     Issue as LinearIssue,
 )
 from ...tracker import (
+    IssueTracker,
     TrackerContext,
 )
 from ._base import SlashHandlerFailure as SlashHandlerFailure
@@ -287,6 +290,63 @@ _CODEX_REVIEWED_COMMIT_RE = re.compile(
     r"reviewed\s+commit:\s*\**\s*`?\s*([0-9a-fA-F]{7,40})",
     re.IGNORECASE,
 )
+
+
+def _tracker_context_from_review_row(row: aiosqlite.Row | None) -> TrackerContext | None:
+    if row is None:
+        return None
+    provider = str(row["provider"] or "")
+    site = str(row["site"] or "")
+    if not provider or not site:
+        return None
+    project_key = str(row["team_key"] or "") if provider == "jira" else ""
+    return TrackerContext(provider=provider, site=site, project_key=project_key)
+
+
+def _binding_matches_review_state(
+    binding: RepoBinding,
+    *,
+    tracker_ctx: TrackerContext | None,
+    team_key: str,
+    state: db.review_state.ReviewState,
+) -> bool:
+    if tracker_ctx is not None and _tracker_context_for_binding(binding) != tracker_ctx:
+        return False
+    if team_key and binding.linear_team_key != team_key:
+        return False
+    if state.github_repo:
+        return (
+            binding.github_repo == state.github_repo
+            and (binding.issue_label or "") == state.issue_label
+        )
+    return not state.issue_label or (binding.issue_label or "") == state.issue_label
+
+
+def _codex_lgtm_entry_created_at(entry: dict[str, object]) -> datetime | None:
+    raw = str(entry.get("created_at") or entry.get("createdAt") or "")
+    if not raw:
+        return None
+    try:
+        return _parse_rfc3339(raw)
+    except ValueError:
+        log.warning("ignoring Codex LGTM comment with invalid created_at: %s", raw)
+        return None
+
+
+def _is_current_codex_lgtm_entry(
+    entry: dict[str, object],
+    *,
+    min_created_at: datetime,
+    marker: str,
+) -> bool:
+    created_at = _codex_lgtm_entry_created_at(entry)
+    if created_at is None or created_at < min_created_at:
+        return False
+    user = entry.get("user") or {}
+    login = str(user.get("login") or "") if isinstance(user, dict) else ""
+    if not is_codex_author(login):
+        return False
+    return marker in str(entry.get("body") or "").lower()
 
 
 def _codex_lgtm_reactions_from_issue_comments(
@@ -726,30 +786,15 @@ class _ReviewMixin(_OrchestratorBase):
         )
         row = await cur.fetchone()
         team_key = str(row["team_key"]) if row is not None else ""
-        tracker_ctx: TrackerContext | None = None
-        if row is not None:
-            provider = str(row["provider"] or "")
-            site = str(row["site"] or "")
-            if provider and site:
-                project_key = str(row["team_key"] or "") if provider == "jira" else ""
-                tracker_ctx = TrackerContext(
-                    provider=provider,
-                    site=site,
-                    project_key=project_key,
-                )
+        tracker_ctx = _tracker_context_from_review_row(row)
         for binding in self.config.repos:
-            if tracker_ctx is not None and _tracker_context_for_binding(binding) != tracker_ctx:
-                continue
-            if team_key and binding.linear_team_key != team_key:
-                continue
-            if state.github_repo and binding.github_repo != state.github_repo:
-                continue
-            if state.github_repo and (binding.issue_label or "") != state.issue_label:
-                continue
-            if not state.github_repo and state.issue_label:
-                if (binding.issue_label or "") != state.issue_label:
-                    continue
-            return binding
+            if _binding_matches_review_state(
+                binding,
+                tracker_ctx=tracker_ctx,
+                team_key=team_key,
+                state=state,
+            ):
+                return binding
         return None
 
     async def _poll_review_runs(self) -> list[asyncio.Task[None]]:
@@ -1337,6 +1382,65 @@ class _ReviewMixin(_OrchestratorBase):
         await db.review_state.reset_ci_fetch_failures(self._conn, storage_issue_id)
         return checks
 
+    async def _github_reviews(self, binding: RepoBinding, pr_number: int) -> tuple[Review, ...]:
+        try:
+            raw = await (await self._gh_client()).pr_reviews(pr_number, repo=binding.github_repo)
+        except GitHubError as e:
+            log.warning(
+                "could not fetch PR reviews for %s#%d: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            return ()
+        return _reviews_from_github(raw)
+
+    async def _github_review_comments(
+        self, binding: RepoBinding, pr_number: int
+    ) -> list[ReviewComment]:
+        try:
+            raw = await (await self._gh_client()).pr_review_comments(
+                pr_number, repo=binding.github_repo
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not fetch PR review comments for %s#%d: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            return []
+        return _review_comments_from_github(raw)
+
+    async def _github_reactions(self, binding: RepoBinding, pr_number: int) -> tuple[Reaction, ...]:
+        try:
+            raw = await (await self._gh_client()).pr_reactions(pr_number, repo=binding.github_repo)
+        except GitHubError as e:
+            log.warning(
+                "could not fetch PR reactions for %s#%d: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            return ()
+        return _reactions_from_github(raw)
+
+    async def _github_issue_comments(
+        self, binding: RepoBinding, pr_number: int
+    ) -> list[dict[str, object]]:
+        try:
+            return await (await self._gh_client()).pr_issue_comments(
+                pr_number, repo=binding.github_repo
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not fetch PR issue comments for %s#%d: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            return []
+
     async def _compute_review_verdict(
         self,
         *,
@@ -1383,50 +1487,13 @@ class _ReviewMixin(_OrchestratorBase):
                 # to notice later review comments on the same head. Local-only
                 # bindings still ignore Codex bot signals here; they only
                 # honor human review-state changes.
-                try:
-                    raw_reviews = await (await self._gh_client()).pr_reviews(
-                        pr_number, repo=binding.github_repo
-                    )
-                    review_signal_reviews = _reviews_from_github(raw_reviews)
-                except GitHubError as e:
-                    log.warning(
-                        "could not fetch PR reviews for %s#%d: %s",
-                        binding.github_repo,
-                        pr_number,
-                        e,
-                    )
-                    review_signal_reviews = ()
+                review_signal_reviews = await self._github_reviews(binding, pr_number)
 
                 review_signal_comments: list[ReviewComment] = []
                 review_signal_reactions: tuple[Reaction, ...] = ()
                 if remote_review:
-                    try:
-                        raw_comments = await (await self._gh_client()).pr_review_comments(
-                            pr_number, repo=binding.github_repo
-                        )
-                        review_signal_comments = _review_comments_from_github(raw_comments)
-                    except GitHubError as e:
-                        log.warning(
-                            "could not fetch PR review comments for %s#%d: %s",
-                            binding.github_repo,
-                            pr_number,
-                            e,
-                        )
-                        review_signal_comments = []
-
-                    try:
-                        raw_reactions = await (await self._gh_client()).pr_reactions(
-                            pr_number, repo=binding.github_repo
-                        )
-                        review_signal_reactions = _reactions_from_github(raw_reactions)
-                    except GitHubError as e:
-                        log.warning(
-                            "could not fetch PR reactions for %s#%d: %s",
-                            binding.github_repo,
-                            pr_number,
-                            e,
-                        )
-                        review_signal_reactions = ()
+                    review_signal_comments = await self._github_review_comments(binding, pr_number)
+                    review_signal_reactions = await self._github_reactions(binding, pr_number)
                 else:
                     review_signal_reviews = tuple(
                         r for r in review_signal_reviews if not is_codex_author(r.user_login)
@@ -1446,23 +1513,11 @@ class _ReviewMixin(_OrchestratorBase):
                 if review_verdict.kind is VerdictKind.CHANGES_REQUESTED:
                     verdict = review_verdict
         elif not remote_review:
-            try:
-                raw_reviews = await (await self._gh_client()).pr_reviews(
-                    pr_number, repo=binding.github_repo
-                )
-                human_reviews = tuple(
-                    r
-                    for r in _reviews_from_github(raw_reviews)
-                    if not is_codex_author(r.user_login)
-                )
-            except GitHubError as e:
-                log.warning(
-                    "could not fetch PR reviews for %s#%d: %s",
-                    binding.github_repo,
-                    pr_number,
-                    e,
-                )
-                human_reviews = ()
+            human_reviews = tuple(
+                review
+                for review in await self._github_reviews(binding, pr_number)
+                if not is_codex_author(review.user_login)
+            )
 
             verdict = review_classifier(
                 comments=[],
@@ -1475,60 +1530,10 @@ class _ReviewMixin(_OrchestratorBase):
                 ),
             )
         else:
-            try:
-                raw_reviews = await (await self._gh_client()).pr_reviews(
-                    pr_number, repo=binding.github_repo
-                )
-                reviews: tuple[Review, ...] = _reviews_from_github(raw_reviews)
-            except GitHubError as e:
-                log.warning(
-                    "could not fetch PR reviews for %s#%d: %s",
-                    binding.github_repo,
-                    pr_number,
-                    e,
-                )
-                reviews = ()
-
-            try:
-                raw_comments = await (await self._gh_client()).pr_review_comments(
-                    pr_number, repo=binding.github_repo
-                )
-                comments: list[ReviewComment] = _review_comments_from_github(raw_comments)
-            except GitHubError as e:
-                log.warning(
-                    "could not fetch PR review comments for %s#%d: %s",
-                    binding.github_repo,
-                    pr_number,
-                    e,
-                )
-                comments = []
-
-            try:
-                raw_reactions = await (await self._gh_client()).pr_reactions(
-                    pr_number, repo=binding.github_repo
-                )
-                reactions: tuple[Reaction, ...] = _reactions_from_github(raw_reactions)
-            except GitHubError as e:
-                log.warning(
-                    "could not fetch PR reactions for %s#%d: %s",
-                    binding.github_repo,
-                    pr_number,
-                    e,
-                )
-                reactions = ()
-
-            try:
-                issue_comments = await (await self._gh_client()).pr_issue_comments(
-                    pr_number, repo=binding.github_repo
-                )
-            except GitHubError as e:
-                log.warning(
-                    "could not fetch PR issue comments for %s#%d: %s",
-                    binding.github_repo,
-                    pr_number,
-                    e,
-                )
-                issue_comments = []
+            reviews = await self._github_reviews(binding, pr_number)
+            comments = await self._github_review_comments(binding, pr_number)
+            reactions = await self._github_reactions(binding, pr_number)
+            issue_comments = await self._github_issue_comments(binding, pr_number)
 
             verdict = review_classifier(
                 comments=comments,
@@ -1546,6 +1551,34 @@ class _ReviewMixin(_OrchestratorBase):
             )
 
         return verdict, issue_comments
+
+    async def _review_fix_dispatch_gate(
+        self,
+        *,
+        run: db.runs.Run,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        state: db.review_state.ReviewState,
+        verdict: Verdict,
+    ) -> bool | None:
+        if not should_dispatch_fix_run(
+            prev_signature=state.last_trigger_signature,
+            new_signature=verdict.trigger_signature,
+        ):
+            return False
+        if has_hit_iteration_cap(iteration=state.iteration, cap=self.config.review_iteration_cap):
+            if await self._review_poll_deferred_by_deliver_failed_wait(run.issue_id, run.id):
+                return False
+            await self._park_review_for_approval(
+                run=run,
+                binding=binding,
+                issue=issue,
+                trigger=verdict.trigger_signature,
+            )
+            return True
+        if await self._agent_infra_retry_backoff_active(run.issue_id):
+            return False
+        return None
 
     async def _dispatch_review_changes_requested_fix(
         self,
@@ -1568,28 +1601,16 @@ class _ReviewMixin(_OrchestratorBase):
         # fix-run dispatch boundary: park instead of dispatching the next fix.
         if await self._maybe_park_for_token_budget(storage_issue_id, run.id, binding):
             return True
+        gate = await self._review_fix_dispatch_gate(
+            run=run,
+            binding=binding,
+            issue=issue,
+            state=state,
+            verdict=verdict,
+        )
+        if gate is not None:
+            return gate
         if verdict.merge_conflict:
-            if not should_dispatch_fix_run(
-                prev_signature=state.last_trigger_signature,
-                new_signature=verdict.trigger_signature,
-            ):
-                return False
-            if has_hit_iteration_cap(
-                iteration=state.iteration, cap=self.config.review_iteration_cap
-            ):
-                if await self._review_poll_deferred_by_deliver_failed_wait(
-                    storage_issue_id, run.id
-                ):
-                    return False
-                await self._park_review_for_approval(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    trigger=verdict.trigger_signature,
-                )
-                return True
-            if await self._agent_infra_retry_backoff_active(storage_issue_id):
-                return False
             dispatched = await self._dispatch_merge_conflict_fix_run(
                 run=run,
                 binding=binding,
@@ -1603,24 +1624,6 @@ class _ReviewMixin(_OrchestratorBase):
                 # re-evaluate instead of being blocked by the dedup gate.
                 await db.review_state.set_signature(self._conn, storage_issue_id, "")
             return dispatched
-        if not should_dispatch_fix_run(
-            prev_signature=state.last_trigger_signature,
-            new_signature=verdict.trigger_signature,
-        ):
-            return False
-        if has_hit_iteration_cap(iteration=state.iteration, cap=self.config.review_iteration_cap):
-            if await self._review_poll_deferred_by_deliver_failed_wait(storage_issue_id, run.id):
-                return False
-            await self._park_review_for_approval(
-                run=run,
-                binding=binding,
-                issue=issue,
-                trigger=verdict.trigger_signature,
-            )
-            return True
-
-        if await self._agent_infra_retry_backoff_active(storage_issue_id):
-            return False
 
         iteration = state.iteration + 1
         if verdict.rule == "failing_ci":
@@ -2344,6 +2347,160 @@ class _ReviewMixin(_OrchestratorBase):
         )
         return bool(result)
 
+    async def _resolve_rebase_conflicts(
+        self,
+        *,
+        run: db.runs.Run,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        base_branch: str | None,
+        workspace_path: Path,
+        fix_run_id: str,
+        rebase_clean: bool,
+        conflicted_files: list[str],
+    ) -> UsageDelta | None:
+        cumulative_usage = UsageDelta()
+        if rebase_clean:
+            log.info("rebase was clean for %s; skipping agent", issue.identifier)
+        while not rebase_clean:
+            prompt = merge_conflict_fix_prompt(
+                issue_title=issue.title,
+                issue_body=issue.description,
+                labels=list(issue.labels),
+                base_branch=base_branch or "main",
+                conflicted_files=conflicted_files,
+            )
+            try:
+                prior_total = (
+                    await db.runs.cost_for_issue(self._conn, issue.id)
+                ) + cumulative_usage.cost_usd
+                run_usage, final_kind, final_returncode = await self._run_fix_agent(
+                    binding=binding,
+                    issue=issue,
+                    run_id=fix_run_id,
+                    workspace_path=workspace_path,
+                    prompt=prompt,
+                    prior_total=prior_total,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.exception("merge-conflict fix-run execution failed for %s", issue.identifier)
+                await _abort_rebase_safely(
+                    workspace_path,
+                    issue_identifier=issue.identifier,
+                    reason="merge-conflict fix-run execution failure",
+                )
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=self._now().isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        exc=e,
+                        reason=f"merge-conflict fix-run execution failed: {e}",
+                    ),
+                )
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"merge-conflict fix-run execution failed: {e}",
+                    last_log=str(e),
+                )
+                return None
+            cumulative_usage = _sum_usage(cumulative_usage, run_usage)
+            transition = on_runner_event(
+                stage="review", event_kind=final_kind, returncode=final_returncode
+            )
+            if transition.next_run_status != "completed":
+                await _abort_rebase_safely(
+                    workspace_path,
+                    issue_identifier=issue.identifier,
+                    reason=f"merge-conflict fix-run {final_kind}",
+                )
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    transition.next_run_status,
+                    ended_at=self._now().isoformat(),
+                    **_termination_kwargs(
+                        status=transition.next_run_status,
+                        final_kind=final_kind,
+                        returncode=final_returncode,
+                        reason=f"merge-conflict fix-run ended with {final_kind}",
+                    ),
+                )
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"merge-conflict fix-run ended with {final_kind}",
+                    last_log="",
+                )
+                return None
+            try:
+                rebase_clean = await _git_add_and_continue_rebase(workspace_path, conflicted_files)
+            except Exception as e:  # noqa: BLE001
+                log.warning("rebase --continue failed for %s: %s", issue.identifier, e)
+                await _abort_rebase_safely(
+                    workspace_path,
+                    issue_identifier=issue.identifier,
+                    reason="rebase --continue failure",
+                )
+                await db.runs.update_status(
+                    self._conn,
+                    fix_run_id,
+                    "failed",
+                    ended_at=self._now().isoformat(),
+                    **_termination_kwargs(
+                        status="failed",
+                        exc=e,
+                        reason=f"rebase --continue failed: {e}",
+                    ),
+                )
+                await self._fail_review_run(
+                    run=run,
+                    binding=binding,
+                    issue=issue,
+                    error=f"rebase --continue failed: {e}",
+                    last_log=str(e),
+                )
+                return None
+            if not rebase_clean:
+                conflicted_files = await _git_conflicted_files(workspace_path)
+                if not conflicted_files:
+                    status_short = await _git_status_short(workspace_path)
+                    log.warning(
+                        "rebase --continue non-zero but no unresolved paths "
+                        "for %s; git status:\n%s",
+                        issue.identifier,
+                        status_short or "<clean>",
+                    )
+                    await _abort_rebase_safely(
+                        workspace_path,
+                        issue_identifier=issue.identifier,
+                        reason="rebase --continue with no unresolved paths",
+                    )
+                    error = "rebase --continue failed with no unresolved paths"
+                    if status_short:
+                        error += f"; git status: {status_short}"
+                    await db.runs.update_status(
+                        self._conn,
+                        fix_run_id,
+                        "failed",
+                        ended_at=self._now().isoformat(),
+                        **_termination_kwargs(status="failed", reason=error),
+                    )
+                    await self._fail_review_run(
+                        run=run,
+                        binding=binding,
+                        issue=issue,
+                        error=error,
+                        last_log=status_short,
+                    )
+                    return None
+        return cumulative_usage
+
     async def _dispatch_merge_conflict_fix_run(
         self,
         *,
@@ -2523,165 +2680,18 @@ class _ReviewMixin(_OrchestratorBase):
                     )
                     return False
 
-            cumulative_usage = UsageDelta()
-            if rebase_clean:
-                # No conflicts: skip the agent entirely.
-                log.info("rebase was clean for %s; skipping agent", issue.identifier)
-            while not rebase_clean:
-                # Step 3: dispatch the agent to resolve conflict markers (no git cmds).
-                prompt = merge_conflict_fix_prompt(
-                    issue_title=issue.title,
-                    issue_body=issue.description,
-                    labels=list(issue.labels),
-                    base_branch=base_branch or "main",
-                    conflicted_files=conflicted_files,
-                )
-                try:
-                    prior_total = (
-                        await db.runs.cost_for_issue(self._conn, issue.id)
-                    ) + cumulative_usage.cost_usd
-                    (
-                        run_usage,
-                        final_kind,
-                        final_returncode,
-                    ) = await self._run_fix_agent(
-                        binding=binding,
-                        issue=issue,
-                        run_id=fix_run_id,
-                        workspace_path=workspace_path,
-                        prompt=prompt,
-                        prior_total=prior_total,
-                    )
-                except Exception as e:  # noqa: BLE001
-                    log.exception(
-                        "merge-conflict fix-run execution failed for %s",
-                        issue.identifier,
-                    )
-                    await _abort_rebase_safely(
-                        workspace_path,
-                        issue_identifier=issue.identifier,
-                        reason="merge-conflict fix-run execution failure",
-                    )
-                    await db.runs.update_status(
-                        self._conn,
-                        fix_run_id,
-                        "failed",
-                        ended_at=self._now().isoformat(),
-                        **_termination_kwargs(
-                            status="failed",
-                            exc=e,
-                            reason=f"merge-conflict fix-run execution failed: {e}",
-                        ),
-                    )
-                    await self._fail_review_run(
-                        run=run,
-                        binding=binding,
-                        issue=issue,
-                        error=f"merge-conflict fix-run execution failed: {e}",
-                        last_log=str(e),
-                    )
-                    return False
-                cumulative_usage = _sum_usage(cumulative_usage, run_usage)
-
-                transition = on_runner_event(
-                    stage="review",
-                    event_kind=final_kind,
-                    returncode=final_returncode,
-                )
-                if transition.next_run_status != "completed":
-                    await _abort_rebase_safely(
-                        workspace_path,
-                        issue_identifier=issue.identifier,
-                        reason=f"merge-conflict fix-run {final_kind}",
-                    )
-                    await db.runs.update_status(
-                        self._conn,
-                        fix_run_id,
-                        transition.next_run_status,
-                        ended_at=self._now().isoformat(),
-                        **_termination_kwargs(
-                            status=transition.next_run_status,
-                            final_kind=final_kind,
-                            returncode=final_returncode,
-                            reason=f"merge-conflict fix-run ended with {final_kind}",
-                        ),
-                    )
-                    await self._fail_review_run(
-                        run=run,
-                        binding=binding,
-                        issue=issue,
-                        error=f"merge-conflict fix-run ended with {final_kind}",
-                        last_log="",
-                    )
-                    return False
-
-                # Step 4: stage resolved files and continue the rebase.
-                try:
-                    rebase_clean = await _git_add_and_continue_rebase(
-                        workspace_path, conflicted_files
-                    )
-                except Exception as e:  # noqa: BLE001
-                    log.warning("rebase --continue failed for %s: %s", issue.identifier, e)
-                    await _abort_rebase_safely(
-                        workspace_path,
-                        issue_identifier=issue.identifier,
-                        reason="rebase --continue failure",
-                    )
-                    await db.runs.update_status(
-                        self._conn,
-                        fix_run_id,
-                        "failed",
-                        ended_at=self._now().isoformat(),
-                        **_termination_kwargs(
-                            status="failed",
-                            exc=e,
-                            reason=f"rebase --continue failed: {e}",
-                        ),
-                    )
-                    await self._fail_review_run(
-                        run=run,
-                        binding=binding,
-                        issue=issue,
-                        error=f"rebase --continue failed: {e}",
-                        last_log=str(e),
-                    )
-                    return False
-                if not rebase_clean:
-                    conflicted_files = await _git_conflicted_files(workspace_path)
-                    if not conflicted_files:
-                        status_short = await _git_status_short(workspace_path)
-                        log.warning(
-                            "rebase --continue non-zero but no unresolved paths "
-                            "for %s; git status:\n%s",
-                            issue.identifier,
-                            status_short or "<clean>",
-                        )
-                        await _abort_rebase_safely(
-                            workspace_path,
-                            issue_identifier=issue.identifier,
-                            reason="rebase --continue with no unresolved paths",
-                        )
-                        error = "rebase --continue failed with no unresolved paths"
-                        if status_short:
-                            error += f"; git status: {status_short}"
-                        await db.runs.update_status(
-                            self._conn,
-                            fix_run_id,
-                            "failed",
-                            ended_at=self._now().isoformat(),
-                            **_termination_kwargs(
-                                status="failed",
-                                reason=error,
-                            ),
-                        )
-                        await self._fail_review_run(
-                            run=run,
-                            binding=binding,
-                            issue=issue,
-                            error=error,
-                            last_log=status_short,
-                        )
-                        return False
+            cumulative_usage = await self._resolve_rebase_conflicts(
+                run=run,
+                binding=binding,
+                issue=issue,
+                base_branch=base_branch,
+                workspace_path=workspace_path,
+                fix_run_id=fix_run_id,
+                rebase_clean=rebase_clean,
+                conflicted_files=conflicted_files,
+            )
+            if cumulative_usage is None:
+                return False
 
             drop_dispatch_id()
             await _add_run_usage(self._conn, fix_run_id, cumulative_usage)
@@ -3173,6 +3183,45 @@ class _ReviewMixin(_OrchestratorBase):
         except LinearError as e:
             log.warning("retry comment failed for %s: %s", issue_id, e)
 
+    async def _stop_skip_review_fix_run(
+        self,
+        *,
+        issue_id: str,
+        monitor_run_id: str,
+        fix_run_id: str | None,
+        issue: LinearIssue,
+        tracker: IssueTracker,
+    ) -> bool:
+        if fix_run_id is None or fix_run_id == monitor_run_id:
+            return True
+        log.info(
+            "skip-review: killing concurrent review_fix run %s for %s",
+            fix_run_id,
+            issue.identifier,
+        )
+        try:
+            await self._runner.kill(fix_run_id)
+        except Exception:  # noqa: BLE001
+            log.exception("skip-review: could not kill fix run %s", fix_run_id)
+            try:
+                await tracker.post_comment(
+                    issue_id,
+                    truncate_body(
+                        command_rejected(
+                            "$skip-review",
+                            "could not stop active review fix-run",
+                        )
+                    ),
+                )
+            except LinearError as e:
+                log.warning(
+                    "could not post skip-review rejection for %s: %s",
+                    issue.identifier,
+                    e,
+                )
+            return False
+        return True
+
     async def _handle_skip_review_intent(self, issue_id: str, run_id: str) -> None:
         """Handle `$skip-review`: stop the review monitor and dispatch merge directly.
 
@@ -3230,33 +3279,14 @@ class _ReviewMixin(_OrchestratorBase):
         # Kill it before completing the monitor; if the process cannot be
         # stopped, leave Review active and do not race Merge against it.
         fix_run_id = self._dispatch_run_ids.get(issue_id)
-        if fix_run_id is not None and fix_run_id != monitor_run_id:
-            log.info(
-                "skip-review: killing concurrent review_fix run %s for %s",
-                fix_run_id,
-                issue.identifier,
-            )
-            try:
-                await self._runner.kill(fix_run_id)
-            except Exception:  # noqa: BLE001
-                log.exception("skip-review: could not kill fix run %s", fix_run_id)
-                try:
-                    await tracker.post_comment(
-                        issue_id,
-                        truncate_body(
-                            command_rejected(
-                                "$skip-review",
-                                "could not stop active review fix-run",
-                            )
-                        ),
-                    )
-                except LinearError as e:
-                    log.warning(
-                        "could not post skip-review rejection for %s: %s",
-                        issue.identifier,
-                        e,
-                    )
-                return
+        if not await self._stop_skip_review_fix_run(
+            issue_id=issue_id,
+            monitor_run_id=monitor_run_id,
+            fix_run_id=fix_run_id,
+            issue=issue,
+            tracker=tracker,
+        ):
+            return
 
         # Durably record the bypass *before* completing the monitor, so a
         # restart in the window before the merge run is created cannot let the
@@ -3701,6 +3731,58 @@ class _ReviewMixin(_OrchestratorBase):
                 run.id,
             )
 
+    async def _codex_lgtm_min_created_at(
+        self,
+        *,
+        run: db.runs.Run,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        head_committed_at: str,
+    ) -> datetime | None:
+        cycle_started_raw = run.started_at
+        issue_pr = await db.issue_prs.get(
+            self._conn,
+            issue_id=issue.id,
+            github_repo=binding.github_repo,
+        )
+        if issue_pr is not None:
+            cycle_started_raw = issue_pr.created_at
+        try:
+            min_created_at = _parse_rfc3339(cycle_started_raw)
+        except ValueError:
+            log.warning(
+                "could not parse review cycle start for %s: %s",
+                issue.identifier,
+                cycle_started_raw,
+            )
+            return None
+        if head_committed_at:
+            try:
+                min_created_at = max(min_created_at, _parse_rfc3339(head_committed_at))
+            except ValueError:
+                log.warning(
+                    "could not parse PR head commit time for %s: %s",
+                    issue.identifier,
+                    head_committed_at,
+                )
+        return min_created_at
+
+    def _latest_codex_lgtm_comment(
+        self,
+        entries: list[dict[str, object]],
+        *,
+        min_created_at: datetime,
+    ) -> dict[str, object] | None:
+        lgtm_comment: dict[str, object] | None = None
+        for entry in entries:
+            if _is_current_codex_lgtm_entry(
+                entry,
+                min_created_at=min_created_at,
+                marker=self._CODEX_NO_ISSUES_MARKER,
+            ):
+                lgtm_comment = entry
+        return lgtm_comment
+
     async def _maybe_post_codex_lgtm(
         self,
         *,
@@ -3732,55 +3814,15 @@ class _ReviewMixin(_OrchestratorBase):
         else:
             raw = issue_comments
 
-        lgtm_comment: dict[str, Any] | None = None
-        cycle_started_raw = run.started_at
-        issue_pr = await db.issue_prs.get(
-            self._conn,
-            issue_id=issue.id,
-            github_repo=binding.github_repo,
+        min_created_at = await self._codex_lgtm_min_created_at(
+            run=run,
+            binding=binding,
+            issue=issue,
+            head_committed_at=head_committed_at,
         )
-        if issue_pr is not None:
-            cycle_started_raw = issue_pr.created_at
-        try:
-            cycle_started_at = _parse_rfc3339(cycle_started_raw)
-        except ValueError:
-            log.warning(
-                "could not parse review cycle start for %s: %s",
-                issue.identifier,
-                cycle_started_raw,
-            )
+        if min_created_at is None:
             return
-        min_created_at = cycle_started_at
-        if head_committed_at:
-            try:
-                head_dt = _parse_rfc3339(head_committed_at)
-            except ValueError:
-                log.warning(
-                    "could not parse PR head commit time for %s: %s",
-                    issue.identifier,
-                    head_committed_at,
-                )
-            else:
-                min_created_at = max(min_created_at, head_dt)
-        for entry in raw:
-            user: dict[str, Any] = entry.get("user") or {}
-            login = str(user.get("login") or "")
-            body = str(entry.get("body") or "")
-            created_at_raw = str(entry.get("created_at") or entry.get("createdAt") or "")
-            if not created_at_raw:
-                continue
-            try:
-                created_at = _parse_rfc3339(created_at_raw)
-            except ValueError:
-                log.warning(
-                    "ignoring Codex LGTM comment with invalid created_at: %s",
-                    created_at_raw,
-                )
-                continue
-            if created_at < min_created_at:
-                continue
-            if is_codex_author(login) and self._CODEX_NO_ISSUES_MARKER in body.lower():
-                lgtm_comment = entry
+        lgtm_comment = self._latest_codex_lgtm_comment(raw, min_created_at=min_created_at)
 
         if lgtm_comment is None:
             return

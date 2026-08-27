@@ -305,25 +305,36 @@ _REQUIRED_CHECK_FAILURE_STATES = {
 }
 
 
+def _dict_list(raw: object) -> list[dict[str, Any]] | None:
+    if not isinstance(raw, list):
+        return None
+    return [entry for entry in raw if isinstance(entry, dict)]
+
+
+def _edge_nodes(raw: object) -> list[dict[str, Any]] | None:
+    edges = _dict_list(raw)
+    if edges is None:
+        return None
+    return [edge["node"] for edge in edges if isinstance(edge.get("node"), dict)]
+
+
 def _status_rollup_nodes(raw: object) -> list[dict[str, Any]]:
-    if isinstance(raw, list):
-        return [entry for entry in raw if isinstance(entry, dict)]
-    if not isinstance(raw, dict):
-        return []
-    nodes = raw.get("nodes")
-    if isinstance(nodes, list):
-        return [entry for entry in nodes if isinstance(entry, dict)]
-    edges = raw.get("edges")
-    if isinstance(edges, list):
-        return [
-            edge["node"]
-            for edge in edges
-            if isinstance(edge, dict) and isinstance(edge.get("node"), dict)
-        ]
-    contexts = raw.get("contexts")
-    if isinstance(contexts, list):
-        return [entry for entry in contexts if isinstance(entry, dict)]
+    direct = _dict_list(raw)
+    if direct is not None:
+        return direct
+    if isinstance(raw, dict):
+        return _mapping_status_rollup_nodes(raw)
     return []
+
+
+def _mapping_status_rollup_nodes(raw: dict[str, object]) -> list[dict[str, Any]]:
+    nodes = _dict_list(raw.get("nodes"))
+    if nodes is not None:
+        return nodes
+    edges = _edge_nodes(raw.get("edges"))
+    if edges is not None:
+        return edges
+    return _dict_list(raw.get("contexts")) or []
 
 
 def _status_check_identity(check: Mapping[str, object]) -> str:

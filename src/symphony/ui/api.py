@@ -19,10 +19,14 @@ from .db import ReadOnlyDbPool
 from .status import (
     DEFAULT_STUCK_THRESHOLDS,
     CanonicalState,
+    CanonicalStatus,
     canonical_status_sort_key,
     compute_canonical_statuses,
 )
 from .warnings import DEFAULT_PR_NO_PROGRESS_THRESHOLD, issue_warnings
+
+_IssueStatusTriple = tuple[dict[str, Any], CanonicalStatus, str | None]
+_IssueStatusPair = tuple[dict[str, Any], CanonicalStatus]
 
 
 class CanonicalStatusPayload(BaseModel):
@@ -1246,6 +1250,194 @@ def create_api_router(
     def now() -> datetime:
         return clock() if clock is not None else datetime.now(UTC)
 
+    async def _queue_context(
+        conn: aiosqlite.Connection,
+        raw_queue: list[dict[str, Any]],
+        *,
+        is_done: bool,
+        q: str | None,
+        date_from: str | None,
+        date_to: str | None,
+        provider_filter: str | None,
+        team_filter: list[str],
+        model_filter: list[tuple[str, str]],
+    ) -> tuple[
+        list[dict[str, Any]],
+        dict[tuple[str, str, str], str],
+        dict[str, dict[str, Any]],
+    ]:
+        queue_rows = (
+            []
+            if is_done
+            else _dedupe_queue_rows(
+                [
+                    row
+                    for row in raw_queue
+                    if _queue_row_matches(
+                        row,
+                        q=q,
+                        teams=team_filter,
+                        date_from=date_from,
+                        date_to=date_to,
+                    )
+                ]
+            )
+        )
+        resolve_rows = raw_queue if is_done else queue_rows
+        queue_storage_ids = await _resolve_queue_storage_ids(conn, resolve_rows)
+        queued_storage_ids = set(queue_storage_ids.values())
+        if not is_done and (provider_filter is not None or model_filter):
+            matching = await _queue_ids_matching_usage(
+                conn,
+                queued_storage_ids,
+                provider=provider_filter,
+                models=model_filter,
+            )
+            queue_rows = [
+                row for row in queue_rows if queue_storage_ids.get(_queue_key(row)) in matching
+            ]
+        queue_totals: dict[str, dict[str, Any]] = {}
+        if queue_storage_ids and not is_done:
+            queue_totals = await _queue_issue_totals(
+                conn,
+                queued_storage_ids,
+                provider=provider_filter,
+                models=model_filter,
+            )
+        return queue_rows, queue_storage_ids, queue_totals
+
+    async def _done_issue_triples(
+        conn: aiosqlite.Connection,
+        issues: list[dict[str, Any]],
+        *,
+        request_now: datetime,
+        effective_limit: int,
+        queued_storage_ids: set[str],
+        done_since: str | None,
+        date_from: str | None,
+        date_to: str | None,
+    ) -> list[_IssueStatusTriple]:
+        issues.sort(
+            key=lambda issue: (
+                str(issue.get("max_merged_at") or issue.get("latest_activity_ts") or ""),
+                _identifier_sort_key(str(issue["identifier"])),
+            ),
+            reverse=True,
+        )
+        triples: list[_IssueStatusTriple] = []
+        chunk_size = max(effective_limit, DONE_SCOPE_DEFAULT_LIMIT)
+        for start in range(0, len(issues), chunk_size):
+            chunk = issues[start : start + chunk_size]
+            status_by_id = await compute_canonical_statuses(
+                conn,
+                [str(issue["id"]) for issue in chunk],
+                now=request_now,
+                thresholds=thresholds,
+            )
+            for issue in chunk:
+                status = status_by_id[str(issue["id"])]
+                completed_at = issue.get("max_merged_at") or issue.get("latest_activity_ts")
+                if status.state != "done" or str(issue["id"]) in queued_storage_ids:
+                    continue
+                if completed_at is None or (
+                    done_since is not None and str(completed_at) < done_since
+                ):
+                    continue
+                completed_day = str(completed_at)[:10]
+                if date_from is not None and completed_day < date_from:
+                    continue
+                if date_to is not None and completed_day > date_to:
+                    continue
+                triples.append((issue, status, str(completed_at)))
+                if len(triples) >= effective_limit:
+                    return triples
+        return triples
+
+    async def _active_issue_triples(
+        conn: aiosqlite.Connection,
+        issues: list[dict[str, Any]],
+        *,
+        request_now: datetime,
+    ) -> tuple[list[_IssueStatusTriple], list[_IssueStatusPair]]:
+        status_by_id = await compute_canonical_statuses(
+            conn,
+            [str(issue["id"]) for issue in issues],
+            now=request_now,
+            thresholds=thresholds,
+        )
+        statuses = [(issue, status_by_id[str(issue["id"])]) for issue in issues]
+        statuses.sort(
+            key=lambda item: (
+                *canonical_status_sort_key(item[1]),
+                _identifier_sort_key(str(item[0]["identifier"])),
+            )
+        )
+        return [(issue, status, None) for issue, status in statuses], statuses
+
+    def _issue_summary_payloads(
+        triples: list[_IssueStatusTriple],
+        *,
+        queue_rows: list[dict[str, Any]],
+        queue_storage_ids: dict[tuple[str, str, str], str],
+    ) -> list[IssueSummary]:
+        queue_by_storage_id = {
+            queue_storage_ids[_queue_key(row)]: row
+            for row in queue_rows
+            if _queue_key(row) in queue_storage_ids
+        }
+        payloads: list[IssueSummary] = []
+        for issue, status, completed_at in triples:
+            warnings = issue_warnings(
+                status,
+                latest_activity_age_secs=_optional_int(issue["latest_activity_age_secs"]),
+                pr_no_progress_threshold=pr_no_progress_threshold,
+            )
+            payload: dict[str, object] = {**issue, "canonical_status": status.to_dict()}
+            queue_row = queue_by_storage_id.get(str(issue["id"]))
+            if queue_row is not None and status.state == CanonicalState.IDLE:
+                payload["canonical_status"] = _queue_status_dict(queue_row)
+            payload.pop("max_merged_at", None)
+            if completed_at is not None:
+                payload["completed_at"] = completed_at
+            if warnings:
+                payload["warnings"] = warnings
+            payloads.append(IssueSummary.model_validate(payload))
+        return payloads
+
+    def _append_queue_extras(
+        payloads: list[IssueSummary],
+        *,
+        queue_rows: list[dict[str, Any]],
+        queue_storage_ids: dict[tuple[str, str, str], str],
+        queue_totals: dict[str, dict[str, Any]],
+        active_ids: set[str],
+    ) -> None:
+        extras = [
+            row for row in queue_rows if queue_storage_ids.get(_queue_key(row)) not in active_ids
+        ]
+        extras.sort(key=lambda row: _identifier_sort_key(str(row["identifier"])))
+        for row in extras:
+            storage_id = queue_storage_ids.get(_queue_key(row))
+            totals = queue_totals.get(storage_id or "", {})
+            payloads.append(
+                IssueSummary.model_validate(
+                    {
+                        "id": storage_id or _queue_fallback_id(row),
+                        "identifier": str(row["identifier"]),
+                        "title": str(row["title"]),
+                        "team_key": str(row["team_key"]),
+                        "input_tokens": int(totals.get("input_tokens") or 0),
+                        "output_tokens": int(totals.get("output_tokens") or 0),
+                        "cache_write_tokens": int(totals.get("cache_write_tokens") or 0),
+                        "cache_read_tokens": int(totals.get("cache_read_tokens") or 0),
+                        "latest_activity_ts": totals.get("latest_activity_ts"),
+                        "latest_activity_age_secs": None,
+                        "canonical_status": _queue_status_dict(row),
+                        "tracked": storage_id is not None,
+                    }
+                )
+            )
+
     @router.get(
         "/issues",
         response_model=list[IssueSummary],
@@ -1310,180 +1502,56 @@ def create_api_router(
                 """
             )
             raw_queue = [dict(row) for row in await qcur.fetchall()]
-            queue_rows: list[dict[str, Any]] = []
-            if not is_done:
-                queue_rows = _dedupe_queue_rows(
-                    [
-                        row
-                        for row in raw_queue
-                        if _queue_row_matches(
-                            row, q=q, teams=team_filter, date_from=date_from, date_to=date_to
-                        )
-                    ]
-                )
-            # Queue issues the daemon has seen before (a requeued issue, or
-            # dispatch paused) have an `issues` row and thus an issue page —
-            # resolve their storage ids so they stay internal links. Keyed by
-            # the full tracker identity (provider, site, tracker issue id)
-            # carried in the snapshot's scope — display identifiers are not
-            # unique across tracker providers/sites. The done scope resolves
-            # every queued row so it can suppress issues that were requeued.
-            resolve_rows = raw_queue if is_done else queue_rows
-            queue_storage_ids = await _resolve_queue_storage_ids(conn, resolve_rows)
+            queue_rows, queue_storage_ids, queue_totals = await _queue_context(
+                conn,
+                raw_queue,
+                is_done=is_done,
+                q=q,
+                date_from=date_from,
+                date_to=date_to,
+                provider_filter=provider_filter,
+                team_filter=team_filter,
+                model_filter=model_filter,
+            )
             queued_storage_id_set = set(queue_storage_ids.values())
-            if not is_done and (provider_filter is not None or model_filter):
-                # Usage filters: queue-only rows have no runs and drop out,
-                # but a requeued issue with matching historical usage stays.
-                matching = await _queue_ids_matching_usage(
-                    conn,
-                    queued_storage_id_set,
-                    provider=provider_filter,
-                    models=model_filter,
-                )
-                queue_rows = [
-                    row for row in queue_rows if queue_storage_ids.get(_queue_key(row)) in matching
-                ]
-            queue_totals: dict[str, dict[str, Any]] = {}
-            if queue_storage_ids and not is_done:
-                # A requeued issue keeps its historical spend and activity —
-                # don't report zeros just because it is back in the queue.
-                queue_totals = await _queue_issue_totals(
-                    conn,
-                    queued_storage_id_set,
-                    provider=provider_filter,
-                    models=model_filter,
-                )
-
             statuses: list[tuple[dict[str, Any], Any]] = []
             if is_done:
-                # Newest N done issues (default 50). `len == limit` implies more
-                # done history exists beyond what's returned.
                 effective_limit = DONE_SCOPE_DEFAULT_LIMIT if limit is None else limit
-                # Sort by the SQL-computed completion timestamp — no canonical
-                # status needed for that — so the status fan-out below can stop
-                # as soon as `effective_limit` done issues are found instead of
-                # computing status for the whole (possibly all-time) window.
-                issues.sort(
-                    key=lambda issue: (
-                        str(issue.get("max_merged_at") or issue.get("latest_activity_ts") or ""),
-                        _identifier_sort_key(str(issue["identifier"])),
-                    ),
-                    reverse=True,
-                )
-                triples = []
-                chunk_size = max(effective_limit, DONE_SCOPE_DEFAULT_LIMIT)
-                for start in range(0, len(issues), chunk_size):
-                    chunk = issues[start : start + chunk_size]
-                    status_by_id = await compute_canonical_statuses(
-                        conn,
-                        [str(issue["id"]) for issue in chunk],
-                        now=request_now,
-                        thresholds=thresholds,
-                    )
-                    for issue in chunk:
-                        status = status_by_id[str(issue["id"])]
-                        if status.state != "done":
-                            continue
-                        # A completed issue that was requeued (back in
-                        # Todo/Waiting) shows in the active scope's queue
-                        # lanes — not in Done too.
-                        if str(issue["id"]) in queued_storage_id_set:
-                            continue
-                        completed_at = issue.get("max_merged_at") or issue.get("latest_activity_ts")
-                        if completed_at is None:
-                            continue
-                        if done_since is not None and str(completed_at) < done_since:
-                            continue
-                        completed_day = str(completed_at)[:10]
-                        if date_from is not None and completed_day < date_from:
-                            continue
-                        if date_to is not None and completed_day > date_to:
-                            continue
-                        triples.append((issue, status, str(completed_at)))
-                        if len(triples) >= effective_limit:
-                            break
-                    if len(triples) >= effective_limit:
-                        break
-            else:
-                status_by_id = await compute_canonical_statuses(
+                triples = await _done_issue_triples(
                     conn,
-                    [str(issue["id"]) for issue in issues],
-                    now=request_now,
-                    thresholds=thresholds,
+                    issues,
+                    request_now=request_now,
+                    effective_limit=effective_limit,
+                    queued_storage_ids=queued_storage_id_set,
+                    done_since=done_since,
+                    date_from=date_from,
+                    date_to=date_to,
                 )
-                statuses = [(issue, status_by_id[str(issue["id"])]) for issue in issues]
-                statuses.sort(
-                    key=lambda item: (
-                        *canonical_status_sort_key(item[1]),
-                        _identifier_sort_key(str(item[0]["identifier"])),
-                    )
+            else:
+                triples, statuses = await _active_issue_triples(
+                    conn,
+                    issues,
+                    request_now=request_now,
                 )
-                triples = [(issue, status, None) for issue, status in statuses]
         except aiosqlite.Error as exc:
             raise HTTPException(
                 status_code=503,
                 detail="UI database is not available",
             ) from exc
 
-        queue_by_storage_id = {
-            queue_storage_ids[_queue_key(row)]: row
-            for row in queue_rows
-            if _queue_key(row) in queue_storage_ids
-        }
-        payloads: list[IssueSummary] = []
-        for issue, status, completed_at in triples:
-            warnings = issue_warnings(
-                status,
-                latest_activity_age_secs=_optional_int(issue["latest_activity_age_secs"]),
-                pr_no_progress_threshold=pr_no_progress_threshold,
-            )
-            payload: dict[str, object] = {
-                **issue,
-                "canonical_status": status.to_dict(),
-            }
-            # A tracked issue with no daemon state that sits in the dispatch
-            # queue is really Todo/Waiting, not idle — reflect the queue.
-            queue_row = queue_by_storage_id.get(str(issue["id"]))
-            if queue_row is not None and status.state == CanonicalState.IDLE:
-                payload["canonical_status"] = _queue_status_dict(queue_row)
-            payload.pop("max_merged_at", None)
-            if completed_at is not None:
-                payload["completed_at"] = completed_at
-            if warnings:
-                payload["warnings"] = warnings
-            payloads.append(IssueSummary.model_validate(payload))
-
-        # Queue issues absent from the active scope: no live daemon state, so
-        # they surface with their queue status to keep the Todo/Waiting lanes
-        # honest. Ones with an `issues` row keep their storage id, issue page,
-        # and historical totals; the rest are untracked and link out to the
-        # tracker.
+        payloads = _issue_summary_payloads(
+            triples,
+            queue_rows=queue_rows,
+            queue_storage_ids=queue_storage_ids,
+        )
         active_ids = {str(issue["id"]) for issue, _ in statuses}
-        extras = [
-            row for row in queue_rows if queue_storage_ids.get(_queue_key(row)) not in active_ids
-        ]
-        extras.sort(key=lambda row: _identifier_sort_key(str(row["identifier"])))
-        for row in extras:
-            storage_id = queue_storage_ids.get(_queue_key(row))
-            totals = queue_totals.get(storage_id or "", {})
-            payloads.append(
-                IssueSummary.model_validate(
-                    {
-                        "id": storage_id or _queue_fallback_id(row),
-                        "identifier": str(row["identifier"]),
-                        "title": str(row["title"]),
-                        "team_key": str(row["team_key"]),
-                        "input_tokens": int(totals.get("input_tokens") or 0),
-                        "output_tokens": int(totals.get("output_tokens") or 0),
-                        "cache_write_tokens": int(totals.get("cache_write_tokens") or 0),
-                        "cache_read_tokens": int(totals.get("cache_read_tokens") or 0),
-                        "latest_activity_ts": totals.get("latest_activity_ts"),
-                        "latest_activity_age_secs": None,
-                        "canonical_status": _queue_status_dict(row),
-                        "tracked": storage_id is not None,
-                    }
-                )
-            )
+        _append_queue_extras(
+            payloads,
+            queue_rows=queue_rows,
+            queue_storage_ids=queue_storage_ids,
+            queue_totals=queue_totals,
+            active_ids=active_ids,
+        )
         return payloads
 
     @router.get("/spend/summary", response_model=SpendSummary)

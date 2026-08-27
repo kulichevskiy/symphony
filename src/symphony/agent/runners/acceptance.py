@@ -809,19 +809,37 @@ async def _start_dev_server(
         stderr_lines=stderr_lines,
         pump_tasks=tasks,
     )
+    error_details = await _wait_for_dev_server(
+        proc,
+        stdout_lines=stdout_lines,
+        stderr_lines=stderr_lines,
+        port=port,
+        startup_timeout_secs=startup_timeout_secs,
+    )
+    if error_details is not None:
+        server.error_details = error_details
+    return server
+
+
+async def _wait_for_dev_server(
+    proc: asyncio.subprocess.Process,
+    *,
+    stdout_lines: list[str],
+    stderr_lines: list[str],
+    port: int,
+    startup_timeout_secs: float,
+) -> str | None:
     deadline = time.monotonic() + startup_timeout_secs
     while time.monotonic() < deadline:
         if proc.returncode is not None:
-            server.error_details = _dev_server_exit_details(proc, stdout_lines, stderr_lines)
-            return server
+            return _dev_server_exit_details(proc, stdout_lines, stderr_lines)
         if await _port_reachable("127.0.0.1", port):
-            return server
+            return None
         await asyncio.sleep(0.1)
-    server.error_details = (
+    return (
         "dev server did not become reachable on "
         f"127.0.0.1:{port} within {startup_timeout_secs:.1f}s."
     )
-    return server
 
 
 async def _pump_dev_stream(
@@ -844,6 +862,14 @@ async def _stop_dev_server(server: _DevServer) -> None:
     proc = server.process
     if proc is None:
         return
+    await _terminate_dev_process(proc)
+    for task in server.pump_tasks:
+        if not task.done():
+            task.cancel()
+    await asyncio.gather(*server.pump_tasks, return_exceptions=True)
+
+
+async def _terminate_dev_process(proc: asyncio.subprocess.Process) -> None:
     if proc.returncode is None:
         with suppress(ProcessLookupError):
             os.killpg(proc.pid, signal.SIGTERM)
@@ -854,10 +880,6 @@ async def _stop_dev_server(server: _DevServer) -> None:
                 os.killpg(proc.pid, signal.SIGKILL)
             with suppress(Exception):
                 await proc.wait()
-    for task in server.pump_tasks:
-        if not task.done():
-            task.cancel()
-    await asyncio.gather(*server.pump_tasks, return_exceptions=True)
 
 
 async def _port_reachable(host: str, port: int) -> bool:
@@ -953,86 +975,92 @@ def _validate_dev_artifacts(
     criteria: list[str] | None,
 ) -> AcceptanceVerdict:
     expected_criteria = list(criteria or [])
-    if verdict.kind == "pass":
-        hero = [item for item in verdict.screenshots if item.kind == "hero"]
-        if len(hero) != 1:
-            return AcceptanceVerdict(
-                kind="infra_error",
-                criteria=list(criteria or []),
-                cost=verdict.cost,
-                hero_screenshot_url="",
-                details="dev acceptance pass must include exactly one hero screenshot.",
-                preview_url=verdict.preview_url,
-            )
-        if expected_criteria and not verdict.criterion_results:
-            return AcceptanceVerdict(
-                kind="infra_error",
-                criteria=expected_criteria,
-                cost=verdict.cost,
-                hero_screenshot_url="",
-                details="dev acceptance pass must include per-criterion results.",
-                preview_url=verdict.preview_url,
-            )
-        reported = {item.criterion.casefold() for item in verdict.criterion_results}
-        missing = [
-            criterion for criterion in expected_criteria if criterion.casefold() not in reported
-        ]
-        if missing:
-            return AcceptanceVerdict(
-                kind="infra_error",
-                criteria=expected_criteria,
-                cost=verdict.cost,
-                hero_screenshot_url="",
-                details=(f"dev acceptance pass did not report criteria: {', '.join(missing)}"),
-                preview_url=verdict.preview_url,
-            )
-        failed = [item.criterion for item in verdict.criterion_results if not item.passed]
-        if failed:
-            return AcceptanceVerdict(
-                kind="infra_error",
-                criteria=list(criteria or []),
-                cost=verdict.cost,
-                hero_screenshot_url="",
-                details=(f"dev acceptance pass reported failed criteria: {', '.join(failed)}"),
-                preview_url=verdict.preview_url,
-            )
-    if verdict.kind == "reject":
-        if criteria and not verdict.criterion_results:
-            return AcceptanceVerdict(
-                kind="infra_error",
-                criteria=list(criteria),
-                cost=verdict.cost,
-                hero_screenshot_url="",
-                details="dev acceptance reject must include per-criterion results.",
-                preview_url=verdict.preview_url,
-            )
-        if criteria and not any(not item.passed for item in verdict.criterion_results):
-            return AcceptanceVerdict(
-                kind="infra_error",
-                criteria=list(criteria),
-                cost=verdict.cost,
-                hero_screenshot_url="",
-                details="dev acceptance reject must identify at least one failed criterion.",
-                preview_url=verdict.preview_url,
-            )
-        missing = [
-            item.criterion
-            for item in verdict.criterion_results
-            if not item.passed and not item.screenshot_path
-        ]
-        if missing:
-            return AcceptanceVerdict(
-                kind="infra_error",
-                criteria=list(criteria or []),
-                cost=verdict.cost,
-                hero_screenshot_url="",
-                details=(
-                    "dev acceptance reject is missing screenshots for failed "
-                    f"criteria: {', '.join(missing)}"
-                ),
-                preview_url=verdict.preview_url,
-            )
+    details = _dev_artifact_error(verdict, expected_criteria)
+    if details is not None:
+        return _invalid_dev_artifacts(verdict, expected_criteria, details)
     return verdict
+
+
+def _dev_artifact_error(
+    verdict: AcceptanceVerdict,
+    expected_criteria: list[str],
+) -> str | None:
+    if verdict.kind == "pass":
+        return _passing_dev_artifact_error(verdict, expected_criteria)
+    if verdict.kind == "reject":
+        return _rejected_dev_artifact_error(verdict, expected_criteria)
+    return None
+
+
+def _passing_dev_artifact_error(
+    verdict: AcceptanceVerdict,
+    expected_criteria: list[str],
+) -> str | None:
+    hero = [item for item in verdict.screenshots if item.kind == "hero"]
+    if len(hero) != 1:
+        return "dev acceptance pass must include exactly one hero screenshot."
+    if expected_criteria and not verdict.criterion_results:
+        return "dev acceptance pass must include per-criterion results."
+    reported = {item.criterion.casefold() for item in verdict.criterion_results}
+    missing = [criterion for criterion in expected_criteria if criterion.casefold() not in reported]
+    if missing:
+        return f"dev acceptance pass did not report criteria: {', '.join(missing)}"
+    failed = [item.criterion for item in verdict.criterion_results if not item.passed]
+    if failed:
+        return f"dev acceptance pass reported failed criteria: {', '.join(failed)}"
+    return None
+
+
+def _rejected_dev_artifact_error(
+    verdict: AcceptanceVerdict,
+    expected_criteria: list[str],
+) -> str | None:
+    criteria_error = _rejected_criteria_error(verdict, expected_criteria)
+    if criteria_error is not None:
+        return criteria_error
+    missing = _failed_criteria_without_screenshot(verdict)
+    if missing:
+        return (
+            "dev acceptance reject is missing screenshots for failed "
+            f"criteria: {', '.join(missing)}"
+        )
+    return None
+
+
+def _rejected_criteria_error(
+    verdict: AcceptanceVerdict,
+    expected_criteria: list[str],
+) -> str | None:
+    if not expected_criteria:
+        return None
+    if not verdict.criterion_results:
+        return "dev acceptance reject must include per-criterion results."
+    if not any(not item.passed for item in verdict.criterion_results):
+        return "dev acceptance reject must identify at least one failed criterion."
+    return None
+
+
+def _failed_criteria_without_screenshot(verdict: AcceptanceVerdict) -> list[str]:
+    return [
+        item.criterion
+        for item in verdict.criterion_results
+        if not item.passed and not item.screenshot_path
+    ]
+
+
+def _invalid_dev_artifacts(
+    verdict: AcceptanceVerdict,
+    criteria: list[str],
+    details: str,
+) -> AcceptanceVerdict:
+    return AcceptanceVerdict(
+        kind="infra_error",
+        criteria=criteria,
+        cost=verdict.cost,
+        hero_screenshot_url="",
+        details=details,
+        preview_url=verdict.preview_url,
+    )
 
 
 def build_acceptance_command(
