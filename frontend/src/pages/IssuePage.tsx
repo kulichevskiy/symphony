@@ -983,25 +983,41 @@ function NoTailableLog({ stageLabel, reason }: { stageLabel: string; reason: str
   );
 }
 
-/** Final-log viewer for a non-running issue: a run picker (stage, status,
- *  started, duration) over all the issue's runs, defaulting to the most-recent
- *  failed run, with the selected run's log drained once through the LiveFeed in
- *  non-live mode. Runs with no per-run log (`!has_log`) get an explanatory
- *  empty state instead of a stuck spinner. */
-export function FinalLogCard({ runs }: { runs: Run[] }) {
+/** Persistent activity viewer across the whole issue. A newly-running step
+ *  streams automatically once it has output; while it does not, the most
+ *  recent saved log remains visible and every run stays reachable in the
+ *  picker. Selecting a completed run drains its saved log once. */
+export function ActivityLogCard({ runs }: { runs: Run[] }) {
   const sorted = runsByStartDesc(runs);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   if (!sorted.length) return null;
 
-  const fallback = pickDefaultRun(sorted)!;
+  const eligible = sorted.filter((r) => !isSupersededRun(r));
+  const { live, active } = pickLiveRun(eligible);
+  const fallback =
+    live ??
+    eligible.find((r) => r.has_log) ??
+    active ??
+    eligible[0] ??
+    sorted[0];
   const selected = sorted.find((r) => r.id === selectedId) ?? fallback;
   const stageLabel = STAGE_LABEL[selected.stage] ?? selected.stage;
+  const selectedIsLive = selected.status === "running" && selected.has_log;
+  const activeStage = active ? (STAGE_LABEL[active.stage] ?? active.stage) : null;
 
   return (
     <CockpitCard
-      title="Final log"
+      title="Activity"
       aside={
-        <span className="font-mono text-[11px] text-muted-foreground">finished run</span>
+        selectedIsLive ? (
+          <span className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 dark:text-blue-400">
+            <LiveDot tone="bg-blue-500" /> live
+          </span>
+        ) : (
+          <span className="font-mono text-[11px] text-muted-foreground">
+            {activeStage ? `${activeStage} running · history` : "saved history"}
+          </span>
+        )
       }
     >
       {sorted.length > 1 ? (
@@ -1010,15 +1026,15 @@ export function FinalLogCard({ runs }: { runs: Run[] }) {
       {!selected.has_log ? (
         <NoTailableLog
           stageLabel={stageLabel}
-          reason="recorded no per-run log, so there's nothing to show here."
+          reason="has no saved output. Choose another step to view its history."
         />
       ) : (
         <LiveFeed
           key={selected.id}
           runId={selected.id}
           active
-          live={false}
-          label={`final log — ${stageLabel}, ${selected.status}`}
+          live={selectedIsLive}
+          label={`activity — ${stageLabel}, ${selected.status}`}
         />
       )}
     </CockpitCard>
@@ -1073,8 +1089,6 @@ export function IssuePage() {
 
   const detail = detailQuery.data;
   const cockpit = detail ? deriveCockpit(detail, externalQuery.data) : null;
-  const { live: liveRun, active: activeRun } = pickLiveRun(detail?.runs ?? []);
-
   return (
     <main className="mx-auto w-full max-w-[1200px] px-4 py-6 sm:px-6 lg:px-8">
       <div className="mb-5">
@@ -1153,27 +1167,7 @@ export function IssuePage() {
               ) : null}
               <ActionLog entries={log} />
             </CockpitCard>
-            {liveRun ? (
-              <CockpitCard title="Live output">
-                <LiveFeed runId={liveRun.id} active />
-              </CockpitCard>
-            ) : activeRun ? (
-              <CockpitCard
-                title="Live output"
-                aside={
-                  <span className="inline-flex items-center gap-1.5 text-xs font-medium text-blue-600 dark:text-blue-400">
-                    <LiveDot tone="bg-blue-500" /> running
-                  </span>
-                }
-              >
-                <NoTailableLog
-                  stageLabel={STAGE_LABEL[activeRun.stage] ?? activeRun.stage}
-                  reason="is running now — no per-run log to tail yet. The live feed appears here as soon as one does."
-                />
-              </CockpitCard>
-            ) : (
-              <FinalLogCard runs={detail.runs} />
-            )}
+            <ActivityLogCard runs={detail.runs} />
             <TokensCard c={cockpit} />
             <StageSpendCard runs={detail.runs} />
             <TimelineSection issueId={detail.issue.id} />

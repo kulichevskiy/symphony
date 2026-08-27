@@ -360,7 +360,7 @@ def test_activity_digest_is_compact_sanitized_and_limited(tmp_path: Path) -> Non
 
     assert "Run ID: `run-1`" in body
     assert "Review Fix" in body
-    assert "Completed commands: **1**" in body
+    assert "**Completed:** 1 command" in body
     assert "`pytest` exited `1`" in body
     assert "TOKEN=[redacted]" in body
     assert "AssertionError: nope" in body
@@ -371,6 +371,60 @@ def test_activity_digest_is_compact_sanitized_and_limited(tmp_path: Path) -> Non
     assert "supersecret" not in body
     assert "$" not in body
     assert "Tokens: in 1200 · out 340 · cache w 50 / r 10 · eff 1,604" in body
+
+
+def test_activity_comment_leads_with_agent_update_not_shell_commands(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    session = ActivitySession(
+        settings=ActivitySettings(),
+        run_id="run-1",
+        stage="implement",
+        workspace_path=workspace,
+    )
+    now = datetime(2026, 5, 11, 10, 0, tzinfo=UTC)
+
+    assert session.record_line(
+        _line(
+            "item.completed",
+            {
+                "id": "message-1",
+                "type": "agent_message",
+                "text": (
+                    "I found the stale layout contract. The focused test is red; "
+                    "I am updating the shared component now. SYMPHONY_DONE"
+                ),
+            },
+        ),
+        now,
+    )
+    session.record_event(
+        ActivityEvent(
+            kind="command_completed",
+            item_id="cmd-1",
+            command="/bin/bash -lc 'npm test -- --run src/layout.test.ts'",
+            exit_code=1,
+        ),
+        now + timedelta(seconds=1),
+    )
+    session.record_event(
+        ActivityEvent(kind="file_changed", item_id="file-1", file_path="src/layout.tsx"),
+        now + timedelta(seconds=2),
+    )
+
+    body = format_activity_digest(
+        session.build_digest(reason="final", now=now + timedelta(seconds=3))
+    )
+
+    assert body.startswith("🧭 **Implement update — agent finished**")
+    assert "**Latest update**" in body
+    assert "I found the stale layout contract" in body
+    assert "SYMPHONY_DONE" not in body
+    assert body.index("**Latest update**") < body.index("**Changed files**")
+    assert "`npm test -- --run src/layout.test.ts` exited `1`" in body
+    assert "**Completed:** 1 command" in body
+    assert "/bin/bash -lc" not in body
+    assert body.index("**Run details**") > body.index("**Changed files**")
 
 
 @pytest.mark.asyncio
@@ -517,9 +571,9 @@ async def test_orchestrator_final_flushes_unpublished_activity_events(
 
         linear.post_comment.assert_awaited_once()
         body = linear.post_comment.await_args.args[1]
-        assert "Activity digest" in body
+        assert "Implement update — agent finished" in body
         assert "Run ID: `run-1`" in body
-        assert "Running commands: `uv run pytest`" in body
+        assert "- `uv run pytest` (0s)" in body
         assert "`src/app.py`" in body
         mark = await db.activity_comments.get(conn, "run-1")
         assert mark is not None
@@ -605,7 +659,8 @@ async def test_orchestrator_posts_long_running_heartbeat_without_new_output(
 
         linear.post_comment.assert_awaited_once()
         body = linear.post_comment.await_args.args[1]
-        assert "Running commands: `npm test` (5m 1s)" in body
+        assert "Implement update — still working" in body
+        assert "- `npm test` (5m 1s)" in body
         assert (
             await db.activity_comments.last_heartbeat_at(
                 conn,
