@@ -12,7 +12,6 @@ Logs written before the sidecar existed simply have none; lookups then return
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
@@ -37,13 +36,12 @@ class RunLogWriter:
     while the run is still in progress.
     """
 
-    def __init__(self, log_path: Path, now: Callable[[], datetime] | None = None) -> None:
+    def __init__(self, log_path: Path) -> None:
         self._log_path = log_path
-        # Wall clock by default, and that is what callers want: a receipt time
-        # is the real instant Symphony saw the line, so the orchestrator does
-        # *not* hand over its (test-scriptable) clock here. `now` exists so
-        # this module's own tests can pin the stamp.
-        self._now = now if now is not None else _wall_clock
+        # Wall clock: a receipt time is the real instant Symphony saw the
+        # line, so the orchestrator does not hand over its (test-scriptable)
+        # clock here.
+        self._now = _wall_clock
         # Tracked rather than read back via `tell()`, which is an opaque
         # cookie for text-mode handles.
         self._offset = log_path.stat().st_size if log_path.exists() else 0

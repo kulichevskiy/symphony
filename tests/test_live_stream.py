@@ -807,8 +807,19 @@ async def test_events_service_and_token_lines_do_not_consume_page_size(
     lines: list[str] = []
     for i in range(150):
         lines.extend([_token_line(), "[stderr] noise", "not json", _msg(f"m{i}")])
+
+    # Receipts are keyed by end-of-line byte offset, accumulated over *every*
+    # appended line (service/token/non-JSON included) — a reader that only
+    # advances `offset` on visible lines mis-keys every receipt lookup below.
+    stamps: list[tuple[int, str]] = []
+    running = 0
+    for i, line in enumerate(lines):
+        running += len(f"{line}\n".encode())
+        stamps.append((running, f"2026-08-27T10:00:{i % 60:02d}+00:00"))
+
     async with _events_client(tmp_path, "run-mixed") as client:
         _append(log_root, "run-mixed", lines)
+        _write_receipts(log_root, "run-mixed", stamps)
         body = (await client.get("/api/runs/run-mixed/events")).json()
 
     kinds = {e["kind"] for e in body["events"]}
@@ -816,6 +827,13 @@ async def test_events_service_and_token_lines_do_not_consume_page_size(
     assert len(body["events"]) == 100
     assert body["events"][0]["text"] == "m149"
     assert body["next_before"] == 50
+    assert body["offset"] == (log_root / "run-mixed.log").stat().st_size
+
+    # Message m_i is the (4*i + 3)-th appended line; the page holds m50..m149
+    # newest-first, so its `ts` values must line up with those exact stamps.
+    assert [e["ts"] for e in body["events"]] == [
+        stamps[4 * i + 3][1] for i in range(149, 49, -1)
+    ]
 
 
 @pytest.mark.asyncio
