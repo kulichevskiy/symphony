@@ -407,7 +407,7 @@ def _activity_state(digest: ActivityDigest) -> str:
         return "agent finished"
     if outcome.kind == "exit":
         if outcome.returncode == 0:
-            return "completed successfully"
+            return "process exited cleanly"
         code = outcome.returncode if outcome.returncode is not None else "unknown"
         return f"failed (exit {code})"
     if outcome.kind == "stall_timeout":

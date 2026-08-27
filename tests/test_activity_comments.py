@@ -656,7 +656,7 @@ async def test_orchestrator_final_flushes_unpublished_activity_events(
 
         linear.post_comment.assert_awaited_once()
         body = linear.post_comment.await_args.args[1]
-        assert "Implement update — completed successfully" in body
+        assert "Implement update — process exited cleanly" in body
         assert "Run ID: `run-1`" in body
         assert "**Still running**" not in body
         assert "`src/app.py`" in body
@@ -788,7 +788,7 @@ async def test_orchestrator_posts_long_running_heartbeat_without_new_output(
         assert "Implement update — still working" in heartbeat_body
         assert "- `npm test` (5m 1s)" in heartbeat_body
         final_body = linear.post_comment.await_args_list[1].args[1]
-        assert "Implement update — completed successfully" in final_body
+        assert "Implement update — process exited cleanly" in final_body
         assert "**Still running**" not in final_body
         assert (
             await db.activity_comments.last_heartbeat_at(
