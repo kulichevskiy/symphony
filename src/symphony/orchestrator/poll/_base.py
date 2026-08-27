@@ -38,6 +38,7 @@ import aiosqlite
 
 from ... import db
 from ...agent.activity import (
+    ActivityOutcome,
     ActivityPublishReason,
     ActivitySession,
     ActivitySettings,
@@ -2749,8 +2750,9 @@ class _OrchestratorBase:
         binding: RepoBinding,
         issue: LinearIssue,
         cumulative_usage: UsageDelta,
+        outcome: ActivityOutcome,
     ) -> None:
-        if session is None or not session.has_unpublished_events():
+        if session is None:
             return
         await self._publish_activity_digest(
             session=session,
@@ -2759,6 +2761,7 @@ class _OrchestratorBase:
             reason="final",
             now=self._now(),
             cumulative_usage=cumulative_usage,
+            outcome=outcome,
         )
 
     async def _publish_activity_digest(
@@ -2771,6 +2774,7 @@ class _OrchestratorBase:
         now: datetime,
         cumulative_usage: UsageDelta,
         heartbeat_item_ids: tuple[str, ...] = (),
+        outcome: ActivityOutcome | None = None,
     ) -> bool:
         digest = session.build_digest(
             reason=reason,
@@ -2779,6 +2783,7 @@ class _OrchestratorBase:
             output_tokens=cumulative_usage.output_tokens,
             cache_write_tokens=cumulative_usage.cache_write_tokens,
             cache_read_tokens=cumulative_usage.cache_read_tokens,
+            outcome=outcome,
         )
         body = truncate_body(format_activity_digest(digest))
         fingerprint = digest_fingerprint(body)
@@ -3936,14 +3941,18 @@ class _OrchestratorBase:
                         "wall_clock_timeout",
                         "spawn_failed",
                     ):
+                        final_kind = ev.kind
+                        final_returncode = ev.returncode
                         await self._flush_activity(
                             session=activity,
                             binding=binding,
                             issue=issue,
                             cumulative_usage=cumulative_usage,
+                            outcome=ActivityOutcome(
+                                kind=final_kind,
+                                returncode=final_returncode,
+                            ),
                         )
-                        final_kind = ev.kind
-                        final_returncode = ev.returncode
                         break
         finally:
             self._active_run_ids.discard(run_id)
@@ -4278,14 +4287,18 @@ class _OrchestratorBase:
                         "wall_clock_timeout",
                         "spawn_failed",
                     ):
+                        final_kind = ev.kind
+                        final_returncode = ev.returncode
                         await self._flush_activity(
                             session=activity,
                             binding=binding,
                             issue=issue,
                             cumulative_usage=cumulative_usage,
+                            outcome=ActivityOutcome(
+                                kind=final_kind,
+                                returncode=final_returncode,
+                            ),
                         )
-                        final_kind = ev.kind
-                        final_returncode = ev.returncode
                         break
         finally:
             self._active_run_ids.discard(run_id)

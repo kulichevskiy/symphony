@@ -27,6 +27,7 @@ ActivityEventKind = Literal[
     "file_changed",
 ]
 ActivityPublishReason = Literal["interval", "threshold", "heartbeat", "final"]
+ActivityFinalKind = Literal["exit", "stall_timeout", "wall_clock_timeout", "spawn_failed"]
 
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|KEY)[A-Z0-9_]*)=([^ \t\n]+)"
@@ -80,10 +81,17 @@ class FailedCommandDigest:
 
 
 @dataclass(frozen=True)
+class ActivityOutcome:
+    kind: ActivityFinalKind
+    returncode: int | None = None
+
+
+@dataclass(frozen=True)
 class ActivityDigest:
     run_id: str
     stage: str
     reason: ActivityPublishReason
+    outcome: ActivityOutcome | None = None
     input_tokens: int = 0
     output_tokens: int = 0
     cache_write_tokens: int = 0
@@ -256,6 +264,7 @@ class ActivitySession:
         output_tokens: int = 0,
         cache_write_tokens: int = 0,
         cache_read_tokens: int = 0,
+        outcome: ActivityOutcome | None = None,
     ) -> ActivityDigest:
         running = sorted(
             self.active_commands.values(),
@@ -273,12 +282,13 @@ class ActivitySession:
             run_id=self.run_id,
             stage=self.stage,
             reason=reason,
+            outcome=outcome,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cache_write_tokens=cache_write_tokens,
             cache_read_tokens=cache_read_tokens,
             latest_agent_update=self.latest_agent_update,
-            running_commands=running_digest,
+            running_commands=() if outcome is not None else running_digest,
             completed_command_count=self.completed_command_count,
             failed_commands=tuple(self.failed_commands[:3]),
             changed_files=tuple(self.changed_files.keys())[:5],
@@ -338,10 +348,7 @@ def format_activity_digest(digest: ActivityDigest) -> str:
         digest.cache_write_tokens,
         digest.cache_read_tokens,
     )
-    state = {
-        "final": "agent finished",
-        "heartbeat": "still working",
-    }.get(digest.reason, "work in progress")
+    state = _activity_state(digest)
     lines = [f"🧭 **{title_stage} update — {state}**"]
     if digest.latest_agent_update:
         lines.extend(["", "**Latest update**", "", digest.latest_agent_update])
@@ -388,6 +395,28 @@ def format_activity_digest(digest: ActivityDigest) -> str:
         ]
     )
     return "\n".join(lines) + "\n"
+
+
+def _activity_state(digest: ActivityDigest) -> str:
+    if digest.reason == "heartbeat":
+        return "still working"
+    if digest.reason != "final":
+        return "work in progress"
+    outcome = digest.outcome
+    if outcome is None:
+        return "agent finished"
+    if outcome.kind == "exit":
+        if outcome.returncode == 0:
+            return "completed successfully"
+        code = outcome.returncode if outcome.returncode is not None else "unknown"
+        return f"failed (exit {code})"
+    if outcome.kind == "stall_timeout":
+        return "stalled"
+    if outcome.kind == "wall_clock_timeout":
+        return "timed out"
+    if outcome.kind == "spawn_failed":
+        return "failed to start"
+    return "agent finished"
 
 
 def _display_command(command: str) -> str:

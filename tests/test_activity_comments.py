@@ -600,13 +600,144 @@ async def test_orchestrator_final_flushes_unpublished_activity_events(
 
         linear.post_comment.assert_awaited_once()
         body = linear.post_comment.await_args.args[1]
-        assert "Implement update — agent finished" in body
+        assert "Implement update — completed successfully" in body
         assert "Run ID: `run-1`" in body
-        assert "- `uv run pytest` (0s)" in body
+        assert "**Still running**" not in body
         assert "`src/app.py`" in body
         mark = await db.activity_comments.get(conn, "run-1")
         assert mark is not None
         assert mark.event_count_since_post == 0
+    finally:
+        await conn.close()
+
+
+@pytest.mark.parametrize(
+    ("terminal_event", "expected_title"),
+    [
+        (RunnerEvent(kind="exit", returncode=7), "Implement update — failed (exit 7)"),
+        (RunnerEvent(kind="stall_timeout"), "Implement update — stalled"),
+        (RunnerEvent(kind="wall_clock_timeout"), "Implement update — timed out"),
+        (RunnerEvent(kind="spawn_failed"), "Implement update — failed to start"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_orchestrator_final_comment_names_failed_outcome(
+    tmp_path: Path,
+    terminal_event: RunnerEvent,
+    expected_title: str,
+) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        issue = _issue()
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=issue.id,
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-11T10:00:00+00:00",
+        )
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        runner = _FakeRunner(
+            [
+                RunnerEvent(
+                    kind="stdout",
+                    line=_line(
+                        "item.completed",
+                        {
+                            "id": "message-1",
+                            "type": "agent_message",
+                            "text": "I was applying the fix.",
+                        },
+                    ),
+                ),
+                terminal_event,
+            ]
+        )
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "workspaces",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, linear, conn, runner=runner)
+
+        await orch._run_stage_command(  # noqa: SLF001
+            binding=_binding(),
+            issue=issue,
+            command=["codex"],
+            run_id="run-1",
+            workspace_path=workspace,
+            stage="implement",
+            role=ResolvedRole(agent="codex"),
+            prior_total=0.0,
+        )
+
+        body = linear.post_comment.await_args.args[1]
+        assert expected_title in body
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_posts_final_outcome_without_prior_activity(tmp_path: Path) -> None:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        issue = _issue()
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=issue.id,
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-11T10:00:00+00:00",
+        )
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        runner = _FakeRunner([RunnerEvent(kind="spawn_failed")])
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "workspaces",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, linear, conn, runner=runner)
+
+        await orch._run_stage_command(  # noqa: SLF001
+            binding=_binding(),
+            issue=issue,
+            command=["codex"],
+            run_id="run-1",
+            workspace_path=workspace,
+            stage="implement",
+            role=ResolvedRole(agent="codex"),
+            prior_total=0.0,
+        )
+
+        linear.post_comment.assert_awaited_once()
+        body = linear.post_comment.await_args.args[1]
+        assert "Implement update — failed to start" in body
     finally:
         await conn.close()
 
@@ -686,10 +817,13 @@ async def test_orchestrator_posts_long_running_heartbeat_without_new_output(
             prior_total=0.0,
         )
 
-        linear.post_comment.assert_awaited_once()
-        body = linear.post_comment.await_args.args[1]
-        assert "Implement update — still working" in body
-        assert "- `npm test` (5m 1s)" in body
+        assert linear.post_comment.await_count == 2
+        heartbeat_body = linear.post_comment.await_args_list[0].args[1]
+        assert "Implement update — still working" in heartbeat_body
+        assert "- `npm test` (5m 1s)" in heartbeat_body
+        final_body = linear.post_comment.await_args_list[1].args[1]
+        assert "Implement update — completed successfully" in final_body
+        assert "**Still running**" not in final_body
         assert (
             await db.activity_comments.last_heartbeat_at(
                 conn,
