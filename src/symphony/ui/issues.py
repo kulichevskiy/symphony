@@ -484,8 +484,7 @@ def create_issue_detail_router(
         for run in runs:
             try:
                 run["has_log"] = (
-                    log_root is not None
-                    and (log_root / f"{run['id']}.log").stat().st_size > 0
+                    log_root is not None and (log_root / f"{run['id']}.log").stat().st_size > 0
                 )
             except OSError:
                 run["has_log"] = False
