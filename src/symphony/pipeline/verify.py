@@ -21,6 +21,7 @@ from pathlib import Path
 
 from ..agent.process import Usage
 from ..agent.prompt import review_comment_fix_prompt
+from ..agent.run_log import RunLogWriter, receipts_path
 from ..agent.runner import Runner, RunnerSpec
 from ..config import ResolvedRole
 from .local_review_io import collect_runner_output
@@ -87,17 +88,22 @@ async def run_verify_command(
 
 
 def _write_fix_log(fix_log_path: Path | None, text: str) -> None:
+    # `RunLogWriter.write` always terminates the line with `\n` — the stream
+    # endpoint buffers an unterminated final line forever, waiting for bytes
+    # that never arrive, so without it the note would never reach the UI.
     if fix_log_path is None:
         return
-    # `/api/runs/{id}/stream` only emits an event once it sees a trailing
-    # `\n` (it buffers an unterminated final line forever, waiting for more
-    # bytes that never arrive) — without this, the last line a fix turn ever
-    # writes never reaches the UI.
-    if text and not text.endswith("\n"):
-        text += "\n"
     try:
         fix_log_path.parent.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240
-        fix_log_path.write_text(text, encoding="utf-8")  # noqa: ASYNC240
+        # This call always replaces the fix log wholesale, so truncate both
+        # it and its receipt-time sidecar first — otherwise a stale sidecar
+        # left by a preceding tee (`collect_runner_output`) would key an
+        # entry at the note's new, smaller end offset and reuse a much older
+        # receipt time instead of stamping this write's real one.
+        fix_log_path.write_text("", encoding="utf-8")  # noqa: ASYNC240
+        receipts_path(fix_log_path).unlink(missing_ok=True)  # noqa: ASYNC240
+        with RunLogWriter(fix_log_path) as writer:
+            writer.write(text)
     except OSError:
         pass  # per-model attribution is best-effort
 

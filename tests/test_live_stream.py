@@ -746,6 +746,40 @@ async def test_events_walks_older_pages_until_history_is_exhausted(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_events_before_zero_returns_empty_page(tmp_path: Path) -> None:
+    """`before=0` is the exclusive upper bound just past the oldest event —
+    there is nothing older, so the page must be empty with no further
+    history to load (an off-by-one here would either duplicate the oldest
+    event or offer a "Загрузить ещё" that leads nowhere)."""
+    log_root = tmp_path / "logs"
+    async with _events_client(tmp_path, "run-before-zero") as client:
+        _append(log_root, "run-before-zero", [_msg(f"m{i}") for i in range(250)])
+        resp = await client.get("/api/runs/run-before-zero/events?before=0")
+
+    body = resp.json()
+    assert body["events"] == []
+    assert body["next_before"] is None
+
+
+@pytest.mark.asyncio
+async def test_events_before_past_history_clamps_to_newest_page(tmp_path: Path) -> None:
+    """A `before` past the run's visible-event count (reachable via the raw
+    query param) must clamp to the newest page rather than slicing with a
+    bound bigger than the event list."""
+    log_root = tmp_path / "logs"
+    async with _events_client(tmp_path, "run-before-big") as client:
+        _append(log_root, "run-before-big", [_msg(f"m{i}") for i in range(250)])
+        resp = await client.get("/api/runs/run-before-big/events?before=300")
+
+    body = resp.json()
+    texts = [e["text"] for e in body["events"]]
+    assert len(texts) == 100
+    assert texts[0] == "m249"
+    assert texts[-1] == "m150"
+    assert body["next_before"] == 150
+
+
+@pytest.mark.asyncio
 async def test_events_pages_stay_stable_when_new_events_arrive_between_requests(
     tmp_path: Path,
 ) -> None:

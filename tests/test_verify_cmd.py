@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from symphony import db
+from symphony.agent.run_log import ReceiptTimes, receipts_path
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.config import Config, LinearStates, RepoBinding, ResolvedRole
 from symphony.linear.client import LinearIssue
@@ -31,6 +32,7 @@ from symphony.pipeline.local_review import (
 )
 from symphony.pipeline.verify import (
     VerifyResult,
+    _fix_log_note,
     run_verify_command,
     run_verify_session,
 )
@@ -185,6 +187,57 @@ async def test_verify_session_green_first_run_still_writes_fix_log(tmp_path: Pat
     assert events == [
         {"kind": "message", "text": "verify_cmd passed on first attempt; no fix turn was run."}
     ]
+
+
+@pytest.mark.asyncio
+async def test_verify_session_green_first_run_fix_log_note_is_stamped(tmp_path: Path) -> None:
+    """The synthetic note `_write_fix_log` writes for a green first attempt
+    must carry a real receipt time — otherwise the only feed line a green
+    verify run ever shows renders `—` in the UI."""
+
+    async def command_runner(path: Path, cmd: str, timeout_secs: int) -> tuple[bool, str]:
+        return True, "all green"
+
+    runner = _StagedRunner({})
+    fix_log_path = tmp_path / "verify.log"
+    result = await run_verify_session(
+        **_session_kwargs(runner, command_runner), fix_log_path=fix_log_path
+    )
+    assert result.ok
+    end_offset = len(fix_log_path.read_bytes())
+    ts = ReceiptTimes(fix_log_path).get(end_offset)
+    assert ts is not None
+
+
+@pytest.mark.asyncio
+async def test_verify_session_fix_log_note_does_not_reuse_stale_sidecar_time(
+    tmp_path: Path,
+) -> None:
+    """`_write_fix_log` truncates `fix_log_path` before writing its note, but
+    a stale sidecar left by a preceding `collect_runner_output` tee can carry
+    an entry keyed at the exact offset the truncated note ends at. That
+    entry must not leak into the note's timestamp — the sidecar has to be
+    cleared, not just the log."""
+
+    async def command_runner(path: Path, cmd: str, timeout_secs: int) -> tuple[bool, str]:
+        return True, "all green"
+
+    note = _fix_log_note("verify_cmd passed on first attempt; no fix turn was run.") + "\n"
+    stale_offset = len(note.encode("utf-8"))
+    fix_log_path = tmp_path / "verify.log"
+    fix_log_path.write_text("stale content left by a previous tee\n", encoding="utf-8")
+    receipts_path(fix_log_path).write_text(
+        f"{stale_offset} 2020-01-01T00:00:00+00:00\n", encoding="utf-8"
+    )
+
+    runner = _StagedRunner({})
+    result = await run_verify_session(
+        **_session_kwargs(runner, command_runner), fix_log_path=fix_log_path
+    )
+    assert result.ok
+    ts = ReceiptTimes(fix_log_path).get(stale_offset)
+    assert ts is not None
+    assert ts != "2020-01-01T00:00:00+00:00"
 
 
 @pytest.mark.asyncio
