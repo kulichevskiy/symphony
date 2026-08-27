@@ -1577,12 +1577,12 @@ async def test_issue_detail_api_serializes_run_termination_fields(
 
 @pytest.mark.asyncio
 async def test_issue_detail_api_reports_has_log_per_run(tmp_path: Path) -> None:
-    """`has_log` is true iff `{log_root}/{run_id}.log` exists — the final-log
-    viewer keys purely off it (drained when true, empty state when false)."""
+    """`has_log` is true only once `{log_root}/{run_id}.log` has output."""
     db_path = tmp_path / "state.sqlite"
     log_root = tmp_path / "logs"
     log_root.mkdir()
     (log_root / "run-with-log.log").write_text("hi\n", encoding="utf-8")
+    (log_root / "run-empty-log.log").touch()
     conn = await db.connect(db_path)
     try:
         await db.issues.upsert(
@@ -1594,6 +1594,7 @@ async def test_issue_detail_api_reports_has_log_per_run(tmp_path: Path) -> None:
         )
         for run_id, started in (
             ("run-with-log", "2026-05-17T10:00:00Z"),
+            ("run-empty-log", "2026-05-17T09:30:00Z"),
             ("run-without-log", "2026-05-17T09:00:00Z"),
         ):
             await conn.execute(
@@ -1624,7 +1625,11 @@ async def test_issue_detail_api_reports_has_log_per_run(tmp_path: Path) -> None:
 
     assert response.status_code == 200
     has_log = {r["id"]: r["has_log"] for r in response.json()["runs"]}
-    assert has_log == {"run-with-log": True, "run-without-log": False}
+    assert has_log == {
+        "run-with-log": True,
+        "run-empty-log": False,
+        "run-without-log": False,
+    }
 
 
 @pytest.mark.asyncio

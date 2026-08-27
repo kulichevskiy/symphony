@@ -38,6 +38,8 @@ import aiosqlite
 
 from ... import db
 from ...agent.activity import (
+    ActivityFinalKind,
+    ActivityOutcome,
     ActivityPublishReason,
     ActivitySession,
     ActivitySettings,
@@ -49,7 +51,7 @@ from ...agent.control_channel import Conversation
 from ...agent.model_usage import ModelUsage, parse_model_usage
 from ...agent.process import parse_event_line
 from ...agent.prompt import implement_prompt
-from ...agent.runner import Runner, RunnerSpec
+from ...agent.runner import Runner, RunnerEvent, RunnerSpec
 from ...agent.runners.local import CLAUDE_AMBIENT_AUTH_ENV, LocalRunner
 from ...claude_login import (
     claude_access_token,
@@ -264,6 +266,14 @@ class SlashHandlerFailure(RuntimeError):
         super().__init__(reason)
         self.slash_text = slash_text
         self.reason = reason
+
+
+_ACTIVITY_TERMINAL_EVENT_KINDS: tuple[ActivityFinalKind, ...] = (
+    "exit",
+    "stall_timeout",
+    "wall_clock_timeout",
+    "spawn_failed",
+)
 
 
 class _OrchestratorBase:
@@ -2749,8 +2759,9 @@ class _OrchestratorBase:
         binding: RepoBinding,
         issue: LinearIssue,
         cumulative_usage: UsageDelta,
+        outcome: ActivityOutcome,
     ) -> None:
-        if session is None or not session.has_unpublished_events():
+        if session is None:
             return
         await self._publish_activity_digest(
             session=session,
@@ -2759,7 +2770,28 @@ class _OrchestratorBase:
             reason="final",
             now=self._now(),
             cumulative_usage=cumulative_usage,
+            outcome=outcome,
         )
+
+    async def _flush_terminal_activity(
+        self,
+        *,
+        session: ActivitySession | None,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        cumulative_usage: UsageDelta,
+        event: RunnerEvent,
+    ) -> tuple[ActivityFinalKind, int | None]:
+        kind = cast(ActivityFinalKind, event.kind)
+        returncode = event.returncode
+        await self._flush_activity(
+            session=session,
+            binding=binding,
+            issue=issue,
+            cumulative_usage=cumulative_usage,
+            outcome=ActivityOutcome(kind=kind, returncode=returncode),
+        )
+        return kind, returncode
 
     async def _publish_activity_digest(
         self,
@@ -2771,6 +2803,7 @@ class _OrchestratorBase:
         now: datetime,
         cumulative_usage: UsageDelta,
         heartbeat_item_ids: tuple[str, ...] = (),
+        outcome: ActivityOutcome | None = None,
     ) -> bool:
         digest = session.build_digest(
             reason=reason,
@@ -2779,6 +2812,7 @@ class _OrchestratorBase:
             output_tokens=cumulative_usage.output_tokens,
             cache_write_tokens=cumulative_usage.cache_write_tokens,
             cache_read_tokens=cumulative_usage.cache_read_tokens,
+            outcome=outcome,
         )
         body = truncate_body(format_activity_digest(digest))
         fingerprint = digest_fingerprint(body)
@@ -3930,20 +3964,14 @@ class _OrchestratorBase:
                             issue=issue,
                             cumulative_usage=cumulative_usage,
                         )
-                    elif ev.kind in (
-                        "exit",
-                        "stall_timeout",
-                        "wall_clock_timeout",
-                        "spawn_failed",
-                    ):
-                        await self._flush_activity(
+                    elif ev.kind in _ACTIVITY_TERMINAL_EVENT_KINDS:
+                        final_kind, final_returncode = await self._flush_terminal_activity(
                             session=activity,
                             binding=binding,
                             issue=issue,
                             cumulative_usage=cumulative_usage,
+                            event=ev,
                         )
-                        final_kind = ev.kind
-                        final_returncode = ev.returncode
                         break
         finally:
             self._active_run_ids.discard(run_id)
@@ -4272,20 +4300,14 @@ class _OrchestratorBase:
                             issue=issue,
                             cumulative_usage=cumulative_usage,
                         )
-                    elif ev.kind in (
-                        "exit",
-                        "stall_timeout",
-                        "wall_clock_timeout",
-                        "spawn_failed",
-                    ):
-                        await self._flush_activity(
+                    elif ev.kind in _ACTIVITY_TERMINAL_EVENT_KINDS:
+                        final_kind, final_returncode = await self._flush_terminal_activity(
                             session=activity,
                             binding=binding,
                             issue=issue,
                             cumulative_usage=cumulative_usage,
+                            event=ev,
                         )
-                        final_kind = ev.kind
-                        final_returncode = ev.returncode
                         break
         finally:
             self._active_run_ids.discard(run_id)

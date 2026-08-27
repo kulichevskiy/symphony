@@ -2,13 +2,13 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  ActivityLogCard,
   aggregateRunsByStage,
   CmdButton,
   ConfirmBar,
   deriveCockpit,
-  FinalLogCard,
   NowCard,
-  pickDefaultRun,
+  pickActivityRun,
   pickLiveRun,
   rawDetailJson,
   StageSpendCard,
@@ -325,14 +325,14 @@ describe("StageSpendCard", () => {
   });
 });
 
-describe("pickDefaultRun", () => {
-  it("surfaces the most-recent failed/interrupted run with a log, even under a newer success", () => {
+describe("pickActivityRun", () => {
+  it("opens the most recent saved run, regardless of outcome", () => {
     const runs = [
       run("merge", { id: "r-merge", status: "done", has_log: true, started_at: "2026-06-07T13:00:00Z" }),
       run("implement", { id: "r-fail", status: "failed", has_log: true, started_at: "2026-06-07T12:00:00Z" }),
       run("implement", { id: "r-old-fail", status: "interrupted", has_log: true, started_at: "2026-06-07T09:00:00Z" }),
     ];
-    expect(pickDefaultRun(runs)?.id).toBe("r-fail");
+    expect(pickActivityRun(runs)?.id).toBe("r-merge");
   });
 
   it("falls back to the most-recent run with a log when none failed", () => {
@@ -340,7 +340,7 @@ describe("pickDefaultRun", () => {
       run("implement", { id: "r-old", status: "done", has_log: true, started_at: "2026-06-07T09:00:00Z" }),
       run("merge", { id: "r-new", status: "done", has_log: true, started_at: "2026-06-07T13:00:00Z" }),
     ];
-    expect(pickDefaultRun(runs)?.id).toBe("r-new");
+    expect(pickActivityRun(runs)?.id).toBe("r-new");
   });
 
   it("skips a run without a log for the older run that has one", () => {
@@ -351,19 +351,19 @@ describe("pickDefaultRun", () => {
       run("merge", { id: "r-park", status: "needs_approval", has_log: false, started_at: "2026-06-07T14:00:00Z" }),
       run("implement", { id: "r-impl", status: "completed", has_log: true, started_at: "2026-06-07T12:00:00Z" }),
     ];
-    expect(pickDefaultRun(runs)?.id).toBe("r-impl");
+    expect(pickActivityRun(runs)?.id).toBe("r-impl");
   });
 
   it("returns null for no runs", () => {
-    expect(pickDefaultRun([])).toBeNull();
+    expect(pickActivityRun([])).toBeNull();
   });
 
-  it("prefers a failed run with a log over a newer failed run without one", () => {
+  it("prefers a saved run over a newer run without a log", () => {
     const runs = [
       run("review", { id: "r-review", status: "failed", has_log: false, started_at: "2026-06-07T14:00:00Z" }),
       run("implement", { id: "r-impl-fail", status: "failed", has_log: true, started_at: "2026-06-07T12:00:00Z" }),
     ];
-    expect(pickDefaultRun(runs)?.id).toBe("r-impl-fail");
+    expect(pickActivityRun(runs)?.id).toBe("r-impl-fail");
   });
 
   it("falls back to the newest run when nothing has a log", () => {
@@ -371,7 +371,7 @@ describe("pickDefaultRun", () => {
       run("review", { id: "r-review", status: "needs_approval", has_log: false, started_at: "2026-06-07T14:00:00Z" }),
       run("implement", { id: "r-impl", status: "completed", has_log: false, started_at: "2026-06-07T12:00:00Z" }),
     ];
-    expect(pickDefaultRun(runs)?.id).toBe("r-review");
+    expect(pickActivityRun(runs)?.id).toBe("r-review");
   });
 
   it("skips a superseded duplicate for the older surviving run", () => {
@@ -382,19 +382,18 @@ describe("pickDefaultRun", () => {
       run("implement", { id: "r-dup", status: "superseded", has_log: true, started_at: "2026-06-07T13:00:00Z" }),
       run("implement", { id: "r-survivor", status: "completed", has_log: true, started_at: "2026-06-07T12:00:00Z" }),
     ];
-    expect(pickDefaultRun(runs)?.id).toBe("r-survivor");
+    expect(pickActivityRun(runs)?.id).toBe("r-survivor");
   });
 
   it("falls back to a superseded run only when nothing else exists", () => {
     const runs = [run("implement", { id: "r-only", status: "superseded" })];
-    expect(pickDefaultRun(runs)?.id).toBe("r-only");
+    expect(pickActivityRun(runs)?.id).toBe("r-only");
   });
 
   it("skips an interrupted merge displaced by interrupt_running_merge (termination_kind=superseded)", () => {
     // interrupt_running_merge (and the orphaned-approval cleanup) stamp the
     // displaced row status="interrupted"/termination_kind="superseded" rather
-    // than status="superseded" — it must not win over a real failed run just
-    // because FAILED_RUN_STATUSES includes "interrupted".
+    // than status="superseded" — it must not win over a real run.
     const runs = [
       run("merge", {
         id: "r-displaced",
@@ -405,7 +404,7 @@ describe("pickDefaultRun", () => {
       }),
       run("implement", { id: "r-fail", status: "failed", has_log: true, started_at: "2026-06-07T12:00:00Z" }),
     ];
-    expect(pickDefaultRun(runs)?.id).toBe("r-fail");
+    expect(pickActivityRun(runs)?.id).toBe("r-fail");
   });
 });
 
@@ -463,14 +462,14 @@ describe("pickLiveRun", () => {
   });
 });
 
-describe("FinalLogCard", () => {
-  it("opens the failed run's final log by default, clearly labelled", () => {
+describe("ActivityLogCard", () => {
+  it("opens the most recent saved activity by default", () => {
     const runs = [
       run("merge", { id: "r-merge", status: "done", has_log: true, started_at: "2026-06-07T13:00:00Z", ended_at: "2026-06-07T13:01:00Z" }),
       run("implement", { id: "r-fail", status: "failed", has_log: true, started_at: "2026-06-07T12:00:00Z", ended_at: "2026-06-07T12:05:00Z" }),
     ];
-    const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
-    expect(markup).toContain("final log — Implement, failed");
+    const markup = renderToStaticMarkup(<ActivityLogCard runs={runs} />);
+    expect(markup).toContain("activity — Merge, done");
   });
 
   it("opens the newest run with a log by default, not an unlogged newer park row", () => {
@@ -482,8 +481,8 @@ describe("FinalLogCard", () => {
       run("local_review", { id: "r-lr", status: "completed", has_log: true, started_at: "2026-06-07T13:00:00Z", ended_at: "2026-06-07T13:01:00Z" }),
       run("implement", { id: "r-impl", status: "completed", has_log: true, started_at: "2026-06-07T12:00:00Z", ended_at: "2026-06-07T12:05:00Z" }),
     ];
-    const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
-    expect(markup).toContain("final log — Local review, completed");
+    const markup = renderToStaticMarkup(<ActivityLogCard runs={runs} />);
+    expect(markup).toContain("activity — Local review, completed");
     expect(markup).not.toContain("no per-run log");
   });
 
@@ -492,7 +491,7 @@ describe("FinalLogCard", () => {
       run("merge", { id: "r-merge", status: "done", has_log: true, started_at: "2026-06-07T13:00:00Z", ended_at: "2026-06-07T13:00:30Z" }),
       run("implement", { id: "r-fail", status: "failed", has_log: true, started_at: "2026-06-07T12:00:00Z", ended_at: "2026-06-07T12:05:00Z" }),
     ];
-    const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
+    const markup = renderToStaticMarkup(<ActivityLogCard runs={runs} />);
     expect(markup).toContain("Merge");
     expect(markup).toContain("Implement");
     expect(markup).toContain("done");
@@ -508,8 +507,8 @@ describe("FinalLogCard", () => {
     const runs = [
       run("local_review", { id: "r-lr", status: "failed", has_log: false, started_at: "2026-06-07T12:00:00Z", ended_at: "2026-06-07T12:01:00Z" }),
     ];
-    const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
-    expect(markup).toContain("no per-run log");
+    const markup = renderToStaticMarkup(<ActivityLogCard runs={runs} />);
+    expect(markup).toContain("has no saved output");
     expect(markup).not.toContain("Waiting for output…");
   });
 
@@ -525,14 +524,39 @@ describe("FinalLogCard", () => {
         ended_at: "2026-06-07T12:05:00Z",
       }),
     ];
-    const markup = renderToStaticMarkup(<FinalLogCard runs={runs} />);
-    expect(markup).toContain("final log — Local review, failed");
-    expect(markup).not.toContain("no per-run log");
+    const markup = renderToStaticMarkup(<ActivityLogCard runs={runs} />);
+    expect(markup).toContain("activity — Local review, failed");
+    expect(markup).not.toContain("has no saved output");
   });
 
   it("renders nothing when the issue has no runs", () => {
-    const markup = renderToStaticMarkup(<FinalLogCard runs={[]} />);
+    const markup = renderToStaticMarkup(<ActivityLogCard runs={[]} />);
     expect(markup).toBe("");
+  });
+
+  it("keeps the completed step's log visible while the next step has no log", () => {
+    const runs = [
+      run("review", {
+        id: "r-review",
+        status: "running",
+        has_log: false,
+        started_at: "2026-06-07T13:00:00Z",
+      }),
+      run("implement", {
+        id: "r-impl",
+        status: "completed",
+        has_log: true,
+        started_at: "2026-06-07T12:00:00Z",
+        ended_at: "2026-06-07T12:05:00Z",
+      }),
+    ];
+
+    const markup = renderToStaticMarkup(<ActivityLogCard runs={runs} />);
+
+    expect(markup).toContain("Activity");
+    expect(markup).toContain("activity — Implement, completed");
+    expect(markup).toContain("Review");
+    expect(markup).not.toContain("Review is running now");
   });
 });
 

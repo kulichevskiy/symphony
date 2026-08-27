@@ -1,8 +1,8 @@
 """Codex activity-event parsing and digest formatting.
 
 The raw Codex JSONL stream still belongs in the per-run log. This module
-extracts only the small command/file activity surface needed for rate-limited
-Linear comments.
+extracts only the small agent-update, command, and file activity surface needed
+for rate-limited Linear comments.
 """
 
 from __future__ import annotations
@@ -20,14 +20,21 @@ from typing import Literal
 
 from ..tokens import effective_tokens
 
-ActivityEventKind = Literal["command_started", "command_completed", "file_changed"]
+ActivityEventKind = Literal[
+    "agent_message",
+    "command_started",
+    "command_completed",
+    "file_changed",
+]
 ActivityPublishReason = Literal["interval", "threshold", "heartbeat", "final"]
+ActivityFinalKind = Literal["exit", "stall_timeout", "wall_clock_timeout", "spawn_failed"]
 
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"(?i)\b([A-Z0-9_]*(?:TOKEN|SECRET|PASSWORD|API_KEY|KEY)[A-Z0-9_]*)=([^ \t\n]+)"
 )
 _URL_CREDENTIAL_RE = re.compile(r"://([^/\s:@]+):([^/\s@]+)@")
 _AUTH_TOKEN_RE = re.compile(r"(?i)\b(bearer|token|api[_-]?key)\s+([A-Za-z0-9._~+/=-]{8,})")
+_CONTROL_MARKER_RE = re.compile(r"\bSYMPHONY_(?:DONE|BLOCKED|ALREADY_DONE)\b")
 
 
 @dataclass(frozen=True)
@@ -45,6 +52,7 @@ class ActivitySettings:
 class ActivityEvent:
     kind: ActivityEventKind
     item_id: str
+    message: str = ""
     command: str = ""
     exit_code: int | None = None
     output_lines: tuple[str, ...] = ()
@@ -73,17 +81,24 @@ class FailedCommandDigest:
 
 
 @dataclass(frozen=True)
+class ActivityOutcome:
+    kind: ActivityFinalKind
+    returncode: int | None = None
+
+
+@dataclass(frozen=True)
 class ActivityDigest:
     run_id: str
     stage: str
     reason: ActivityPublishReason
+    outcome: ActivityOutcome | None = None
     input_tokens: int = 0
     output_tokens: int = 0
     cache_write_tokens: int = 0
     cache_read_tokens: int = 0
+    latest_agent_update: str = ""
     running_commands: tuple[RunningCommandDigest, ...] = ()
     completed_command_count: int = 0
-    completed_command_examples: tuple[str, ...] = ()
     failed_commands: tuple[FailedCommandDigest, ...] = ()
     changed_files: tuple[str, ...] = ()
 
@@ -93,8 +108,8 @@ class ActivitySession:
     """In-memory activity window for one live run.
 
     SQLite stores the publish marks and heartbeat marks; this object holds the
-    current live command/file window so digests do not require replaying the
-    full raw stream.
+    current live agent-update/command/file window so digests do not require
+    replaying the full raw stream.
     """
 
     settings: ActivitySettings
@@ -104,8 +119,8 @@ class ActivitySession:
     active_commands: dict[str, RunningCommand] = field(default_factory=dict)
     pending_event_count: int = 0
     first_unpublished_at: datetime | None = None
+    latest_agent_update: str = ""
     completed_command_count: int = 0
-    completed_command_examples: list[str] = field(default_factory=list)
     failed_commands: list[FailedCommandDigest] = field(default_factory=list)
     changed_files: OrderedDict[str, None] = field(default_factory=OrderedDict)
     heartbeat_marks_loaded: bool = False
@@ -122,6 +137,16 @@ class ActivitySession:
         if self.first_unpublished_at is None:
             self.first_unpublished_at = now
         self.pending_event_count += 1
+
+        if event.kind == "agent_message":
+            message = sanitize_text(
+                _CONTROL_MARKER_RE.sub("", event.message),
+                workspace_path=self.workspace_path,
+                limit=700,
+            )
+            if message:
+                self.latest_agent_update = message
+            return
 
         if event.kind == "command_started":
             command = sanitize_text(
@@ -140,8 +165,6 @@ class ActivitySession:
             raw_command = event.command or (running.command if running is not None else "(command)")
             command = sanitize_text(raw_command, workspace_path=self.workspace_path)
             self.completed_command_count += 1
-            if len(self.completed_command_examples) < 3:
-                self.completed_command_examples.append(command)
             if event.exit_code is not None and event.exit_code != 0:
                 output_lines = tuple(
                     sanitize_text(
@@ -241,6 +264,7 @@ class ActivitySession:
         output_tokens: int = 0,
         cache_write_tokens: int = 0,
         cache_read_tokens: int = 0,
+        outcome: ActivityOutcome | None = None,
     ) -> ActivityDigest:
         running = sorted(
             self.active_commands.values(),
@@ -258,13 +282,14 @@ class ActivitySession:
             run_id=self.run_id,
             stage=self.stage,
             reason=reason,
+            outcome=outcome,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cache_write_tokens=cache_write_tokens,
             cache_read_tokens=cache_read_tokens,
-            running_commands=running_digest,
+            latest_agent_update=self.latest_agent_update,
+            running_commands=() if outcome is not None else running_digest,
             completed_command_count=self.completed_command_count,
-            completed_command_examples=tuple(self.completed_command_examples[:3]),
             failed_commands=tuple(self.failed_commands[:3]),
             changed_files=tuple(self.changed_files.keys())[:5],
         )
@@ -273,7 +298,6 @@ class ActivitySession:
         self.pending_event_count = 0
         self.first_unpublished_at = None
         self.completed_command_count = 0
-        self.completed_command_examples.clear()
         self.failed_commands.clear()
         self.changed_files.clear()
 
@@ -305,6 +329,14 @@ def parse_codex_activity_line(line: str, workspace_path: Path) -> ActivityEvent 
             item=item,
             workspace_path=workspace_path,
         )
+    if item_type in {"agent_message", "assistant_message"} and event_type == "item.completed":
+        message = item.get("text") or item.get("message")
+        if isinstance(message, str) and message.strip():
+            return ActivityEvent(
+                kind="agent_message",
+                item_id=_item_id(raw, item, fallback=message),
+                message=message,
+            )
     return None
 
 
@@ -316,39 +348,90 @@ def format_activity_digest(digest: ActivityDigest) -> str:
         digest.cache_write_tokens,
         digest.cache_read_tokens,
     )
-    lines = [
-        f"📡 **Activity digest — {title_stage}**",
-        "",
-        f"- Run ID: `{digest.run_id}`",
-        (
-            f"- Tokens: in {digest.input_tokens} · out {digest.output_tokens} · "
-            f"cache w {digest.cache_write_tokens} / r {digest.cache_read_tokens} · "
-            f"eff {eff:,.0f}"
-        ),
-    ]
-    if digest.running_commands:
-        running = ", ".join(
-            f"`{cmd.command}` ({_format_duration(cmd.duration_secs)})"
-            for cmd in digest.running_commands
-        )
-        lines.append(f"- Running commands: {running}")
-    if digest.completed_command_count:
-        examples = ", ".join(f"`{cmd}`" for cmd in digest.completed_command_examples)
-        suffix = f" ({examples})" if examples else ""
-        lines.append(f"- Completed commands: **{digest.completed_command_count}**{suffix}")
+    state = _activity_state(digest)
+    lines = [f"🧭 **{title_stage} update — {state}**"]
+    if digest.latest_agent_update:
+        lines.extend(["", "**Latest update**", "", digest.latest_agent_update])
+    if digest.changed_files:
+        lines.extend(["", "**Changed files**", ""])
+        lines.extend(f"- `{path}`" for path in digest.changed_files)
     if digest.failed_commands:
-        lines.append("- Failed commands:")
+        lines.extend(["", "**Failed checks**", ""])
         for failed in digest.failed_commands:
             code = failed.exit_code if failed.exit_code is not None else "unknown"
-            lines.append(f"  - `{failed.command}` exited `{code}`")
+            lines.append(f"- `{_display_command(failed.command)}` exited `{code}`")
             for output in failed.output_lines:
-                lines.append(f"    - `{output}`")
-    if digest.changed_files:
-        files = ", ".join(f"`{path}`" for path in digest.changed_files)
-        lines.append(f"- Changed files: {files}")
-    if len(lines) == 4:
-        lines.append("- Activity: no unpublished command or file events")
+                lines.append(f"  - `{output}`")
+    if digest.running_commands:
+        lines.extend(["", "**Still running**", ""])
+        lines.extend(
+            f"- `{_display_command(cmd.command)}` ({_format_duration(cmd.duration_secs)})"
+            for cmd in digest.running_commands
+        )
+    if digest.completed_command_count:
+        noun = "command" if digest.completed_command_count == 1 else "commands"
+        lines.extend(["", f"**Completed:** {digest.completed_command_count} {noun}"])
+    if not any(
+        (
+            digest.latest_agent_update,
+            digest.changed_files,
+            digest.failed_commands,
+            digest.running_commands,
+            digest.completed_command_count,
+        )
+    ):
+        lines.extend(["", "No new agent updates, file changes, or checks in this window."])
+    lines.extend(
+        [
+            "",
+            "**Run details**",
+            "",
+            f"- Run ID: `{digest.run_id}`",
+            (
+                f"- Tokens: in {digest.input_tokens} · out {digest.output_tokens} · "
+                f"cache w {digest.cache_write_tokens} / r {digest.cache_read_tokens} · "
+                f"eff {eff:,.0f}"
+            ),
+        ]
+    )
     return "\n".join(lines) + "\n"
+
+
+def _activity_state(digest: ActivityDigest) -> str:
+    if digest.reason == "heartbeat":
+        return "still working"
+    if digest.reason != "final":
+        return "work in progress"
+    outcome = digest.outcome
+    if outcome is None:
+        return "agent finished"
+    if outcome.kind == "exit":
+        if outcome.returncode == 0:
+            return "process exited cleanly"
+        code = outcome.returncode if outcome.returncode is not None else "unknown"
+        return f"failed (exit {code})"
+    if outcome.kind == "stall_timeout":
+        return "stalled"
+    if outcome.kind == "wall_clock_timeout":
+        return "timed out"
+    if outcome.kind == "spawn_failed":
+        return "failed to start"
+    return "agent finished"
+
+
+def _display_command(command: str) -> str:
+    """Strip the common shell launcher so operator comments show the check."""
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        parts = []
+    if (
+        len(parts) >= 3
+        and Path(parts[0]).name in {"bash", "sh", "zsh"}
+        and parts[1] in {"-c", "-lc"}
+    ):
+        command = parts[2]
+    return sanitize_text(command, limit=140)
 
 
 def digest_fingerprint(body: str) -> str:
