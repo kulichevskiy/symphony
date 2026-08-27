@@ -80,6 +80,62 @@ def _line(kind: str, item: dict[str, object]) -> str:
     return json.dumps({"type": kind, "item": item})
 
 
+async def _terminal_activity_comments(
+    tmp_path: Path,
+    terminal_event: RunnerEvent,
+    *,
+    activity_lines: tuple[str, ...] = (),
+) -> list[str]:
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        issue = _issue()
+        await db.issues.upsert(
+            conn,
+            id=issue.id,
+            identifier=issue.identifier,
+            title=issue.title,
+            team_key=issue.team_key,
+        )
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=issue.id,
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-05-11T10:00:00+00:00",
+        )
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        runner = _FakeRunner(
+            [*(RunnerEvent(kind="stdout", line=line) for line in activity_lines), terminal_event]
+        )
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        cfg = Config(
+            repos=[_binding()],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "workspaces",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(cfg, linear, conn, runner=runner)
+
+        await orch._run_stage_command(  # noqa: SLF001
+            binding=_binding(),
+            issue=issue,
+            command=["codex"],
+            run_id="run-1",
+            workspace_path=workspace,
+            stage="implement",
+            role=ResolvedRole(agent="codex"),
+            prior_total=0.0,
+        )
+
+        return [call.args[1] for call in linear.post_comment.await_args_list]
+    finally:
+        await conn.close()
+
+
 def test_parses_codex_command_and_file_activity(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -626,120 +682,30 @@ async def test_orchestrator_final_comment_names_failed_outcome(
     terminal_event: RunnerEvent,
     expected_title: str,
 ) -> None:
-    conn = await db.connect(tmp_path / "s.sqlite")
-    try:
-        issue = _issue()
-        await db.issues.upsert(
-            conn,
-            id=issue.id,
-            identifier=issue.identifier,
-            title=issue.title,
-            team_key=issue.team_key,
-        )
-        await db.runs.create(
-            conn,
-            id="run-1",
-            issue_id=issue.id,
-            stage="implement",
-            status="running",
-            pid=None,
-            started_at="2026-05-11T10:00:00+00:00",
-        )
-        workspace = tmp_path / "ws"
-        workspace.mkdir()
-        runner = _FakeRunner(
-            [
-                RunnerEvent(
-                    kind="stdout",
-                    line=_line(
-                        "item.completed",
-                        {
-                            "id": "message-1",
-                            "type": "agent_message",
-                            "text": "I was applying the fix.",
-                        },
-                    ),
-                ),
-                terminal_event,
-            ]
-        )
-        linear = AsyncMock()
-        linear.post_comment = AsyncMock(return_value="cmt-1")
-        cfg = Config(
-            repos=[_binding()],
-            log_root=tmp_path / "logs",
-            workspace_root=tmp_path / "workspaces",
-            db_path=tmp_path / "s.sqlite",
-        )
-        orch = Orchestrator(cfg, linear, conn, runner=runner)
+    bodies = await _terminal_activity_comments(
+        tmp_path,
+        terminal_event,
+        activity_lines=(
+            _line(
+                "item.completed",
+                {
+                    "id": "message-1",
+                    "type": "agent_message",
+                    "text": "I was applying the fix.",
+                },
+            ),
+        ),
+    )
 
-        await orch._run_stage_command(  # noqa: SLF001
-            binding=_binding(),
-            issue=issue,
-            command=["codex"],
-            run_id="run-1",
-            workspace_path=workspace,
-            stage="implement",
-            role=ResolvedRole(agent="codex"),
-            prior_total=0.0,
-        )
-
-        body = linear.post_comment.await_args.args[1]
-        assert expected_title in body
-    finally:
-        await conn.close()
+    assert expected_title in bodies[-1]
 
 
 @pytest.mark.asyncio
 async def test_orchestrator_posts_final_outcome_without_prior_activity(tmp_path: Path) -> None:
-    conn = await db.connect(tmp_path / "s.sqlite")
-    try:
-        issue = _issue()
-        await db.issues.upsert(
-            conn,
-            id=issue.id,
-            identifier=issue.identifier,
-            title=issue.title,
-            team_key=issue.team_key,
-        )
-        await db.runs.create(
-            conn,
-            id="run-1",
-            issue_id=issue.id,
-            stage="implement",
-            status="running",
-            pid=None,
-            started_at="2026-05-11T10:00:00+00:00",
-        )
-        workspace = tmp_path / "ws"
-        workspace.mkdir()
-        runner = _FakeRunner([RunnerEvent(kind="spawn_failed")])
-        linear = AsyncMock()
-        linear.post_comment = AsyncMock(return_value="cmt-1")
-        cfg = Config(
-            repos=[_binding()],
-            log_root=tmp_path / "logs",
-            workspace_root=tmp_path / "workspaces",
-            db_path=tmp_path / "s.sqlite",
-        )
-        orch = Orchestrator(cfg, linear, conn, runner=runner)
+    bodies = await _terminal_activity_comments(tmp_path, RunnerEvent(kind="spawn_failed"))
 
-        await orch._run_stage_command(  # noqa: SLF001
-            binding=_binding(),
-            issue=issue,
-            command=["codex"],
-            run_id="run-1",
-            workspace_path=workspace,
-            stage="implement",
-            role=ResolvedRole(agent="codex"),
-            prior_total=0.0,
-        )
-
-        linear.post_comment.assert_awaited_once()
-        body = linear.post_comment.await_args.args[1]
-        assert "Implement update — failed to start" in body
-    finally:
-        await conn.close()
+    assert len(bodies) == 1
+    assert "Implement update — failed to start" in bodies[0]
 
 
 @pytest.mark.asyncio
