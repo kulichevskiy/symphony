@@ -235,6 +235,16 @@ async def test_verify_session_fix_log_note_does_not_reuse_stale_sidecar_time(
         **_session_kwargs(runner, command_runner), fix_log_path=fix_log_path
     )
     assert result.ok
+    # A dict-keyed-by-offset reader would let the fresh entry mask the stale
+    # one at the same key even without a truncate, so pin the sidecar's raw
+    # contents rather than just the resolved lookup.
+    receipts_lines = [
+        line
+        for line in receipts_path(fix_log_path).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(receipts_lines) == 1
+    assert "2020-01-01" not in receipts_lines[0]
     ts = ReceiptTimes(fix_log_path).get(stale_offset)
     assert ts is not None
     assert ts != "2020-01-01T00:00:00+00:00"

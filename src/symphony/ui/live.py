@@ -261,9 +261,14 @@ def _scan_visible(
     events: list[dict[str, Any]] = []
     tokens: dict[str, Any] | None = None
     offset = 0
+    # One refresh up front, not a `get()` per line: `data` was already read in
+    # full, so every line's receipt entry (written before the line itself
+    # became visible) is already on disk — a per-line miss would just re-stat
+    # the sidecar for nothing on a log with no sidecar at all.
+    times_snapshot = times.snapshot()
     for raw in data.split(b"\n")[:-1]:
         offset += len(raw) + 1
-        ts = times.get(offset)
+        ts = times_snapshot.get(offset)
         for event in parse_stream_events(raw.decode(errors="replace")):
             if event["kind"] == "tokens":
                 tokens = _fold_tokens(tokens, event)

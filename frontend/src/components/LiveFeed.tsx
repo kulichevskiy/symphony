@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 
 import { Icon } from "@/components/ui/icon";
 import { formatEventTime, formatTokens, localDay } from "@/lib/format";
@@ -178,6 +185,10 @@ function useActivityFeed(runId: string, enabled: boolean, live: boolean) {
   }, [runId, nextBefore, loadingMore, entries]);
 
   return {
+    // `tailItems` is exposed separately (not just folded into `items`) so a
+    // caller can anchor scroll-restoration to top-prepends alone, without
+    // reacting to `history` growing from `loadMore`'s bottom appends.
+    tailItems,
     items: [...tailItems, ...history],
     tokens,
     status,
@@ -267,8 +278,29 @@ export function LiveFeed({
   live?: boolean;
   label?: ReactNode;
 }) {
-  const { items, tokens, status, hasMore, loadingMore, loadMore, reconnect } =
+  const { items, tailItems, tokens, status, hasMore, loadingMore, loadMore, reconnect } =
     useActivityFeed(runId, active, live);
+
+  // New tail events are prepended above whatever the operator is reading, so
+  // restore their scroll offset after each insertion — relying on implicit
+  // browser scroll anchoring here would break on browsers that don't
+  // implement it (e.g. Safari). Only `tailItems` (top inserts) trigger this;
+  // `loadMore`'s bottom appends need no compensation since they don't shift
+  // content already in view.
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const prevScrollHeightRef = useRef<number | null>(null);
+  useLayoutEffect(() => {
+    prevScrollHeightRef.current = null;
+  }, [runId]);
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (el === null) return;
+    const prevHeight = prevScrollHeightRef.current;
+    if (prevHeight !== null && el.scrollTop > 0) {
+      el.scrollTop += el.scrollHeight - prevHeight;
+    }
+    prevScrollHeightRef.current = el.scrollHeight;
+  }, [tailItems]);
 
   const dot =
     status === "live"
@@ -316,7 +348,10 @@ export function LiveFeed({
           </button>
         ) : null}
       </div>
-      <div className="max-h-[420px] overflow-y-auto overscroll-contain rounded-md border border-border bg-secondary/20 px-3 py-2">
+      <div
+        ref={scrollRef}
+        className="max-h-[420px] overflow-y-auto overscroll-contain rounded-md border border-border bg-secondary/20 px-3 py-2"
+      >
         {rows.length === 0 ? (
           <p className="py-6 text-center text-sm text-muted-foreground">
             {status === "ended"

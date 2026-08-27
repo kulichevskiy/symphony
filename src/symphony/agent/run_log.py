@@ -75,15 +75,24 @@ class RunLogWriter:
         self.close()
 
     def write(self, line: str) -> None:
-        """Append one line (no trailing newline) and stamp its receipt time."""
+        """Append one line (no trailing newline) and stamp its receipt time.
+
+        The receipts line is written and flushed *before* the log line, not
+        after: a reader tails the log, not the sidecar, so the moment the log
+        line becomes visible is the moment its receipt time must already be
+        on disk. A sidecar entry for a not-yet-visible log line is harmless;
+        a visible log line with no receipt entry yet is a permanent `ts:
+        null`, since the stream emits each event once and never re-asks.
+        """
         if self._log is None or self._receipts is None:
             raise RuntimeError("RunLogWriter used outside its context")
         data = line + "\n"
+        offset = self._offset + len(data.encode("utf-8"))
+        self._receipts.write(f"{offset} {self._now().isoformat()}\n")
+        self._receipts.flush()
         self._log.write(data)
         self._log.flush()
-        self._offset += len(data.encode("utf-8"))
-        self._receipts.write(f"{self._offset} {self._now().isoformat()}\n")
-        self._receipts.flush()
+        self._offset = offset
 
 
 class ReceiptTimes:
@@ -106,6 +115,18 @@ class ReceiptTimes:
         if end_offset not in self._times:
             self._refresh()
         return self._times.get(end_offset)
+
+    def snapshot(self) -> dict[int, str]:
+        """Refresh once and return the full offset -> receipt-time mapping.
+
+        For a one-shot scan of an already-fully-read log (the history page),
+        every line's receipt entry is already on disk by the time the line
+        itself is readable (see `RunLogWriter.write`), so a single refresh
+        here covers every lookup — unlike `get`, which re-stats per miss to
+        keep up with a sidecar still growing under a live tail.
+        """
+        self._refresh()
+        return self._times
 
     def _refresh(self) -> None:
         try:
