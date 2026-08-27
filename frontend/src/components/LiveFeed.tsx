@@ -409,7 +409,7 @@ export function LiveFeed({
       </div>
       <div
         ref={scrollRef}
-        className="max-h-[420px] overflow-y-auto overscroll-contain [overflow-anchor:none] rounded-md border border-border bg-secondary/20 px-3 py-2"
+        className="relative max-h-[420px] overflow-y-auto overscroll-contain [overflow-anchor:none] rounded-md border border-border bg-secondary/20 px-3 py-2"
       >
         {rows.length === 0 ? (
           <p className="py-6 text-center text-sm text-muted-foreground">

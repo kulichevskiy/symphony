@@ -85,8 +85,20 @@ function stubScrollGeometry(rowHeight: number): () => void {
   });
 
   return () => {
-    if (heightDescriptor) Object.defineProperty(HTMLElement.prototype, "scrollHeight", heightDescriptor);
-    if (topDescriptor) Object.defineProperty(HTMLElement.prototype, "scrollTop", topDescriptor);
+    // jsdom defines `scrollHeight`/`scrollTop` on `Element.prototype`, not
+    // `HTMLElement.prototype`, so there is no own descriptor to restore here
+    // — the stub must be deleted instead, or it permanently shadows the real
+    // `Element.prototype` accessor for every test that runs after this one.
+    if (heightDescriptor) {
+      Object.defineProperty(HTMLElement.prototype, "scrollHeight", heightDescriptor);
+    } else {
+      delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollHeight;
+    }
+    if (topDescriptor) {
+      Object.defineProperty(HTMLElement.prototype, "scrollTop", topDescriptor);
+    } else {
+      delete (HTMLElement.prototype as unknown as Record<string, unknown>).scrollTop;
+    }
     if (offsetTopDescriptor) Object.defineProperty(HTMLElement.prototype, "offsetTop", offsetTopDescriptor);
   };
 }
