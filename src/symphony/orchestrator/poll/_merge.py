@@ -541,6 +541,14 @@ class _MergeMixin(_OrchestratorBase):
                 return base_ref
         if binding.base_branch is not None:
             return binding.base_branch
+        return await self._repo_default_branch_or_main(binding=binding, issue=issue)
+
+    async def _repo_default_branch_or_main(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+    ) -> str:
         try:
             result_obj: object = (await self._gh_client()).repo_default_branch(binding.github_repo)
             if inspect.isawaitable(result_obj):
