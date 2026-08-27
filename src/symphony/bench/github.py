@@ -38,14 +38,7 @@ class SubprocessCommands:
         process = await asyncio.create_subprocess_exec(
             *argv,
             cwd=cwd,
-            env={
-                **{
-                    key: value
-                    for key, value in os.environ.items()
-                    if not key.startswith("SYMPHONY_")
-                },
-                **(env or {}),
-            },
+            env=_command_env(env),
             stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -56,21 +49,37 @@ class SubprocessCommands:
                 stdin.encode("utf-8") if stdin is not None else None
             )
         except asyncio.CancelledError:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGTERM)
-            try:
-                await asyncio.wait_for(process.wait(), timeout=5)
-            except TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
-                await process.wait()
+            await _stop_cancelled_process(process)
             raise
         if process.returncode != 0:
-            detail = (
-                stderr.decode(errors="replace").strip() or stdout.decode(errors="replace").strip()
-            )
-            raise CommandError(f"{' '.join(argv)} exited {process.returncode}: {detail}")
+            raise _command_error(argv, process.returncode, stdout, stderr)
         return stdout.decode(errors="replace")
+
+
+def _command_env(env: dict[str, str] | None) -> dict[str, str]:
+    inherited = {key: value for key, value in os.environ.items() if not key.startswith("SYMPHONY_")}
+    return {**inherited, **(env or {})}
+
+
+async def _stop_cancelled_process(process: asyncio.subprocess.Process) -> None:
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGTERM)
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        await process.wait()
+
+
+def _command_error(
+    argv: list[str],
+    returncode: int | None,
+    stdout: bytes,
+    stderr: bytes,
+) -> CommandError:
+    detail = stderr.decode(errors="replace").strip() or stdout.decode(errors="replace").strip()
+    return CommandError(f"{' '.join(argv)} exited {returncode}: {detail}")
 
 
 @dataclass(frozen=True)

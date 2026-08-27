@@ -394,11 +394,11 @@ class SubprocessCodexLogin:
     async def poll(self) -> CodexPollResult:
         if self._proc is None:
             raise CodexLoginError("login process is not running")
-        task = self._drain_task
-        if task is None or not task.done():
+        task = _completed_codex_poll_task(self._drain_task)
+        if task is None:
             return CodexPollResult(status=STATUS_PENDING)
         # The drain task awaited `proc.wait()`, so `returncode` is set now.
-        if task.cancelled() or task.exception() is not None or self._proc.returncode != 0:
+        if _codex_poll_failed(task, self._proc):
             return CodexPollResult(status=STATUS_FAILED)
         credential = read_codex_credential(self._credentials_path)
         if not credential:
@@ -406,19 +406,42 @@ class SubprocessCodexLogin:
         return CodexPollResult(status=STATUS_SUCCESS, credential=credential)
 
     async def close(self) -> None:
-        task = self._drain_task
-        if task is not None and not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        proc = self._proc
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
+        await _cancel_drain_task(self._drain_task)
+        await _kill_login_process(self._proc)
         if self._owns_home:
             import shutil as _shutil
 
             _shutil.rmtree(self._credentials_path.parent, ignore_errors=True)
+
+
+def _codex_poll_failed(
+    task: asyncio.Task[None],
+    proc: asyncio.subprocess.Process,
+) -> bool:
+    return task.cancelled() or task.exception() is not None or proc.returncode != 0
+
+
+def _completed_codex_poll_task(
+    task: asyncio.Task[None] | None,
+) -> asyncio.Task[None] | None:
+    if task is None or not task.done():
+        return None
+    return task
+
+
+async def _cancel_drain_task(task: asyncio.Task[None] | None) -> None:
+    if task is None or task.done():
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def _kill_login_process(proc: asyncio.subprocess.Process | None) -> None:
+    if proc is None or proc.returncode is not None:
+        return
+    try:
+        proc.kill()
+        await proc.wait()
+    except ProcessLookupError:
+        pass

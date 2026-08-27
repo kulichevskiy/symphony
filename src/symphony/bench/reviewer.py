@@ -106,13 +106,13 @@ class CodexFinalReviewer:
                     checkout=checkout,
                     codex_home=codex_home,
                     name="spec",
-                    prompt=spec_prompt or _spec_prompt(),
+                    prompt=_review_prompt(spec_prompt, _spec_prompt()),
                 )
                 standards = await self._run_one(
                     checkout=checkout,
                     codex_home=codex_home,
                     name="standards",
-                    prompt=standards_prompt or _standards_prompt(),
+                    prompt=_review_prompt(standards_prompt, _standards_prompt()),
                 )
                 refreshed = read_codex_credential(auth)
                 if refreshed and refreshed != credential:
@@ -157,6 +157,10 @@ class CodexFinalReviewer:
         except OSError as exc:
             raise RuntimeError(f"final {name} reviewer wrote no result") from exc
         return parse_review(text)
+
+
+def _review_prompt(value: str | None, fallback: str) -> str:
+    return value if value else fallback
 
 
 _OUTPUT_CONTRACT = """

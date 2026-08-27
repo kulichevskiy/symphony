@@ -171,6 +171,14 @@ class _NoSignalMergeReadiness(NamedTuple):
     review_bypass_ready: bool
 
 
+def _first_check_text(check: dict[str, object], *keys: str) -> str:
+    for key in keys:
+        value = str(check.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 class _MergeMixin(_OrchestratorBase):
     """Owns the poll loop's merge domain; `Orchestrator` extends it."""
 
@@ -308,40 +316,14 @@ class _MergeMixin(_OrchestratorBase):
             repo_view_cache,
         )
 
-        classifier: str | None = None
-        if _pr_view_has_merge_conflict(view):
-            classifier = "merge-conflict rebase fix-run"
-        elif _pr_view_is_clean_mergeable(view):
-            classifier = "clean merge retry"
-        if classifier is None:
+        classified = await self._classify_recoverable_merge_wait(
+            binding=binding,
+            pr=pr,
+            view=view,
+        )
+        if classified is None:
             return False
-
-        approved_head_sha = str(view.get("headRefOid") or "")
-        if classifier == "clean merge retry":
-            try:
-                verdict = await self._review_verdict_for_pr(
-                    binding=binding,
-                    pr_number=pr.pr_number,
-                    view=view,
-                )
-            except GitHubError as e:
-                log.warning(
-                    "could not classify review before clean merge wait reconcile %s#%d: %s",
-                    binding.github_repo,
-                    pr.pr_number,
-                    e,
-                )
-                return False
-            if verdict.kind is not VerdictKind.APPROVED:
-                log.info(
-                    "skipping clean merge wait reconcile for %s#%d: current HEAD "
-                    "%s is not approved (%s)",
-                    binding.github_repo,
-                    pr.pr_number,
-                    approved_head_sha[:12] or "(unknown)",
-                    verdict.rule or verdict.kind.value,
-                )
-                return False
+        classifier, approved_head_sha = classified
 
         async with self._schedule_lock:
             current_wait = await db.operator_waits.get(self._conn, wait.issue_id)
@@ -410,6 +392,43 @@ class _MergeMixin(_OrchestratorBase):
                 reason,
             )
             return True
+
+    async def _classify_recoverable_merge_wait(
+        self,
+        *,
+        binding: RepoBinding,
+        pr: db.issue_prs.IssuePR,
+        view: dict[str, object],
+    ) -> tuple[str, str] | None:
+        approved_head_sha = str(view.get("headRefOid") or "")
+        if _pr_view_has_merge_conflict(view):
+            return "merge-conflict rebase fix-run", approved_head_sha
+        if not _pr_view_is_clean_mergeable(view):
+            return None
+        try:
+            verdict = await self._review_verdict_for_pr(
+                binding=binding,
+                pr_number=pr.pr_number,
+                view=view,
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not classify review before clean merge wait reconcile %s#%d: %s",
+                binding.github_repo,
+                pr.pr_number,
+                e,
+            )
+            return None
+        if verdict.kind is VerdictKind.APPROVED:
+            return "clean merge retry", approved_head_sha
+        log.info(
+            "skipping clean merge wait reconcile for %s#%d: current HEAD %s is not approved (%s)",
+            binding.github_repo,
+            pr.pr_number,
+            approved_head_sha[:12] or "(unknown)",
+            verdict.rule or verdict.kind.value,
+        )
+        return None
 
     async def _repo_view_for_merge_wait_reconcile(
         self,
@@ -605,35 +624,51 @@ class _MergeMixin(_OrchestratorBase):
     ) -> str:
         sections: list[str] = []
         for check in failing_checks:
-            if str(check.get("__typename") or "") != "CheckRun":
-                continue
-            run_id = str(check.get("runId") or "").strip()
-            name = _status_check_identity(check)
-            try:
-                if run_id:
-                    tail = await (await self._gh_client()).run_failed_log_tail(run_id, repo=repo)
-                else:
-                    link = str(check.get("detailsUrl") or check.get("targetUrl") or "")
-                    tail = await (await self._gh_client()).check_log_tail(
-                        GitHubCheckRun(
-                            name=name,
-                            state=str(check.get("state") or check.get("conclusion") or ""),
-                            bucket="fail",
-                            link=link or None,
-                        ),
-                        repo=repo,
-                    )
-            except GitHubError as e:
-                log.warning(
-                    "could not fetch failed log for required check %s in %s: %s",
-                    name,
-                    repo,
-                    e,
-                )
-                continue
-            if tail.strip():
-                sections.append(f"## {name}\n{tail.strip()}")
+            section = await self._merge_required_check_log_section(repo=repo, check=check)
+            if section is not None:
+                sections.append(section)
         return "\n\n".join(sections)
+
+    async def _merge_required_check_log_section(
+        self,
+        *,
+        repo: str,
+        check: dict[str, object],
+    ) -> str | None:
+        if str(check.get("__typename") or "") != "CheckRun":
+            return None
+        name = _status_check_identity(check)
+        try:
+            tail = await self._merge_required_check_log_tail(repo=repo, check=check)
+        except GitHubError as e:
+            log.warning(
+                "could not fetch failed log for required check %s in %s: %s",
+                name,
+                repo,
+                e,
+            )
+            return None
+        return f"## {name}\n{tail.strip()}" if tail.strip() else None
+
+    async def _merge_required_check_log_tail(
+        self,
+        *,
+        repo: str,
+        check: dict[str, object],
+    ) -> str:
+        run_id = _first_check_text(check, "runId")
+        if run_id:
+            return await (await self._gh_client()).run_failed_log_tail(run_id, repo=repo)
+        link = _first_check_text(check, "detailsUrl", "targetUrl")
+        return await (await self._gh_client()).check_log_tail(
+            GitHubCheckRun(
+                name=_status_check_identity(check),
+                state=_first_check_text(check, "state", "conclusion"),
+                bucket="fail",
+                link=link or None,
+            ),
+            repo=repo,
+        )
 
     async def _mark_merge_required_check_fix_needs_approval(
         self,
@@ -766,6 +801,276 @@ class _MergeMixin(_OrchestratorBase):
             await db.review_state.set_signature(self._conn, storage_issue_id, signature)
         return dispatched is not False
 
+    async def _run_required_check_fix_attempt(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_url: str,
+        fix_run_id: str,
+        workspace_path: Path,
+        prompt: str,
+        merge_run_id: str | None,
+        storage_issue_id: str,
+    ) -> tuple[UsageDelta, str, int | None] | None:
+        prior_total = await db.runs.cost_for_issue(self._conn, storage_issue_id)
+        try:
+            return await self._run_required_check_fix_agent(
+                binding=binding,
+                issue=issue,
+                run_id=fix_run_id,
+                workspace_path=workspace_path,
+                prompt=prompt,
+                prior_total=prior_total,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception("required-check fix-run execution failed for %s", issue.identifier)
+            await db.runs.update_status(
+                self._conn,
+                fix_run_id,
+                "failed",
+                ended_at=self._now().isoformat(),
+                **_termination_kwargs(
+                    status="failed",
+                    exc=e,
+                    reason=f"required-check fix-run failed: {e}",
+                ),
+            )
+            await self._mark_merge_required_check_fix_needs_approval(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                reason=f"required-check fix-run failed: {e}",
+                merge_run_id=merge_run_id,
+                storage_issue_id=storage_issue_id,
+            )
+            return None
+
+    async def _required_check_fix_transition_result(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_url: str,
+        fix_run_id: str,
+        workspace_path: Path,
+        final_kind: str,
+        final_returncode: int | None,
+        merge_run_id: str | None,
+        storage_issue_id: str,
+    ) -> tuple[bool, bool | None]:
+        transition = on_runner_event(
+            stage="review", event_kind=final_kind, returncode=final_returncode
+        )
+        if transition.next_run_status == "completed":
+            return False, None
+        if await self._requeue_auth_failed_fix_run(
+            run_id=fix_run_id,
+            binding=binding,
+            issue=issue,
+            storage_issue_id=issue.id,
+            workspace_path=workspace_path,
+            final_kind=final_kind,
+            returncode=final_returncode,
+        ):
+            if merge_run_id is not None:
+                await db.runs.interrupt_running_merge(self._conn, merge_run_id)
+            return True, None
+        await db.runs.update_status(
+            self._conn,
+            fix_run_id,
+            transition.next_run_status,
+            ended_at=self._now().isoformat(),
+            **_termination_kwargs(
+                status=transition.next_run_status,
+                final_kind=final_kind,
+                returncode=final_returncode,
+                reason=f"required-check fix-run ended with {final_kind}",
+            ),
+        )
+        await self._mark_merge_required_check_fix_needs_approval(
+            binding=binding,
+            issue=issue,
+            pr_url=pr_url,
+            reason=f"required-check fix-run ended with {final_kind}",
+            merge_run_id=merge_run_id,
+            storage_issue_id=storage_issue_id,
+        )
+        return True, False
+
+    async def _required_check_fix_no_advance_result(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_url: str,
+        fix_run_id: str,
+        workspace_path: Path,
+        branch: str,
+        start_sha: str,
+        pushed_sha: str,
+        merge_run_id: str | None,
+        storage_issue_id: str,
+    ) -> bool | None:
+        short_sha = (pushed_sha or start_sha)[:12] or "(unknown)"
+        reason = (
+            "required-check fix-run completed without advancing "
+            f"{branch}; HEAD stayed at {short_sha}"
+        )
+        log_path = self.config.log_root / f"{fix_run_id}.log"
+        api_error = _read_run_stream_api_error_obj(log_path)
+        if await self._maybe_requeue_transient_agent_failure(
+            run_id=fix_run_id,
+            binding=binding,
+            issue=issue,
+            storage_issue_id=storage_issue_id,
+            api_error=api_error,
+            reason=reason,
+            termination_kind=db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
+            workspace_path=workspace_path,
+            force_requeue=await self._claude_auth_requeue_signal(
+                self._launched_agent(
+                    fix_run_id, binding.resolved_role("fix", self.config.roles).agent
+                ),
+                api_error,
+                run_id=fix_run_id,
+                log_path=log_path,
+            ),
+        ):
+            await self._interrupt_merge_after_required_check_fix(merge_run_id)
+            return None
+        await db.runs.update_status(
+            self._conn,
+            fix_run_id,
+            "failed",
+            ended_at=self._now().isoformat(),
+            **_termination_kwargs(status="failed", reason=reason),
+        )
+        await self._mark_merge_required_check_fix_needs_approval(
+            binding=binding,
+            issue=issue,
+            pr_url=pr_url,
+            reason=reason,
+            merge_run_id=merge_run_id,
+            storage_issue_id=storage_issue_id,
+        )
+        return False
+
+    async def _finalize_required_check_fix(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        fix_run_id: str,
+        workspace_path: Path,
+        branch: str,
+        merge_run_id: str | None,
+        storage_issue_id: str,
+    ) -> bool:
+        local_review_result: LoopResult | None = None
+        pending_local_only_needs_approval: LoopResult | None = None
+        if binding.resolved_local_review():
+            local_review_result = await self._run_local_review_phase(
+                binding=binding,
+                issue=issue,
+                storage_issue_id=storage_issue_id,
+                workspace_path=workspace_path,
+                parent_run_id=fix_run_id,
+            )
+            if not binding.resolved_remote_review():
+                if _local_review_infra_failed(local_review_result):
+                    run = await self._merge_required_check_terminal_run(
+                        binding=binding,
+                        issue=issue,
+                        merge_run_id=merge_run_id,
+                        storage_issue_id=storage_issue_id,
+                    )
+                    await self._block_local_only_review_infra_failure(
+                        binding=binding,
+                        issue=issue,
+                        storage_issue_id=storage_issue_id,
+                        run_id=run.id,
+                        result=local_review_result,
+                    )
+                    return False
+                assert local_review_result is not None
+                if _local_review_needs_approval(local_review_result):
+                    pending_local_only_needs_approval = local_review_result
+                elif local_review_result.outcome != LoopOutcome.APPROVED:
+                    await self._mark_merge_required_check_fix_needs_approval(
+                        binding=binding,
+                        issue=issue,
+                        pr_url=pr_url,
+                        reason=(
+                            "post-required-check local-only review did not approve: "
+                            f"{_local_review_termination_reason(local_review_result)}"
+                        ),
+                        merge_run_id=merge_run_id,
+                        storage_issue_id=storage_issue_id,
+                    )
+                    return False
+        try:
+            await self._push_fn(workspace_path, branch)
+        except Exception as e:  # noqa: BLE001
+            log.warning("git push failed for required-check fix-run %s: %s", issue.identifier, e)
+            await self._mark_merge_required_check_fix_needs_approval(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                reason=f"required-check fix-run push failed: {e}",
+                merge_run_id=merge_run_id,
+                storage_issue_id=storage_issue_id,
+            )
+            return False
+        if pending_local_only_needs_approval is not None:
+            run = await self._merge_required_check_terminal_run(
+                binding=binding,
+                issue=issue,
+                merge_run_id=merge_run_id,
+                storage_issue_id=storage_issue_id,
+            )
+            await self._park_local_only_review_needs_approval(
+                run=run,
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                result=pending_local_only_needs_approval,
+                operator_wait=True,
+            )
+            return True
+        state = await db.review_state.get(self._conn, storage_issue_id)
+        if state.pr_number is None:
+            state = replace(
+                state,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                github_repo=binding.github_repo,
+                issue_label=binding.issue_label or "",
+            )
+        await self._retrigger_codex_review_unless_approved(
+            binding=binding, issue=issue, state=state
+        )
+        await self._interrupt_stale_merge_needs_approval_for_state(
+            binding=binding,
+            issue=issue,
+            state=state,
+            storage_issue_id=storage_issue_id,
+        )
+        await self._interrupt_merge_after_required_check_fix(merge_run_id)
+        return True
+
+    async def _interrupt_merge_after_required_check_fix(self, merge_run_id: str | None) -> None:
+        if merge_run_id is None:
+            return
+        running_interrupted = await db.runs.interrupt_running_merge(self._conn, merge_run_id)
+        if running_interrupted:
+            log.info(
+                "interrupted active merge run %s after required-check fix-run",
+                merge_run_id,
+            )
+
     async def _dispatch_merge_required_check_fix_run(
         self,
         *,
@@ -858,154 +1163,50 @@ class _MergeMixin(_OrchestratorBase):
             fix_run_id: str,
             drop_dispatch_id: Callable[[], None],
         ) -> bool | None:
-            prior_total = await db.runs.cost_for_issue(self._conn, storage_issue_id)
-            try:
-                (
-                    usage_delta,
-                    final_kind,
-                    final_returncode,
-                ) = await self._run_required_check_fix_agent(
-                    binding=binding,
-                    issue=issue,
-                    run_id=fix_run_id,
-                    workspace_path=workspace_path,
-                    prompt=prompt,
-                    prior_total=prior_total,
-                )
-            except Exception as e:  # noqa: BLE001
-                log.exception(
-                    "required-check fix-run execution failed for %s",
-                    issue.identifier,
-                )
-                await db.runs.update_status(
-                    self._conn,
-                    fix_run_id,
-                    "failed",
-                    ended_at=self._now().isoformat(),
-                    **_termination_kwargs(
-                        status="failed",
-                        exc=e,
-                        reason=f"required-check fix-run failed: {e}",
-                    ),
-                )
-                await self._mark_merge_required_check_fix_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    reason=f"required-check fix-run failed: {e}",
-                    merge_run_id=merge_run_id,
-                    storage_issue_id=storage_issue_id,
-                )
+            attempt = await self._run_required_check_fix_attempt(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                fix_run_id=fix_run_id,
+                workspace_path=workspace_path,
+                prompt=prompt,
+                merge_run_id=merge_run_id,
+                storage_issue_id=storage_issue_id,
+            )
+            if attempt is None:
                 return False
+            usage_delta, final_kind, final_returncode = attempt
 
             drop_dispatch_id()
             await _add_run_usage(self._conn, fix_run_id, usage_delta)
-
-            transition = on_runner_event(
-                stage="review",
-                event_kind=final_kind,
-                returncode=final_returncode,
+            handled, result = await self._required_check_fix_transition_result(
+                binding=binding,
+                issue=issue,
+                pr_url=pr_url,
+                fix_run_id=fix_run_id,
+                workspace_path=workspace_path,
+                final_kind=final_kind,
+                final_returncode=final_returncode,
+                merge_run_id=merge_run_id,
+                storage_issue_id=storage_issue_id,
             )
-            if transition.next_run_status != "completed":
-                # A Claude auth failure the daemon re-validated is a stale
-                # per-run token, not a dead account: requeue this fix-run with
-                # backoff instead of escalating to needs-approval (SYM-229).
-                if await self._requeue_auth_failed_fix_run(
-                    run_id=fix_run_id,
-                    binding=binding,
-                    issue=issue,
-                    storage_issue_id=issue.id,
-                    workspace_path=workspace_path,
-                    final_kind=final_kind,
-                    returncode=final_returncode,
-                ):
-                    if merge_run_id is not None:
-                        await db.runs.interrupt_running_merge(self._conn, merge_run_id)
-                    return None
-                await db.runs.update_status(
-                    self._conn,
-                    fix_run_id,
-                    transition.next_run_status,
-                    ended_at=self._now().isoformat(),
-                    **_termination_kwargs(
-                        status=transition.next_run_status,
-                        final_kind=final_kind,
-                        returncode=final_returncode,
-                        reason=f"required-check fix-run ended with {final_kind}",
-                    ),
-                )
-                await self._mark_merge_required_check_fix_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    reason=f"required-check fix-run ended with {final_kind}",
-                    merge_run_id=merge_run_id,
-                    storage_issue_id=storage_issue_id,
-                )
-                return False
+            if handled:
+                return result
 
             pushed_sha = await _workspace_head_sha(workspace_path)
             if not pushed_sha or pushed_sha == start_sha:
-                short_sha = (pushed_sha or start_sha)[:12] or "(unknown)"
-                reason = (
-                    "required-check fix-run completed without advancing "
-                    f"{branch}; HEAD stayed at {short_sha}"
-                )
-                # Before escalating, check for a transient provider API error
-                # (exit 0, no HEAD advance). If transient, requeue with backoff;
-                # return None so the caller skips signature recording but still
-                # treats this as "handled" (no needs_approval escalation).
-                log_path = self.config.log_root / f"{fix_run_id}.log"
-                api_error = _read_run_stream_api_error_obj(log_path)
-                if await self._maybe_requeue_transient_agent_failure(
-                    run_id=fix_run_id,
-                    binding=binding,
-                    issue=issue,
-                    storage_issue_id=storage_issue_id,
-                    api_error=api_error,
-                    reason=reason,
-                    termination_kind=db.runs.REVIEW_FIX_TRANSIENT_RETRY_KIND,
-                    workspace_path=workspace_path,
-                    force_requeue=await self._claude_auth_requeue_signal(
-                        self._launched_agent(
-                            fix_run_id, binding.resolved_role("fix", self.config.roles).agent
-                        ),
-                        api_error,
-                        run_id=fix_run_id,
-                        log_path=log_path,
-                    ),
-                ):
-                    if merge_run_id is not None:
-                        running_interrupted = await db.runs.interrupt_running_merge(
-                            self._conn,
-                            merge_run_id,
-                        )
-                        if running_interrupted:
-                            log.info(
-                                "interrupted active merge run %s after required-check "
-                                "fix-run transient retry",
-                                merge_run_id,
-                            )
-                    return None
-                await db.runs.update_status(
-                    self._conn,
-                    fix_run_id,
-                    "failed",
-                    ended_at=self._now().isoformat(),
-                    **_termination_kwargs(
-                        status="failed",
-                        reason=reason,
-                    ),
-                )
-                await self._mark_merge_required_check_fix_needs_approval(
+                return await self._required_check_fix_no_advance_result(
                     binding=binding,
                     issue=issue,
                     pr_url=pr_url,
-                    reason=reason,
+                    fix_run_id=fix_run_id,
+                    workspace_path=workspace_path,
+                    branch=branch,
+                    start_sha=start_sha,
+                    pushed_sha=pushed_sha,
                     merge_run_id=merge_run_id,
                     storage_issue_id=storage_issue_id,
                 )
-                return False
 
             await db.runs.update_status(
                 self._conn,
@@ -1013,117 +1214,17 @@ class _MergeMixin(_OrchestratorBase):
                 "completed",
                 ended_at=self._now().isoformat(),
             )
-
-            local_review_result: LoopResult | None = None
-            pending_local_only_needs_approval: LoopResult | None = None
-            if binding.resolved_local_review():
-                local_review_result = await self._run_local_review_phase(
-                    binding=binding,
-                    issue=issue,
-                    storage_issue_id=storage_issue_id,
-                    workspace_path=workspace_path,
-                    parent_run_id=fix_run_id,
-                )
-                if not binding.resolved_remote_review():
-                    if _local_review_infra_failed(local_review_result):
-                        run = await self._merge_required_check_terminal_run(
-                            binding=binding,
-                            issue=issue,
-                            merge_run_id=merge_run_id,
-                            storage_issue_id=storage_issue_id,
-                        )
-                        await self._block_local_only_review_infra_failure(
-                            binding=binding,
-                            issue=issue,
-                            storage_issue_id=storage_issue_id,
-                            run_id=run.id,
-                            result=local_review_result,
-                        )
-                        return False
-                    assert local_review_result is not None
-                    if _local_review_needs_approval(local_review_result):
-                        pending_local_only_needs_approval = local_review_result
-                    elif local_review_result.outcome != LoopOutcome.APPROVED:
-                        await self._mark_merge_required_check_fix_needs_approval(
-                            binding=binding,
-                            issue=issue,
-                            pr_url=pr_url,
-                            reason=(
-                                "post-required-check local-only review did not "
-                                "approve: "
-                                f"{_local_review_termination_reason(local_review_result)}"
-                            ),
-                            merge_run_id=merge_run_id,
-                            storage_issue_id=storage_issue_id,
-                        )
-                        return False
-
-            try:
-                await self._push_fn(workspace_path, branch)
-            except Exception as e:  # noqa: BLE001
-                log.warning(
-                    "git push failed for required-check fix-run %s: %s",
-                    issue.identifier,
-                    e,
-                )
-                await self._mark_merge_required_check_fix_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    reason=f"required-check fix-run push failed: {e}",
-                    merge_run_id=merge_run_id,
-                    storage_issue_id=storage_issue_id,
-                )
-                return False
-
-            if pending_local_only_needs_approval is not None:
-                run = await self._merge_required_check_terminal_run(
-                    binding=binding,
-                    issue=issue,
-                    merge_run_id=merge_run_id,
-                    storage_issue_id=storage_issue_id,
-                )
-                await self._park_local_only_review_needs_approval(
-                    run=run,
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    result=pending_local_only_needs_approval,
-                    operator_wait=True,
-                )
-                return True
-
-            state = await db.review_state.get(self._conn, storage_issue_id)
-            if state.pr_number is None:
-                state = replace(
-                    state,
-                    pr_number=pr_number,
-                    pr_url=pr_url,
-                    github_repo=binding.github_repo,
-                    issue_label=binding.issue_label or "",
-                )
-            await self._retrigger_codex_review_unless_approved(
+            return await self._finalize_required_check_fix(
                 binding=binding,
                 issue=issue,
-                state=state,
-            )
-            await self._interrupt_stale_merge_needs_approval_for_state(
-                binding=binding,
-                issue=issue,
-                state=state,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                fix_run_id=fix_run_id,
+                workspace_path=workspace_path,
+                branch=branch,
+                merge_run_id=merge_run_id,
                 storage_issue_id=storage_issue_id,
             )
-            if merge_run_id is not None:
-                running_interrupted = await db.runs.interrupt_running_merge(
-                    self._conn,
-                    merge_run_id,
-                )
-                if running_interrupted:
-                    log.info(
-                        "interrupted active merge run %s after required-check fix-run",
-                        merge_run_id,
-                    )
-            return True
 
         return await self._run_fix_dispatch(
             binding=binding,
@@ -3154,6 +3255,76 @@ class _MergeMixin(_OrchestratorBase):
             return True
         return False
 
+    async def _changed_premerge_head_is_approved(
+        self,
+        *,
+        binding: RepoBinding,
+        issue: LinearIssue,
+        pr_number: int,
+        pr_url: str,
+        run_id: str,
+        storage_issue_id: str,
+        premerge_view: dict[str, object],
+        premerge_head_sha: str,
+    ) -> bool:
+        try:
+            verdict = await self._review_verdict_for_pr(
+                binding=binding,
+                pr_number=pr_number,
+                view=premerge_view,
+            )
+        except GitHubError as e:
+            log.warning(
+                "could not classify review for post-merge-agent HEAD %s#%d at %s: %s",
+                binding.github_repo,
+                pr_number,
+                premerge_head_sha[:12] or "(unknown)",
+                e,
+            )
+            verdict = None
+        if verdict is not None and verdict.kind is VerdictKind.APPROVED:
+            return True
+        await self._mark_merge_needs_approval(
+            binding=binding,
+            issue=issue,
+            pr_url=pr_url,
+            run_id=run_id,
+            reason=f"merge-agent pushed unreviewed HEAD {premerge_head_sha or '(unknown)'}",
+        )
+        state = await db.review_state.get(self._conn, storage_issue_id)
+        await self._retrigger_codex_review_unless_approved(
+            binding=binding,
+            issue=issue,
+            state=state,
+        )
+        return False
+
+    async def _configured_premerge_checks_ready(
+        self,
+        *,
+        binding: RepoBinding,
+        pr_number: int,
+        storage_issue_id: str,
+        premerge_view: dict[str, object],
+        premerge_head_sha: str,
+    ) -> tuple[bool, GitHubError | None]:
+        try:
+            checks = await (await self._gh_client()).pr_checks(
+                pr_number,
+                repo=binding.github_repo,
+                required_contexts=binding.required_status_checks,
+            )
+        except GitHubError as e:
+            return False, e
+        if checks.all_passed:
+            return True, None
+        if _no_signal_head_check_state(premerge_view) == "none":
+            ready = await self._zero_rollup_merge_authorized(
+                binding=binding, issue_id=storage_issue_id, head_sha=premerge_head_sha
+            )
+            return ready, None
+        return False, None
+
     async def _verify_premerge_head(
         self,
         *,
@@ -3202,72 +3373,39 @@ class _MergeMixin(_OrchestratorBase):
         premerge_head_sha = str(premerge_view.get("headRefOid") or "")
         head_changed = bool(approved_head_sha and premerge_head_sha != approved_head_sha)
         if head_changed:
-            try:
-                verdict = await self._review_verdict_for_pr(
-                    binding=binding,
-                    pr_number=pr_number,
-                    view=premerge_view,
-                )
-            except GitHubError as e:
-                log.warning(
-                    "could not classify review for post-merge-agent HEAD %s#%d at %s: %s",
-                    binding.github_repo,
-                    pr_number,
-                    premerge_head_sha[:12] or "(unknown)",
-                    e,
-                )
-                verdict = None
-            if verdict is None or verdict.kind is not VerdictKind.APPROVED:
-                await self._mark_merge_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    run_id=run_id,
-                    reason=(
-                        f"merge-agent pushed unreviewed HEAD {premerge_head_sha or '(unknown)'}"
-                    ),
-                )
-                state = await db.review_state.get(self._conn, storage_issue_id)
-                await self._retrigger_codex_review_unless_approved(
-                    binding=binding,
-                    issue=issue,
-                    state=state,
-                )
+            if not await self._changed_premerge_head_is_approved(
+                binding=binding,
+                issue=issue,
+                pr_number=pr_number,
+                pr_url=pr_url,
+                run_id=run_id,
+                storage_issue_id=storage_issue_id,
+                premerge_view=premerge_view,
+                premerge_head_sha=premerge_head_sha,
+            ):
                 return True, premerge_view
         elif binding.required_status_checks:
-            try:
-                checks = await (await self._gh_client()).pr_checks(
-                    pr_number,
-                    repo=binding.github_repo,
-                    required_contexts=binding.required_status_checks,
-                )
-            except GitHubError as e:
-                await self._mark_merge_needs_approval(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
-                    run_id=run_id,
-                    reason=f"could not verify configured required checks: {e}",
-                    exc=e,
-                )
-                return True, premerge_view
-            premerge_checks_ready = checks.all_passed
-            if not premerge_checks_ready and _no_signal_head_check_state(premerge_view) == "none":
-                premerge_checks_ready = await self._zero_rollup_merge_authorized(
-                    binding=binding,
-                    issue_id=storage_issue_id,
-                    head_sha=premerge_head_sha,
-                )
+            premerge_checks_ready, checks_error = await self._configured_premerge_checks_ready(
+                binding=binding,
+                pr_number=pr_number,
+                storage_issue_id=storage_issue_id,
+                premerge_view=premerge_view,
+                premerge_head_sha=premerge_head_sha,
+            )
             if not premerge_checks_ready:
+                reason = (
+                    f"could not verify configured required checks: {checks_error}"
+                    if checks_error is not None
+                    else "configured required checks are no longer green for HEAD "
+                    f"{premerge_head_sha or '(unknown)'}"
+                )
                 await self._mark_merge_needs_approval(
                     binding=binding,
                     issue=issue,
                     pr_url=pr_url,
                     run_id=run_id,
-                    reason=(
-                        "configured required checks are no longer green for HEAD "
-                        f"{premerge_head_sha or '(unknown)'}"
-                    ),
+                    reason=reason,
+                    exc=checks_error,
                 )
                 return True, premerge_view
 

@@ -26,6 +26,8 @@ from .harness import load_harness, snapshot_harness
 from .live import LiveBenchConfig, LiveTrialExecutor
 from .maintainability import (
     ClaudeOpusMediumProbeAgent,
+    MutationOutcome,
+    ProbeOutcome,
     SubprocessMutationRunner,
     WaitingOnCustomerVerifier,
     analyze_static,
@@ -476,11 +478,10 @@ def maintainability(
     existing_mutations, existing_probe, existing_errors = load_existing_results(output)
     local = Path(repository).expanduser()
     if local.exists() and static_only:
-        checkout = local.resolve()
         write_reports(
             output=output,
             repository=repository,
-            static=analyze_static(checkout),
+            static=analyze_static(local.resolve()),
             mutations=existing_mutations,
             probe=existing_probe,
             errors=existing_errors,
@@ -488,49 +489,16 @@ def maintainability(
     else:
         with tempfile.TemporaryDirectory(prefix="symphony-maintainability-") as temporary:
             checkout = Path(temporary) / "checkout"
-            if local.exists():
-                shutil.copytree(local.resolve(), checkout, ignore=shutil.ignore_patterns(".git"))
-            else:
-                try:
-                    subprocess.run(
-                        ["gh", "repo", "clone", repository, str(checkout), "--", "--depth=1"],
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                    )
-                except (OSError, subprocess.CalledProcessError) as exc:
-                    raise click.ClickException(f"could not clone {repository}: {exc}") from exc
+            _materialize_maintainability_checkout(local, repository, checkout)
             mutation_outcomes = existing_mutations
             errors = existing_errors
             probe_outcome = existing_probe
             if mutations:
-                try:
-                    subprocess.run(
-                        ["uv", "sync", "--locked"],
-                        cwd=checkout,
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                    )
-                    subprocess.run(
-                        ["npm", "ci"],
-                        cwd=checkout / "frontend",
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                    )
-                except (OSError, subprocess.CalledProcessError) as exc:
-                    raise click.ClickException(f"could not prepare mutation tests: {exc}") from exc
-                try:
-                    mutation_outcomes = run_mutation_pack(
-                        checkout,
-                        mutants=discover_mutants(checkout, limit=24),
-                        runner=SubprocessMutationRunner(),
-                        timeout_seconds=mutation_timeout,
-                    )
-                except RuntimeError as exc:
-                    mutation_outcomes = ()
-                    errors = (str(exc),)
+                mutation_outcomes, errors = _maintainability_mutations(
+                    checkout,
+                    mutation_timeout=mutation_timeout,
+                    existing_errors=existing_errors,
+                )
             if probe:
                 probe_outcome = run_maintenance_probe(
                     checkout,
@@ -539,26 +507,11 @@ def maintainability(
                     timeout_seconds=probe_timeout,
                 )
             if probe_receipt is not None:
-                try:
-                    identity_checkout = local.resolve() if local.exists() else checkout
-                    baseline_sha = subprocess.run(
-                        ["git", "rev-parse", "HEAD"],
-                        cwd=identity_checkout,
-                        check=True,
-                        capture_output=True,
-                        text=True,
-                    ).stdout.strip()
-                    probe_outcome = load_probe_receipt(
-                        probe_receipt,
-                        repository=repository,
-                        baseline_sha=baseline_sha,
-                    )
-                except (OSError, ValueError, json.JSONDecodeError, TypeError) as exc:
-                    raise click.ClickException(f"invalid probe receipt: {exc}") from exc
-                except subprocess.CalledProcessError as exc:
-                    raise click.ClickException(
-                        "could not resolve repository baseline for probe receipt"
-                    ) from exc
+                probe_outcome = _maintainability_probe_receipt(
+                    probe_receipt,
+                    repository=repository,
+                    identity_checkout=local.resolve() if local.exists() else checkout,
+                )
             write_reports(
                 output=output,
                 repository=repository,
@@ -568,6 +521,87 @@ def maintainability(
                 errors=errors,
             )
     click.echo(f"wrote {output / 'MAINTAINABILITY.json'} and MAINTAINABILITY.md")
+
+
+def _materialize_maintainability_checkout(
+    local: Path,
+    repository: str,
+    checkout: Path,
+) -> None:
+    if local.exists():
+        shutil.copytree(local.resolve(), checkout, ignore=shutil.ignore_patterns(".git"))
+        return
+    try:
+        subprocess.run(
+            ["gh", "repo", "clone", repository, str(checkout), "--", "--depth=1"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise click.ClickException(f"could not clone {repository}: {exc}") from exc
+
+
+def _maintainability_mutations(
+    checkout: Path,
+    *,
+    mutation_timeout: float,
+    existing_errors: tuple[str, ...],
+) -> tuple[tuple[MutationOutcome, ...], tuple[str, ...]]:
+    try:
+        subprocess.run(
+            ["uv", "sync", "--locked"],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["npm", "ci"],
+            cwd=checkout / "frontend",
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise click.ClickException(f"could not prepare mutation tests: {exc}") from exc
+    try:
+        outcomes = run_mutation_pack(
+            checkout,
+            mutants=discover_mutants(checkout, limit=24),
+            runner=SubprocessMutationRunner(),
+            timeout_seconds=mutation_timeout,
+        )
+    except RuntimeError as exc:
+        return (), (str(exc),)
+    return outcomes, existing_errors
+
+
+def _maintainability_probe_receipt(
+    probe_receipt: Path,
+    *,
+    repository: str,
+    identity_checkout: Path,
+) -> ProbeOutcome:
+    try:
+        baseline_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=identity_checkout,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        return load_probe_receipt(
+            probe_receipt,
+            repository=repository,
+            baseline_sha=baseline_sha,
+        )
+    except (OSError, ValueError, json.JSONDecodeError, TypeError) as exc:
+        raise click.ClickException(f"invalid probe receipt: {exc}") from exc
+    except subprocess.CalledProcessError as exc:
+        raise click.ClickException(
+            "could not resolve repository baseline for probe receipt"
+        ) from exc
 
 
 async def _snapshot(db_path: Path) -> dict[str, object]:
@@ -675,20 +709,22 @@ def serve(
     import uvicorn
 
     mounted = _BenchSecrets()
-    api_token = api_token or mounted.api_token
-    encryption_key = encryption_key or mounted.encryption_key
-    executor_token = executor_token or mounted.executor_token
-    github_owner = github_owner or mounted.github_owner
-    linear_team_id = linear_team_id or mounted.linear_team_id
-    linear_label_id = linear_label_id or mounted.linear_label_id
-    linear_label_name = linear_label_name or mounted.linear_label_name
-    symphony_repository = symphony_repository or mounted.symphony_repository
-    if not api_token:
-        raise click.ClickException("SYMPHONY_BENCH_TOKEN is required")
-    if not encryption_key:
-        raise click.ClickException("SYMPHONY_ENCRYPTION_KEY is required")
-    if not executor_token:
-        raise click.ClickException("SYMPHONY_BENCH_EXECUTOR_TOKEN is required")
+    api_token = _required_bench_secret(api_token, mounted.api_token, "SYMPHONY_BENCH_TOKEN")
+    encryption_key = _required_bench_secret(
+        encryption_key,
+        mounted.encryption_key,
+        "SYMPHONY_ENCRYPTION_KEY",
+    )
+    executor_token = _required_bench_secret(
+        executor_token,
+        mounted.executor_token,
+        "SYMPHONY_BENCH_EXECUTOR_TOKEN",
+    )
+    github_owner = _bench_secret(github_owner, mounted.github_owner)
+    linear_team_id = _bench_secret(linear_team_id, mounted.linear_team_id)
+    linear_label_id = _bench_secret(linear_label_id, mounted.linear_label_id)
+    linear_label_name = _bench_secret(linear_label_name, mounted.linear_label_name)
+    symphony_repository = _bench_secret(symphony_repository, mounted.symphony_repository)
     asyncio.run(_initialize_control_db(db_path))
     packaged_profile = files("symphony.bench.assets").joinpath("profiles/current.json")
 
@@ -720,6 +756,21 @@ def serve(
         return
     with as_file(packaged_profile) as resolved_profile:
         run_with_profile(resolved_profile)
+
+
+def _bench_secret(explicit: str | None, mounted: str) -> str:
+    return explicit if explicit else mounted
+
+
+def _required_bench_secret(
+    explicit: str | None,
+    mounted: str,
+    name: str,
+) -> str:
+    value = _bench_secret(explicit, mounted)
+    if not value:
+        raise click.ClickException(f"{name} is required")
+    return value
 
 
 async def _initialize_control_db(path: Path) -> None:

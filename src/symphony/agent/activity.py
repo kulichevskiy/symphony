@@ -442,21 +442,32 @@ def _command_value_to_text(value: object) -> str:
 def _extract_exit_code(item: Mapping[str, object]) -> int | None:
     for source in (item, _as_mapping(item.get("result"))):
         for key in ("exit_code", "returncode", "return_code", "code"):
-            value = source.get(key)
-            if isinstance(value, bool):
-                continue
-            if isinstance(value, int):
-                return value
-            if isinstance(value, str):
-                try:
-                    return int(value)
-                except ValueError:
-                    continue
-        status = str(source.get("status") or "").lower()
-        if status in {"failed", "failure", "error"}:
-            return 1
-        if status in {"succeeded", "success", "completed"}:
-            return 0
+            if (exit_code := _coerce_exit_code(source.get(key))) is not None:
+                return exit_code
+        if (exit_code := _status_exit_code(source.get("status"))) is not None:
+            return exit_code
+    return None
+
+
+def _coerce_exit_code(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _status_exit_code(value: object) -> int | None:
+    status = str(value or "").lower()
+    if status in {"failed", "failure", "error"}:
+        return 1
+    if status in {"succeeded", "success", "completed"}:
+        return 0
     return None
 
 
@@ -471,17 +482,26 @@ def _extract_output_lines(item: Mapping[str, object], workspace_path: Path) -> t
 
 
 def _output_value_to_lines(value: object, workspace_path: Path) -> list[str]:
-    raw_lines: list[str] = []
-    if isinstance(value, str):
-        raw_lines = value.splitlines()
-    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray, str)):
-        raw_lines = [str(item) for item in value if item is not None]
     out: list[str] = []
-    for line in raw_lines:
+    for line in _raw_output_lines(value):
         cleaned = sanitize_text(line.strip(), workspace_path=workspace_path, limit=180)
         if cleaned:
             out.append(cleaned)
     return out
+
+
+def _raw_output_lines(value: object) -> list[str]:
+    if isinstance(value, str):
+        return value.splitlines()
+    if not isinstance(value, Sequence):
+        return []
+    if isinstance(value, bytes | bytearray):
+        return []
+    return _stringify_output_items(value)
+
+
+def _stringify_output_items(value: Sequence[object]) -> list[str]:
+    return [str(item) for item in value if item is not None]
 
 
 def _extract_file_paths(item: Mapping[str, object], workspace_path: Path) -> tuple[str, ...]:

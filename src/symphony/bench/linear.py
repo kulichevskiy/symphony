@@ -275,6 +275,116 @@ class LinearSandbox:
         self._projects[experiment_id] = project_id
         return project_id
 
+    async def _load_existing_campaign_issues(
+        self,
+        *,
+        team_id: str,
+        label: str,
+        campaign: Campaign,
+        issue_by_key: dict[str, dict[str, str]],
+    ) -> None:
+        expected_titles = {f"[{label}] {ticket.title}": ticket.key for ticket in campaign.tickets}
+        existing_data = await self._query(
+            _CAMPAIGN_ISSUES,
+            {"teamId": team_id, "titlePrefix": f"[{label}]"},
+            retry_transient=True,
+        )
+        seen_keys: set[str] = set()
+        for issue in (existing_data.get("issues") or {}).get("nodes") or []:
+            if not isinstance(issue, dict):
+                continue
+            key = expected_titles.get(str(issue.get("title", "")))
+            if key is None:
+                continue
+            if key in seen_keys:
+                raise LinearSandboxError(f"duplicate benchmark issue for {label}: {key}")
+            seen_keys.add(key)
+            issue_by_key[key] = {
+                "id": str(issue["id"]),
+                "identifier": str(issue["identifier"]),
+                "url": str(issue["url"]),
+            }
+
+    async def _create_missing_campaign_issues(
+        self,
+        *,
+        team_id: str,
+        todo_id: str,
+        label: str,
+        repo_url: str,
+        project_id: str,
+        campaign: Campaign,
+        issue_by_key: dict[str, dict[str, str]],
+    ) -> None:
+        for ticket in campaign.tickets:
+            if ticket.key in issue_by_key:
+                continue
+            payload = self._successful(
+                await self._query(
+                    _CREATE_ISSUE,
+                    {
+                        "input": {
+                            "teamId": team_id,
+                            "stateId": todo_id,
+                            "labelIds": [self._routing_label_id],
+                            "projectId": project_id,
+                            "title": f"[{label}] {ticket.title}",
+                            "description": (
+                                f"{ticket.description}\n\nBenchmark repository: {repo_url}\n"
+                            ),
+                        }
+                    },
+                ),
+                "issueCreate",
+            )
+            issue = payload["issue"]
+            issue_by_key[ticket.key] = {
+                "id": issue["id"],
+                "identifier": issue["identifier"],
+                "url": issue["url"],
+            }
+
+    async def _ensure_campaign_relations(
+        self,
+        *,
+        campaign: Campaign,
+        issue_by_key: dict[str, dict[str, str]],
+    ) -> None:
+        for ticket in campaign.tickets:
+            for blocker_key in ticket.blocked_by:
+                relation_key = (issue_by_key[blocker_key]["id"], issue_by_key[ticket.key]["id"])
+                if relation_key in self._relations:
+                    continue
+                relation_data = await self._query(
+                    _ISSUE_RELATIONS,
+                    {"id": relation_key[0]},
+                    retry_transient=True,
+                )
+                relation_issue = relation_data.get("issue") or {}
+                relation_nodes = (relation_issue.get("relations") or {}).get("nodes") or []
+                already_exists = any(
+                    isinstance(relation, dict)
+                    and relation.get("type") == "blocks"
+                    and isinstance(relation.get("relatedIssue"), dict)
+                    and str(relation["relatedIssue"].get("id")) == relation_key[1]
+                    for relation in relation_nodes
+                )
+                if not already_exists:
+                    self._successful(
+                        await self._query(
+                            _CREATE_RELATION,
+                            {
+                                "input": {
+                                    "issueId": relation_key[0],
+                                    "relatedIssueId": relation_key[1],
+                                    "type": "blocks",
+                                }
+                            },
+                        ),
+                        "issueRelationCreate",
+                    )
+                self._relations.add(relation_key)
+
     async def create_campaign(
         self,
         *,
@@ -302,91 +412,22 @@ class LinearSandbox:
             )
 
         issue_by_key = self._issues.setdefault(label, {})
-        expected_titles = {f"[{label}] {ticket.title}": ticket.key for ticket in campaign.tickets}
-        existing_data = await self._query(
-            _CAMPAIGN_ISSUES,
-            {"teamId": team_id, "titlePrefix": f"[{label}]"},
-            retry_transient=True,
+        await self._load_existing_campaign_issues(
+            team_id=team_id,
+            label=label,
+            campaign=campaign,
+            issue_by_key=issue_by_key,
         )
-        existing_nodes = (existing_data.get("issues") or {}).get("nodes") or []
-        seen_keys: set[str] = set()
-        for issue in existing_nodes:
-            if not isinstance(issue, dict):
-                continue
-            key = expected_titles.get(str(issue.get("title", "")))
-            if key is None:
-                continue
-            if key in seen_keys:
-                raise LinearSandboxError(f"duplicate benchmark issue for {label}: {key}")
-            seen_keys.add(key)
-            issue_by_key[key] = {
-                "id": str(issue["id"]),
-                "identifier": str(issue["identifier"]),
-                "url": str(issue["url"]),
-            }
-        for ticket in campaign.tickets:
-            if ticket.key in issue_by_key:
-                continue
-            description = f"{ticket.description}\n\nBenchmark repository: {repo_url}\n"
-            issue_payload = self._successful(
-                await self._query(
-                    _CREATE_ISSUE,
-                    {
-                        "input": {
-                            "teamId": team_id,
-                            "stateId": todo_id,
-                            "labelIds": [self._routing_label_id],
-                            "projectId": project_id,
-                            "title": f"[{label}] {ticket.title}",
-                            "description": description,
-                        }
-                    },
-                ),
-                "issueCreate",
-            )
-            issue = issue_payload["issue"]
-            issue_by_key[ticket.key] = {
-                "id": issue["id"],
-                "identifier": issue["identifier"],
-                "url": issue["url"],
-            }
-
-        for ticket in campaign.tickets:
-            for blocker_key in ticket.blocked_by:
-                relation_key = (issue_by_key[blocker_key]["id"], issue_by_key[ticket.key]["id"])
-                if relation_key in self._relations:
-                    continue
-                relation_data = await self._query(
-                    _ISSUE_RELATIONS,
-                    {"id": relation_key[0]},
-                    retry_transient=True,
-                )
-                relation_issue = relation_data.get("issue") or {}
-                relation_nodes = (relation_issue.get("relations") or {}).get("nodes") or []
-                already_exists = any(
-                    isinstance(relation, dict)
-                    and relation.get("type") == "blocks"
-                    and isinstance(relation.get("relatedIssue"), dict)
-                    and str(relation["relatedIssue"].get("id")) == relation_key[1]
-                    for relation in relation_nodes
-                )
-                if already_exists:
-                    self._relations.add(relation_key)
-                    continue
-                self._successful(
-                    await self._query(
-                        _CREATE_RELATION,
-                        {
-                            "input": {
-                                "issueId": issue_by_key[blocker_key]["id"],
-                                "relatedIssueId": issue_by_key[ticket.key]["id"],
-                                "type": "blocks",
-                            }
-                        },
-                    ),
-                    "issueRelationCreate",
-                )
-                self._relations.add(relation_key)
+        await self._create_missing_campaign_issues(
+            team_id=team_id,
+            todo_id=str(todo_id),
+            label=label,
+            repo_url=repo_url,
+            project_id=project_id,
+            campaign=campaign,
+            issue_by_key=issue_by_key,
+        )
+        await self._ensure_campaign_relations(campaign=campaign, issue_by_key=issue_by_key)
 
         ordered = [issue_by_key[ticket.key] for ticket in campaign.tickets]
         return LinearCampaign(

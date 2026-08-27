@@ -226,6 +226,38 @@ def _binding_key(binding: RepoBinding) -> BindingKey:
     return binding_natural_key(binding)
 
 
+def _binding_matches_issue(
+    binding: RepoBinding,
+    issue: LinearIssue,
+    tracker_ctx: TrackerContext | None,
+) -> bool:
+    if tracker_ctx is not None and _tracker_context_for_binding(binding) != tracker_ctx:
+        return False
+    if binding.linear_team_key != issue.team_key:
+        return False
+    return not binding.issue_label or binding.issue_label in issue.labels
+
+
+def _parse_run_timestamp(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _operator_reconnected_after_run(
+    status: db.oauth_connections.ConnectionStatus,
+    run_started_at: str,
+) -> bool:
+    if status.updated_by not in ("oauth",) or not run_started_at or not status.updated_at:
+        return False
+    updated = _parse_run_timestamp(status.updated_at)
+    started = _parse_run_timestamp(run_started_at)
+    return bool(
+        updated is not None and started is not None and updated >= started.replace(microsecond=0)
+    )
+
+
 def _queue_scope(binding: RepoBinding) -> str:
     """`tracker_queue.scope` for a binding: `_binding_key` minus the team
     (already its own column), so two bindings on one team never clobber each
@@ -880,13 +912,8 @@ class _OrchestratorBase:
         self, issue: LinearIssue, tracker_ctx: TrackerContext | None = None
     ) -> RepoBinding | None:
         for binding in self.config.repos:
-            if tracker_ctx is not None and _tracker_context_for_binding(binding) != tracker_ctx:
-                continue
-            if binding.linear_team_key != issue.team_key:
-                continue
-            if binding.issue_label and binding.issue_label not in issue.labels:
-                continue
-            return binding
+            if _binding_matches_issue(binding, issue, tracker_ctx):
+                return binding
         return None
 
     def _binding_for_review(
@@ -1166,7 +1193,15 @@ class _OrchestratorBase:
             )
 
     async def _tick(self) -> list[asyncio.Task[None]]:
-        scheduled: list[asyncio.Task[None]] = []
+        await self._reload_tick_state()
+        await self._react_to_binding_set()
+        await self._refresh_tick_state()
+        scheduled = await self._poll_tick_work()
+        scheduled.extend(await self._scan_tick_bindings())
+        await self._poll_tick_slash_commands()
+        return scheduled
+
+    async def _reload_tick_state(self) -> None:
         if self._reload_bindings_from_db:
             try:
                 await self._reload_bindings()
@@ -1177,12 +1212,8 @@ class _OrchestratorBase:
                     await self._repo_secret_view.reload(self._conn)
                 except Exception:  # noqa: BLE001 — must not kill the loop
                     log.exception("repo secret view reload failed")
-        # React to the current binding set — the first tick always fires (prunes
-        # stale `tracker_queue` scopes, registers boot trackers), later ticks
-        # only when a reload changed the set. Runs before the scan loop so a
-        # hot-added binding's tracker is registered before `_scan_binding`
-        # resolves it.
-        await self._react_to_binding_set()
+
+    async def _refresh_tick_state(self) -> None:
         try:
             await self._refresh_linear_tracker_credentials()
         except Exception:  # noqa: BLE001 — must not kill the loop
@@ -1215,6 +1246,9 @@ class _OrchestratorBase:
             await self._retry_pending_notifications()
         except Exception:  # noqa: BLE001 — must not kill the loop
             log.exception("telegram notification retry failed")
+
+    async def _poll_tick_work(self) -> list[asyncio.Task[None]]:
+        scheduled: list[asyncio.Task[None]] = []
         try:
             scheduled.extend(await self._poll_merge_candidates())
         except Exception:  # noqa: BLE001 — must not kill the loop
@@ -1227,6 +1261,10 @@ class _OrchestratorBase:
             scheduled.extend(await self._resurrect_review_runs())
         except Exception:  # noqa: BLE001 — must not kill the loop
             log.exception("review resurrection failed")
+        return scheduled
+
+    async def _scan_tick_bindings(self) -> list[asyncio.Task[None]]:
+        scheduled: list[asyncio.Task[None]] = []
         for binding in self.config.repos:
             ctx = _tracker_context_for_binding(binding)
             # A stale context's registered tracker is the pre-edit client
@@ -1245,11 +1283,13 @@ class _OrchestratorBase:
                 scheduled.extend(await self._scan_binding(binding))
             except Exception:  # noqa: BLE001 — one dead lane must not starve the rest
                 log.exception("scan failed for binding %s", binding.linear_team_key)
+        return scheduled
+
+    async def _poll_tick_slash_commands(self) -> None:
         try:
             await self._poll_slash_commands()
         except Exception:  # noqa: BLE001 — must not kill the loop
             log.exception("slash command poll failed")
-        return scheduled
 
     @property
     def config_write_lock(self) -> asyncio.Lock:
@@ -1258,6 +1298,25 @@ class _OrchestratorBase:
         run its whole transaction while holding this lock so the reload — which
         also takes it — only ever observes committed state."""
         return self._config_write_lock
+
+    def _binding_reload_snapshots(
+        self,
+    ) -> tuple[
+        dict[StateCacheKey, dict[BindingKey, object]],
+        dict[BindingKey, int],
+        dict[TrackerContext, str | None],
+    ]:
+        states_by_key: dict[StateCacheKey, dict[BindingKey, object]] = {}
+        max_concurrent_by_key: dict[BindingKey, int] = {}
+        jira_base_url_by_ctx: dict[TrackerContext, str | None] = {}
+        for binding in self.config.repos:
+            states_by_key.setdefault(_state_cache_key(binding), {})[_binding_key(binding)] = (
+                binding.linear_states
+            )
+            max_concurrent_by_key[_binding_key(binding)] = binding.max_concurrent
+            if binding.provider == "jira":
+                jira_base_url_by_ctx[_tracker_context_for_binding(binding)] = binding.base_url
+        return states_by_key, max_concurrent_by_key, jira_base_url_by_ctx
 
     async def _reload_bindings(self) -> None:
         """Re-read all bindings (enabled + disabled) from the config DB and
@@ -1275,8 +1334,11 @@ class _OrchestratorBase:
         argv/env captured at its dispatch. `_react_to_binding_set` (called next
         in `_tick`) reconciles the tracker registry and queue scopes.
         """
-        previous_states_by_state_key: dict[StateCacheKey, dict[BindingKey, object]] = {}
-        previous_max_concurrent_by_key: dict[BindingKey, int] = {}
+        (
+            previous_states_by_state_key,
+            previous_max_concurrent_by_key,
+            previous_jira_base_url_by_ctx,
+        ) = self._binding_reload_snapshots()
         # A Jira binding's `tracker_site` is its stable natural-key component —
         # editing `base_url` alone leaves both it and `state_key` unchanged, so
         # neither the hot-add "context already registered" check nor the
@@ -1284,16 +1346,6 @@ class _OrchestratorBase:
         # per context (last-write-wins, mirroring `_hot_add_trackers`'
         # `representative` selection) and mark the context stale below when it
         # moves (SYM-189).
-        previous_jira_base_url_by_ctx: dict[TrackerContext, str | None] = {}
-        for binding in self.config.repos:
-            previous_states_by_state_key.setdefault(_state_cache_key(binding), {})[
-                _binding_key(binding)
-            ] = binding.linear_states
-            previous_max_concurrent_by_key[_binding_key(binding)] = binding.max_concurrent
-            if binding.provider == "jira":
-                previous_jira_base_url_by_ctx[_tracker_context_for_binding(binding)] = (
-                    binding.base_url
-                )
         async with self._config_write_lock:
             try:
                 effective = await assemble_effective_config(
@@ -3274,27 +3326,14 @@ class _OrchestratorBase:
         # refresh (auto-refresh/write-back) bumps updated_at but keeps the same
         # account, so a 401 on the refreshed token must still expire it
         # (review fix: don't treat a refreshed run as stale).
-        _operator_touched = status.updated_by in ("oauth",)
-        if _operator_touched and run_started_at and status.updated_at:
-            updated: datetime | None
-            started: datetime | None
-            try:
-                updated = datetime.fromisoformat(status.updated_at.replace("Z", "+00:00"))
-                started = datetime.fromisoformat(run_started_at.replace("Z", "+00:00"))
-            except ValueError:
-                updated = started = None
-            # OAuth updated_at has second precision while run started_at can
-            # carry microseconds — floor the start so a same-second reconnect
-            # counts as "after the run started" (conservative: don't flag).
-            if (
-                updated is not None
-                and started is not None
-                and updated >= started.replace(microsecond=0)
-            ):
-                log.info(
-                    "claude auth failure from a run older than the stored credential; not flagging"
-                )
-                return self._record_claude_auth_verdict(run_id, False)
+        # OAuth updated_at has second precision while run started_at can carry
+        # microseconds; the helper floors the latter so same-second reconnects
+        # conservatively count as newer than the failed run.
+        if _operator_reconnected_after_run(status, run_started_at):
+            log.info(
+                "claude auth failure from a run older than the stored credential; not flagging"
+            )
+            return self._record_claude_auth_verdict(run_id, False)
         # Re-validate before expiring: a daemon refresh that still succeeds
         # means the shared connection is fine and the run's failure was
         # transient. Only claude has a clean central refresh here — codex keeps

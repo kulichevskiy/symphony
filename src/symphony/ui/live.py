@@ -117,6 +117,14 @@ def _message_usage_event(usage: object) -> dict[str, Any] | None:
     output_tokens = usage.get("output_tokens")
     if input_tokens is None and output_tokens is None:
         return None
+    return _incremental_tokens_event(usage, input_tokens, output_tokens)
+
+
+def _incremental_tokens_event(
+    usage: Mapping[str, Any],
+    input_tokens: Any,
+    output_tokens: Any,
+) -> dict[str, Any]:
     # Claude's per-assistant-message usage is scoped to that one turn, ahead
     # of the terminal cumulative `result` tick above — the client must add it
     # to the running total rather than replace.
