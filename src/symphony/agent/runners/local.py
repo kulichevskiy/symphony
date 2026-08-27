@@ -154,71 +154,6 @@ class _Heartbeat:
         return self.last_line + stall_secs
 
 
-def _prepare_run_environment(spec: RunnerSpec) -> tuple[dict[str, str], str | None]:
-    inherited = {key: value for key, value in os.environ.items() if not key.startswith("SYMPHONY_")}
-    _scrub_ambient_agent_auth(inherited, spec.env)
-    env = {**inherited, **spec.env}
-    credentials = spec.credentials
-    if credentials is not None and "GH_TOKEN" in spec.env:
-        credentials = RunCredentials(
-            github_token=spec.env["GH_TOKEN"],
-            linear_token=credentials.linear_token,
-        )
-    if credentials is None or credentials.is_empty:
-        return env, None
-
-    cred_home = tempfile.mkdtemp(prefix="symphony-run-creds-")
-    try:
-        os.chmod(cred_home, 0o700)
-        prior_gitconfig = Path(env["GIT_CONFIG_GLOBAL"]) if "GIT_CONFIG_GLOBAL" in env else None
-        cred_env = materialize_credentials(
-            credentials,
-            Path(cred_home),
-            prior_gitconfig=prior_gitconfig,
-            github_host=spec.github_host,
-        )
-    except Exception:
-        _remove_cred_home(cred_home)
-        raise
-    return {**env, **cred_env, **spec.env}, cred_home
-
-
-async def _drain_runner_events(
-    *,
-    proc: asyncio.subprocess.Process,
-    wait_task: asyncio.Task[int],
-    stdout_task: asyncio.Task[None],
-    stderr_task: asyncio.Task[None],
-    events: asyncio.Queue[RunnerEvent],
-    loop: asyncio.AbstractEventLoop,
-) -> AsyncIterator[RunnerEvent]:
-    drain_deadline: float | None = None
-    cleaned_process_group = False
-    while True:
-        try:
-            event = await asyncio.wait_for(events.get(), timeout=0.25)
-        except TimeoutError:
-            process_done = (
-                wait_task.done() or proc.returncode is not None or not _pid_alive(proc.pid)
-            )
-            if not process_done:
-                drain_deadline = None
-                yield RunnerEvent(kind="tick")
-                continue
-            if not cleaned_process_group:
-                with suppress(ProcessLookupError):
-                    _terminate_process_group(proc.pid)
-                cleaned_process_group = True
-            if stdout_task.done() and stderr_task.done():
-                return
-            if drain_deadline is None:
-                drain_deadline = loop.time() + _STREAM_DRAIN_SECS
-            if loop.time() >= drain_deadline:
-                return
-            continue
-        yield event
-
-
 class LocalRunner:
     """Runs agent CLIs as subprocesses on this host.
 
@@ -237,8 +172,44 @@ class LocalRunner:
         # agent working on this very repo must not have its tests/verification
         # inherit the host deployment's posture. spec.env (the per-binding
         # allowlist) still overrides.
-        # Materialize DB-resolved credentials into a private, per-run home.
-        env, cred_home = _prepare_run_environment(spec)
+        inherited = {k: v for k, v in os.environ.items() if not k.startswith("SYMPHONY_")}
+        _scrub_ambient_agent_auth(inherited, spec.env)
+        env = {**inherited, **spec.env}
+        # Materialize DB-resolved creds into a private home for this run only
+        # (OAuth in UI 4/7). Torn down in `finally` and on spawn failure — never
+        # a persistent volume file. spec.env still overrides (the per-binding
+        # allowlist wins over a materialized default).
+        cred_home: str | None = None
+        credentials = spec.credentials
+        # A binding that supplies its own `GH_TOKEN` via `env:` wants that
+        # token used everywhere — not just by env-reading consumers like
+        # `gh`. Without this, materializing the DB/volume-resolved GitHub
+        # token below still writes a `.git-credentials` file + credential
+        # helper (`GIT_CONFIG_GLOBAL`) built from the *other* token, so plain
+        # `git push` would silently authenticate with it regardless of the
+        # binding's override (SYM-199 review fix). Materialize the binding's
+        # own token instead so git and `gh` agree.
+        if credentials is not None and "GH_TOKEN" in spec.env:
+            credentials = RunCredentials(
+                github_token=spec.env["GH_TOKEN"], linear_token=credentials.linear_token
+            )
+        if credentials is not None and not credentials.is_empty:
+            cred_home = tempfile.mkdtemp(prefix="symphony-run-creds-")
+            try:
+                os.chmod(cred_home, 0o700)
+                prior_gitconfig = (
+                    Path(env["GIT_CONFIG_GLOBAL"]) if "GIT_CONFIG_GLOBAL" in env else None
+                )
+                cred_env = materialize_credentials(
+                    credentials,
+                    Path(cred_home),
+                    prior_gitconfig=prior_gitconfig,
+                    github_host=spec.github_host,
+                )
+            except Exception:
+                _remove_cred_home(cred_home)
+                raise
+            env = {**env, **cred_env, **spec.env}
         # Control-channel mode (SYM-235): the prompt travels on stdin and stdin
         # stays open so the agent can ask questions mid-run. Every other spawn
         # site keeps /dev/null, where no control traffic is possible.
@@ -420,6 +391,9 @@ class LocalRunner:
         wait_task = asyncio.create_task(proc.wait())
         refusal_task = asyncio.create_task(refusal_guard(channel)) if channel is not None else None
         watch_task = asyncio.create_task(watchdog())
+        drain_deadline: float | None = None
+        cleaned_process_group = False
+
         try:
             if spec.run_id in self._pending_kills:
                 self._pending_kills.discard(spec.run_id)
@@ -433,15 +407,32 @@ class LocalRunner:
             # still tears down the child, the tasks and the credential home.
             if channel is not None and conversation is not None:
                 await channel.send_prompt(conversation.prompt)
-            async for event in _drain_runner_events(
-                proc=proc,
-                wait_task=wait_task,
-                stdout_task=stdout_task,
-                stderr_task=stderr_task,
-                events=events,
-                loop=loop,
-            ):
-                yield event
+            while True:
+                # Drain queued events; if process has exited and queue is empty, stop.
+                try:
+                    ev = await asyncio.wait_for(events.get(), timeout=0.25)
+                except TimeoutError:
+                    process_done = (
+                        wait_task.done() or proc.returncode is not None or not _pid_alive(proc.pid)
+                    )
+                    if process_done:
+                        # Flush tail output without letting inherited pipe handles
+                        # keep the runner open after the parent process is gone.
+                        if not cleaned_process_group:
+                            with suppress(ProcessLookupError):
+                                _terminate_process_group(proc.pid)
+                            cleaned_process_group = True
+                        if stdout_task.done() and stderr_task.done():
+                            break
+                        if drain_deadline is None:
+                            drain_deadline = loop.time() + _STREAM_DRAIN_SECS
+                        if loop.time() >= drain_deadline:
+                            break
+                        continue
+                    drain_deadline = None
+                    yield RunnerEvent(kind="tick")
+                    continue
+                yield ev
 
             for task in (stdout_task, stderr_task):
                 if not task.done():

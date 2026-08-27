@@ -191,206 +191,6 @@ def _latest_reviews_by_author(reviews: Iterable[Review]) -> list[Review]:
     return list(latest.values())
 
 
-def _required_check_verdict(ci: list[CheckRun], *, head_sha: str) -> Verdict | None:
-    failing = [
-        check
-        for check in ci
-        if check.required is not False
-        and check.status == "completed"
-        and check.conclusion in BLOCKING_CHECK_CONCLUSIONS
-    ]
-    if failing:
-        names = sorted(check.name for check in failing)
-        return Verdict(
-            kind=VerdictKind.CHANGES_REQUESTED,
-            trigger_signature=f"ci:{head_sha}:" + ",".join(names),
-            rule="failing_ci",
-            failing_checks=tuple(names),
-        )
-
-    pending = [check for check in ci if check.required is not False and check.status != "completed"]
-    if pending:
-        return Verdict(
-            kind=VerdictKind.PENDING,
-            rule="pending_ci",
-            pending_checks=tuple(check.name for check in pending),
-        )
-    return None
-
-
-def _signal_is_fresh(ts: str, *, head_dt: datetime | None, unknown_is_fresh: bool) -> bool:
-    if head_dt is None:
-        return True
-    signal_dt = _parse_iso(ts)
-    if signal_dt is None:
-        return unknown_is_fresh
-    return signal_dt >= head_dt
-
-
-def _codex_review_has_no_issues_marker(review: Review, *, head_dt: datetime | None) -> bool:
-    return (
-        review.state == "COMMENTED"
-        and is_codex_author(review.user_login)
-        and CODEX_NO_ISSUES_MARKER in review.body.casefold()
-        and _signal_is_fresh(review.submitted_at, head_dt=head_dt, unknown_is_fresh=True)
-    )
-
-
-def _codex_review_has_approval_emoji(review: Review, *, head_dt: datetime | None) -> bool:
-    return (
-        review.state == "COMMENTED"
-        and is_codex_author(review.user_login)
-        and len(review.body) < CODEX_BOILERPLATE_THRESHOLD
-        and "👍" in review.body
-        and _signal_is_fresh(review.submitted_at, head_dt=head_dt, unknown_is_fresh=True)
-    )
-
-
-def _codex_review_is_approval(review: Review, *, head_dt: datetime | None) -> bool:
-    return _codex_review_has_no_issues_marker(
-        review, head_dt=head_dt
-    ) or _codex_review_has_approval_emoji(review, head_dt=head_dt)
-
-
-def _newer_approval_time(
-    current: datetime | None,
-    ts: str,
-    *,
-    head_dt: datetime | None,
-    require_head_timestamp: bool,
-) -> datetime | None:
-    if require_head_timestamp and head_dt is None:
-        return current
-    signal_dt = _parse_iso(ts)
-    if signal_dt is None or (head_dt is not None and signal_dt < head_dt):
-        return current
-    if current is None or signal_dt > current:
-        return signal_dt
-    return current
-
-
-def _codex_approval_time(
-    *,
-    snapshot: ReviewSnapshot,
-    fresh_reviews: list[Review],
-    head_dt: datetime | None,
-) -> datetime | None:
-    approval_at: datetime | None = None
-    for reaction in snapshot.reactions:
-        if not is_codex_author(reaction.user_login) or reaction.content != "+1":
-            continue
-        if reaction.commit_sha and not _sha_refers_to(reaction.commit_sha, snapshot.head_sha):
-            continue
-        approval_at = _newer_approval_time(
-            approval_at,
-            reaction.created_at,
-            head_dt=head_dt,
-            require_head_timestamp=True,
-        )
-
-    for review in fresh_reviews:
-        if _codex_review_is_approval(review, head_dt=head_dt):
-            approval_at = _newer_approval_time(
-                approval_at,
-                review.submitted_at,
-                head_dt=head_dt,
-                require_head_timestamp=False,
-            )
-    return approval_at
-
-
-def _superseded_by_approval(ts: str, *, approval_at: datetime | None) -> bool:
-    if approval_at is None:
-        return False
-    signal_dt = _parse_iso(ts)
-    return signal_dt is not None and approval_at > signal_dt
-
-
-def _review_feedback_verdict(
-    *,
-    comments: list[ReviewComment],
-    snapshot: ReviewSnapshot,
-    fresh_reviews: list[Review],
-    latest_human_reviews: list[Review],
-    head_dt: datetime | None,
-    codex_approval_at: datetime | None,
-) -> Verdict | None:
-    codex_on_head = [
-        comment
-        for comment in comments
-        if is_codex_author(comment.user_login)
-        and comment.commit_sha == snapshot.head_sha
-        and _signal_is_fresh(comment.created_at, head_dt=head_dt, unknown_is_fresh=False)
-        and not _superseded_by_approval(comment.created_at, approval_at=codex_approval_at)
-    ]
-    if codex_on_head:
-        digest = _stable_digest(sorted(_comment_key(comment) for comment in codex_on_head))
-        return Verdict(
-            kind=VerdictKind.CHANGES_REQUESTED,
-            trigger_signature=f"codex_inline:{digest}",
-            rule="codex_inline",
-            codex_comments=tuple(codex_on_head),
-        )
-
-    codex_substantive = [
-        review
-        for review in fresh_reviews
-        if is_codex_author(review.user_login)
-        and review.state == "COMMENTED"
-        and len(review.body) > CODEX_BOILERPLATE_THRESHOLD
-        and not _codex_review_is_approval(review, head_dt=head_dt)
-        and _signal_is_fresh(review.submitted_at, head_dt=head_dt, unknown_is_fresh=True)
-        and not _superseded_by_approval(review.submitted_at, approval_at=codex_approval_at)
-    ]
-    if codex_substantive:
-        body = codex_substantive[-1].body
-        return Verdict(
-            kind=VerdictKind.CHANGES_REQUESTED,
-            trigger_signature=f"codex_review:{_stable_digest((body,))}",
-            rule="codex_review",
-            last_review_body=body,
-        )
-
-    human_changes_requested = [
-        review for review in latest_human_reviews if review.state == "CHANGES_REQUESTED"
-    ]
-    if human_changes_requested:
-        logins = sorted({review.user_login for review in human_changes_requested})
-        return Verdict(
-            kind=VerdictKind.CHANGES_REQUESTED,
-            trigger_signature=f"human_cr:{snapshot.head_sha}:" + ",".join(logins),
-            rule="human_changes_requested",
-            last_review_body=human_changes_requested[-1].body,
-        )
-    return None
-
-
-def _approval_verdict(
-    *,
-    snapshot: ReviewSnapshot,
-    fresh_reviews: list[Review],
-    latest_human_reviews: list[Review],
-    head_dt: datetime | None,
-    codex_approval_at: datetime | None,
-) -> Verdict:
-    codex_approved = (
-        codex_approval_at is not None
-        or any(
-            _codex_review_has_no_issues_marker(review, head_dt=head_dt) for review in fresh_reviews
-        )
-        or any(
-            _codex_review_has_approval_emoji(review, head_dt=head_dt) for review in fresh_reviews
-        )
-    )
-    human_approved = any(review.state == "APPROVED" for review in latest_human_reviews)
-    if not (codex_approved or human_approved):
-        return Verdict(kind=VerdictKind.PENDING, rule="no_signal")
-    if snapshot.mergeable != "MERGEABLE":
-        return Verdict(kind=VerdictKind.PENDING, rule="approved_unknown_mergeable")
-    rule_name = "codex_approved" if codex_approved else "human_approved"
-    return Verdict(kind=VerdictKind.APPROVED, rule=rule_name)
-
-
 def review_classifier(
     *,
     comments: list[ReviewComment],
@@ -398,8 +198,32 @@ def review_classifier(
     snapshot: ReviewSnapshot,
 ) -> Verdict:
     """Classify the current review state. See module docstring for rules."""
-    if check_verdict := _required_check_verdict(ci, head_sha=snapshot.head_sha):
-        return check_verdict
+
+    # Rule 1 — failed required (or unknown-required) CI check.
+    failing = [
+        c
+        for c in ci
+        if c.required is not False
+        and c.status == "completed"
+        and c.conclusion in BLOCKING_CHECK_CONCLUSIONS
+    ]
+    if failing:
+        names = sorted(c.name for c in failing)
+        return Verdict(
+            kind=VerdictKind.CHANGES_REQUESTED,
+            trigger_signature=f"ci:{snapshot.head_sha}:" + ",".join(names),
+            rule="failing_ci",
+            failing_checks=tuple(names),
+        )
+
+    pending = [c for c in ci if c.required is not False and c.status != "completed"]
+    # Rule 2 — pending required CI check (no failures).
+    if pending:
+        return Verdict(
+            kind=VerdictKind.PENDING,
+            rule="pending_ci",
+            pending_checks=tuple(c.name for c in pending),
+        )
 
     # Rule 3 — merge conflict blocks regardless of review/approval state.
     # Checked before comment rules so a conflict is always detected even
@@ -414,33 +238,166 @@ def review_classifier(
 
     head_dt = _parse_iso(snapshot.head_committed_at)
 
+    def fresh_for_head(ts: str) -> bool:
+        if head_dt is None:
+            return True
+        signal_dt = _parse_iso(ts)
+        return signal_dt is not None and signal_dt >= head_dt
+
+    def after_head_or_unknown(ts: str) -> bool:
+        if head_dt is None:
+            return True
+        signal_dt = _parse_iso(ts)
+        return signal_dt is None or signal_dt >= head_dt
+
     fresh_reviews = [r for r in snapshot.reviews if r.commit_sha == snapshot.head_sha]
     latest_human_reviews = [
         r for r in _latest_reviews_by_author(fresh_reviews) if not is_codex_author(r.user_login)
     ]
 
-    codex_approval_at = _codex_approval_time(
-        snapshot=snapshot,
-        fresh_reviews=fresh_reviews,
-        head_dt=head_dt,
-    )
-    feedback = _review_feedback_verdict(
-        comments=comments,
-        snapshot=snapshot,
-        fresh_reviews=fresh_reviews,
-        latest_human_reviews=latest_human_reviews,
-        head_dt=head_dt,
-        codex_approval_at=codex_approval_at,
-    )
-    if feedback is not None:
-        return feedback
-    return _approval_verdict(
-        snapshot=snapshot,
-        fresh_reviews=fresh_reviews,
-        latest_human_reviews=latest_human_reviews,
-        head_dt=head_dt,
-        codex_approval_at=codex_approval_at,
-    )
+    def codex_review_has_no_issues_marker(r: Review) -> bool:
+        return (
+            r.state == "COMMENTED"
+            and is_codex_author(r.user_login)
+            and CODEX_NO_ISSUES_MARKER in r.body.casefold()
+            and after_head_or_unknown(r.submitted_at)
+        )
+
+    def codex_review_has_approval_emoji(r: Review) -> bool:
+        return (
+            r.state == "COMMENTED"
+            and is_codex_author(r.user_login)
+            and len(r.body) < CODEX_BOILERPLATE_THRESHOLD
+            and "👍" in r.body
+            and after_head_or_unknown(r.submitted_at)
+        )
+
+    def codex_review_is_approval(r: Review) -> bool:
+        return codex_review_has_no_issues_marker(r) or codex_review_has_approval_emoji(r)
+
+    codex_approval_at: datetime | None = None
+
+    def record_codex_approval_time(
+        ts: str,
+        *,
+        require_head_timestamp: bool,
+    ) -> None:
+        nonlocal codex_approval_at
+        if require_head_timestamp and head_dt is None:
+            return
+        signal_dt = _parse_iso(ts)
+        if signal_dt is None:
+            return
+        if head_dt is not None and signal_dt < head_dt:
+            return
+        if codex_approval_at is None or signal_dt > codex_approval_at:
+            codex_approval_at = signal_dt
+
+    # Codex +1 reactions also carry normalized top-level "no issues" issue
+    # comments, supplied by the orchestrator as Reaction(content="+1").
+    for rxn in snapshot.reactions:
+        if is_codex_author(rxn.user_login) and rxn.content == "+1":
+            # When the approval names the commit it reviewed (Codex's
+            # "Reviewed commit: <sha>" line), require it to be the current
+            # HEAD. Otherwise a stale approval — e.g. after the branch is
+            # updated/rebased past the reviewed commit — would still
+            # authorize an auto-merge of a never-reviewed HEAD. Genuine
+            # GitHub reactions carry no SHA and stay time-validated. Codex
+            # abbreviates the SHA, so match it as a prefix of the full OID.
+            if rxn.commit_sha and not _sha_refers_to(rxn.commit_sha, snapshot.head_sha):
+                continue
+            record_codex_approval_time(
+                rxn.created_at,
+                require_head_timestamp=True,
+            )
+
+    for review in fresh_reviews:
+        if codex_review_is_approval(review):
+            record_codex_approval_time(
+                review.submitted_at,
+                require_head_timestamp=False,
+            )
+
+    def superseded_by_codex_approval(ts: str) -> bool:
+        if codex_approval_at is None:
+            return False
+        signal_dt = _parse_iso(ts)
+        return signal_dt is not None and codex_approval_at > signal_dt
+
+    # Rule 4 — Codex inline review comments on HEAD.
+    codex_on_head = [
+        c
+        for c in comments
+        if is_codex_author(c.user_login)
+        and c.commit_sha == snapshot.head_sha
+        and fresh_for_head(c.created_at)
+        and not superseded_by_codex_approval(c.created_at)
+    ]
+    if codex_on_head:
+        keys = sorted(_comment_key(c) for c in codex_on_head)
+        # Keep the signature compact while staying stable across interpreter
+        # restarts so persisted dedup state remains meaningful.
+        digest = _stable_digest(keys)
+        return Verdict(
+            kind=VerdictKind.CHANGES_REQUESTED,
+            trigger_signature=f"codex_inline:{digest}",
+            rule="codex_inline",
+            codex_comments=tuple(codex_on_head),
+        )
+
+    # Rule 5 — Codex `COMMENTED` review with substantive body on HEAD.
+    codex_substantive = [
+        r
+        for r in fresh_reviews
+        if is_codex_author(r.user_login)
+        and r.state == "COMMENTED"
+        and len(r.body) > CODEX_BOILERPLATE_THRESHOLD
+        and not codex_review_is_approval(r)
+        and after_head_or_unknown(r.submitted_at)
+        and not superseded_by_codex_approval(r.submitted_at)
+    ]
+    if codex_substantive:
+        body = codex_substantive[-1].body
+        digest = _stable_digest((body,))
+        return Verdict(
+            kind=VerdictKind.CHANGES_REQUESTED,
+            trigger_signature=f"codex_review:{digest}",
+            rule="codex_review",
+            last_review_body=body,
+        )
+
+    # Rule 6 — human `CHANGES_REQUESTED` on HEAD.
+    human_cr = [r for r in latest_human_reviews if r.state == "CHANGES_REQUESTED"]
+    if human_cr:
+        logins = sorted({r.user_login for r in human_cr})
+        return Verdict(
+            kind=VerdictKind.CHANGES_REQUESTED,
+            trigger_signature=f"human_cr:{snapshot.head_sha}:" + ",".join(logins),
+            rule="human_changes_requested",
+            last_review_body=human_cr[-1].body,
+        )
+
+    # Rule 7 — Codex approval signals.
+    codex_no_issues = any(codex_review_has_no_issues_marker(r) for r in fresh_reviews)
+    codex_emoji_approve = any(codex_review_has_approval_emoji(r) for r in fresh_reviews)
+    codex_approved = codex_approval_at is not None or codex_no_issues or codex_emoji_approve
+
+    # Rule 8 — human `APPROVED`.
+    human_approved = any(r.state == "APPROVED" for r in latest_human_reviews)
+    approved = codex_approved or human_approved
+
+    if approved:
+        # Rule 9 — mergeable still computing or unavailable; do not race
+        # `gh pr merge`.
+        if snapshot.mergeable != "MERGEABLE":
+            return Verdict(
+                kind=VerdictKind.PENDING,
+                rule="approved_unknown_mergeable",
+            )
+        rule_name = "codex_approved" if codex_approved else "human_approved"
+        return Verdict(kind=VerdictKind.APPROVED, rule=rule_name)
+
+    return Verdict(kind=VerdictKind.PENDING, rule="no_signal")
 
 
 def should_dispatch_fix_run(*, prev_signature: str, new_signature: str) -> bool:

@@ -880,34 +880,23 @@ def _status_check_detail(check: dict[str, Any]) -> dict[str, object]:
 
 def _status_check_nodes(raw: object) -> list[dict[str, Any]]:
     if isinstance(raw, list):
-        return _dict_entries(raw)
-    if isinstance(raw, dict):
-        return _status_check_mapping_nodes(raw)
-    return []
+        return [entry for entry in raw if isinstance(entry, dict)]
+    if not isinstance(raw, dict):
+        return []
 
-
-def _status_check_mapping_nodes(raw: dict[str, object]) -> list[dict[str, Any]]:
     nodes = raw.get("nodes")
     if isinstance(nodes, list):
-        return _dict_entries(nodes)
+        return [entry for entry in nodes if isinstance(entry, dict)]
+
     edges = raw.get("edges")
     if isinstance(edges, list):
-        return _edge_nodes(edges)
+        return [
+            edge["node"]
+            for edge in edges
+            if isinstance(edge, dict) and isinstance(edge.get("node"), dict)
+        ]
+
     contexts = raw.get("contexts")
     if isinstance(contexts, list):
-        return _dict_entries(contexts)
+        return [entry for entry in contexts if isinstance(entry, dict)]
     return []
-
-
-def _dict_entries(values: list[object]) -> list[dict[str, Any]]:
-    return [entry for entry in values if isinstance(entry, dict)]
-
-
-def _edge_nodes(edges: object) -> list[dict[str, Any]]:
-    if not isinstance(edges, list):
-        return []
-    return [
-        edge["node"]
-        for edge in edges
-        if isinstance(edge, dict) and isinstance(edge.get("node"), dict)
-    ]

@@ -103,16 +103,6 @@ def comment_from_webhook_payload(payload: Mapping[str, Any]) -> LinearComment | 
     )
 
 
-def _linear_response_data(response: httpx.Response) -> dict[str, Any]:
-    if response.status_code >= 500 or response.status_code == 429:
-        raise LinearError(f"server error {response.status_code}: {response.text[:200]}")
-    body: dict[str, Any] = response.json()
-    if body.get("errors"):
-        raise LinearError(f"graphql errors: {body['errors']}")
-    data: dict[str, Any] = body["data"]
-    return data
-
-
 class LinearTracker:
     """Async Linear client.
 
@@ -154,7 +144,13 @@ class LinearTracker:
             r = await self._client.post("/graphql", json={"query": gql, "variables": variables})
         except httpx.HTTPError as e:
             raise LinearError(f"transport error: {e}") from e
-        return _linear_response_data(r)
+        if r.status_code >= 500 or r.status_code == 429:
+            raise LinearError(f"server error {r.status_code}: {r.text[:200]}")
+        body: dict[str, Any] = r.json()
+        if "errors" in body and body["errors"]:
+            raise LinearError(f"graphql errors: {body['errors']}")
+        data: dict[str, Any] = body["data"]
+        return data
 
     # ---- high-level ----
 

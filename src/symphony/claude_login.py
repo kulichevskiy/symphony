@@ -458,7 +458,9 @@ class SubprocessClaudeLogin:
                 return match.group(0)
 
     async def submit_code(self, code: str) -> str:
-        proc = _require_running_login(self._proc)
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            raise ClaudeLoginError("login process is not running")
         try:
             # `communicate` drains stdout/stderr concurrently with the write +
             # wait; a bare `proc.wait()` here can deadlock once the pipe fills
@@ -485,11 +487,3 @@ class SubprocessClaudeLogin:
             await proc.wait()
         except ProcessLookupError:
             pass
-
-
-def _require_running_login(
-    proc: asyncio.subprocess.Process | None,
-) -> asyncio.subprocess.Process:
-    if proc is None or proc.stdin is None:
-        raise ClaudeLoginError("login process is not running")
-    return proc

@@ -228,79 +228,6 @@ def on_runner_event(*, stage: str, event_kind: str, returncode: int | None) -> T
     return Transition(next_run_status="failed", next_linear_state=None, halt=True)
 
 
-def _final_event_termination(final_kind: str | None, returncode: int | None) -> str | None:
-    if final_kind in {"stall_timeout", "wall_clock_timeout", "spawn_failed"}:
-        return final_kind
-    if final_kind == "exit" and returncode not in (None, 0):
-        return "agent_nonzero_exit"
-    return None
-
-
-def _is_orphaned_termination(status: str, text: str) -> bool:
-    return status == "interrupted" and any(
-        signal in text
-        for signal in ("host restarted", "startup reconcile", "pidless", "orphan", "pid ")
-    )
-
-
-def _is_cancelled_termination(text: str) -> bool:
-    return any(
-        signal in text for signal in ("cancelled", "canceled", "skipped", "$stop", "operator stop")
-    )
-
-
-def _is_validation_failure(text: str) -> bool:
-    return any(
-        signal in text
-        for signal in (
-            "without advancing",
-            "validation",
-            "acceptance rejected",
-            "failed criteria",
-            "infra_error",
-            "infra error",
-        )
-    )
-
-
-def _is_tracker_error(text: str) -> bool:
-    return any(
-        signal in text
-        for signal in (
-            "move_issue",
-            "post_comment",
-            "comment failed",
-            "team_states",
-            "lookup_issue",
-            "tracker",
-            "linear",
-            "pr_create",
-            "repo_default_branch",
-            "github",
-            "no pr number",
-            "no longer matches",
-        )
-    )
-
-
-def _text_termination_kind(*, status: str, text: str) -> str | None:
-    if "superseded" in text or "stale merge" in text:
-        return "superseded"
-    if _is_orphaned_termination(status, text):
-        return "orphaned"
-    if _is_cancelled_termination(text):
-        return "cancelled"
-    if "rebase" in text:
-        return "rebase_failed"
-    if any(signal in text for signal in ("push failed", "force-push", "git push")):
-        return "push_failed"
-    if _is_validation_failure(text):
-        return "validation_failed"
-    if _is_tracker_error(text):
-        return "tracker_error"
-    return None
-
-
 def classify_termination(
     *,
     status: str,
@@ -336,12 +263,62 @@ def classify_termination(
         if part
     ).casefold()
 
-    if event_kind := _final_event_termination(final_kind, returncode):
-        return event_kind, detail
+    if final_kind == "stall_timeout":
+        return "stall_timeout", detail
+    if final_kind == "wall_clock_timeout":
+        return "wall_clock_timeout", detail
+    if final_kind == "spawn_failed":
+        return "spawn_failed", detail
+    if final_kind == "exit" and returncode not in (None, 0):
+        return "agent_nonzero_exit", detail
     if status == "needs_approval":
         return "awaiting_human_merge", detail
-    if text_kind := _text_termination_kind(status=status, text=text):
-        return text_kind, detail
+    if "superseded" in text or "stale merge" in text:
+        return "superseded", detail
+    if status == "interrupted" and (
+        "host restarted" in text
+        or "startup reconcile" in text
+        or "pidless" in text
+        or "orphan" in text
+        or "pid " in text
+    ):
+        return "orphaned", detail
+    if (
+        "cancelled" in text
+        or "canceled" in text
+        or "skipped" in text
+        or "$stop" in text
+        or "operator stop" in text
+    ):
+        return "cancelled", detail
+    if "rebase" in text:
+        return "rebase_failed", detail
+    if "push failed" in text or "force-push" in text or "git push" in text:
+        return "push_failed", detail
+    if (
+        "without advancing" in text
+        or "validation" in text
+        or "acceptance rejected" in text
+        or "failed criteria" in text
+        or "infra_error" in text
+        or "infra error" in text
+    ):
+        return "validation_failed", detail
+    if (
+        "move_issue" in text
+        or "post_comment" in text
+        or "comment failed" in text
+        or "team_states" in text
+        or "lookup_issue" in text
+        or "tracker" in text
+        or "linear" in text
+        or "pr_create" in text
+        or "repo_default_branch" in text
+        or "github" in text
+        or "no pr number" in text
+        or "no longer matches" in text
+    ):
+        return "tracker_error", detail
     if exc is not None:
         return "execution_error", detail
     return "unknown", detail

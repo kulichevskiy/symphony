@@ -174,39 +174,6 @@ class _ReconcileIssueResult:
     actions_deferred: int
 
 
-@dataclass(frozen=True)
-class _ReconcileInputs:
-    issue_row: aiosqlite.Row
-    wait: db.operator_waits.OperatorWait | None
-    prs: list[LocalIssuePr]
-    matched_bindings: list[RepoBinding]
-    observed_at: str
-    tracker_ctx: TrackerContext
-    tracker_issue_id: str
-    active: bool
-
-
-@dataclass(frozen=True)
-class _ReconcileObservation:
-    linear_issue: LinearIssue | None
-    linear_payload: dict[str, Any]
-    linear_drift: str | None
-    cancel_wait_eligible: bool
-    github_prs: list[GithubPrObservation]
-    github_payload: dict[str, Any]
-    orphans: list[_AdoptableOrphanPr]
-    drift_prs: list[GithubPrObservation]
-    github_drift: str | None
-
-
-@dataclass(frozen=True)
-class _ReconcileActionPlan:
-    linear_action: str
-    github_action: str
-    actions_taken: int
-    actions_deferred: int
-
-
 class _BackoffRequested(RuntimeError):
     def __init__(self, *, source: str, error: str) -> None:
         super().__init__(error)
@@ -430,91 +397,118 @@ class Reconciler:
         )
         return result.observations
 
-    async def _reconcile_inputs(self, issue_id: str) -> _ReconcileInputs | None:
+    async def _reconcile_issue(
+        self,
+        issue_id: str,
+        *,
+        reason: str,
+        action_budget_remaining: int | None,
+    ) -> _ReconcileIssueResult:
+        if self._backoff_active():
+            return _ReconcileIssueResult(
+                observations=0,
+                actions_taken=0,
+                actions_deferred=0,
+            )
+
         issue_row = await self._issue_row(issue_id)
         if issue_row is None:
-            return None
+            return _ReconcileIssueResult(
+                observations=0,
+                actions_taken=0,
+                actions_deferred=0,
+            )
         wait = await db.operator_waits.get(self._conn, issue_id)
         prs = await self._open_prs(issue_id)
         if wait is None and not prs:
-            return None
+            return _ReconcileIssueResult(
+                observations=0,
+                actions_taken=0,
+                actions_deferred=0,
+            )
         matched_bindings = self._matched_bindings(
             team_key=str(issue_row["team_key"]),
             wait=wait,
             prs=prs,
         )
         if not any(binding.reconcile_enabled for binding in matched_bindings):
-            return None
-        return _ReconcileInputs(
-            issue_row=issue_row,
-            wait=wait,
-            prs=prs,
-            matched_bindings=matched_bindings,
-            observed_at=self._now().isoformat(),
-            tracker_ctx=self._tracker_context_from_issue_row(issue_row, matched_bindings),
-            tracker_issue_id=str(issue_row["tracker_issue_id"] or issue_id),
-            active=reconcile_auto_clear_enabled(),
-        )
-
-    async def _observe_reconcile_sources(
-        self,
-        inputs: _ReconcileInputs,
-        *,
-        action_budget_remaining: int | None,
-    ) -> _ReconcileObservation:
-        linear_issue, linear_payload = await self._tracker_payload(
-            inputs.tracker_issue_id,
-            inputs.tracker_ctx,
-        )
-        linear_drift = classify_linear_drift(
-            has_operator_wait=inputs.wait is not None,
-            state_name=linear_issue.state_name if linear_issue is not None else None,
-            state_type=linear_issue.state_type if linear_issue is not None else None,
-            done_state_names=self._done_state_names(inputs.matched_bindings),
-        )
-        linear_is_canceled = (
-            linear_issue is not None and linear_issue.state_type == _CANCELED_STATE_TYPE
-        )
-        cancel_wait_eligible = (
-            inputs.active
-            and linear_drift == DRIFT_LINEAR_CANCELED
-            and inputs.wait is not None
-            and any(
-                binding.reconcile_enabled for binding in self._wait_matched_bindings(inputs.wait)
+            return _ReconcileIssueResult(
+                observations=0,
+                actions_taken=0,
+                actions_deferred=0,
             )
-        )
-        cancel_clearing = cancel_wait_eligible and (
-            action_budget_remaining is None or action_budget_remaining > 0
-        )
+
+        observed_at = self._now().isoformat()
+        done_state_names = self._done_state_names(matched_bindings)
+        tracker_ctx = self._tracker_context_from_issue_row(issue_row, matched_bindings)
+        post_commit_review_request: _PostCommitReviewRequest | None = None
+        active = reconcile_auto_clear_enabled()
         try:
-            github_prs, github_payload = await self._github_payload(inputs.prs)
-        except _BackoffRequested:
-            if not cancel_clearing:
-                raise
-            github_prs, github_payload = [], {"error": "github unavailable; deferred"}
-
-        orphans = (
-            []
-            if linear_drift == DRIFT_LINEAR_CANCELED
-            else await self._orphan_open_prs(
-                issue_row=inputs.issue_row,
-                wait=inputs.wait,
-                matched_bindings=inputs.matched_bindings,
-                recorded_observations=github_prs,
+            tracker_issue_id = str(issue_row["tracker_issue_id"] or issue_id)
+            linear_issue, linear_payload = await self._tracker_payload(
+                tracker_issue_id,
+                tracker_ctx,
             )
-        )
+            linear_drift = classify_linear_drift(
+                has_operator_wait=wait is not None,
+                state_name=linear_issue.state_name if linear_issue is not None else None,
+                state_type=linear_issue.state_type if linear_issue is not None else None,
+                done_state_names=done_state_names,
+            )
+            linear_is_canceled = (
+                linear_issue is not None and linear_issue.state_type == _CANCELED_STATE_TYPE
+            )
+            cancel_wait_eligible = (
+                active
+                and linear_drift == DRIFT_LINEAR_CANCELED
+                and wait is not None
+                and any(binding.reconcile_enabled for binding in self._wait_matched_bindings(wait))
+            )
+            # Only swallow a GitHub backoff for the cancel clear when it can actually
+            # run this tick — if the shared action budget is already spent, the clear
+            # is deferred anyway, so re-raising here (instead of masking the error)
+            # lets `tick()` enter backoff instead of hammering a rate-limited GitHub.
+            cancel_clearing = cancel_wait_eligible and (
+                action_budget_remaining is None or action_budget_remaining > 0
+            )
+            try:
+                github_prs, github_payload = await self._github_payload(prs)
+            except _BackoffRequested:
+                if not cancel_clearing:
+                    raise
+                # The Linear cancellation is already confirmed — don't let a
+                # transient GitHub 429/5xx gate clearing the parked wait. Treat
+                # GitHub as unobserved this tick; any ride-along PR cleanup
+                # happens on a later tick once GitHub recovers.
+                github_prs, github_payload = [], {"error": "github unavailable; deferred"}
+            # Canceled always wins over orphan-PR adoption (see below), so skip the
+            # GitHub head-branch probe entirely rather than spend the call only to
+            # discard its result.
+            orphans = (
+                []
+                if linear_drift == DRIFT_LINEAR_CANCELED
+                else await self._orphan_open_prs(
+                    issue_row=issue_row,
+                    wait=wait,
+                    matched_bindings=matched_bindings,
+                    recorded_observations=github_prs,
+                )
+            )
+        except _BackoffRequested:
+            raise
+
         if orphans:
             combined = github_prs + [orphan.observation for orphan in orphans]
             github_payload = {"prs": [pr.to_payload() for pr in combined]}
 
-        drift_prs = _github_prs_for_drift(wait=inputs.wait, github_prs=github_prs)
+        drift_prs = _github_prs_for_drift(wait=wait, github_prs=github_prs)
         drift_prs = self._reconcile_enabled_prs(
-            team_key=str(inputs.issue_row["team_key"]),
-            local_prs=inputs.prs,
+            team_key=str(issue_row["team_key"]),
+            local_prs=prs,
             observations=drift_prs,
         )
         github_drift = classify_github_drift(
-            has_merge_wait=_is_merge_like_wait(inputs.wait),
+            has_merge_wait=_is_merge_like_wait(wait),
             prs=drift_prs,
             linear_canceled=linear_is_canceled,
         )
@@ -524,57 +518,36 @@ class Reconciler:
             and orphans
         ):
             github_drift = DRIFT_ORPHAN_PR_OPEN
-        return _ReconcileObservation(
-            linear_issue=linear_issue,
-            linear_payload=linear_payload,
-            linear_drift=linear_drift,
-            cancel_wait_eligible=cancel_wait_eligible,
-            github_prs=github_prs,
-            github_payload=github_payload,
-            orphans=orphans,
-            drift_prs=drift_prs,
-            github_drift=github_drift,
-        )
-
-    @staticmethod
-    def _plan_reconcile_actions(
-        inputs: _ReconcileInputs,
-        observation: _ReconcileObservation,
-        *,
-        action_budget_remaining: int | None,
-    ) -> _ReconcileActionPlan:
         remaining = action_budget_remaining
         actions_taken = 0
         actions_deferred = 0
-        linear_action = _passive_action_for(observation.linear_drift)
-        linear_should_act = inputs.active and (
-            observation.linear_drift == DRIFT_LINEAR_STATE_DONE or observation.cancel_wait_eligible
-        )
-        if linear_should_act:
+        post_cancel_comment = False
+
+        linear_action = _passive_action_for(linear_drift)
+        if active and linear_drift == DRIFT_LINEAR_STATE_DONE:
             if remaining is None or remaining > 0:
-                linear_action = (
-                    ACTION_NOTED
-                    if observation.linear_drift == DRIFT_LINEAR_STATE_DONE
-                    else ACTION_CLEARED
-                )
+                linear_action = ACTION_NOTED
+                actions_taken += 1
+                if remaining is not None:
+                    remaining -= 1
+            else:
+                actions_deferred += 1
+        elif cancel_wait_eligible:
+            if remaining is None or remaining > 0:
+                linear_action = ACTION_CLEARED
                 actions_taken += 1
                 if remaining is not None:
                     remaining -= 1
             else:
                 actions_deferred += 1
 
-        github_action = _passive_action_for(observation.github_drift)
+        github_action = _passive_action_for(github_drift)
         github_clearable = _github_clearable(
-            github_drift=observation.github_drift,
-            wait=inputs.wait,
-            github_prs=observation.drift_prs,
+            github_drift=github_drift,
+            wait=wait,
+            github_prs=drift_prs,
         )
-        github_adoptable = (
-            inputs.active
-            and observation.github_drift == DRIFT_ORPHAN_PR_OPEN
-            and bool(observation.orphans)
-        )
-        if github_adoptable:
+        if active and github_drift == DRIFT_ORPHAN_PR_OPEN and orphans:
             if remaining is None or remaining > 0:
                 github_action = ACTION_ADOPTED
                 actions_taken += 1
@@ -582,103 +555,94 @@ class Reconciler:
                     remaining -= 1
             else:
                 actions_deferred += 1
-        elif inputs.active and github_clearable and linear_action == ACTION_CLEARED:
+        elif active and github_clearable and linear_action == ACTION_CLEARED:
+            # Same wait, same cancel event: the PR cleanup rides along with the
+            # cancel-clear's budget slot instead of needing its own. Otherwise a
+            # cancel-clear that spends the tick's last slot would delete the wait
+            # here and strand the closed/merged PR row forever — `_github_clearable`
+            # requires the wait to still exist, and it won't on the next tick.
             github_action = ACTION_CLEARED
-        elif inputs.active and github_clearable:
+        elif active and github_clearable:
             if remaining is None or remaining > 0:
                 github_action = ACTION_CLEARED
                 actions_taken += 1
+                if remaining is not None:
+                    remaining -= 1
             else:
                 actions_deferred += 1
-        return _ReconcileActionPlan(
-            linear_action=linear_action,
-            github_action=github_action,
-            actions_taken=actions_taken,
-            actions_deferred=actions_deferred,
-        )
 
-    async def _persist_reconcile_actions(
-        self,
-        *,
-        issue_id: str,
-        reason: str,
-        inputs: _ReconcileInputs,
-        observation: _ReconcileObservation,
-        plan: _ReconcileActionPlan,
-    ) -> tuple[_PostCommitReviewRequest | None, bool]:
-        post_commit_review_request: _PostCommitReviewRequest | None = None
-        post_cancel_comment = False
         try:
             await db.external_observations.insert(
                 self._conn,
                 issue_id=issue_id,
                 source=SOURCE_LINEAR,
-                observed_at=inputs.observed_at,
-                payload_json=_json_payload({**observation.linear_payload, "reason": reason}),
-                drift_kind=observation.linear_drift,
-                action_taken=plan.linear_action,
+                observed_at=observed_at,
+                payload_json=_json_payload(
+                    {
+                        **linear_payload,
+                        "reason": reason,
+                    }
+                ),
+                drift_kind=linear_drift,
+                action_taken=linear_action,
                 commit=False,
             )
             await db.external_observations.insert(
                 self._conn,
                 issue_id=issue_id,
                 source=SOURCE_GITHUB,
-                observed_at=inputs.observed_at,
-                payload_json=_json_payload({**observation.github_payload, "reason": reason}),
-                drift_kind=observation.github_drift,
-                action_taken=plan.github_action,
+                observed_at=observed_at,
+                payload_json=_json_payload(
+                    {
+                        **github_payload,
+                        "reason": reason,
+                    }
+                ),
+                drift_kind=github_drift,
+                action_taken=github_action,
                 commit=False,
             )
-            if plan.linear_action == ACTION_NOTED and observation.linear_issue is not None:
+            if linear_action == ACTION_NOTED and linear_issue is not None:
                 await self._note_external_state_change(
                     issue_id=issue_id,
                     source=SOURCE_LINEAR,
-                    state_name=observation.linear_issue.state_name,
-                    ts=inputs.observed_at,
+                    state_name=linear_issue.state_name,
+                    ts=observed_at,
                 )
             if (
-                plan.linear_action == ACTION_CLEARED
-                and observation.linear_drift == DRIFT_LINEAR_CANCELED
-                and observation.linear_issue is not None
+                linear_action == ACTION_CLEARED
+                and linear_drift == DRIFT_LINEAR_CANCELED
+                and linear_issue is not None
             ):
                 await self._apply_linear_canceled_clear(
                     issue_id=issue_id,
-                    wait=inputs.wait,
-                    state_name=observation.linear_issue.state_name,
-                    ts=inputs.observed_at,
+                    wait=wait,
+                    state_name=linear_issue.state_name,
+                    ts=observed_at,
                 )
                 post_cancel_comment = True
-            if plan.github_action == ACTION_CLEARED:
+            if github_action == ACTION_CLEARED:
                 await self._apply_github_clear(
                     issue_id=issue_id,
-                    wait=inputs.wait,
-                    drift_kind=observation.github_drift,
-                    github_prs=observation.drift_prs,
+                    wait=wait,
+                    drift_kind=github_drift,
+                    github_prs=drift_prs,
                 )
-            elif plan.github_action == ACTION_ADOPTED:
+            elif github_action == ACTION_ADOPTED:
                 post_commit_review_request = await self._adopt_orphan_prs(
                     issue_id=issue_id,
-                    tracker_issue_id=inputs.tracker_issue_id,
-                    tracker_ctx=inputs.tracker_ctx,
-                    team_key=str(inputs.issue_row["team_key"]),
-                    wait=inputs.wait,
-                    orphans=observation.orphans,
-                    observed_at=inputs.observed_at,
+                    tracker_issue_id=tracker_issue_id,
+                    tracker_ctx=tracker_ctx,
+                    team_key=str(issue_row["team_key"]),
+                    wait=wait,
+                    orphans=orphans,
+                    observed_at=observed_at,
                 )
             await self._conn.commit()
         except Exception:
             await self._conn.rollback()
             raise
-        return post_commit_review_request, post_cancel_comment
 
-    async def _post_reconcile_notifications(
-        self,
-        *,
-        issue_id: str,
-        inputs: _ReconcileInputs,
-        post_commit_review_request: _PostCommitReviewRequest | None,
-        post_cancel_comment: bool,
-    ) -> None:
         if post_commit_review_request is not None:
             try:
                 gh = await self._gh_client(repo=post_commit_review_request.github_repo)
@@ -687,62 +651,30 @@ class Reconciler:
                     "@codex review",
                     repo=post_commit_review_request.github_repo,
                 )
-            except GitHubError as exc:
+            except GitHubError as e:
                 log.warning(
                     "could not post @codex review on %s#%d: %s",
                     post_commit_review_request.github_repo,
                     post_commit_review_request.pr_number,
-                    exc,
+                    e,
                 )
-        if not post_cancel_comment:
-            return
-        pr_remains_open = bool(await self._open_prs(issue_id))
-        body = _CANCELED_CLEAR_BODY_PR_OPEN if pr_remains_open else _CANCELED_CLEAR_BODY
-        try:
-            await self.tracker(inputs.tracker_ctx).post_comment(inputs.tracker_issue_id, body)
-        except LinearError as exc:
-            log.warning("could not post canceled auto-clear comment on %s: %s", issue_id, exc)
 
-    async def _reconcile_issue(
-        self,
-        issue_id: str,
-        *,
-        reason: str,
-        action_budget_remaining: int | None,
-    ) -> _ReconcileIssueResult:
-        if self._backoff_active():
-            return _ReconcileIssueResult(0, 0, 0)
-        inputs = await self._reconcile_inputs(issue_id)
-        if inputs is None:
-            return _ReconcileIssueResult(0, 0, 0)
-        observation = await self._observe_reconcile_sources(
-            inputs,
-            action_budget_remaining=action_budget_remaining,
-        )
-        plan = self._plan_reconcile_actions(
-            inputs,
-            observation,
-            action_budget_remaining=action_budget_remaining,
-        )
-
-        post_commit_review_request, post_cancel_comment = await self._persist_reconcile_actions(
-            issue_id=issue_id,
-            reason=reason,
-            inputs=inputs,
-            observation=observation,
-            plan=plan,
-        )
-        await self._post_reconcile_notifications(
-            issue_id=issue_id,
-            inputs=inputs,
-            post_commit_review_request=post_commit_review_request,
-            post_cancel_comment=post_cancel_comment,
-        )
+        if post_cancel_comment:
+            # `github_action == ACTION_CLEARED` only proves the single drifted PR
+            # the tick handled got cleared — with multiple linked PR rows, another
+            # one can still be open. Re-check the actual remaining rows rather than
+            # inferring "none open" from that one action.
+            pr_remains_open = bool(await self._open_prs(issue_id))
+            body = _CANCELED_CLEAR_BODY_PR_OPEN if pr_remains_open else _CANCELED_CLEAR_BODY
+            try:
+                await self.tracker(tracker_ctx).post_comment(tracker_issue_id, body)
+            except LinearError as e:
+                log.warning("could not post canceled auto-clear comment on %s: %s", issue_id, e)
 
         return _ReconcileIssueResult(
             observations=2,
-            actions_taken=plan.actions_taken,
-            actions_deferred=plan.actions_deferred,
+            actions_taken=actions_taken,
+            actions_deferred=actions_deferred,
         )
 
     async def reconcile_github_event(self, event: GitHubWebhookEvent) -> int:

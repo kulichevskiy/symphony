@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, cast
+from typing import cast
 
 import aiosqlite
 from fastapi import Depends, FastAPI
-from fastapi.params import Depends as DependsParam
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
@@ -145,26 +144,25 @@ def create_app(
             "UI/API unauthenticated on a public deployment. Set all three in "
             ".env, or unset SYMPHONY_REQUIRE_AUTH0 for a local-only stack."
         )
-
-    def _create_ui_pools() -> tuple[
-        ReadOnlyDbPool | None,
-        WriteDbPool | None,
-        WriteDbPool | None,
-        WriteDbPool | None,
-    ]:
-        ui_pool = ReadOnlyDbPool(ui_db_path) if ui_enabled and ui_db_path is not None else None
-        config_pool = (
-            WriteDbPool(ui_db_path)
-            if ui_enabled and ui_db_owns_topology and ui_db_path is not None
-            else None
-        )
-        catalog_pool = (
-            WriteDbPool(ui_db_path) if config_pool is not None and ui_db_path is not None else None
-        )
-        oauth_pool = WriteDbPool(ui_db_path) if ui_enabled and ui_db_path is not None else None
-        return ui_pool, config_pool, catalog_pool, oauth_pool
-
-    ui_pool, config_write_pool, catalog_write_pool, oauth_write_pool = _create_ui_pools()
+    ui_pool = ReadOnlyDbPool(ui_db_path) if ui_enabled and ui_db_path is not None else None
+    # A dedicated write connection for the config-CRUD router — never the
+    # `conn` shared with the orchestrator (SYM-190; see `WriteDbPool`).
+    config_write_pool = (
+        WriteDbPool(ui_db_path)
+        if ui_enabled and ui_db_owns_topology and ui_db_path is not None
+        else None
+    )
+    # Catalog credential refreshes commit independently from config CRUD's
+    # multi-row transactions.
+    catalog_write_pool = (
+        WriteDbPool(ui_db_path)
+        if config_write_pool is not None and ui_db_path is not None
+        else None
+    )
+    # Dedicated write connection for the OAuth callback/disconnect/test routes
+    # (the read-only `ui_pool` can't store a freshly-minted token). Independent
+    # of `ui_db_owns_topology` — connecting a provider doesn't touch bindings.
+    oauth_write_pool = WriteDbPool(ui_db_path) if ui_enabled and ui_db_path is not None else None
     credential_cipher: CredentialCipher | None = None
     external_service = ui_external_service
     if (
@@ -179,145 +177,21 @@ def create_app(
             clock=clock,
         )
 
-    def _mount_oauth_routers(
-        app: FastAPI,
-        api_dependencies: list[DependsParam],
-    ) -> CredentialCipher | None:
-        if oauth_write_pool is None:
-            return None
-        resolved = ui_external_config() if callable(ui_external_config) else ui_external_config
-        base_config = resolved if resolved is not None else Config()
-        credential_cipher = oauth_cipher or CredentialCipher(
-            resolve_encryption_key(
-                base_config.symphony_encryption_key,
-                oauth_write_pool.path.parent,
-            )
-        )
-        app.include_router(
-            create_claude_oauth_router(
-                oauth_write_pool.connection,
-                cipher=credential_cipher,
-                registry=PendingLoginRegistry[ClaudeLoginProcess](),
-                login_factory=(
-                    claude_login_factory
-                    or (lambda: SubprocessClaudeLogin(credentials_path=claude_credentials_path))
-                ),
-                clock=clock,
-                credentials_path=claude_credentials_path,
-            ),
-            dependencies=api_dependencies,
-        )
-        app.include_router(
-            create_codex_oauth_router(
-                oauth_write_pool.connection,
-                cipher=credential_cipher,
-                registry=PendingLoginRegistry[CodexLoginProcess](),
-                login_factory=(
-                    codex_login_factory
-                    or (lambda: SubprocessCodexLogin(credentials_path=codex_credentials_path))
-                ),
-                clock=clock,
-                credentials_path=codex_credentials_path,
-            ),
-            dependencies=api_dependencies,
-        )
-        oauth_gated, oauth_public = create_oauth_routers(
-            oauth_write_pool.connection,
-            providers={
-                "github": github_provider(
-                    base_config.github_oauth_client_id,
-                    base_config.github_oauth_client_secret,
-                ),
-                "linear": linear_provider(
-                    base_config.linear_oauth_client_id,
-                    base_config.linear_oauth_client_secret,
-                ),
-            },
-            cipher=credential_cipher,
-            state_store=OAuthStateStore(),
-            clock=clock,
-            public_origin=base_config.symphony_oauth_public_origin or None,
-        )
-        app.include_router(oauth_gated, dependencies=api_dependencies)
-        app.include_router(oauth_public)
-        return credential_cipher
-
-    def _mount_config_crud_router(
-        app: FastAPI,
-        api_dependencies: list[DependsParam],
-        auth_dependency: Callable[..., Awaitable[dict[str, Any]]] | None,
-        credential_cipher: CredentialCipher | None,
-    ) -> None:
-        if not (
-            ui_db_owns_topology and config_write_pool is not None and catalog_write_pool is not None
-        ):
-            return
-
-        def _scheduled_slots(key: tuple[str, str, str, str, str]) -> int:
-            fn = getattr(handler, "scheduled_slot_count_for_binding_key", None)
-            return int(fn(key)) if fn is not None else 0
-
-        async def _codex_catalog() -> CodexCatalog:
-            if credential_cipher is None:
-                return await codex_catalog_client.get(credential=None, generation=None)
-            catalog_conn = await catalog_write_pool.connection()
-            try:
-                snapshot = await oauth_connections.get_connection_snapshot(
-                    catalog_conn,
-                    "codex",
-                    credential_cipher,
-                )
-            except (CredentialDecryptError, CredentialKeyMissingError):
-                snapshot = None
-            if snapshot is None or snapshot.status != "connected":
-                return await codex_catalog_client.get(credential=None, generation=None)
-
-            async def _write_back(credential: str) -> int | None:
-                wrote = await CredentialWriteBack(catalog_conn, credential_cipher).write_back(
-                    "codex",
-                    credential,
-                    expires_at=codex_expires_at(credential),
-                    expected_prior=snapshot.credential,
-                    expect_connected_generation=snapshot.generation,
-                )
-                if not wrote:
-                    return None
-                status = await oauth_connections.get_status(catalog_conn, "codex")
-                return status.generation if status is not None else None
-
-            return await codex_catalog_client.get(
-                credential=snapshot.credential,
-                generation=snapshot.generation,
-                write_back=_write_back,
-            )
-
-        app.include_router(
-            create_config_crud_router(
-                config_write_pool.connection,
-                config_provider=ui_external_config,
-                write_lock=ui_config_write_lock,
-                auth_dependency=auth_dependency,
-                clock=clock,
-                scheduled_slots=_scheduled_slots,
-                repo_secret_view=cast(RepoSecretView | None, ui_repo_secret_view),
-                codex_catalog_provider=_codex_catalog,
-            ),
-            dependencies=api_dependencies,
-        )
-
-    async def _close_ui_resources() -> None:
-        if external_service is not None:
-            external_service.cache.clear()
-        for pool in (ui_pool, config_write_pool, catalog_write_pool, oauth_write_pool):
-            if pool is not None:
-                await pool.close()
-
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         try:
             yield
         finally:
-            await _close_ui_resources()
+            if external_service is not None:
+                external_service.cache.clear()
+            if ui_pool is not None:
+                await ui_pool.close()
+            if config_write_pool is not None:
+                await config_write_pool.close()
+            if catalog_write_pool is not None:
+                await catalog_write_pool.close()
+            if oauth_write_pool is not None:
+                await oauth_write_pool.close()
 
     app = FastAPI(
         lifespan=lifespan
@@ -405,7 +279,84 @@ def create_app(
                 dependencies=api_dependencies,
             )
 
-        credential_cipher = _mount_oauth_routers(app, api_dependencies)
+        # Redirect-OAuth for GitHub (2/7) and Linear (3/7) on one engine.
+        # `start`/`disconnect`/`test` are gated like the rest of `/api/*`;
+        # `callback` is mounted OUTSIDE the gate — a browser redirect from the
+        # provider carries no bearer, so security rests on the single-use
+        # `state` + PKCE the engine enforces.
+        if oauth_write_pool is not None:
+            resolved = ui_external_config() if callable(ui_external_config) else ui_external_config
+            base_config = resolved if resolved is not None else Config()
+            # Not `CredentialCipher.from_env()`: Coolify mounts `.env` as a file
+            # and deliberately never injects it into os.environ (see
+            # docker-compose.coolify.yml), so reading process env directly would
+            # never see the key there. `base_config` is sourced from `Secrets`,
+            # which reads `.env` the same way `github_oauth_client_id` above does.
+            # An empty key auto-provisions from/into the data volume next to the
+            # DB (Config v2 2/9) instead of leaving the cipher unavailable.
+            credential_cipher = (
+                oauth_cipher
+                if oauth_cipher is not None
+                else CredentialCipher(
+                    resolve_encryption_key(
+                        base_config.symphony_encryption_key, oauth_write_pool.path.parent
+                    )
+                )
+            )
+            # Claude code-paste login (5/7): no browser-reachable callback, so
+            # it's a separate router mounted BEFORE the generic engine below —
+            # `/api/oauth/claude/*` must win over `/api/oauth/{provider}/*`
+            # (which doesn't know `claude` and would 404). Gated like the rest.
+            app.include_router(
+                create_claude_oauth_router(
+                    oauth_write_pool.connection,
+                    cipher=credential_cipher,
+                    registry=PendingLoginRegistry[ClaudeLoginProcess](),
+                    login_factory=(
+                        claude_login_factory
+                        or (lambda: SubprocessClaudeLogin(credentials_path=claude_credentials_path))
+                    ),
+                    clock=clock,
+                    credentials_path=claude_credentials_path,
+                ),
+                dependencies=api_dependencies,
+            )
+            # Codex device-auth login (6/7): same "no browser-reachable callback"
+            # reason as Claude, so it too mounts BEFORE the generic engine below
+            # (`/api/oauth/codex/*` must win over `/api/oauth/{provider}/*`).
+            app.include_router(
+                create_codex_oauth_router(
+                    oauth_write_pool.connection,
+                    cipher=credential_cipher,
+                    registry=PendingLoginRegistry[CodexLoginProcess](),
+                    login_factory=(
+                        codex_login_factory
+                        or (lambda: SubprocessCodexLogin(credentials_path=codex_credentials_path))
+                    ),
+                    clock=clock,
+                    credentials_path=codex_credentials_path,
+                ),
+                dependencies=api_dependencies,
+            )
+            oauth_gated, oauth_public = create_oauth_routers(
+                oauth_write_pool.connection,
+                providers={
+                    "github": github_provider(
+                        base_config.github_oauth_client_id,
+                        base_config.github_oauth_client_secret,
+                    ),
+                    "linear": linear_provider(
+                        base_config.linear_oauth_client_id,
+                        base_config.linear_oauth_client_secret,
+                    ),
+                },
+                cipher=credential_cipher,
+                state_store=OAuthStateStore(),
+                clock=clock,
+                public_origin=base_config.symphony_oauth_public_origin or None,
+            )
+            app.include_router(oauth_gated, dependencies=api_dependencies)
+            app.include_router(oauth_public)
 
         # Read-only view of the loaded config (redacted). Gated like the other
         # /api routers; included before create_api_router's catch-all.
@@ -414,7 +365,77 @@ def create_app(
             dependencies=api_dependencies,
         )
 
-        _mount_config_crud_router(app, api_dependencies, auth_dep, credential_cipher)
+        # Binding CRUD (create/edit/delete + options) — writes go through
+        # `config_write_pool`'s own connection (never the daemon's shared
+        # `conn`; see `WriteDbPool`), serialized against the daemon's
+        # tick-boundary binding reload by the config write lock (SYM-189) so
+        # a write's multi-row transaction never interleaves with a reload.
+        # Gated on `ui_db_owns_topology` (default True so callers that don't
+        # pass it — tests, any future non-daemon entrypoint — keep today's
+        # behavior): a legacy YAML topology not yet imported keeps the daemon
+        # reading `repos:` from YAML (`reload_bindings_from_db=False`), so
+        # writes here would round-trip through the API looking successful
+        # while the daemon silently never applies them. `cli._run` is the only
+        # caller that computes and passes the real value. Also requires
+        # `ui_db_path` (always passed alongside it by `cli._run`) to open the
+        # dedicated connection; without one the router simply doesn't mount.
+        if ui_db_owns_topology and config_write_pool is not None and catalog_write_pool is not None:
+
+            def _scheduled_slots(key: tuple[str, str, str, str, str]) -> int:
+                # The daemon reserves in-memory dispatch/fix-run slots before a
+                # run row exists; the drain guard must see them (SYM-193). The
+                # orchestrator is `handler` here; a non-orchestrator handler
+                # (some tests) simply reports zero reservations.
+                fn = getattr(handler, "scheduled_slot_count_for_binding_key", None)
+                return int(fn(key)) if fn is not None else 0
+
+            async def _codex_catalog() -> CodexCatalog:
+                if credential_cipher is None:
+                    return await codex_catalog_client.get(credential=None, generation=None)
+                catalog_conn = await catalog_write_pool.connection()
+                try:
+                    snapshot = await oauth_connections.get_connection_snapshot(
+                        catalog_conn,
+                        "codex",
+                        credential_cipher,
+                    )
+                except (CredentialDecryptError, CredentialKeyMissingError):
+                    snapshot = None
+                if snapshot is None or snapshot.status != "connected":
+                    return await codex_catalog_client.get(credential=None, generation=None)
+
+                async def _write_back(credential: str) -> int | None:
+                    wrote = await CredentialWriteBack(catalog_conn, credential_cipher).write_back(
+                        "codex",
+                        credential,
+                        expires_at=codex_expires_at(credential),
+                        expected_prior=snapshot.credential,
+                        expect_connected_generation=snapshot.generation,
+                    )
+                    if not wrote:
+                        return None
+                    status = await oauth_connections.get_status(catalog_conn, "codex")
+                    return status.generation if status is not None else None
+
+                return await codex_catalog_client.get(
+                    credential=snapshot.credential,
+                    generation=snapshot.generation,
+                    write_back=_write_back,
+                )
+
+            app.include_router(
+                create_config_crud_router(
+                    config_write_pool.connection,
+                    config_provider=ui_external_config,
+                    write_lock=ui_config_write_lock,
+                    auth_dependency=auth_dep,
+                    clock=clock,
+                    scheduled_slots=_scheduled_slots,
+                    repo_secret_view=cast(RepoSecretView | None, ui_repo_secret_view),
+                    codex_catalog_provider=_codex_catalog,
+                ),
+                dependencies=api_dependencies,
+            )
 
         def _ui_teams() -> list[str] | None:
             current = ui_external_config() if callable(ui_external_config) else ui_external_config
