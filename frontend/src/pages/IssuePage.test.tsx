@@ -8,7 +8,7 @@ import {
   ConfirmBar,
   deriveCockpit,
   NowCard,
-  pickDefaultRun,
+  pickActivityRun,
   pickLiveRun,
   rawDetailJson,
   StageSpendCard,
@@ -325,14 +325,14 @@ describe("StageSpendCard", () => {
   });
 });
 
-describe("pickDefaultRun", () => {
-  it("surfaces the most-recent failed/interrupted run with a log, even under a newer success", () => {
+describe("pickActivityRun", () => {
+  it("opens the most recent saved run, regardless of outcome", () => {
     const runs = [
       run("merge", { id: "r-merge", status: "done", has_log: true, started_at: "2026-06-07T13:00:00Z" }),
       run("implement", { id: "r-fail", status: "failed", has_log: true, started_at: "2026-06-07T12:00:00Z" }),
       run("implement", { id: "r-old-fail", status: "interrupted", has_log: true, started_at: "2026-06-07T09:00:00Z" }),
     ];
-    expect(pickDefaultRun(runs)?.id).toBe("r-fail");
+    expect(pickActivityRun(runs)?.id).toBe("r-merge");
   });
 
   it("falls back to the most-recent run with a log when none failed", () => {
@@ -340,7 +340,7 @@ describe("pickDefaultRun", () => {
       run("implement", { id: "r-old", status: "done", has_log: true, started_at: "2026-06-07T09:00:00Z" }),
       run("merge", { id: "r-new", status: "done", has_log: true, started_at: "2026-06-07T13:00:00Z" }),
     ];
-    expect(pickDefaultRun(runs)?.id).toBe("r-new");
+    expect(pickActivityRun(runs)?.id).toBe("r-new");
   });
 
   it("skips a run without a log for the older run that has one", () => {
@@ -351,19 +351,19 @@ describe("pickDefaultRun", () => {
       run("merge", { id: "r-park", status: "needs_approval", has_log: false, started_at: "2026-06-07T14:00:00Z" }),
       run("implement", { id: "r-impl", status: "completed", has_log: true, started_at: "2026-06-07T12:00:00Z" }),
     ];
-    expect(pickDefaultRun(runs)?.id).toBe("r-impl");
+    expect(pickActivityRun(runs)?.id).toBe("r-impl");
   });
 
   it("returns null for no runs", () => {
-    expect(pickDefaultRun([])).toBeNull();
+    expect(pickActivityRun([])).toBeNull();
   });
 
-  it("prefers a failed run with a log over a newer failed run without one", () => {
+  it("prefers a saved run over a newer run without a log", () => {
     const runs = [
       run("review", { id: "r-review", status: "failed", has_log: false, started_at: "2026-06-07T14:00:00Z" }),
       run("implement", { id: "r-impl-fail", status: "failed", has_log: true, started_at: "2026-06-07T12:00:00Z" }),
     ];
-    expect(pickDefaultRun(runs)?.id).toBe("r-impl-fail");
+    expect(pickActivityRun(runs)?.id).toBe("r-impl-fail");
   });
 
   it("falls back to the newest run when nothing has a log", () => {
@@ -371,7 +371,7 @@ describe("pickDefaultRun", () => {
       run("review", { id: "r-review", status: "needs_approval", has_log: false, started_at: "2026-06-07T14:00:00Z" }),
       run("implement", { id: "r-impl", status: "completed", has_log: false, started_at: "2026-06-07T12:00:00Z" }),
     ];
-    expect(pickDefaultRun(runs)?.id).toBe("r-review");
+    expect(pickActivityRun(runs)?.id).toBe("r-review");
   });
 
   it("skips a superseded duplicate for the older surviving run", () => {
@@ -382,19 +382,18 @@ describe("pickDefaultRun", () => {
       run("implement", { id: "r-dup", status: "superseded", has_log: true, started_at: "2026-06-07T13:00:00Z" }),
       run("implement", { id: "r-survivor", status: "completed", has_log: true, started_at: "2026-06-07T12:00:00Z" }),
     ];
-    expect(pickDefaultRun(runs)?.id).toBe("r-survivor");
+    expect(pickActivityRun(runs)?.id).toBe("r-survivor");
   });
 
   it("falls back to a superseded run only when nothing else exists", () => {
     const runs = [run("implement", { id: "r-only", status: "superseded" })];
-    expect(pickDefaultRun(runs)?.id).toBe("r-only");
+    expect(pickActivityRun(runs)?.id).toBe("r-only");
   });
 
   it("skips an interrupted merge displaced by interrupt_running_merge (termination_kind=superseded)", () => {
     // interrupt_running_merge (and the orphaned-approval cleanup) stamp the
     // displaced row status="interrupted"/termination_kind="superseded" rather
-    // than status="superseded" — it must not win over a real failed run just
-    // because FAILED_RUN_STATUSES includes "interrupted".
+    // than status="superseded" — it must not win over a real run.
     const runs = [
       run("merge", {
         id: "r-displaced",
@@ -405,7 +404,7 @@ describe("pickDefaultRun", () => {
       }),
       run("implement", { id: "r-fail", status: "failed", has_log: true, started_at: "2026-06-07T12:00:00Z" }),
     ];
-    expect(pickDefaultRun(runs)?.id).toBe("r-fail");
+    expect(pickActivityRun(runs)?.id).toBe("r-fail");
   });
 });
 

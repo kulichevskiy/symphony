@@ -35,14 +35,19 @@ function useLiveFeed(runId: string, enabled: boolean, live: boolean) {
   const [tokens, setTokens] = useState<TokenTick | null>(null);
   const [status, setStatus] = useState<FeedStatus>("connecting");
   const [attempt, setAttempt] = useState(0);
+  const streamState = useRef({ runId: "", offset: 0 });
 
   useEffect(() => {
     if (!enabled || !runId) return;
     let cancelled = false;
     const controller = new AbortController();
-    let offset = 0;
-    setItems([]);
-    setTokens(null);
+    const changedRun = streamState.current.runId !== runId;
+    if (changedRun) {
+      streamState.current = { runId, offset: 0 };
+      setItems([]);
+      setTokens(null);
+    }
+    let offset = streamState.current.offset;
     setStatus("connecting");
 
     void (async () => {
@@ -53,9 +58,12 @@ function useLiveFeed(runId: string, enabled: boolean, live: boolean) {
             offset,
             signal: controller.signal,
             onCursor: (o) => {
+              if (cancelled) return;
               offset = o;
+              streamState.current.offset = o;
             },
             onEvent: (event) => {
+              if (cancelled) return;
               if (event.kind === "tokens") {
                 setTokens((prev) => foldTokenTick(prev, event));
               } else if (
@@ -67,6 +75,7 @@ function useLiveFeed(runId: string, enabled: boolean, live: boolean) {
             },
           });
           offset = result.offset;
+          streamState.current.offset = result.offset;
           if (result.ended) {
             if (!cancelled) setStatus("ended");
             return;

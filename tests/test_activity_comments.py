@@ -427,6 +427,35 @@ def test_activity_comment_leads_with_agent_update_not_shell_commands(tmp_path: P
     assert body.index("**Run details**") > body.index("**Changed files**")
 
 
+def test_latest_agent_update_survives_across_comment_windows(tmp_path: Path) -> None:
+    session = ActivitySession(
+        settings=ActivitySettings(),
+        run_id="run-1",
+        stage="implement",
+        workspace_path=tmp_path,
+    )
+    now = datetime(2026, 5, 11, 10, 0, tzinfo=UTC)
+    session.record_event(
+        ActivityEvent(
+            kind="agent_message",
+            item_id="message-1",
+            message="The regression test is red; I am applying the fix.",
+        ),
+        now,
+    )
+    session.mark_published()
+    session.record_event(
+        ActivityEvent(kind="file_changed", item_id="file-1", file_path="src/fix.py"),
+        now + timedelta(seconds=1),
+    )
+
+    body = format_activity_digest(
+        session.build_digest(reason="final", now=now + timedelta(seconds=2))
+    )
+
+    assert "The regression test is red; I am applying the fix." in body
+
+
 @pytest.mark.asyncio
 async def test_activity_comment_marks_persist_publish_and_heartbeat_state(
     tmp_path: Path,

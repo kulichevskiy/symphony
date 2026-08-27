@@ -88,7 +88,7 @@ class ActivityDigest:
     output_tokens: int = 0
     cache_write_tokens: int = 0
     cache_read_tokens: int = 0
-    agent_updates: tuple[str, ...] = ()
+    latest_agent_update: str = ""
     running_commands: tuple[RunningCommandDigest, ...] = ()
     completed_command_count: int = 0
     failed_commands: tuple[FailedCommandDigest, ...] = ()
@@ -100,8 +100,8 @@ class ActivitySession:
     """In-memory activity window for one live run.
 
     SQLite stores the publish marks and heartbeat marks; this object holds the
-    current live command/file window so digests do not require replaying the
-    full raw stream.
+    current live agent-update/command/file window so digests do not require
+    replaying the full raw stream.
     """
 
     settings: ActivitySettings
@@ -111,7 +111,7 @@ class ActivitySession:
     active_commands: dict[str, RunningCommand] = field(default_factory=dict)
     pending_event_count: int = 0
     first_unpublished_at: datetime | None = None
-    agent_updates: list[str] = field(default_factory=list)
+    latest_agent_update: str = ""
     completed_command_count: int = 0
     failed_commands: list[FailedCommandDigest] = field(default_factory=list)
     changed_files: OrderedDict[str, None] = field(default_factory=OrderedDict)
@@ -132,12 +132,12 @@ class ActivitySession:
 
         if event.kind == "agent_message":
             message = sanitize_text(
-                event.message,
+                _CONTROL_MARKER_RE.sub("", event.message),
                 workspace_path=self.workspace_path,
                 limit=700,
             )
             if message:
-                self.agent_updates.append(message)
+                self.latest_agent_update = message
             return
 
         if event.kind == "command_started":
@@ -277,7 +277,7 @@ class ActivitySession:
             output_tokens=output_tokens,
             cache_write_tokens=cache_write_tokens,
             cache_read_tokens=cache_read_tokens,
-            agent_updates=tuple(self.agent_updates[-2:]),
+            latest_agent_update=self.latest_agent_update,
             running_commands=running_digest,
             completed_command_count=self.completed_command_count,
             failed_commands=tuple(self.failed_commands[:3]),
@@ -287,7 +287,6 @@ class ActivitySession:
     def mark_published(self) -> None:
         self.pending_event_count = 0
         self.first_unpublished_at = None
-        self.agent_updates.clear()
         self.completed_command_count = 0
         self.failed_commands.clear()
         self.changed_files.clear()
@@ -326,11 +325,7 @@ def parse_codex_activity_line(line: str, workspace_path: Path) -> ActivityEvent 
             return ActivityEvent(
                 kind="agent_message",
                 item_id=_item_id(raw, item, fallback=message),
-                message=sanitize_text(
-                    _CONTROL_MARKER_RE.sub("", message),
-                    workspace_path=workspace_path,
-                    limit=700,
-                ),
+                message=message,
             )
     return None
 
@@ -348,8 +343,8 @@ def format_activity_digest(digest: ActivityDigest) -> str:
         "heartbeat": "still working",
     }.get(digest.reason, "work in progress")
     lines = [f"🧭 **{title_stage} update — {state}**"]
-    if digest.agent_updates:
-        lines.extend(["", "**Latest update**", "", digest.agent_updates[-1]])
+    if digest.latest_agent_update:
+        lines.extend(["", "**Latest update**", "", digest.latest_agent_update])
     if digest.changed_files:
         lines.extend(["", "**Changed files**", ""])
         lines.extend(f"- `{path}`" for path in digest.changed_files)
@@ -371,7 +366,7 @@ def format_activity_digest(digest: ActivityDigest) -> str:
         lines.extend(["", f"**Completed:** {digest.completed_command_count} {noun}"])
     if not any(
         (
-            digest.agent_updates,
+            digest.latest_agent_update,
             digest.changed_files,
             digest.failed_commands,
             digest.running_commands,

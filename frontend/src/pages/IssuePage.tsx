@@ -846,11 +846,6 @@ function useNowMs(): number {
 
 type Run = IssueDetail["runs"][number];
 
-// Terminal statuses that mean the run failed or was cut short — the ones an
-// operator most wants to inspect (mirrors runs.py TERMINAL_NON_SUCCESS_STATUSES
-// plus the legacy "halted").
-const FAILED_RUN_STATUSES = new Set(["failed", "interrupted", "needs_approval", "halted"]);
-
 // Mirrors runs.py SUPERSEDED_STATUS: startup reconcile marks a collapsed
 // duplicate live run this way — pure bookkeeping that must never shadow the
 // surviving run's log.
@@ -869,21 +864,18 @@ function runsByStartDesc(runs: Run[]): Run[] {
   return [...runs].sort((a, b) => Date.parse(b.started_at) - Date.parse(a.started_at));
 }
 
-/** The run whose final log opens by default: the most-recent failed/interrupted
- *  run that actually has a per-run log (`has_log`, a stat of
- *  `{log_root}/{run_id}.log` from the API), falling back to the most-recent run
- *  with a log, then to the most recent run overall — a failed `review` run or a
- *  synthetic merge-approval park row (no subprocess, so no log) must not shadow
- *  a run with real output. `superseded` rows are excluded from both fallbacks:
- *  they're a killed duplicate of a surviving run, not something an operator
- *  wants to see by default. Null when the issue has no runs. */
-export function pickDefaultRun(runs: Run[]): Run | null {
+/** The run the persistent Activity viewer opens by default: live output first,
+ *  then the newest saved log, then the active/log-less or newest real run.
+ *  Superseded bookkeeping rows never shadow a surviving run. */
+export function pickActivityRun(runs: Run[]): Run | null {
   if (!runs.length) return null;
   const sorted = runsByStartDesc(runs);
   const eligible = sorted.filter((r) => !isSupersededRun(r));
+  const { live, active } = pickLiveRun(eligible);
   return (
-    eligible.find((r) => FAILED_RUN_STATUSES.has(r.status) && r.has_log) ??
+    live ??
     eligible.find((r) => r.has_log) ??
+    active ??
     eligible[0] ??
     sorted[0]
   );
@@ -992,14 +984,8 @@ export function ActivityLogCard({ runs }: { runs: Run[] }) {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   if (!sorted.length) return null;
 
-  const eligible = sorted.filter((r) => !isSupersededRun(r));
-  const { live, active } = pickLiveRun(eligible);
-  const fallback =
-    live ??
-    eligible.find((r) => r.has_log) ??
-    active ??
-    eligible[0] ??
-    sorted[0];
+  const fallback = pickActivityRun(sorted)!;
+  const { active } = pickLiveRun(sorted);
   const selected = sorted.find((r) => r.id === selectedId) ?? fallback;
   const stageLabel = STAGE_LABEL[selected.stage] ?? selected.stage;
   const selectedIsLive = selected.status === "running" && selected.has_log;
