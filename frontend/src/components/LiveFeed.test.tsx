@@ -45,6 +45,39 @@ function neverResolves(): Promise<never> {
   return new Promise(() => undefined);
 }
 
+/** jsdom implements neither layout nor scrolling: `scrollHeight` is always 0
+ *  and `scrollTop` is a no-op. Stub both on the shared prototype so the
+ *  anchoring effect has real geometry to react to, and hand back a restore
+ *  function so the stub doesn't leak into other tests. Row height is derived
+ *  from the rendered `EventRow` count (each one is a ".py-1" div), so the
+ *  fake height tracks history/tail growth the same way a real layout would. */
+function stubScrollGeometry(rowHeight: number): () => void {
+  const scrollTops = new WeakMap<Element, number>();
+  const heightDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollHeight");
+  const topDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollTop");
+
+  Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+    configurable: true,
+    get(this: HTMLElement) {
+      return this.querySelectorAll(".py-1").length * rowHeight;
+    },
+  });
+  Object.defineProperty(HTMLElement.prototype, "scrollTop", {
+    configurable: true,
+    get(this: HTMLElement) {
+      return scrollTops.get(this) ?? 0;
+    },
+    set(this: HTMLElement, value: number) {
+      scrollTops.set(this, value);
+    },
+  });
+
+  return () => {
+    if (heightDescriptor) Object.defineProperty(HTMLElement.prototype, "scrollHeight", heightDescriptor);
+    if (topDescriptor) Object.defineProperty(HTMLElement.prototype, "scrollTop", topDescriptor);
+  };
+}
+
 beforeEach(() => {
   streamRunMock.mockReset();
   fetchRunEventsMock.mockReset();
@@ -120,6 +153,42 @@ describe("LiveFeed", () => {
 
     const text = view.container.textContent ?? "";
     expect(text.indexOf("fresh line")).toBeLessThan(text.indexOf("history line"));
+  });
+
+  it("keeps the operator's scroll offset on a live prepend, but not on a load-more append", async () => {
+    const restore = stubScrollGeometry(20);
+    try {
+      fetchRunEventsMock
+        .mockResolvedValueOnce(page({ events: [message("page1 line", { seq: 100 })], nextBefore: 100 }))
+        .mockResolvedValueOnce(page({ events: [message("page2 line", { seq: 99 })], nextBefore: null }));
+      const emitters: Array<(event: LiveEvent) => void> = [];
+      streamRunMock.mockImplementation(async (_runId, options) => {
+        emitters.push(options.onEvent);
+        return await neverResolves();
+      });
+
+      const view = render(<LiveFeed runId="run-1" active live />);
+      await screen.findByText("page1 line");
+      await waitFor(() => expect(emitters.length).toBe(1));
+
+      const scrollEl = view.container.querySelector(".overflow-y-auto") as HTMLElement;
+      scrollEl.scrollTop = 40;
+
+      emitters[0]?.({ kind: "message", text: "fresh line", ts: null } as LiveEvent);
+      await waitFor(() =>
+        expect(within(view.container).getByText("fresh line")).toBeTruthy(),
+      );
+      expect(scrollEl.scrollTop).toBe(60);
+
+      const more = within(view.container).getByRole("button", { name: "Загрузить ещё" });
+      more.click();
+      await waitFor(() =>
+        expect(within(view.container).getByText("page2 line")).toBeTruthy(),
+      );
+      expect(scrollEl.scrollTop).toBe(60);
+    } finally {
+      restore();
+    }
   });
 
   it("renders local HH:mm:ss, the date at a day boundary, and — without a timestamp", async () => {

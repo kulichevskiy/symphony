@@ -289,18 +289,29 @@ export function LiveFeed({
   // content already in view.
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const prevScrollHeightRef = useRef<number | null>(null);
+  const prevTailRef = useRef<typeof tailItems>(tailItems);
   useLayoutEffect(() => {
     prevScrollHeightRef.current = null;
+    prevTailRef.current = tailItems;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId]);
+  // Runs after every render (not just tail insertions), since `history`
+  // growing from a first page load or `loadMore` also changes `scrollHeight`
+  // and must refresh the baseline — otherwise the next tail insertion
+  // compensates against a stale, too-small height and overshoots to the
+  // bottom. Only an actual top-prepend (a new `tailItems` identity) should
+  // apply the compensating scroll; `loadMore`'s bottom appends must not.
   useLayoutEffect(() => {
     const el = scrollRef.current;
     if (el === null) return;
     const prevHeight = prevScrollHeightRef.current;
-    if (prevHeight !== null && el.scrollTop > 0) {
+    const prepended = prevTailRef.current !== tailItems;
+    if (prepended && prevHeight !== null && el.scrollTop > 0) {
       el.scrollTop += el.scrollHeight - prevHeight;
     }
     prevScrollHeightRef.current = el.scrollHeight;
-  }, [tailItems]);
+    prevTailRef.current = tailItems;
+  });
 
   const dot =
     status === "live"
