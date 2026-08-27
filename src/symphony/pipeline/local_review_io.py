@@ -15,9 +15,9 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO
 
 from ..agent.process import Usage, parse_event_line
+from ..agent.run_log import RunLogWriter
 from ..agent.runner import Runner, RunnerSpec
 
 # stderr lines are teed with this prefix so the JSONL stream parser (which
@@ -26,24 +26,25 @@ from ..agent.runner import Runner, RunnerSpec
 _STDERR_PREFIX = "[stderr] "
 
 
-def open_run_log(log_path: Path | None) -> IO[str] | None:
+def open_run_log(log_path: Path | None) -> RunLogWriter | None:
     """Open `log_path` for append-teeing, or return None when unset.
 
     Parent dirs are created on demand — same lazy `mkdir` the orchestrator
-    does before an implement run's tee.
+    does before an implement run's tee. Lines go through `RunLogWriter`, so
+    these runs get the same per-line receipt times the UI feed timestamps
+    implement runs with.
     """
     if log_path is None:
         return None
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    return log_path.open("a", encoding="utf-8")
+    return RunLogWriter(log_path).open()
 
 
-def tee_run_log(logf: IO[str] | None, line: str, *, stderr: bool = False) -> None:
+def tee_run_log(logf: RunLogWriter | None, line: str, *, stderr: bool = False) -> None:
     """Append one line to the run log, flushing so `tail -f` sees it live."""
     if logf is None:
         return
-    logf.write(f"{_STDERR_PREFIX}{line}\n" if stderr else f"{line}\n")
-    logf.flush()
+    logf.write(f"{_STDERR_PREFIX}{line}" if stderr else line)
 
 
 @dataclass(frozen=True)

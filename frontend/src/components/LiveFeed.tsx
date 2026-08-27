@@ -1,16 +1,24 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 
 import { Icon } from "@/components/ui/icon";
-import { formatTokens } from "@/lib/format";
-import { foldTokenTick, streamRun, type LiveEvent, type TokenTick } from "@/lib/live";
+import { formatEventTime, formatTokens, localDay } from "@/lib/format";
+import {
+  fetchRunEvents,
+  foldTokenTick,
+  streamRun,
+  type FeedEvent,
+  type TokenTick,
+} from "@/lib/live";
 import { cn } from "@/lib/utils";
 
-/** Cap the retained feed so a long run can't grow the DOM without bound. */
-const MAX_FEED = 300;
 const RECONNECT_DELAY_MS = 2000;
 
-type FeedItem = Exclude<LiveEvent, { kind: "tokens" | "cursor" | "end" }>;
 type FeedStatus = "connecting" | "live" | "ended" | "error";
+
+/** A feed event plus a render key that stays stable as newer events arrive
+ *  above it. History events key off their `seq` (stable per run); tail events
+ *  get a local counter, since the stream carries no sequence. */
+type FeedEntry = { key: string; event: FeedEvent };
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -23,30 +31,79 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
 }
 
 /**
- * Subscribe to a run's event stream. In live mode reconnects from the last
- * byte offset if the connection drops before the run finishes; in non-live
- * mode (a finished run) it drains the log in a single pass and never
- * reconnects — the server tails a terminal run's log to the end and emits
- * `end`. Stops cleanly on that `end` frame. Token ticks are folded into a
- * single running total rather than appended as feed lines.
+ * A run's activity feed, newest first.
+ *
+ * Opens on one bounded page of the run's newest visible events (the history
+ * endpoint pages backwards by 100), appends older pages on demand, and — in
+ * `live` mode — tails the log from the byte offset that page was read at,
+ * inserting fresh events at the top. Because history is paged rather than
+ * replayed from byte 0, opening a long run no longer builds its whole DOM up
+ * front; live arrivals are kept in full, since dropping the oldest of them
+ * would leave a gap between the tail and the loaded pages.
+ *
+ * In non-live mode (a finished run) the tail drains the log once and never
+ * reconnects. Token ticks fold into a single running total instead of feed
+ * lines.
  */
-function useLiveFeed(runId: string, enabled: boolean, live: boolean) {
-  const [items, setItems] = useState<FeedItem[]>([]);
+function useActivityFeed(runId: string, enabled: boolean, live: boolean) {
+  const [history, setHistory] = useState<FeedEntry[]>([]);
+  const [tailItems, setTailItems] = useState<FeedEntry[]>([]);
+  const [nextBefore, setNextBefore] = useState<number | null>(null);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [tokens, setTokens] = useState<TokenTick | null>(null);
   const [status, setStatus] = useState<FeedStatus>("connecting");
   const [attempt, setAttempt] = useState(0);
+  // Where the tail resumes from. Set once the first page lands (so streamed
+  // events start exactly where that page ended) and advanced by `cursor`
+  // frames, so a reconnect or a live→finished flip never re-reads a line.
+  const [tailFrom, setTailFrom] = useState<{ runId: string; offset: number } | null>(null);
   const streamState = useRef({ runId: "", offset: 0 });
+  const localKey = useRef(0);
 
+  const entries = useCallback((events: FeedEvent[]): FeedEntry[] => {
+    return events.map((event) => ({
+      key: event.seq !== undefined ? `seq-${event.seq}` : `local-${localKey.current++}`,
+      event,
+    }));
+  }, []);
+
+  // First page per run. `attempt` is a dep so `retry` also recovers a failed
+  // page load; the guard keeps a successful one from being re-fetched (and its
+  // loaded older pages discarded) when the run finishes or retry fires.
   useEffect(() => {
     if (!enabled || !runId) return;
+    if (streamState.current.runId === runId) return;
+    let cancelled = false;
+    setHistory([]);
+    setTailItems([]);
+    setTokens(null);
+    setNextBefore(null);
+    setStatus("connecting");
+
+    void (async () => {
+      try {
+        const page = await fetchRunEvents(runId);
+        if (cancelled) return;
+        setHistory(entries(page.events));
+        setNextBefore(page.nextBefore);
+        // Usage the skipped prefix accounts for; live ticks fold onto it.
+        if (page.tokens) setTokens(page.tokens);
+        streamState.current = { runId, offset: page.offset };
+        setTailFrom({ runId, offset: page.offset });
+      } catch {
+        if (!cancelled) setStatus("error");
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [runId, enabled, attempt, entries]);
+
+  useEffect(() => {
+    if (!enabled || !runId || tailFrom === null || tailFrom.runId !== runId) return;
     let cancelled = false;
     const controller = new AbortController();
-    const changedRun = streamState.current.runId !== runId;
-    if (changedRun) {
-      streamState.current = { runId, offset: 0 };
-      setItems([]);
-      setTokens(null);
-    }
     let offset = streamState.current.offset;
     setStatus("connecting");
 
@@ -66,11 +123,11 @@ function useLiveFeed(runId: string, enabled: boolean, live: boolean) {
               if (cancelled) return;
               if (event.kind === "tokens") {
                 setTokens((prev) => foldTokenTick(prev, event));
-              } else if (
-                event.kind !== "cursor" &&
-                event.kind !== "end"
-              ) {
-                setItems((prev) => [...prev, event].slice(-MAX_FEED));
+              } else if (event.kind !== "cursor" && event.kind !== "end") {
+                setTailItems((prev) => [
+                  { key: `local-${localKey.current++}`, event },
+                  ...prev,
+                ]);
               }
             },
           });
@@ -104,25 +161,47 @@ function useLiveFeed(runId: string, enabled: boolean, live: boolean) {
       cancelled = true;
       controller.abort();
     };
-  }, [runId, enabled, live, attempt]);
+  }, [runId, enabled, live, attempt, tailFrom]);
 
-  return { items, tokens, status, reconnect: () => setAttempt((n) => n + 1) };
+  const loadMore = useCallback(async () => {
+    if (nextBefore === null || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const page = await fetchRunEvents(runId, { before: nextBefore });
+      setHistory((prev) => [...prev, ...entries(page.events)]);
+      setNextBefore(page.nextBefore);
+    } catch {
+      // Keep the action visible so the operator can try the page again.
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [runId, nextBefore, loadingMore, entries]);
+
+  return {
+    items: [...tailItems, ...history],
+    tokens,
+    status,
+    hasMore: nextBefore !== null,
+    loadingMore,
+    loadMore,
+    reconnect: () => setAttempt((n) => n + 1),
+  };
 }
 
-function EventRow({ event }: { event: FeedItem }) {
+function EventBody({ event }: { event: FeedEvent }) {
   if (event.kind === "message") {
     return (
-      <div className="flex gap-2 py-1">
+      <>
         <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-blue-500" />
         <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground">
           {event.text}
         </p>
-      </div>
+      </>
     );
   }
   if (event.kind === "file_edit") {
     return (
-      <div className="flex gap-2 py-1">
+      <>
         <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-violet-500" />
         <p className="break-words text-sm leading-relaxed">
           <span className="font-medium text-violet-600 dark:text-violet-400">
@@ -132,12 +211,12 @@ function EventRow({ event }: { event: FeedItem }) {
             {event.files.length ? event.files.join(", ") : event.tool ?? "file"}
           </span>
         </p>
-      </div>
+      </>
     );
   }
   // tool_call
   return (
-    <div className="flex gap-2 py-1">
+    <>
       <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500" />
       <p className="break-words text-sm leading-relaxed">
         <span className="font-medium text-amber-600 dark:text-amber-400">
@@ -149,6 +228,17 @@ function EventRow({ event }: { event: FeedItem }) {
           </span>
         ) : null}
       </p>
+    </>
+  );
+}
+
+function EventRow({ event, withDate }: { event: FeedEvent; withDate: boolean }) {
+  return (
+    <div className="flex gap-2 py-1">
+      <span className="mt-0.5 shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground">
+        {formatEventTime(event.ts, withDate)}
+      </span>
+      <EventBody event={event} />
     </div>
   );
 }
@@ -161,11 +251,11 @@ const STATUS_LABEL: Record<FeedStatus, string> = {
 };
 
 /** Parsed view of an agent run — messages, tool calls, file edits and a running
- *  token total, tailed from the run log. In `live` mode (default) it follows a
- *  running run and reconnects on drops; with `live={false}` it drains a
- *  finished run's log once (no reconnect loop) as a final log. `label`
- *  overrides the header text (e.g. "final log — implement, failed"). Scrolls
- *  with new output; readable on mobile. */
+ *  token total, newest first. In `live` mode (default) it follows a running run
+ *  and reconnects on drops; with `live={false}` it drains a finished run's log
+ *  once (no reconnect loop) as a final log. `label` overrides the header text
+ *  (e.g. "final log — implement, failed"). Older history loads on demand, so
+ *  new output never scrolls the operator away from what they were reading. */
 export function LiveFeed({
   runId,
   active,
@@ -177,22 +267,8 @@ export function LiveFeed({
   live?: boolean;
   label?: ReactNode;
 }) {
-  const { items, tokens, status, reconnect } = useLiveFeed(runId, active, live);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const pinnedRef = useRef(true);
-
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (el && pinnedRef.current) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [items]);
-
-  function onScroll() {
-    const el = scrollRef.current;
-    if (!el) return;
-    pinnedRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-  }
+  const { items, tokens, status, hasMore, loadingMore, loadMore, reconnect } =
+    useActivityFeed(runId, active, live);
 
   const dot =
     status === "live"
@@ -200,6 +276,16 @@ export function LiveFeed({
       : status === "ended"
         ? "bg-green-500"
         : "bg-amber-500";
+
+  // Newest first, so a row shows its date only where the day changes going
+  // down the feed. Rows without a receipt time never open a day.
+  let lastDay: string | null = null;
+  const rows = items.map(({ key, event }) => {
+    const day = localDay(event.ts);
+    const withDate = day !== null && lastDay !== null && day !== lastDay;
+    if (day !== null) lastDay = day;
+    return { key, event, withDate };
+  });
 
   return (
     <div>
@@ -230,12 +316,8 @@ export function LiveFeed({
           </button>
         ) : null}
       </div>
-      <div
-        ref={scrollRef}
-        onScroll={onScroll}
-        className="max-h-[420px] overflow-y-auto overscroll-contain rounded-md border border-border bg-secondary/20 px-3 py-2"
-      >
-        {items.length === 0 ? (
+      <div className="max-h-[420px] overflow-y-auto overscroll-contain rounded-md border border-border bg-secondary/20 px-3 py-2">
+        {rows.length === 0 ? (
           <p className="py-6 text-center text-sm text-muted-foreground">
             {status === "ended"
               ? live
@@ -245,11 +327,23 @@ export function LiveFeed({
           </p>
         ) : (
           <div className="divide-y divide-border/40">
-            {items.map((event, i) => (
-              <EventRow key={i} event={event} />
+            {rows.map(({ key, event, withDate }) => (
+              <EventRow key={key} event={event} withDate={withDate} />
             ))}
           </div>
         )}
+        {hasMore ? (
+          <div className="pt-2 text-center">
+            <button
+              type="button"
+              onClick={() => void loadMore()}
+              disabled={loadingMore}
+              className="text-xs font-medium text-muted-foreground hover:text-foreground disabled:opacity-50"
+            >
+              {loadingMore ? "Загрузка…" : "Загрузить ещё"}
+            </button>
+          </div>
+        ) : null}
       </div>
     </div>
   );

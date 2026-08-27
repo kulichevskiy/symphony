@@ -8,7 +8,11 @@ Two pieces the SPA needs to watch a running agent:
   browser renders a feed instead of a raw JSONL dump.
 - ``create_live_stream_router`` mounts ``GET /api/runs/{run_id}/stream`` which
   tails ``{log_root}/{run_id}.log`` and pushes those events as NDJSON while the
-  run is live, ending cleanly once the run leaves ``running``.
+  run is live, ending cleanly once the run leaves ``running``, plus
+  ``GET /api/runs/{run_id}/events`` which serves that log's *visible* events
+  (messages, tool calls, file edits) as newest-first pages of
+  ``_PAGE_SIZE``, so opening a long run costs one bounded page instead of the
+  whole history.
 
 The endpoint lives under the shared ``/api/*`` auth gate (see ``app.py``); the
 frontend consumes it with ``fetch`` + ``ReadableStream`` so the request carries
@@ -29,6 +33,7 @@ from starlette.responses import StreamingResponse
 
 from ..agent.activity import sanitize_text
 from ..agent.process import parse_event_line
+from ..agent.run_log import ReceiptTimes
 from ..db.runs import LIVE_STATUSES
 from .db import ReadOnlyDbPool
 
@@ -39,6 +44,14 @@ _FILE_EDIT_TOOLS = frozenset(
 )
 
 _POLL_INTERVAL_SECS = 0.5
+
+# Event kinds the feed actually renders. Token ticks and unparsed service
+# lines are excluded, so they never eat a page slot.
+_VISIBLE_KINDS = frozenset({"message", "tool_call", "file_edit"})
+
+# Fixed page size for the history endpoint — the UI opens on one page and
+# appends older pages on demand.
+_PAGE_SIZE = 100
 
 
 def parse_stream_events(line: str) -> list[dict[str, Any]]:
@@ -214,6 +227,72 @@ def _ndjson(event: Mapping[str, Any]) -> str:
     return json.dumps(event, separators=(",", ":")) + "\n"
 
 
+def _fold_tokens(total: dict[str, Any] | None, tick: Mapping[str, Any]) -> dict[str, Any]:
+    """Fold a token tick into a running total — mirrors the frontend's
+    ``foldTokenTick``: cumulative ticks replace, per-turn deltas add."""
+    if total is None or tick.get("cumulative"):
+        return dict(tick)
+    summed = dict(total)
+    summed["cumulative"] = False
+    for field in (
+        "input_tokens",
+        "output_tokens",
+        "cache_write_tokens",
+        "cache_read_tokens",
+        "cost_usd",
+    ):
+        summed[field] = total[field] + tick[field]
+    return summed
+
+
+def _scan_visible(
+    data: bytes, times: ReceiptTimes
+) -> tuple[list[dict[str, Any]], int, dict[str, Any] | None]:
+    """Parse every *complete* line in ``data`` into visible events.
+
+    Each event carries its ``seq`` — its position in the run's visible-event
+    sequence, which is stable because the log is append-only — and the receipt
+    time of the line it came from (``None`` for logs with no sidecar). Also
+    returns the byte offset just past the last complete line (so a half-written
+    trailing line is left for the live tail to re-read whole) and the token
+    total folded over everything scanned, which is the only place a page's
+    caller can learn the usage of the prefix it skipped.
+    """
+    events: list[dict[str, Any]] = []
+    tokens: dict[str, Any] | None = None
+    offset = 0
+    for raw in data.split(b"\n")[:-1]:
+        offset += len(raw) + 1
+        ts = times.get(offset)
+        for event in parse_stream_events(raw.decode(errors="replace")):
+            if event["kind"] == "tokens":
+                tokens = _fold_tokens(tokens, event)
+            elif event["kind"] in _VISIBLE_KINDS:
+                events.append({**event, "seq": len(events), "ts": ts})
+    return events, offset, tokens
+
+
+def _visible_page(log_path: Path, before: int | None) -> dict[str, Any]:
+    """One newest-first page of visible events ending just below ``before``.
+
+    ``before`` is the exclusive upper ``seq`` bound (the previous page's
+    ``next_before``); ``None`` opens on the newest events. ``offset`` is the
+    live-tail resume point for the log as read here, so events streamed from it
+    neither duplicate nor skip what this page already contains, and ``tokens``
+    is the run's usage total over everything up to that offset.
+    """
+    data = log_path.read_bytes() if log_path.exists() else b""
+    events, offset, tokens = _scan_visible(data, ReceiptTimes(log_path))
+    upper = len(events) if before is None else min(before, len(events))
+    start = max(0, upper - _PAGE_SIZE)
+    return {
+        "events": list(reversed(events[start:upper])),
+        "next_before": start if start > 0 else None,
+        "offset": offset,
+        "tokens": tokens,
+    }
+
+
 def create_live_stream_router(
     pool: ReadOnlyDbPool,
     *,
@@ -244,6 +323,7 @@ def create_live_stream_router(
         async def events() -> AsyncIterator[str]:
             pos = offset
             buffer = b""
+            times = ReceiptTimes(log_path)
 
             async def drain_once() -> AsyncIterator[str]:
                 # Emits a `cursor` after each complete line (not just once per
@@ -257,13 +337,18 @@ def create_live_stream_router(
                 pos = new_pos
                 while b"\n" in buffer:
                     raw, buffer = buffer.split(b"\n", 1)
-                    for event in parse_stream_events(raw.decode(errors="replace")):
-                        yield _ndjson(event)
                     # `pos` is the total bytes physically read; `buffer` now
                     # holds only what's left unconsumed (later lines plus a
                     # trailing partial line), so their difference is exactly
-                    # this line's resumable boundary.
-                    yield _ndjson({"kind": "cursor", "offset": pos - len(buffer)})
+                    # this line's resumable boundary — and the key its receipt
+                    # time is recorded under.
+                    boundary = pos - len(buffer)
+                    ts = await asyncio.to_thread(times.get, boundary)
+                    for event in parse_stream_events(raw.decode(errors="replace")):
+                        if event["kind"] in _VISIBLE_KINDS:
+                            event["ts"] = ts
+                        yield _ndjson(event)
+                    yield _ndjson({"kind": "cursor", "offset": boundary})
 
             while True:
                 async for chunk in drain_once():
@@ -280,6 +365,16 @@ def create_live_stream_router(
             yield _ndjson({"kind": "end"})
 
         return StreamingResponse(events(), media_type="application/x-ndjson")
+
+    @router.get("/runs/{run_id}/events")
+    async def run_events(
+        run_id: str,
+        before: int | None = Query(None, ge=0),
+    ) -> dict[str, Any]:
+        """Newest-first page of a run's visible events (see ``_visible_page``)."""
+        if await _run_status(run_id) is None:
+            raise HTTPException(status_code=404, detail="Run not found")
+        return await asyncio.to_thread(_visible_page, log_root / f"{run_id}.log", before)
 
     return router
 

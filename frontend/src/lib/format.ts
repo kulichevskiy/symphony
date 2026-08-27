@@ -69,6 +69,39 @@ export function formatRelative(
   return diff < 0 ? `in ${value}${unit}` : `${value}${unit} ago`;
 }
 
+function pad(value: number): string {
+  return String(value).padStart(2, "0");
+}
+
+/** Browser-local calendar day of a receipt time, for spotting day boundaries
+ *  in the activity feed. `null` when there is no usable timestamp. */
+export function localDay(ts: string | null | undefined): string | null {
+  if (!ts) {
+    return null;
+  }
+  const d = new Date(ts);
+  if (Number.isNaN(d.getTime())) {
+    return null;
+  }
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** Browser-local `HH:mm:ss` for an activity event, prefixed with the local
+ *  date when `withDate` (a day boundary in the feed). Renders `—` for legacy
+ *  log lines with no recoverable receipt time rather than inventing one. */
+export function formatEventTime(
+  ts: string | null | undefined,
+  withDate = false,
+): string {
+  const day = localDay(ts);
+  if (!ts || day === null) {
+    return "—";
+  }
+  const d = new Date(ts);
+  const time = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  return withDate ? `${day} ${time}` : time;
+}
+
 export function formatLongDate(ts: string): string {
   const d = new Date(ts);
   if (Number.isNaN(d.getTime())) {
