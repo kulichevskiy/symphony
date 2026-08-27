@@ -60,6 +60,8 @@ from .ui.oauth import linear_provider
 from .webhook import WebhookSettings
 
 if TYPE_CHECKING:
+    from uvicorn import Server
+
     from .db.token_backfill import CodexModels
 
 _ANSI_RESET = "\x1b[0m"
@@ -92,16 +94,23 @@ class _ColorFormatter(logging.Formatter):
             return _ANSI_BOLD_RED
         if record.levelno >= logging.WARNING:
             return _ANSI_YELLOW
-        match = _HTTP_STATUS_RE.search(text)
-        if match:
-            status = int(match.group(1))
-            if status >= 500:
-                return _ANSI_BOLD_RED
-            if status >= 400:
-                return _ANSI_YELLOW
+        if http_color := _http_status_color(text):
+            return http_color
         if record.levelno <= logging.DEBUG:
             return _ANSI_DIM
         return None
+
+
+def _http_status_color(text: str) -> str | None:
+    match = _HTTP_STATUS_RE.search(text)
+    if match is None:
+        return None
+    status = int(match.group(1))
+    if status >= 500:
+        return _ANSI_BOLD_RED
+    if status >= 400:
+        return _ANSI_YELLOW
+    return None
 
 
 def _setup_logging() -> None:
@@ -417,38 +426,7 @@ async def _run(*, once: bool) -> None:
         # topology (a fresh install boots with zero bindings; the operator
         # adds them in the UI). The tick-boundary reload (SYM-189) is always on.
         db_owns_topology = True
-        base = Config.from_env()
-        try:
-            cfg = await assemble_effective_config(conn, base)
-        except ConfigBootError as e:
-            click.echo(str(e), err=True)
-            sys.exit(2)
-        # Effective encryption key (Config v2 2/9): explicit env/.env wins,
-        # else auto-provisioned from/into the data volume next to the DB. The
-        # resolved key rides on cfg so every downstream cipher (orchestrator,
-        # UI routers via ui_external_config, the auth gates below) agrees.
-        cfg = _resolve_key_into(cfg)
-        # Fail the boot loudly when stored credentials no longer decrypt (key
-        # lost/rotated) — never silent OAuth 503s at runtime.
-        try:
-            await db.oauth_connections.assert_cipher_usable(
-                conn, CredentialCipher(cfg.symphony_encryption_key)
-            )
-        except EncryptionKeyLostError as e:
-            click.echo(str(e), err=True)
-            sys.exit(2)
-        # Must run before `_config_has_usable_linear_auth`: that check's DB-first
-        # resolver can refresh (and write back) an expired Linear OAuth token,
-        # which is state mutation this fail-closed gate must precede, not follow
-        # (OAuth in UI 4/7 review fix).
-        _enforce_require_auth0(cfg)
-        if _config_has_linear_bindings(cfg) and not await _config_has_usable_linear_auth(conn, cfg):
-            click.echo(
-                "LINEAR_API_KEY env var is empty and no Linear OAuth connection is "
-                "configured; aborting",
-                err=True,
-            )
-            sys.exit(2)
+        cfg = await _load_runtime_config(conn)
         async with _configured_tracker_registry(cfg, conn) as (trackers, _):
             # When the DB owns topology, hot-apply binding edits at each tick
             # boundary (SYM-189). A reload introducing a provider/site the
@@ -498,91 +476,126 @@ async def _run(*, once: bool) -> None:
                 await orch.drain_dispatch_tasks()
                 await orch.aclose_hot_added_trackers()
                 return
-            webhook_server: object | None = None
-            webhook_task: asyncio.Task[None] | None = None
-            github_webhook_settings = _github_webhook_settings(cfg, repo_secret_view.as_map())
-            # A DB-owned topology can hot-enable a repo's webhook (or add a
-            # binding needing one) at any later tick — the boot-time booleans
-            # above can't see that yet, so a headless (`ui.enabled=False`)
-            # deployment with nothing webhook-enabled at boot must still
-            # start the HTTP surface, or a hot-enabled repo would need a
-            # restart to get a live endpoint (SYM-189).
-            if (
-                cfg.linear_webhook_secret
-                or github_webhook_settings
-                or cfg.ui.enabled
-                or db_owns_topology
-            ):
-                import uvicorn
-
-                webhook_settings = (
-                    WebhookSettings(
-                        secret=cfg.linear_webhook_secret,
-                        dedupe_ttl_secs=cfg.webhook_dedupe_ttl_secs,
-                        timestamp_tolerance_secs=(cfg.webhook_timestamp_tolerance_secs),
-                    )
-                    if cfg.linear_webhook_secret
-                    else None
-                )
-                app = create_app(
-                    orch,
-                    conn,
-                    webhook_settings,
-                    # A DB-owned topology hot-applies binding edits onto
-                    # `orch.config` (SYM-189) — resolve the webhook settings
-                    # from it on every request instead of baking in this
-                    # boot-time snapshot, so an edited/added repo's
-                    # enabled/secret state doesn't need a restart. The
-                    # callable is always passed (even when nothing is
-                    # webhook-enabled at boot) so a binding hot-added later
-                    # doesn't need one either — the router itself no-ops
-                    # (ignores every repo) when the resolved settings are
-                    # `None`.
-                    lambda: _live_github_webhook_settings(orch.config, repo_secret_view.as_map()),
-                    ui_enabled=cfg.ui.enabled,
-                    ui_db_path=cfg.db_path,
-                    ui_log_root=cfg.log_root,
-                    ui_status_thresholds=cfg.ui.status_stuck_thresholds.to_timedeltas(),
-                    ui_external_config=lambda: orch.config,
-                    ui_external_linear=lambda: _external_linear_tracker(trackers),
-                    ui_external_github=cast(GitHubExternalClient, orch._gh),
-                    ui_pr_no_progress_threshold=(
-                        cfg.ui.status_stuck_thresholds.pr_no_progress_threshold()
-                    ),
-                    ui_command_sink=orch,
-                    ui_pause_controller=orch,
-                    ui_config_write_lock=orch.config_write_lock,
-                    ui_repo_secret_view=repo_secret_view,
-                    ui_db_owns_topology=db_owns_topology,
-                    ui_webhook_public_url=os.environ.get("SYMPHONY_WEBHOOK_PUBLIC_URL"),
-                    auth0_settings=_auth0_settings(cfg) if cfg.ui.enabled else None,
-                )
-                server = uvicorn.Server(
-                    build_server_config(
-                        app,
-                        host=cfg.webhook_host,
-                        port=cfg.webhook_port,
-                    )
-                )
-                webhook_server = server
-                webhook_task = asyncio.create_task(server.serve())
-                logging.getLogger(__name__).info(
-                    "http surface listening on %s:%d",
-                    cfg.webhook_host,
-                    cfg.webhook_port,
-                )
+            webhook_server, webhook_task = await _start_http_surface(
+                cfg=cfg,
+                orch=orch,
+                conn=conn,
+                trackers=trackers,
+                repo_secret_view=repo_secret_view,
+                db_owns_topology=db_owns_topology,
+            )
             loop = asyncio.get_running_loop()
             for sig in (signal.SIGINT, signal.SIGTERM):
                 loop.add_signal_handler(sig, lambda: asyncio.create_task(orch.shutdown()))
             try:
                 await orch.run()
             finally:
-                if webhook_server is not None and webhook_task is not None:
-                    webhook_server.should_exit = True  # type: ignore[attr-defined]
-                    await webhook_task
+                await _stop_http_surface(webhook_server, webhook_task)
                 await orch.aclose_hot_added_trackers()
     finally:
         await conn.close()
+
+
+async def _load_runtime_config(conn: aiosqlite.Connection) -> Config:
+    try:
+        cfg = await assemble_effective_config(conn, Config.from_env())
+    except ConfigBootError as e:
+        click.echo(str(e), err=True)
+        sys.exit(2)
+    cfg = _resolve_key_into(cfg)
+    try:
+        await db.oauth_connections.assert_cipher_usable(
+            conn, CredentialCipher(cfg.symphony_encryption_key)
+        )
+    except EncryptionKeyLostError as e:
+        click.echo(str(e), err=True)
+        sys.exit(2)
+    _enforce_require_auth0(cfg)
+    if _config_has_linear_bindings(cfg) and not await _config_has_usable_linear_auth(conn, cfg):
+        click.echo(
+            "LINEAR_API_KEY env var is empty and no Linear OAuth connection is "
+            "configured; aborting",
+            err=True,
+        )
+        sys.exit(2)
+    return cfg
+
+
+async def _start_http_surface(
+    *,
+    cfg: Config,
+    orch: Orchestrator,
+    conn: aiosqlite.Connection,
+    trackers: TrackerRegistry,
+    repo_secret_view: db.config_repo_secrets.RepoSecretView,
+    db_owns_topology: bool,
+) -> tuple[Server | None, asyncio.Task[None] | None]:
+    github_webhook_settings = _github_webhook_settings(cfg, repo_secret_view.as_map())
+    if not _needs_http_surface(cfg, github_webhook_settings, db_owns_topology):
+        return None, None
+
+    import uvicorn
+
+    webhook_settings = _runtime_webhook_settings(cfg)
+    app = create_app(
+        orch,
+        conn,
+        webhook_settings,
+        lambda: _live_github_webhook_settings(orch.config, repo_secret_view.as_map()),
+        ui_enabled=cfg.ui.enabled,
+        ui_db_path=cfg.db_path,
+        ui_log_root=cfg.log_root,
+        ui_status_thresholds=cfg.ui.status_stuck_thresholds.to_timedeltas(),
+        ui_external_config=lambda: orch.config,
+        ui_external_linear=lambda: _external_linear_tracker(trackers),
+        ui_external_github=cast(GitHubExternalClient, orch._gh),
+        ui_pr_no_progress_threshold=cfg.ui.status_stuck_thresholds.pr_no_progress_threshold(),
+        ui_command_sink=orch,
+        ui_pause_controller=orch,
+        ui_config_write_lock=orch.config_write_lock,
+        ui_repo_secret_view=repo_secret_view,
+        ui_db_owns_topology=db_owns_topology,
+        ui_webhook_public_url=os.environ.get("SYMPHONY_WEBHOOK_PUBLIC_URL"),
+        auth0_settings=_auth0_settings(cfg) if cfg.ui.enabled else None,
+    )
+    server = uvicorn.Server(build_server_config(app, host=cfg.webhook_host, port=cfg.webhook_port))
+    task = asyncio.create_task(server.serve())
+    logging.getLogger(__name__).info(
+        "http surface listening on %s:%d",
+        cfg.webhook_host,
+        cfg.webhook_port,
+    )
+    return server, task
+
+
+def _needs_http_surface(
+    cfg: Config,
+    github_webhook_settings: GitHubWebhookSettings | None,
+    db_owns_topology: bool,
+) -> bool:
+    return bool(
+        cfg.linear_webhook_secret or github_webhook_settings or cfg.ui.enabled or db_owns_topology
+    )
+
+
+def _runtime_webhook_settings(cfg: Config) -> WebhookSettings | None:
+    if not cfg.linear_webhook_secret:
+        return None
+    return WebhookSettings(
+        secret=cfg.linear_webhook_secret,
+        dedupe_ttl_secs=cfg.webhook_dedupe_ttl_secs,
+        timestamp_tolerance_secs=cfg.webhook_timestamp_tolerance_secs,
+    )
+
+
+async def _stop_http_surface(
+    server: Server | None,
+    task: asyncio.Task[None] | None,
+) -> None:
+    if server is None or task is None:
+        return
+    server.should_exit = True
+    await task
 
 
 @main.command()

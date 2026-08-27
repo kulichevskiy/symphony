@@ -276,27 +276,19 @@ async def run_local_review_loop(
             cache_read_tokens=total_cache_read_tokens,
         )
 
-    i = 0
-    fixes_used = 0
-    prior_findings: list[str] = []
-    while True:
-        verdict: LocalVerdict | None = None
+    async def _review_iteration(
+        iteration: int,
+    ) -> tuple[LocalVerdict | None, str | None, str | None, str | None]:
         reviewer_error: str | None = None
-        # The real stream error (an API/config failure) can surface on one
-        # attempt but not a later one; retain the last non-empty one so an
-        # unparseable final attempt still reports the real cause rather than
-        # the generic marker message.
         stream_error: str | None = None
         last_failed_agent: str | None = None
         reviewer_retries_used = 0
         severity_retries_used = 0
         while True:
-            out = await reviewer(i)
+            out = await reviewer(iteration)
             _record_usage(out)
             if out.agent_error:
                 stream_error = out.agent_error
-            # Record first, then clear: an output never reports a provider as
-            # both failed and healthy, so order only matters for readability.
             if out.api_error is not None:
                 last_failed_agent = out.api_error_agent or str(reviewer_agent)
                 ledger.record(out.api_error, last_failed_agent)
@@ -307,12 +299,8 @@ async def run_local_review_loop(
                 if reviewer_retries_used < REVIEWER_FAILURE_RETRIES:
                     reviewer_retries_used += 1
                     continue
-                return _result(
-                    outcome=LoopOutcome.REVIEWER_FAILED,
-                    iterations=i + 1,
-                    error=reviewer_error,
-                    prefer_agent=last_failed_agent,
-                )
+                return None, reviewer_error, stream_error, last_failed_agent
+
             parsed = parse_local_review_output(
                 agent=reviewer_agent,
                 stdout=out.stdout,
@@ -326,8 +314,15 @@ async def run_local_review_loop(
             elif parsed.severity_inferred and severity_retries_used < REVIEWER_FAILURE_RETRIES:
                 severity_retries_used += 1
                 continue
-            verdict = parsed
-            break
+            return parsed, reviewer_error, stream_error, last_failed_agent
+
+    i = 0
+    fixes_used = 0
+    prior_findings: list[str] = []
+    while True:
+        # The real stream error can surface on one attempt but not a later
+        # one; the review cycle retains it for an unparseable final attempt.
+        verdict, reviewer_error, stream_error, last_failed_agent = await _review_iteration(i)
 
         if verdict is None:
             return _result(

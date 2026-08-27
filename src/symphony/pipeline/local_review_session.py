@@ -508,135 +508,127 @@ async def run_local_review_session(
             cache_read_tokens=cache_read_delta,
         )
 
-    async def _reviewer(iteration: int) -> ReviewerOutput:
+    async def _hybrid_reviewer(iteration: int, head_sha: str) -> ReviewerOutput:
         nonlocal hybrid_initial_head
         nonlocal hybrid_previous_findings
-        head_sha = await head_sha_provider(workspace_path)
-
-        if review_mode == "hybrid":
-            if hybrid_initial_head is None:
-                hybrid_initial_head = head_sha
-            comparison_ref = base_branch if iteration == 0 else hybrid_initial_head
-            bug_role = verifier_role
-            builtin_bug_review = bug_role.agent == "codex"
-
-            spec_prompt = local_review_spec_prompt(
-                issue_title=issue_title,
-                issue_body=issue_body,
-                labels=labels,
-                comparison_ref=comparison_ref,
-                previous_findings=hybrid_previous_findings,
-            )
-            bug_prompt = local_review_bug_prompt(
-                issue_title=issue_title,
-                issue_body=issue_body,
-                labels=labels,
-                comparison_ref=comparison_ref,
-                previous_findings=hybrid_previous_findings,
-            )
-            spec_out, bug_out = await asyncio.gather(
-                _run_reviewer_pass(
-                    agent=reviewer_role.agent,
-                    codex_model=reviewer_role.codex_model_arg(),
-                    claude_model=reviewer_role.claude_model_arg(),
-                    effort=reviewer_role.effort,
-                    prompt=spec_prompt,
-                    stem=f"review-{iteration}-spec",
-                    run_suffix=f"rev-{iteration}-spec",
-                    head_sha=head_sha,
-                ),
-                _run_reviewer_pass(
-                    agent=bug_role.agent,
-                    codex_model=bug_role.codex_model_arg(),
-                    claude_model=bug_role.claude_model_arg(),
-                    effort=bug_role.effort,
-                    # `codex exec review --base` owns its prompt; the CLI
-                    # rejects a custom positional prompt in this mode.
-                    prompt="" if builtin_bug_review else bug_prompt,
-                    stem=f"review-{iteration}-bug",
-                    run_suffix=f"rev-{iteration}-bug",
-                    head_sha=head_sha,
-                    builtin_review=builtin_bug_review,
-                    comparison_ref=comparison_ref,
-                ),
-            )
-            if workspace_scrubber is not None:
-                await workspace_scrubber(workspace_path, head_sha)
-
-            total_cost_usd = spec_out.cost_usd + bug_out.cost_usd
-            total_input_tokens = spec_out.input_tokens + bug_out.input_tokens
-            total_output_tokens = spec_out.output_tokens + bug_out.output_tokens
-            total_cache_write_tokens = spec_out.cache_write_tokens + bug_out.cache_write_tokens
-            total_cache_read_tokens = spec_out.cache_read_tokens + bug_out.cache_read_tokens
-            failed = spec_out if not spec_out.ok else bug_out if not bug_out.ok else None
-            if failed is not None:
-                return replace(
-                    failed,
-                    cost_usd=total_cost_usd,
-                    input_tokens=total_input_tokens,
-                    output_tokens=total_output_tokens,
-                    cache_write_tokens=total_cache_write_tokens,
-                    cache_read_tokens=total_cache_read_tokens,
-                )
-
-            spec_message = extract_last_agent_message(
+        if hybrid_initial_head is None:
+            hybrid_initial_head = head_sha
+        comparison_ref = base_branch if iteration == 0 else hybrid_initial_head
+        bug_role = verifier_role
+        builtin_bug_review = bug_role.agent == "codex"
+        spec_prompt = local_review_spec_prompt(
+            issue_title=issue_title,
+            issue_body=issue_body,
+            labels=labels,
+            comparison_ref=comparison_ref,
+            previous_findings=hybrid_previous_findings,
+        )
+        bug_prompt = local_review_bug_prompt(
+            issue_title=issue_title,
+            issue_body=issue_body,
+            labels=labels,
+            comparison_ref=comparison_ref,
+            previous_findings=hybrid_previous_findings,
+        )
+        spec_out, bug_out = await asyncio.gather(
+            _run_reviewer_pass(
                 agent=reviewer_role.agent,
-                stdout=spec_out.stdout,
-                last_message_file=spec_out.last_message_file,
-            )
-            bug_message = extract_last_agent_message(
+                codex_model=reviewer_role.codex_model_arg(),
+                claude_model=reviewer_role.claude_model_arg(),
+                effort=reviewer_role.effort,
+                prompt=spec_prompt,
+                stem=f"review-{iteration}-spec",
+                run_suffix=f"rev-{iteration}-spec",
+                head_sha=head_sha,
+            ),
+            _run_reviewer_pass(
                 agent=bug_role.agent,
-                stdout=bug_out.stdout,
-                last_message_file=bug_out.last_message_file,
-            )
-            merged = merge_hybrid_review_messages(
-                spec_message=spec_message,
-                bug_message=bug_message,
+                codex_model=bug_role.codex_model_arg(),
+                claude_model=bug_role.claude_model_arg(),
+                effort=bug_role.effort,
+                prompt="" if builtin_bug_review else bug_prompt,
+                stem=f"review-{iteration}-bug",
+                run_suffix=f"rev-{iteration}-bug",
                 head_sha=head_sha,
-                builtin_bug_review=builtin_bug_review,
-            )
-            if merged.kind is LocalVerdictKind.APPROVED:
-                final_message = f"Hybrid local review passed.\n{VERDICT_APPROVED_MARKER}"
-            elif merged.kind is LocalVerdictKind.CHANGES_REQUESTED:
-                hybrid_previous_findings = merged.findings
-                final_message = (
-                    f"## Findings\n{merged.findings}\n{VERDICT_CHANGES_REQUESTED_MARKER}"
-                )
-            else:
-                final_message = merged.raw_message
-            (last_message_dir / f"review-{iteration}-hybrid.last.txt").write_text(
-                final_message,
-                encoding="utf-8",
-            )
-            api_error, api_error_agent = _prefer_actionable_api_error(
-                primary=(spec_out.api_error, spec_out.api_error_agent),
-                secondary=(bug_out.api_error, bug_out.api_error_agent),
-            )
-            return ReviewerOutput(
-                stdout="",
-                head_sha=head_sha,
-                last_message_file=final_message,
-                api_error=api_error,
-                api_error_agent=api_error_agent,
-                extra_api_errors=_spare_auth_errors(
-                    chosen=api_error,
-                    candidates=(
-                        (spec_out.api_error, spec_out.api_error_agent),
-                        (bug_out.api_error, bug_out.api_error_agent),
-                    ),
-                ),
-                healthy_agents=tuple(
-                    {
-                        *spec_out.healthy_agents,
-                        *bug_out.healthy_agents,
-                    }
-                ),
+                builtin_review=builtin_bug_review,
+                comparison_ref=comparison_ref,
+            ),
+        )
+        if workspace_scrubber is not None:
+            await workspace_scrubber(workspace_path, head_sha)
+
+        total_cost_usd = spec_out.cost_usd + bug_out.cost_usd
+        total_input_tokens = spec_out.input_tokens + bug_out.input_tokens
+        total_output_tokens = spec_out.output_tokens + bug_out.output_tokens
+        total_cache_write_tokens = spec_out.cache_write_tokens + bug_out.cache_write_tokens
+        total_cache_read_tokens = spec_out.cache_read_tokens + bug_out.cache_read_tokens
+        failed = spec_out if not spec_out.ok else bug_out if not bug_out.ok else None
+        if failed is not None:
+            return replace(
+                failed,
                 cost_usd=total_cost_usd,
                 input_tokens=total_input_tokens,
                 output_tokens=total_output_tokens,
                 cache_write_tokens=total_cache_write_tokens,
                 cache_read_tokens=total_cache_read_tokens,
             )
+
+        spec_message = extract_last_agent_message(
+            agent=reviewer_role.agent,
+            stdout=spec_out.stdout,
+            last_message_file=spec_out.last_message_file,
+        )
+        bug_message = extract_last_agent_message(
+            agent=bug_role.agent,
+            stdout=bug_out.stdout,
+            last_message_file=bug_out.last_message_file,
+        )
+        merged = merge_hybrid_review_messages(
+            spec_message=spec_message,
+            bug_message=bug_message,
+            head_sha=head_sha,
+            builtin_bug_review=builtin_bug_review,
+        )
+        if merged.kind is LocalVerdictKind.APPROVED:
+            final_message = f"Hybrid local review passed.\n{VERDICT_APPROVED_MARKER}"
+        elif merged.kind is LocalVerdictKind.CHANGES_REQUESTED:
+            hybrid_previous_findings = merged.findings
+            final_message = f"## Findings\n{merged.findings}\n{VERDICT_CHANGES_REQUESTED_MARKER}"
+        else:
+            final_message = merged.raw_message
+        (last_message_dir / f"review-{iteration}-hybrid.last.txt").write_text(
+            final_message,
+            encoding="utf-8",
+        )
+        api_error, api_error_agent = _prefer_actionable_api_error(
+            primary=(spec_out.api_error, spec_out.api_error_agent),
+            secondary=(bug_out.api_error, bug_out.api_error_agent),
+        )
+        return ReviewerOutput(
+            stdout="",
+            head_sha=head_sha,
+            last_message_file=final_message,
+            api_error=api_error,
+            api_error_agent=api_error_agent,
+            extra_api_errors=_spare_auth_errors(
+                chosen=api_error,
+                candidates=(
+                    (spec_out.api_error, spec_out.api_error_agent),
+                    (bug_out.api_error, bug_out.api_error_agent),
+                ),
+            ),
+            healthy_agents=tuple({*spec_out.healthy_agents, *bug_out.healthy_agents}),
+            cost_usd=total_cost_usd,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            cache_write_tokens=total_cache_write_tokens,
+            cache_read_tokens=total_cache_read_tokens,
+        )
+
+    async def _reviewer(iteration: int) -> ReviewerOutput:
+        head_sha = await head_sha_provider(workspace_path)
+        if review_mode == "hybrid":
+            return await _hybrid_reviewer(iteration, head_sha)
 
         # Small diffs collapse to a single direct review to save the
         # second subprocess. Without a provider we can't size the diff,

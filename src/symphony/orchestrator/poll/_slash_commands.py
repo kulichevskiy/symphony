@@ -541,43 +541,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
         if run_id in self._budget_exceeded_run_bindings:
             await self._handle_budget_exceeded_slash_intent(issue_id, run_id, intent)
             return
-        wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
-        if wait is not None:
-            if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
-                await self._handle_implement_failed_slash_intent(issue_id, run_id, intent)
-                return
-            if wait.kind == db.operator_waits.KIND_IMPLEMENT_BLOCKED:
-                await self._handle_implement_blocked_slash_intent(issue_id, run_id, intent)
-                return
-            if wait.kind == db.operator_waits.KIND_DELIVER_FAILED:
-                await self._handle_deliver_failed_slash_intent(issue_id, run_id, intent)
-                return
-            if wait.kind in (
-                db.operator_waits.KIND_REVIEW_FAILED,
-                db.operator_waits.KIND_REVIEW_STOPPED,
-            ):
-                await self._handle_review_failed_slash_intent(issue_id, run_id, intent)
-                return
-            if wait.kind in (
-                db.operator_waits.KIND_MERGE,
-                db.operator_waits.KIND_REVIEW_CAP,
-            ):
-                await self._handle_merge_needs_approval_slash_intent(issue_id, run_id, intent)
-                return
-            if wait.kind == db.operator_waits.KIND_ACCEPTANCE_BLOCKED:
-                await self._handle_acceptance_blocked_slash_intent(issue_id, run_id, intent)
-                return
-            if wait.kind == db.operator_waits.KIND_ACCEPTANCE_REJECTED:
-                await self._handle_acceptance_rejected_slash_intent(issue_id, run_id, intent)
-                return
-            if wait.kind == db.operator_waits.KIND_BUDGET_EXCEEDED:
-                await self._handle_budget_exceeded_slash_intent(issue_id, run_id, intent)
-                return
-            await self._post_command_rejected(
-                issue_id,
-                self._slash_text(intent),
-                f"unsupported operator wait kind: {wait.kind}",
-            )
+        if await self._handle_persisted_wait_slash_intent(issue_id, run_id, intent):
             return
         if run_id in self._operator_wait_run_ids:
             await self._post_command_rejected(
@@ -631,6 +595,45 @@ class _SlashCommandsMixin(_OrchestratorBase):
                 "$retry",
                 "no active retry handler for the current run state",
             )
+
+    async def _handle_persisted_wait_slash_intent(
+        self,
+        issue_id: str,
+        run_id: str,
+        intent: SlashIntent,
+    ) -> bool:
+        wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
+        if wait is None:
+            return False
+        if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
+            await self._handle_implement_failed_slash_intent(issue_id, run_id, intent)
+        elif wait.kind == db.operator_waits.KIND_IMPLEMENT_BLOCKED:
+            await self._handle_implement_blocked_slash_intent(issue_id, run_id, intent)
+        elif wait.kind == db.operator_waits.KIND_DELIVER_FAILED:
+            await self._handle_deliver_failed_slash_intent(issue_id, run_id, intent)
+        elif wait.kind in (
+            db.operator_waits.KIND_REVIEW_FAILED,
+            db.operator_waits.KIND_REVIEW_STOPPED,
+        ):
+            await self._handle_review_failed_slash_intent(issue_id, run_id, intent)
+        elif wait.kind in (
+            db.operator_waits.KIND_MERGE,
+            db.operator_waits.KIND_REVIEW_CAP,
+        ):
+            await self._handle_merge_needs_approval_slash_intent(issue_id, run_id, intent)
+        elif wait.kind == db.operator_waits.KIND_ACCEPTANCE_BLOCKED:
+            await self._handle_acceptance_blocked_slash_intent(issue_id, run_id, intent)
+        elif wait.kind == db.operator_waits.KIND_ACCEPTANCE_REJECTED:
+            await self._handle_acceptance_rejected_slash_intent(issue_id, run_id, intent)
+        elif wait.kind == db.operator_waits.KIND_BUDGET_EXCEEDED:
+            await self._handle_budget_exceeded_slash_intent(issue_id, run_id, intent)
+        else:
+            await self._post_command_rejected(
+                issue_id,
+                self._slash_text(intent),
+                f"unsupported operator wait kind: {wait.kind}",
+            )
+        return True
 
     @staticmethod
     def _slash_text(intent: SlashIntent) -> str:
@@ -821,84 +824,14 @@ class _SlashCommandsMixin(_OrchestratorBase):
                 return
 
         tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
-        tracker = self.tracker(binding)
-        states = await self._states_for_binding(binding)
         if intent.kind in (SlashKind.APPROVE, SlashKind.RETRY):
-            ready_id = states.get(binding.linear_states.ready)
-            if ready_id is None:
-                log.warning(
-                    "could not resume blocked implement run %s: missing ready state %r",
-                    run_id,
-                    binding.linear_states.ready,
-                )
-                return
-            # Seed the fresh run's prompt with the original block reason and the
-            # operator's resume comment (which may carry the requested tokens or
-            # instructions). Consumed by the next implement dispatch.
-            blocked_reason = await self._blocked_reason_for_run(run_id)
-            self._implement_handoffs[issue_id] = _ImplementHandoff(
-                blocked_reason=blocked_reason,
-                operator_comment=intent.text,
+            await self._resume_blocked_implement(
+                issue_id, run_id, intent, binding, tracker_issue_id
             )
-            try:
-                await tracker.move_issue(tracker_issue_id, ready_id)
-            except LinearError as e:
-                self._implement_handoffs.pop(issue_id, None)
-                log.warning("could not move %s to ready for resume: %s", issue_id, e)
-                raise SlashHandlerFailure(
-                    slash_text=self._slash_text(intent),
-                    reason=f"could not move issue to ready state for resume: {e}",
-                ) from e
-            body = resumed(
-                CommentVars(
-                    stage="implement",
-                    repo=binding.github_repo,
-                    issue=0,
-                    run_id=run_id,
-                    next_stage=binding.linear_states.ready,
-                )
-            )
-            try:
-                await tracker.post_comment(tracker_issue_id, truncate_body(body))
-            except LinearError as e:
-                log.warning("implement resume comment failed for issue %s: %s", issue_id, e)
-            await self._clear_operator_wait(issue_id, run_id)
             return
 
         if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
-            blocked_id = states.get(binding.linear_states.blocked)
-            if blocked_id is None:
-                log.warning(
-                    "could not stop blocked implement run %s: missing blocked state %r",
-                    run_id,
-                    binding.linear_states.blocked,
-                )
-                try:
-                    await tracker.post_comment(
-                        tracker_issue_id,
-                        truncate_body(
-                            command_rejected(
-                                f"${intent.kind}",
-                                "missing blocked state; keeping issue parked",
-                            )
-                        ),
-                    )
-                except LinearError as e:
-                    log.warning(
-                        "implement stop rejection comment failed for %s: %s",
-                        issue_id,
-                        e,
-                    )
-                return
-            try:
-                await tracker.move_issue(tracker_issue_id, blocked_id)
-            except LinearError as e:
-                log.warning("could not move %s to blocked: %s", issue_id, e)
-                raise SlashHandlerFailure(
-                    slash_text=self._slash_text(intent),
-                    reason=f"could not move issue to blocked state: {e}",
-                ) from e
-            await self._clear_operator_wait(issue_id, run_id)
+            await self._stop_blocked_implement(issue_id, run_id, intent, binding, tracker_issue_id)
             return
 
         log.info(
@@ -906,6 +839,96 @@ class _SlashCommandsMixin(_OrchestratorBase):
             intent.kind,
             run_id,
         )
+
+    async def _resume_blocked_implement(
+        self,
+        issue_id: str,
+        run_id: str,
+        intent: SlashIntent,
+        binding: RepoBinding,
+        tracker_issue_id: str,
+    ) -> None:
+        tracker = self.tracker(binding)
+        states = await self._states_for_binding(binding)
+        ready_id = states.get(binding.linear_states.ready)
+        if ready_id is None:
+            log.warning(
+                "could not resume blocked implement run %s: missing ready state %r",
+                run_id,
+                binding.linear_states.ready,
+            )
+            return
+        self._implement_handoffs[issue_id] = _ImplementHandoff(
+            blocked_reason=await self._blocked_reason_for_run(run_id),
+            operator_comment=intent.text,
+        )
+        try:
+            await tracker.move_issue(tracker_issue_id, ready_id)
+        except LinearError as e:
+            self._implement_handoffs.pop(issue_id, None)
+            log.warning("could not move %s to ready for resume: %s", issue_id, e)
+            raise SlashHandlerFailure(
+                slash_text=self._slash_text(intent),
+                reason=f"could not move issue to ready state for resume: {e}",
+            ) from e
+        body = resumed(
+            CommentVars(
+                stage="implement",
+                repo=binding.github_repo,
+                issue=0,
+                run_id=run_id,
+                next_stage=binding.linear_states.ready,
+            )
+        )
+        try:
+            await tracker.post_comment(tracker_issue_id, truncate_body(body))
+        except LinearError as e:
+            log.warning("implement resume comment failed for issue %s: %s", issue_id, e)
+        await self._clear_operator_wait(issue_id, run_id)
+
+    async def _stop_blocked_implement(
+        self,
+        issue_id: str,
+        run_id: str,
+        intent: SlashIntent,
+        binding: RepoBinding,
+        tracker_issue_id: str,
+    ) -> None:
+        tracker = self.tracker(binding)
+        states = await self._states_for_binding(binding)
+        blocked_id = states.get(binding.linear_states.blocked)
+        if blocked_id is None:
+            log.warning(
+                "could not stop blocked implement run %s: missing blocked state %r",
+                run_id,
+                binding.linear_states.blocked,
+            )
+            try:
+                await tracker.post_comment(
+                    tracker_issue_id,
+                    truncate_body(
+                        command_rejected(
+                            f"${intent.kind}",
+                            "missing blocked state; keeping issue parked",
+                        )
+                    ),
+                )
+            except LinearError as e:
+                log.warning(
+                    "implement stop rejection comment failed for %s: %s",
+                    issue_id,
+                    e,
+                )
+            return
+        try:
+            await tracker.move_issue(tracker_issue_id, blocked_id)
+        except LinearError as e:
+            log.warning("could not move %s to blocked: %s", issue_id, e)
+            raise SlashHandlerFailure(
+                slash_text=self._slash_text(intent),
+                reason=f"could not move issue to blocked state: {e}",
+            ) from e
+        await self._clear_operator_wait(issue_id, run_id)
 
     async def _handle_acceptance_blocked_slash_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
