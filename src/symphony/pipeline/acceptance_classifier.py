@@ -468,15 +468,21 @@ def _block_text(block: dict[str, object]) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict) and isinstance(item.get("text"), str):
-                parts.append(str(item["text"]))
-        return "\n".join(parts)
-    text = block.get("text")
-    return text if isinstance(text, str) else ""
+        return _content_list_text(content)
+    fallback_text = block.get("text")
+    return fallback_text if isinstance(fallback_text, str) else ""
+
+
+def _content_item_text(item: object) -> str:
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict) and isinstance(item.get("text"), str):
+        return str(item["text"])
+    return ""
+
+
+def _content_list_text(content: list[object]) -> str:
+    return "\n".join(text for item in content if (text := _content_item_text(item)))
 
 
 def _event_text(event: dict[str, object]) -> str:
@@ -543,14 +549,14 @@ def _assistant_text_blocks(event: dict[str, object]) -> list[str]:
     content = message.get("content")
     if not isinstance(content, list):
         return []
-    out: list[str] = []
-    for block in content:
-        if not isinstance(block, dict) or block.get("type") != "text":
-            continue
-        text = block.get("text")
-        if isinstance(text, str) and text:
-            out.append(text)
-    return out
+    return [text for block in content if (text := _assistant_block_text(block))]
+
+
+def _assistant_block_text(block: object) -> str:
+    if not isinstance(block, dict) or block.get("type") != "text":
+        return ""
+    text = block.get("text")
+    return text if isinstance(text, str) else ""
 
 
 def _float_or_none(value: object) -> float | None:
