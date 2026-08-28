@@ -160,9 +160,6 @@ def test_unclosed_url_less_tag_does_not_swallow_a_following_real_rich_link() -> 
     """A url-less, tag-shaped `<issue …>` in prose must match on its own and
     not stretch its `text` group forward to a later same-name close tag that
     belongs to a genuine rich link."""
-    description = (
-        "Convert `<issue …>` tags. Blocked by "
-        '<issue url="https://l/9">ENG-9</issue>.'
-    )
+    description = 'Convert `<issue …>` tags. Blocked by <issue url="https://l/9">ENG-9</issue>.'
     result = _linear_rich_links_to_markdown(description)
     assert result == "Convert `<issue …>` tags. Blocked by [ENG-9](https://l/9)."
