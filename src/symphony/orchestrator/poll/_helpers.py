@@ -60,10 +60,27 @@ _BLOCKQUOTE_PREFIX_RE = re.compile(r"^(?: {0,3}>[ \t]?)+")
 # after an `<!--` closes it, regardless of any `<!--` seen in between. Used to
 # track comment open/close state when truncating, so a cut that lands inside
 # an otherwise-valid `<!-- ... -->` doesn't strand the truncation notice and
-# footer inside the (now unterminated) comment.
+# footer inside the (now unterminated) comment. Only scanned for outside
+# inline code spans and indented code blocks (see `_markup_states_per_line`),
+# so a literal `<!--` written as an example in code isn't mistaken for a real
+# comment opener.
 _HTML_COMMENT_TOKEN_RE = re.compile(r"<!--|-->")
 # CommonMark indented code block: 4+ spaces or a tab, then non-whitespace.
 _INDENTED_CODE_LINE_RE = re.compile(r"^(?: {4,}|\t)\S")
+# CommonMark "raw HTML block" (type 1): a line starting with `<pre`, `<script`,
+# `<style`, or `<textarea` (case-insensitive), which swallows everything up to
+# a line containing any of the matching close tags — much like an HTML
+# comment, but for these four tags. Used to track open/close state when
+# truncating, so a cut inside a `<pre>...</pre>` block (closed only after the
+# cutoff) gets its own closer instead of leaving the block open across the
+# truncation notice/footer.
+_RAW_HTML_BLOCK_TAGS = ("pre", "script", "style", "textarea")
+_RAW_HTML_BLOCK_START_RE = re.compile(
+    r"^ {0,3}<(?P<tag>" + "|".join(_RAW_HTML_BLOCK_TAGS) + r")(?=[\s>]|$)", re.IGNORECASE
+)
+_RAW_HTML_BLOCK_END_RE = re.compile(
+    r"</(?:" + "|".join(_RAW_HTML_BLOCK_TAGS) + r")>", re.IGNORECASE
+)
 # Linear rich links: `<issue …>ENG-1</issue>`, `<pull-request … />`. The bare
 # attrs branch excludes quotes *and whitespace* so it can never overlap with
 # either the quoted branches or the `\s+` separator between attrs — each
@@ -168,8 +185,10 @@ def _close_full_dangling_markup(text: str) -> str:
     itself well-formed.
     """
     lines = text.split("\n")
-    fence_states, comment_states = _markup_states_per_line(lines)
-    parts = [p for p in (fence_states[-1], "-->" if comment_states[-1] else None) if p]
+    fence_states, comment_states, html_states = _markup_states_per_line(lines)
+    parts = [
+        p for p in (fence_states[-1], html_states[-1], "-->" if comment_states[-1] else None) if p
+    ]
     if not parts:
         return text
     return f"{text}\n" + "\n".join(parts)
@@ -195,28 +214,45 @@ def _trim_boundary_blank_lines(text: str) -> str:
     return "\n".join(lines[start:end])
 
 
-def _markup_states_per_line(lines: list[str]) -> tuple[list[str | None], list[bool]]:
-    """Per-prefix-length (fence closer, HTML-comment-open) pair for `lines[0:i+1]`.
+def _comment_tokens_outside_inline_code(line: str) -> list[str]:
+    """HTML comment delimiter tokens in *line*, ignoring any inside inline code spans."""
+    return _HTML_COMMENT_TOKEN_RE.findall(_INLINE_CODE_SPAN_RE.sub("", line))
 
-    Fence and HTML-comment tracking run in a single interleaved forward scan
-    because each must ignore markers owned by the other: a fence marker seen
-    while a comment is open is inert (an open `<!-- ... -->` swallows
-    everything up to its `-->` verbatim, including anything fence-shaped), and
-    a `<!--`/`-->` token seen while a bare fence is open is inert code content,
+
+def _markup_states_per_line(
+    lines: list[str],
+) -> tuple[list[str | None], list[bool], list[str | None]]:
+    """Per-prefix-length (fence closer, HTML-comment-open, raw-HTML-block closer)
+    triple for `lines[0:i+1]`.
+
+    Fence, HTML-comment, and raw-HTML-block tracking run in a single
+    interleaved forward scan because each must ignore markers owned by the
+    others: a fence marker seen while a comment (or raw HTML block) is open is
+    inert — an open `<!-- ... -->` or `<pre>...</pre>` swallows everything up
+    to its closer verbatim, including anything fence-shaped — and a
+    `<!--`/`-->` token seen while a bare fence is open is inert code content,
     not a real comment delimiter. Tracks CommonMark fence rules across ``` and
     ~~~ fences of any length (3+): a fence is closed only by a same-character
     run at least as long as its opener, indented by at most 3 spaces, with
-    nothing but trailing whitespace after it. Computed once via a single
-    forward scan, so a caller trimming the tail one line at a time can look up
-    each prefix's state in O(1) instead of rescanning the retained text on
-    every trimmed line.
+    nothing but trailing whitespace after it. A `<!--`/`-->` token inside an
+    inline code span or a 4-space/tab indented code block is likewise inert —
+    it's literal example text, not a real comment delimiter — so those regions
+    are skipped before scanning a line for comment tokens. Computed once via a
+    single forward scan, so a caller trimming the tail one line at a time can
+    look up each prefix's state in O(1) instead of rescanning the retained
+    text on every trimmed line.
     """
     fence_states: list[str | None] = []
     comment_states: list[bool] = []
+    html_states: list[str | None] = []
     open_char: str | None = None
     open_len = 0
     open_comment = False
+    open_html_closer: str | None = None
+    in_indent = False
+    prev_blank = True
     for line in lines:
+        is_blank = line.strip() == ""
         if open_comment:
             for token in _HTML_COMMENT_TOKEN_RE.findall(line):
                 open_comment = token == "<!--"
@@ -226,20 +262,37 @@ def _markup_states_per_line(lines: list[str]) -> tuple[list[str | None], list[bo
                 marker, rest = m["marker"], m["rest"]
                 if marker[0] == open_char and len(marker) >= open_len and rest.strip() == "":
                     open_char, open_len = None, 0
+        elif open_html_closer is not None:
+            if _RAW_HTML_BLOCK_END_RE.search(line):
+                open_html_closer = None
         else:
-            m = _FENCE_MARKER_RE.match(line)
-            opened_fence = False
-            if m is not None:
-                marker, rest = m["marker"], m["rest"]
-                if not (marker[0] == "`" and "`" in rest):  # backtick info string forbids `
-                    open_char, open_len = marker[0], len(marker)
-                    opened_fence = True
-            if not opened_fence:
-                for token in _HTML_COMMENT_TOKEN_RE.findall(line):
-                    open_comment = token == "<!--"
+            if in_indent and not (is_blank or _INDENTED_CODE_LINE_RE.match(line)):
+                in_indent = False
+            if not in_indent:
+                m = _FENCE_MARKER_RE.match(line)
+                opened = False
+                if m is not None:
+                    marker, rest = m["marker"], m["rest"]
+                    if not (marker[0] == "`" and "`" in rest):  # backtick info string forbids `
+                        open_char, open_len = marker[0], len(marker)
+                        opened = True
+                if not opened:
+                    html_match = _RAW_HTML_BLOCK_START_RE.match(line)
+                    if html_match is not None:
+                        opened = True
+                        if not _RAW_HTML_BLOCK_END_RE.search(line):
+                            open_html_closer = f"</{html_match['tag'].lower()}>"
+                if not opened and prev_blank and _INDENTED_CODE_LINE_RE.match(line):
+                    in_indent = True
+                    opened = True
+                if not opened:
+                    for token in _comment_tokens_outside_inline_code(line):
+                        open_comment = token == "<!--"
         fence_states.append(open_char * open_len if open_char is not None else None)
         comment_states.append(open_comment)
-    return fence_states, comment_states
+        html_states.append(open_html_closer)
+        prev_blank = is_blank
+    return fence_states, comment_states, html_states
 
 
 def _close_dangling_markup(kept: str, char_budget: int, byte_budget: int) -> str:
@@ -253,7 +306,7 @@ def _close_dangling_markup(kept: str, char_budget: int, byte_budget: int) -> str
     for.
     """
     lines = kept.split("\n")
-    fence_states, comment_states = _markup_states_per_line(lines)
+    fence_states, comment_states, html_states = _markup_states_per_line(lines)
     char_len = [0] * (len(lines) + 1)
     byte_len = [0] * (len(lines) + 1)
     for i, line in enumerate(lines):
@@ -263,7 +316,12 @@ def _close_dangling_markup(kept: str, char_budget: int, byte_budget: int) -> str
 
     n = len(lines)
     while n > 0:
-        parts = [p for p in (fence_states[n - 1], "-->" if comment_states[n - 1] else None) if p]
+        closer_parts = (
+            fence_states[n - 1],
+            html_states[n - 1],
+            "-->" if comment_states[n - 1] else None,
+        )
+        parts = [p for p in closer_parts if p]
         if not parts:
             break
         closer = "\n".join(parts)

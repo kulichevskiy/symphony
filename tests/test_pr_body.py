@@ -338,6 +338,41 @@ def test_normal_size_body_closes_an_unterminated_html_comment() -> None:
     assert body == f"{description}\n-->\n\n{FOOTER}"
 
 
+def test_comment_opener_inside_inline_code_is_not_treated_as_dangling() -> None:
+    """A literal `` `<!--` `` example inside inline code is inert text, not a
+    real (unterminated) HTML comment opener."""
+    description = "See `<!--` for the syntax."
+    body = build_pr_body(_issue(description))
+    assert body == f"{description}\n\n{FOOTER}"
+
+
+def test_comment_opener_inside_an_indented_code_block_is_not_treated_as_dangling() -> None:
+    description = "    <!-- literal example"
+    body = build_pr_body(_issue(description))
+    assert body == f"{description}\n\n{FOOTER}"
+
+
+def test_normal_size_body_closes_an_unterminated_pre_block() -> None:
+    """A short description that opens a `<pre>` raw HTML block but never
+    closes it must not swallow the `---`/tracker-link footer inside it."""
+    description = "<pre>\nsome code"
+    body = build_pr_body(_issue(description))
+    assert body == f"{description}\n</pre>\n\n{FOOTER}"
+
+
+def test_truncation_closes_an_unterminated_pre_block() -> None:
+    """An oversized description that opens a `<pre>` block and only closes it
+    after the truncation cutoff must get its own `</pre>` in the retained
+    prefix, or the truncation notice/footer render inside the raw HTML block."""
+    line = "y" * 99
+    description = "<pre>\n" + "\n".join([line] * 2000) + "\n</pre>"
+    body = build_pr_body(_issue(description))
+    assert len(body) <= PR_BODY_MAX_CHARS
+    assert body.endswith(FOOTER)
+    head, _, _ = body.partition("\n\nDescription truncated")
+    assert head.endswith("\n</pre>")
+
+
 def test_fence_marker_inside_a_closed_html_comment_is_not_treated_as_dangling() -> None:
     """A fence-shaped line fully inside an already-closed `<!-- -->` comment
     is inert raw text, not a real (unterminated) code fence."""
