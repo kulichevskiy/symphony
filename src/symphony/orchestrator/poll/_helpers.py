@@ -265,8 +265,13 @@ def _escape_markdown_link_label(label: str) -> str:
 # Inline code span: a backtick run, then anything but a newline or that same
 # run, up to the next occurrence of that exact run — mirrors CommonMark's
 # "matching backtick count" delimiter rule closely enough to keep a literal
-# `<issue …>` example inside inline code from being rewritten.
-_INLINE_CODE_SPAN_RE = re.compile(r"(?P<tick>`+)(?:(?!(?P=tick))[^\n])*?(?P=tick)")
+# `<issue …>` example inside inline code from being rewritten. The leading
+# `(?<!`)` anchors the run to its start so a long backtick run is only ever
+# attempted once (not once per backtick in it), and the possessive `++`/`*+`
+# quantifiers forbid backtracking into an already-matched run — together
+# these keep a long backtick run that never finds its match linear instead of
+# quadratic.
+_INLINE_CODE_SPAN_RE = re.compile(r"(?<!`)(?P<tick>`++)(?:(?!(?P=tick))[^\n])*+(?P=tick)")
 
 
 def _fence_open(line: str) -> tuple[str, int] | None:
@@ -331,13 +336,14 @@ def _split_fenced_code_blocks(text: str) -> list[tuple[bool, list[str]]]:
             prev_blank = False
             continue
         if mode == "quoted_fence":
-            current.append(line)
-            if not line.startswith(quote_prefix) or _fence_closes(
-                line[len(quote_prefix) :], fence_char, fence_len
-            ):
-                flush("prose")
-            prev_blank = False
-            continue
+            if line.startswith(quote_prefix):
+                current.append(line)
+                if _fence_closes(line[len(quote_prefix) :], fence_char, fence_len):
+                    flush("prose")
+                prev_blank = False
+                continue
+            flush("prose")
+            # falls through to re-process `line` as prose below
         if mode == "indent":
             if line.strip() == "":
                 current.append(line)

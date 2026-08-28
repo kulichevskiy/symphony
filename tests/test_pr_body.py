@@ -287,3 +287,23 @@ def test_unclosed_url_less_tag_does_not_swallow_a_following_real_rich_link() -> 
     description = 'Convert `<issue …>` tags. Blocked by <issue url="https://l/9">ENG-9</issue>.'
     result = _linear_rich_links_to_markdown(description)
     assert result == "Convert `<issue …>` tags. Blocked by [ENG-9](https://l/9)."
+
+
+def test_unterminated_quoted_fence_followed_by_prose_rich_link_is_rewritten() -> None:
+    """An unterminated block-quoted fence must not swallow the first
+    unquoted line that follows it — that line is prose, not code, so a
+    Linear rich link on it must still be rewritten."""
+    description = '> ```\n> still quoted\n<issue url="https://l/9">ENG-9</issue>'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == "> ```\n> still quoted\n[ENG-9](https://l/9)"
+
+
+def test_long_backtick_run_in_prose_does_not_backtrack_catastrophically() -> None:
+    """A long backtick run with no matching close must not be rescanned once
+    per possible delimiter length (previously quadratic in the run length)."""
+    description = "x" + "`" * 20_000 + "y"
+    start = time.monotonic()
+    result = _linear_rich_links_to_markdown(description)
+    elapsed = time.monotonic() - start
+    assert elapsed < 1.0
+    assert result == description
