@@ -126,16 +126,17 @@ async def test_get_required_contexts_reads_required_pr_checks(fake_gh) -> None: 
     ]
 
 
-async def test_pr_create_appends_linear_url_when_provided(fake_gh) -> None:  # type: ignore[no-untyped-def]
+async def test_pr_create_passes_body_verbatim(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    """The caller owns the body (see `build_pr_body`); the client never
+    rewrites or appends to it."""
     log = fake_gh({"pr create": [0, "https://github.com/org/r/pull/42\n"]})
     gh = GitHub()
     url = await gh.pr_create(
         title="t",
-        body="my body",
+        body="my body\n\n---\n\nRelates to https://linear.app/team/issue/ENG-1",
         base="main",
         head="feat/x",
         repo="org/r",
-        linear_url="https://linear.app/team/issue/ENG-1",
     )
     assert url == "https://github.com/org/r/pull/42"
     calls = _calls(log)
@@ -150,18 +151,7 @@ async def test_pr_create_appends_linear_url_when_provided(fake_gh) -> None:  # t
     assert "--head" in argv and argv[argv.index("--head") + 1] == "feat/x"
     assert "--repo" in argv and argv[argv.index("--repo") + 1] == "org/r"
     body = argv[argv.index("--body") + 1]
-    assert "my body" in body
-    assert "Relates to https://linear.app/team/issue/ENG-1" in body
-
-
-async def test_pr_create_omits_relates_when_no_linear_url(fake_gh) -> None:  # type: ignore[no-untyped-def]
-    log = fake_gh({"pr create": [0, "https://github.com/org/r/pull/1\n"]})
-    gh = GitHub()
-    await gh.pr_create(title="t", body="b", base="main", head="x", repo="org/r")
-    body = _calls(log)[0]["argv"]
-    assert isinstance(body, list)
-    payload = body[body.index("--body") + 1]
-    assert "Relates to" not in str(payload)
+    assert body == "my body\n\n---\n\nRelates to https://linear.app/team/issue/ENG-1"
 
 
 async def test_pr_create_omits_base_when_not_provided(fake_gh) -> None:  # type: ignore[no-untyped-def]
@@ -205,7 +195,8 @@ async def test_ensure_pr_adopts_existing_open_pr(fake_gh) -> None:  # type: igno
     url = await gh.ensure_pr(title="t", body="b", base="main", head="feat/x", repo="org/r")
     assert url == "https://github.com/org/r/pull/7"
     joined = [" ".join(c["argv"]) for c in _calls(log)]  # type: ignore[arg-type]
-    assert not any("pr create" in j for j in joined)
+    # Adoption is read-only: the adopted PR keeps its own title and body.
+    assert not any("pr create" in j or "pr edit" in j for j in joined)
 
 
 async def test_ensure_pr_creates_when_absent(fake_gh) -> None:  # type: ignore[no-untyped-def]

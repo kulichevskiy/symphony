@@ -73,10 +73,9 @@ async def test_pr_merged_during_restart_converges(
         )
         pr_url = await harness.github.ensure_pr(
             title=issue.title,
-            body="",
+            body=f"Relates to {issue.url}",
             head="symphony/eng-1",
             repo=REPO,
-            linear_url=issue.url,
         )
         sim_pr = harness.sim.github.pr_for_issue(issue.id)
         assert sim_pr is not None

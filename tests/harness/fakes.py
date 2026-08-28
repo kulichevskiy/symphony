@@ -510,7 +510,6 @@ class FakeGitHub:
         head: str,
         base: str | None = None,
         repo: str | None = None,
-        linear_url: str | None = None,
         draft: bool = False,
     ) -> str:
         for (pr_repo, _num), pr in self._sim.prs.items():
@@ -520,12 +519,13 @@ class FakeGitHub:
         number = self._sim.next_pr_number()
         key_repo = repo or ""
         url = f"https://github.invalid/{key_repo}/pull/{number}"
+        # The PR body carries the tracker link (`Relates to <url>`), so the
+        # issue↔PR link is derived from it the way a human reader would.
         issue_id = ""
-        if linear_url:
-            for issue in self._sim.issues.values():
-                if issue.url == linear_url:
-                    issue_id = issue.id
-                    break
+        for issue in self._sim.issues.values():
+            if issue.url and issue.url in body:
+                issue_id = issue.id
+                break
         # Prefer the SHA already pushed to the fake origin; fall back to a
         # deterministic fabrication only when no push has been recorded.
         # Keyed by (repo, branch) to avoid cross-repo collisions when two

@@ -136,6 +136,9 @@ from ._helpers import (
     NEEDS_HUMAN_APPROVAL_LABEL as NEEDS_HUMAN_APPROVAL_LABEL,
 )
 from ._helpers import (
+    PR_BODY_MAX_CHARS as PR_BODY_MAX_CHARS,
+)
+from ._helpers import (
     _acceptance_degrade_note as _acceptance_degrade_note,
 )
 from ._helpers import (
@@ -328,6 +331,7 @@ __all__ = [
     "MANUAL_MERGE_PARKED_RUN_PREFIX",
     "NEEDS_HUMAN_APPROVAL_LABEL",
     "Orchestrator",
+    "PR_BODY_MAX_CHARS",
     "PushFn",
     "REVIEW_RESURRECT_COOLDOWN_SECS",
     "SlashHandlerFailure",

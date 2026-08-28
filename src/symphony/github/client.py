@@ -108,7 +108,6 @@ class GitHubClient(Protocol):
         base: str | None = None,
         head: str,
         repo: str | None = None,
-        linear_url: str | None = None,
         draft: bool = False,
     ) -> str: ...
 
@@ -300,21 +299,20 @@ class GitHub:
         base: str | None = None,
         head: str,
         repo: str | None = None,
-        linear_url: str | None = None,
         draft: bool = False,
     ) -> str:
-        """Create a PR; return the PR URL printed by `gh`."""
-        full_body = body
-        if linear_url:
-            sep = "\n\n" if full_body and not full_body.endswith("\n\n") else ""
-            full_body = f"{full_body}{sep}Relates to {linear_url}"
+        """Create a PR with `body` verbatim; return the PR URL printed by `gh`.
+
+        The body is rendered by the caller (`build_pr_body` for the delivery
+        path) so tracker context and the size limit live in one place.
+        """
         argv = [
             "pr",
             "create",
             "--title",
             title,
             "--body",
-            full_body,
+            body,
         ]
         if base:
             argv.extend(["--base", base])
@@ -372,7 +370,6 @@ class GitHub:
         base: str | None = None,
         head: str,
         repo: str | None = None,
-        linear_url: str | None = None,
         draft: bool = False,
     ) -> str:
         """Get-or-create the PR for `(repo, head)`; return its URL.
@@ -380,7 +377,9 @@ class GitHub:
         Idempotent: adopts an existing open PR for the head branch instead of
         creating a duplicate, and recovers if `gh pr create` races and fails
         because a PR already exists. This lets every retry or re-dispatch that
-        reaches the PR step converge on the one PR for the branch.
+        reaches the PR step converge on the one PR for the branch. `title` /
+        `body` apply to a created PR only: an adopted or race-recovered PR is
+        returned untouched.
         """
         existing = await self.pr_for_head(head=head, repo=repo)
         if existing:
@@ -392,7 +391,6 @@ class GitHub:
                 base=base,
                 head=head,
                 repo=repo,
-                linear_url=linear_url,
                 draft=draft,
             )
         except GitHubError as e:

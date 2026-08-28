@@ -73,10 +73,9 @@ async def _seed_parked_pr(harness: Harness):
     )
     pr_url = await harness.github.ensure_pr(
         title=issue.title,
-        body="",
+        body=f"Relates to {issue.url}",
         head="symphony/eng-1",
         repo=REPO,
-        linear_url=issue.url,
     )
     sim_pr = harness.sim.github.pr_for_issue(issue.id)
     assert sim_pr is not None

@@ -36,6 +36,17 @@ _ACCEPTANCE_MISSING_WHERE_TO_VERIFY_NOTE = (
     "Acceptance: degraded to code-only — no `Where to verify` in ticket description"
 )
 
+# GitHub rejects PR bodies past this size, so an oversized ticket description
+# is cut rather than failing delivery.
+PR_BODY_MAX_CHARS = 65_536
+_PR_BODY_TRUNCATION_NOTICE = "Description truncated; see the source ticket"
+# Linear rich links: `<issue …>ENG-1</issue>`, `<pull-request … />`.
+_RICH_LINK_TAG_RE = re.compile(
+    r"<(?P<tag>issue|pull-request)(?P<attrs>\s[^<>]*?)?\s*/?>(?:(?P<text>[^<]*)</(?P=tag)>)?",
+    re.IGNORECASE,
+)
+_TAG_ATTR_RE = re.compile(r"([\w-]+)\s*=\s*[\"']([^\"']*)[\"']")
+
 
 def _sum_usage(left: UsageDelta, right: UsageDelta) -> UsageDelta:
     return UsageDelta(
@@ -83,10 +94,60 @@ def build_pr_title(issue: LinearIssue) -> str:
 
 
 def build_pr_body(issue: LinearIssue) -> str:
-    """The Linear URL goes through `gh pr_create`'s `linear_url` argument
-    (which appends `Relates to ...`), so the body itself is empty by
-    default. Returning the URL here keeps the format pinned in tests."""
-    return f"Relates to {issue.url}"
+    """Body for a newly created PR: the ticket description plus a footer.
+
+    Built from the issue snapshot the stage already holds — no tracker read.
+    The description is trusted Markdown and passes through untouched (Jira and
+    Linear alike); the only rewrite turns Linear `<issue …>` / `<pull-request …>`
+    rich-link tags into ordinary Markdown links. An empty description leaves
+    only the footer. An oversized description is cut at a line boundary and
+    labelled, so the footer survives and `gh pr create` still accepts the body.
+    """
+    footer = f"Relates to {issue.url}"
+    description = _linear_rich_links_to_markdown(issue.description).strip()
+    if not description:
+        return footer
+    footer = f"---\n\n{footer}"
+    body = f"{description}\n\n{footer}"
+    if len(body) <= PR_BODY_MAX_CHARS:
+        return body
+    tail = f"\n\n{_PR_BODY_TRUNCATION_NOTICE}\n\n{footer}"
+    kept = _head_lines_within(description, PR_BODY_MAX_CHARS - len(tail))
+    return f"{kept}{tail}"
+
+
+def _head_lines_within(text: str, budget: int) -> str:
+    """Longest line-boundary prefix of `text` that fits `budget` characters.
+
+    Falls back to a hard character cut when even the first line is too long,
+    so a single-line description cannot defeat the size limit.
+    """
+    kept: list[str] = []
+    used = 0
+    for line in text.splitlines():
+        used += len(line) + (1 if kept else 0)
+        if used > budget:
+            break
+        kept.append(line)
+    return "\n".join(kept) if kept else text[: max(budget, 0)]
+
+
+def _linear_rich_links_to_markdown(description: str) -> str:
+    """Rewrite Linear rich-link tags as `[label](url)`.
+
+    Linear serializes inline issue / PR references as pseudo-HTML tags that
+    GitHub renders as nothing. Label preference: tag text, then `identifier`,
+    then `title`, then the URL. A tag without a URL degrades to its label.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        attrs: dict[str, str] = dict(_TAG_ATTR_RE.findall(match["attrs"] or ""))
+        text = (match["text"] or "").strip()
+        label = text or attrs.get("identifier") or attrs.get("title") or attrs.get("url", "")
+        url = attrs.get("url", "")
+        return f"[{label}]({url})" if url else label
+
+    return _RICH_LINK_TAG_RE.sub(replace, description)
 
 
 def role_codex_model(role: ResolvedRole) -> str:
