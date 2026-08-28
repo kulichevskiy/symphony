@@ -332,6 +332,25 @@ def test_rich_link_tag_inside_a_type6_block_ends_at_a_blank_line() -> None:
     assert "[ENG-10](https://l/10)" in result
 
 
+def test_fence_shaped_text_inside_a_type6_raw_html_block_is_not_treated_as_dangling() -> None:
+    """A ``` line inside a `<div>...</div>` wrapper (CommonMark raw HTML
+    block type 6) is inert HTML content, not a real code fence — the
+    wrapper swallows it, so no closing ``` should be synthesized."""
+    description = "<div>\n```\n</div>"
+    body = build_pr_body(_issue(description))
+    assert body == f"{description}\n\n{FOOTER}"
+
+
+def test_rich_link_tag_inside_a_type7_raw_html_block_is_left_alone() -> None:
+    """A custom-tag wrapper alone on its own lines, like `<x-widget>...
+    </x-widget>`, is a CommonMark raw HTML block (type 7): GitHub renders it
+    as literal HTML, so a rich-link tag nested inside it must not be
+    rewritten."""
+    description = '<x-widget>\n<issue url="https://l/9">ENG-9</issue>\n</x-widget>'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == description
+
+
 def test_indented_code_block_does_not_interrupt_a_paragraph() -> None:
     """A 4-space-indented line right after prose (no blank line separator) is
     a lazy paragraph continuation per CommonMark, not code — so a real rich
@@ -544,6 +563,19 @@ def test_truncation_shortens_a_single_oversized_line_that_leaves_markup_open() -
     assert head.startswith("<pre>")
     assert head.endswith("</pre>")
     assert len(head) > len("<pre></pre>")
+
+
+def test_oversized_single_line_of_pure_backticks_is_dropped_rather_than_overflowing() -> None:
+    """A single line consisting entirely of backticks long enough to fill the
+    whole budget on its own has a fence closer just as long as the opener —
+    no prefix of it can be kept alongside that closer, so the line is
+    dropped instead of producing a body that overruns the size budget."""
+    description = "`" * (PR_BODY_MAX_CHARS * 2)
+    body = build_pr_body(_issue(description))
+    assert len(body) <= PR_BODY_MAX_CHARS
+    assert len(body.encode("utf-8")) <= PR_BODY_MAX_BYTES
+    assert body.endswith(FOOTER)
+    assert "Description truncated; see the source ticket" in body
 
 
 def test_rich_link_url_with_an_unbalanced_close_paren_is_wrapped_in_angle_brackets() -> None:

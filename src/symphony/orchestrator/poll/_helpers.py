@@ -166,6 +166,23 @@ _RAW_HTML_TYPE6_START_RE = re.compile(
     r"^ {0,3}</?(?:" + "|".join(_RAW_HTML_TYPE6_TAGS) + r")(?=[\s>/]|$)",
     re.IGNORECASE,
 )
+# CommonMark raw HTML block type 7: a line consisting of nothing but a
+# complete open tag or complete closing tag (any tag name other than the
+# type-1/6 tags already matched above), followed only by trailing
+# whitespace — e.g. `<x-widget>`, `<x-widget attr="1">`, `</x-widget>`.
+# Unlike type 6, this shape cannot interrupt a paragraph, so a caller must
+# only treat it as an opener when the previous line was blank (or this is
+# the first line). `issue`/`pull-request` are excluded by name so a
+# self-closing rich-link tag alone on its own line is still eligible for
+# rewriting rather than being swallowed as an opaque wrapper. Closes the
+# same way type 6 does: at the next blank line.
+_TYPE7_TAG_ALONE_RE = re.compile(
+    r"^ {0,3}</?(?!(?:issue|pull-request)\b)[A-Za-z][A-Za-z0-9-]*"
+    r"(?:\s+[A-Za-z_:][A-Za-z0-9_.:-]*"
+    r"(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'=<>`]+))?)*"
+    r"\s*/?>\s*$",
+    re.IGNORECASE,
+)
 
 
 def _other_raw_html_block_closer(line: str) -> str | None:
@@ -346,14 +363,17 @@ def _markup_states_per_line(
     """Per-prefix-length (fence closer, HTML-comment-open, raw-HTML-block closer)
     triple for `lines[0:i+1]`.
 
-    Fence, HTML-comment, and raw-HTML-block (types 1 and 3-5) tracking run in
-    a single interleaved forward scan because each must ignore markers owned
-    by the others: a fence marker seen while a comment (or raw HTML block) is
-    open is inert — an open `<!-- ... -->`, `<pre>...</pre>`, or `<?...?>`
-    swallows everything up to its closer verbatim, including anything
+    Fence, HTML-comment, and raw-HTML-block (types 1, 3-5, and 6) tracking run
+    in a single interleaved forward scan because each must ignore markers
+    owned by the others: a fence marker seen while a comment (or raw HTML
+    block) is open is inert — an open `<!-- ... -->`, `<pre>...</pre>`,
+    `<?...?>`, or a type-6 wrapper like `<div>...</div>` swallows everything
+    up to its closer (a blank line, for type 6) verbatim, including anything
     fence-shaped — and a `<!--`/`-->` token seen while a bare fence is open is
-    inert code content, not a real comment delimiter. Tracks CommonMark fence
-    rules across ``` and
+    inert code content, not a real comment delimiter. A type-6 block needs no
+    textual closer of its own (unlike types 1 and 3-5): it always ends at the
+    next blank line, and the blank line the truncation tail always opens with
+    already supplies that. Tracks CommonMark fence rules across ``` and
     ~~~ fences of any length (3+): a fence is closed only by a same-character
     run at least as long as its opener, indented by at most 3 spaces, with
     nothing but trailing whitespace after it. A `<!--`/`-->` token inside an
@@ -373,6 +393,7 @@ def _markup_states_per_line(
     open_comment = False
     open_html_closer: str | None = None
     open_raw_closer: str | None = None
+    open_html6 = False
     in_indent = False
     prev_blank = True
     for line in lines:
@@ -392,6 +413,9 @@ def _markup_states_per_line(
         elif open_raw_closer is not None:
             if open_raw_closer in line:
                 open_raw_closer = None
+        elif open_html6:
+            if is_blank:
+                open_html6 = False
         else:
             if in_indent and not (is_blank or _INDENTED_CODE_LINE_RE.match(line)):
                 in_indent = False
@@ -425,6 +449,9 @@ def _markup_states_per_line(
                         opened = True
                         if raw_closer not in line:
                             open_raw_closer = raw_closer
+                if not opened and _RAW_HTML_TYPE6_START_RE.match(line):
+                    opened = True
+                    open_html6 = True
                 if not opened and prev_blank and _INDENTED_CODE_LINE_RE.match(line):
                     in_indent = True
                     opened = True
@@ -489,10 +516,17 @@ def _shorten_line_for_closer(line: str, closer: str, char_budget: int, byte_budg
     overruns budget at `n == 1` — the line-dropping loop in
     `_close_dangling_markup` would otherwise discard it entirely, leaving no
     description content at all even though the closer alone leaves room for
-    part of it.
+    part of it. But if the closer alone (with an empty line) still doesn't
+    fit — e.g. a single line of 70,000 backticks, whose fence-marker closer
+    is just as long as the opener it was derived from — no prefix of the
+    line can be kept alongside it either; the opener is dropped entirely
+    rather than returning a result that overruns the budget it was meant to
+    respect.
     """
     reserve_chars = 1 + len(closer)
     reserve_bytes = 1 + len(closer.encode("utf-8"))
+    if reserve_chars > char_budget or reserve_bytes > byte_budget:
+        return ""
     line_char_budget = char_budget - reserve_chars
     line_byte_budget = byte_budget - reserve_bytes
     prefix = _char_prefix_within_bytes(line, line_char_budget, line_byte_budget)
@@ -694,10 +728,13 @@ def _split_fenced_code_blocks(text: str) -> list[tuple[bool, list[str]]]:
     (`> \\`\\`\\``), a 4-space/tab indented code block, and CommonMark raw
     HTML blocks — type 1 (`<pre>`/`<script>`/`<style>`/`<textarea>`, closed
     by its matching end tag), types 3-5 (processing instruction/declaration/
-    CDATA, closed by a literal token), and type 6 (a line opening with a
-    block-level tag name such as `<div>`, closed only by a blank line).
-    Reuses the same fence and raw-HTML-block open/close rules as
-    `_markup_states_per_line`.
+    CDATA, closed by a literal token), type 6 (a line opening with a
+    block-level tag name such as `<div>`, closed only by a blank line), and
+    type 7 (a line that is *only* a complete open or close tag of any other
+    name, e.g. `<x-widget>`, preceded by a blank line, also closed only by a
+    blank line). A rich-link tag nested inside a type-7 wrapper is swallowed
+    the same way it is inside a type-6 one. Reuses the same fence and
+    raw-HTML-block open/close rules as `_markup_states_per_line`.
     """
     blocks: list[tuple[bool, list[str]]] = []
     current: list[str] = []
@@ -797,6 +834,11 @@ def _split_fenced_code_blocks(text: str) -> list[tuple[bool, list[str]]]:
                 raw_closer = other_closer
             continue
         if _RAW_HTML_TYPE6_START_RE.match(line):
+            flush("html6")
+            current.append(line)
+            prev_blank = False
+            continue
+        if prev_blank and _TYPE7_TAG_ALONE_RE.match(line):
             flush("html6")
             current.append(line)
             prev_blank = False
