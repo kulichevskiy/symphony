@@ -30,6 +30,7 @@ change.
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from dataclasses import dataclass
 from enum import StrEnum
@@ -37,6 +38,18 @@ from enum import StrEnum
 import aiosqlite
 
 from .. import db
+
+# `apply` is a multi-`await` read-modify-write (snapshot -> record_action ->
+# put -> commit) with nothing else serializing it: two concurrent applies for
+# the same issue (e.g. a web-button Retry racing a tracker-comment Retry) can
+# otherwise both read the same "current" snapshot, both see their action
+# allowed, and both commit. One lock per issue, owned by this module, closes
+# that window regardless of which ingress path called in.
+_issue_locks: dict[str, asyncio.Lock] = {}
+
+
+def _lock(issue_id: str) -> asyncio.Lock:
+    return _issue_locks.setdefault(issue_id, asyncio.Lock())
 
 
 class PipelineMode(StrEnum):
@@ -306,7 +319,8 @@ def _next_mode_and_outcome(
         live = current.outcome is AttemptOutcome.RUNNING
         return (PipelineMode.PAUSING if live else PipelineMode.PAUSED), current.outcome
     if action is ControlAction.ABORT:
-        return PipelineMode.PAUSED, current.outcome
+        live = current.outcome is AttemptOutcome.RUNNING
+        return (PipelineMode.PAUSING if live else PipelineMode.PAUSED), current.outcome
     if action is ControlAction.RETRY:
         return PipelineMode.PLAYING, AttemptOutcome.PENDING
     return PipelineMode.PLAYING, AttemptOutcome.SKIPPED
@@ -326,88 +340,101 @@ async def apply(
     A rejected action writes nothing at all. An accepted one commits the action
     record and the new state together, so the caller may run its side effects
     behind a decision that is already durable.
+
+    The whole snapshot-to-commit sequence is serialized per issue (see
+    `_lock`), so two concurrent applies for the same issue can never both read
+    the same "current" snapshot and both get accepted.
     """
-    current = await snapshot(conn, issue_id)
-    if action not in current.allowed_actions:
-        return ActionResult(
-            accepted=False,
-            snapshot=current,
-            rejection=(
-                f"{action.value} is not available while the pipeline is "
-                f"{current.mode.value} with a {current.outcome.value} attempt"
-            ),
-        )
-    if await db.pipeline_controls.get_action(conn, issue_id, action_id) is not None:
-        return ActionResult(
-            accepted=False,
-            snapshot=current,
-            rejection=f"{action.value} {action_id} was already applied",
-        )
-    mode, outcome = _next_mode_and_outcome(current, action)
-    # An attempt-replacing action drops the previous attempt's diagnostics;
-    # an intent-only one keeps them.
-    reason = current.reason if outcome is current.outcome else None
-    run_id = current.run_id if outcome is current.outcome else None
-    try:
-        await db.pipeline_controls.record_action(
-            conn,
-            issue_id=issue_id,
-            action_id=action_id,
-            action=str(action),
-            actor=actor,
-            from_mode=str(current.mode),
-            to_mode=str(mode),
-            from_outcome=str(current.outcome),
-            to_outcome=str(outcome),
-            stage=current.stage,
-            run_id=current.run_id,
-            ts=at,
-            commit=False,
-        )
-    except sqlite3.IntegrityError:
-        await conn.rollback()
-        # Only a racing insert of the same action id is reported as already
-        # applied; any other constraint violation (e.g. a foreign-key failure
-        # on a missing issue) is a real error and must not be swallowed.
-        if await db.pipeline_controls.get_action(conn, issue_id, action_id) is None:
+    async with _lock(issue_id):
+        current = await snapshot(conn, issue_id)
+        if action not in current.allowed_actions:
+            return ActionResult(
+                accepted=False,
+                snapshot=current,
+                rejection=(
+                    f"{action.value} is not available while the pipeline is "
+                    f"{current.mode.value} with a {current.outcome.value} attempt"
+                ),
+            )
+        if await db.pipeline_controls.get_action(conn, issue_id, action_id) is not None:
+            return ActionResult(
+                accepted=False,
+                snapshot=current,
+                rejection=f"{action.value} {action_id} was already applied",
+            )
+        mode, outcome = _next_mode_and_outcome(current, action)
+        # An attempt-replacing action drops the previous attempt's diagnostics;
+        # an intent-only one keeps them.
+        reason = current.reason if outcome is current.outcome else None
+        run_id = current.run_id if outcome is current.outcome else None
+        # A SAVEPOINT scopes the undo to just these two writes: `conn` is one
+        # connection shared by the whole daemon, so a bare `conn.rollback()`
+        # would discard any other, unrelated work some other coroutine has
+        # written to the same not-yet-committed transaction.
+        await conn.execute("SAVEPOINT control_apply")
+        try:
+            await db.pipeline_controls.record_action(
+                conn,
+                issue_id=issue_id,
+                action_id=action_id,
+                action=str(action),
+                actor=actor,
+                from_mode=str(current.mode),
+                to_mode=str(mode),
+                from_outcome=str(current.outcome),
+                to_outcome=str(outcome),
+                stage=current.stage,
+                run_id=current.run_id,
+                ts=at,
+                commit=False,
+            )
+        except sqlite3.IntegrityError:
+            await conn.execute("ROLLBACK TO SAVEPOINT control_apply")
+            await conn.execute("RELEASE SAVEPOINT control_apply")
+            # Only a racing insert of the same action id is reported as already
+            # applied; any other constraint violation (e.g. a foreign-key failure
+            # on a missing issue) is a real error and must not be swallowed.
+            if await db.pipeline_controls.get_action(conn, issue_id, action_id) is None:
+                raise
+            return ActionResult(
+                accepted=False,
+                snapshot=current,
+                rejection=f"{action.value} {action_id} was already applied",
+            )
+        try:
+            await db.pipeline_controls.put(
+                conn,
+                issue_id=issue_id,
+                mode=str(mode),
+                stage=current.stage,
+                outcome=str(outcome),
+                reason=reason,
+                run_id=run_id,
+                actor=actor,
+                updated_at=at,
+                commit=False,
+            )
+        except Exception:
+            # Never leave half a transition behind for a later unrelated commit
+            # to flush: either both rows land or neither does.
+            await conn.execute("ROLLBACK TO SAVEPOINT control_apply")
+            await conn.execute("RELEASE SAVEPOINT control_apply")
             raise
-        return ActionResult(
-            accepted=False,
-            snapshot=current,
-            rejection=f"{action.value} {action_id} was already applied",
-        )
-    try:
-        await db.pipeline_controls.put(
-            conn,
-            issue_id=issue_id,
-            mode=str(mode),
-            stage=current.stage,
-            outcome=str(outcome),
-            reason=reason,
-            run_id=run_id,
-            actor=actor,
-            updated_at=at,
-            commit=False,
-        )
+        await conn.execute("RELEASE SAVEPOINT control_apply")
         await conn.commit()
-    except Exception:
-        # Never leave half a transition behind for a later unrelated commit to
-        # flush: either both rows land or neither does.
-        await conn.rollback()
-        raise
-    return ActionResult(
-        accepted=True,
-        snapshot=_snapshot(
-            issue_id,
-            mode=mode,
-            stage=current.stage,
-            outcome=outcome,
-            reason=reason,
-            run_id=run_id,
-        ),
-        previous=current,
-        action_id=action_id,
-    )
+        return ActionResult(
+            accepted=True,
+            snapshot=_snapshot(
+                issue_id,
+                mode=mode,
+                stage=current.stage,
+                outcome=outcome,
+                reason=reason,
+                run_id=run_id,
+            ),
+            previous=current,
+            action_id=action_id,
+        )
 
 
 async def release(
@@ -427,29 +454,37 @@ async def release(
     if not result.accepted or result.previous is None or result.action_id is None:
         return
     previous = result.previous
-    try:
-        await db.pipeline_controls.delete_action(
-            conn,
-            issue_id=result.snapshot.issue_id,
-            action_id=result.action_id,
-            commit=False,
-        )
-        await db.pipeline_controls.put(
-            conn,
-            issue_id=previous.issue_id,
-            mode=str(previous.mode),
-            stage=previous.stage,
-            outcome=str(previous.outcome),
-            reason=previous.reason,
-            run_id=previous.run_id,
-            actor=None,
-            updated_at=at,
-            commit=False,
-        )
+    async with _lock(result.snapshot.issue_id):
+        # Scoped like `apply`'s SAVEPOINT: `conn` is the one connection shared
+        # by the whole daemon, so a bare `conn.rollback()` here would discard
+        # any other, unrelated work some other coroutine has written to the
+        # same not-yet-committed transaction.
+        await conn.execute("SAVEPOINT control_release")
+        try:
+            await db.pipeline_controls.delete_action(
+                conn,
+                issue_id=result.snapshot.issue_id,
+                action_id=result.action_id,
+                commit=False,
+            )
+            await db.pipeline_controls.put(
+                conn,
+                issue_id=previous.issue_id,
+                mode=str(previous.mode),
+                stage=previous.stage,
+                outcome=str(previous.outcome),
+                reason=previous.reason,
+                run_id=previous.run_id,
+                actor=None,
+                updated_at=at,
+                commit=False,
+            )
+        except Exception:
+            await conn.execute("ROLLBACK TO SAVEPOINT control_release")
+            await conn.execute("RELEASE SAVEPOINT control_release")
+            raise
+        await conn.execute("RELEASE SAVEPOINT control_release")
         await conn.commit()
-    except Exception:
-        await conn.rollback()
-        raise
 
 
 async def history(

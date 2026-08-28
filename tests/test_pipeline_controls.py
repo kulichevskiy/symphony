@@ -13,6 +13,7 @@ on top of the checkpoint the failed attempt committed.
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -793,5 +794,84 @@ async def test_implement_retry_the_control_model_rejects_changes_nothing(
         assert await controls.history(conn, ISSUE_ID) == []
         posted = [str(c.args[1]) for c in tracker.post_comment.await_args_list]  # type: ignore[attr-defined]
         assert any("$retry" in body for body in posted)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_retries_cannot_both_be_accepted(tmp_path: Path) -> None:
+    """Two different action ids racing `apply(RETRY)` for the same issue must
+    not both be accepted: a UI Retry click racing a tracker `$retry` comment
+    would otherwise both read the same "failed" snapshot, both see Retry
+    allowed, and both start a fresh implement attempt."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _record_implement(conn, outcome=OUTCOMES.FAILED, at="2026-08-27T10:00:00+00:00")
+
+        first, second = await asyncio.gather(
+            controls.apply(
+                conn,
+                ISSUE_ID,
+                ACTIONS.RETRY,
+                actor="tracker:c-1",
+                action_id="c-1",
+                at="2026-08-27T10:01:00+00:00",
+            ),
+            controls.apply(
+                conn,
+                ISSUE_ID,
+                ACTIONS.RETRY,
+                actor="web:cmd-1",
+                action_id="cmd-1",
+                at="2026-08-27T10:01:01+00:00",
+            ),
+        )
+
+        accepted = [result for result in (first, second) if result.accepted]
+        history = await controls.history(conn, ISSUE_ID)
+        assert len(accepted) == 1, (
+            f"both accepted -> double dispatch; actions={[row.action_id for row in history]}"
+        )
+        assert len(history) == 1
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_track_implement_failed_wait_rolls_back_on_upsert_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_track_implement_failed_wait` records the control row and the operator
+    wait in one transaction (`commit=False`, rolled back together on failure).
+    If the wait upsert fails, the control row it just wrote must roll back
+    with it rather than being left behind as a "failed" outcome with no wait
+    and no action row to explain it."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = _cfg(tmp_path, binding)
+        orch = _orchestrator(cfg, conn, AsyncMock(), tmp_path)
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+
+        async def _boom(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(db.operator_waits, "upsert", _boom)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await orch._track_implement_failed_wait(ISSUE_ID, "run-1", binding)  # noqa: SLF001
+
+        assert await db.pipeline_controls.get(conn, ISSUE_ID) is None
     finally:
         await conn.close()
