@@ -1153,3 +1153,23 @@ def test_run_log_writer_keeps_logging_when_receipts_write_fails(
         writer.write("again")
 
     assert log_path.read_text() == "hello\nworld\nagain\n"
+
+
+def test_run_log_writer_close_swallows_receipts_close_failure(
+    tmp_path: Path,
+) -> None:
+    """If the sidecar's `close()` raises `OSError` (e.g. delayed writeback
+    failure on a network filesystem), the run log's own handle must still
+    close and the exception must not escape `close()`."""
+    log_path = tmp_path / "run.log"
+    writer = RunLogWriter(log_path).open()
+    writer.write("hello")
+    broken = MagicMock()
+    broken.close.side_effect = OSError("stale handle")
+    writer._receipts = broken  # noqa: SLF001
+
+    writer.close()
+
+    assert writer._log is None  # noqa: SLF001
+    assert writer._receipts is None  # noqa: SLF001
+    assert log_path.read_text() == "hello\n"

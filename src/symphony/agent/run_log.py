@@ -76,9 +76,22 @@ class RunLogWriter:
         return self
 
     def close(self) -> None:
-        for handle in (self._log, self._receipts):
-            if handle is not None:
-                handle.close()
+        """Close both handles. A receipts-close failure is logged and
+        swallowed, not raised: the sidecar is best-effort, so a delayed
+        writeback failure on it (e.g. a network filesystem) must not stop
+        the run log's own handle from closing or escape to the caller.
+        """
+        if self._log is not None:
+            self._log.close()
+        if self._receipts is not None:
+            try:
+                self._receipts.close()
+            except OSError:
+                log.warning(
+                    "receipts sidecar close failed for %s",
+                    self._log_path,
+                    exc_info=True,
+                )
         self._log = None
         self._receipts = None
 
