@@ -156,6 +156,54 @@ def test_self_closing_tag_does_not_swallow_a_later_same_name_tag() -> None:
     assert result == "[https://l/1](https://l/1) and [ENG-2](https://l/2)"
 
 
+def test_long_whitespace_run_in_a_tag_opener_does_not_backtrack_catastrophically() -> None:
+    """A tag-shaped opener followed by a long contiguous whitespace run must
+    not be rescanned once per attrs split (previously ~140s at 60k spaces)."""
+    description = "<issue " + " " * 60_000 + "text"
+    start = time.monotonic()
+    result = _linear_rich_links_to_markdown(description)
+    elapsed = time.monotonic() - start
+    assert elapsed < 5.0
+    assert result == description
+
+
+def test_truncation_preserves_crlf_line_endings() -> None:
+    """`splitlines()` treats `\\r\\n` as a line break; joining the kept lines
+    back with `\\n` would then drop every `\\r`. The kept head must stay a
+    verbatim prefix of the original description."""
+    line = "x" * 99
+    description = "\r\n".join([line] * 2000)
+    body = build_pr_body(_issue(description))
+    head, _, _ = body.partition("\n\nDescription truncated")
+    assert head
+    assert description.startswith(head)
+
+
+def test_truncation_preserves_unicode_line_separators() -> None:
+    """`splitlines()` also breaks on U+2028/U+2029 and friends; joining with
+    `\\n` would silently convert them. The kept head must stay a verbatim
+    prefix of the original description."""
+    line = "x" * 99
+    description = " ".join([line] * 2000)
+    body = build_pr_body(_issue(description))
+    head, _, _ = body.partition("\n\nDescription truncated")
+    assert head
+    assert description.startswith(head)
+
+
+def test_truncation_closes_an_unterminated_code_fence() -> None:
+    """Cutting a description inside an open ``` fence must close it before
+    the truncation notice/footer, or they render inside the code block."""
+    line = "y" * 99
+    description = "```\n" + "\n".join([line] * 2000)
+    body = build_pr_body(_issue(description))
+    assert len(body) <= PR_BODY_MAX_CHARS
+    assert len(body.encode("utf-8")) <= PR_BODY_MAX_BYTES
+    assert body.endswith(FOOTER)
+    assert "```\n\nDescription truncated" in body
+    assert body.count("```") % 2 == 0
+
+
 def test_unclosed_url_less_tag_does_not_swallow_a_following_real_rich_link() -> None:
     """A url-less, tag-shaped `<issue …>` in prose must match on its own and
     not stretch its `text` group forward to a later same-name close tag that

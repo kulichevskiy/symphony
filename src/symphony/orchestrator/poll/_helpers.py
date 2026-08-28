@@ -45,10 +45,16 @@ PR_BODY_MAX_CHARS = 65_536
 # under that ceiling.
 PR_BODY_MAX_BYTES = 120_000
 _PR_BODY_TRUNCATION_NOTICE = "Description truncated; see the source ticket"
+# Appended to a truncated description that leaves an odd number of ``` fence
+# markers behind, so the notice/footer that follows isn't swallowed into an
+# unterminated code block. Budgeted for up front (see `build_pr_body`) so
+# adding it can never itself push the body over either size ceiling.
+_FENCE_CLOSER = "\n```"
 # Linear rich links: `<issue …>ENG-1</issue>`, `<pull-request … />`. The bare
-# attrs branch excludes quotes so it can never overlap with the quoted
-# branches — an unbalanced quote then just fails the match instead of
-# backtracking exponentially over the ambiguous alternation. `selfclose`
+# attrs branch excludes quotes *and whitespace* so it can never overlap with
+# either the quoted branches or the `\s+` separator between attrs — each
+# attr token is matched exactly once, so a long whitespace run (or an
+# unbalanced quote) can't be rescanned once per attrs split. `selfclose`
 # short-circuits the trailing text/close-tag group entirely, so a
 # self-closing tag can never reach forward and swallow a later same-name
 # tag. The text group's lookahead is barred from crossing another same-name
@@ -56,7 +62,9 @@ _PR_BODY_TRUNCATION_NOTICE = "Description truncated; see the source ticket"
 # instead of stretching to the next real tag's close — this also bounds the
 # forward scan per tag.
 _RICH_LINK_TAG_RE = re.compile(
-    r"<(?P<tag>issue|pull-request)(?P<attrs>\s(?:\"[^\"]*\"|'[^']*'|[^<>\"'])*?)?\s*(?P<selfclose>/)?>"
+    r"<(?P<tag>issue|pull-request)"
+    r"(?P<attrs>(?:\s+(?:\"[^\"]*\"|'[^']*'|[^<>\"'\s/]|/(?!\s*>))+)*)"
+    r"\s*(?P<selfclose>/)?>"
     r"(?(selfclose)|(?:(?P<text>(?:[^<]|<(?!/?(?P=tag)\b))*)</(?P=tag)>)?)",
     re.IGNORECASE,
 )
@@ -127,10 +135,17 @@ def build_pr_body(issue: LinearIssue) -> str:
     if len(body) <= PR_BODY_MAX_CHARS and len(body.encode("utf-8")) <= PR_BODY_MAX_BYTES:
         return body
     tail = f"\n\n{_PR_BODY_TRUNCATION_NOTICE}\n\n{footer}"
-    char_budget = PR_BODY_MAX_CHARS - len(tail)
-    byte_budget = PR_BODY_MAX_BYTES - len(tail.encode("utf-8"))
+    char_budget = PR_BODY_MAX_CHARS - len(tail) - len(_FENCE_CLOSER)
+    byte_budget = PR_BODY_MAX_BYTES - len(tail.encode("utf-8")) - len(_FENCE_CLOSER.encode("utf-8"))
     kept = _head_lines_within(description, char_budget, byte_budget)
+    if _has_unterminated_fence(kept):
+        kept = f"{kept}{_FENCE_CLOSER}"
     return f"{kept}{tail}"
+
+
+def _has_unterminated_fence(text: str) -> bool:
+    """True when *text* ends inside a ``` fence (an odd number of fence lines)."""
+    return sum(1 for line in text.split("\n") if line.startswith("```")) % 2 == 1
 
 
 def _head_lines_within(text: str, char_budget: int, byte_budget: int) -> str:
@@ -145,7 +160,7 @@ def _head_lines_within(text: str, char_budget: int, byte_budget: int) -> str:
     kept: list[str] = []
     used_chars = 0
     used_bytes = 0
-    for line in text.splitlines():
+    for line in text.split("\n"):
         sep = 1 if kept else 0
         used_chars += len(line) + sep
         used_bytes += len(line.encode("utf-8")) + sep
@@ -170,9 +185,10 @@ def _linear_rich_links_to_markdown(description: str) -> str:
     """Rewrite Linear rich-link tags as `[label](url)`.
 
     Linear serializes inline issue / PR references as pseudo-HTML tags that
-    GitHub renders as nothing. Label preference: tag text, then `identifier`,
-    then `title`, then the URL. A tag without a `url` attribute is not a
-    Linear rich link (or is malformed) and passes through verbatim.
+    GitHub renders as unlinked text (or nothing at all when self-closing).
+    Label preference: tag text, then `identifier`, then `title`, then the URL.
+    A tag without a `url` attribute is not a Linear rich link (or is
+    malformed) and passes through verbatim.
     """
 
     def replace(match: re.Match[str]) -> str:
