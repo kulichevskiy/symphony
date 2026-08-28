@@ -94,6 +94,7 @@ from ...linear.templates import (
     truncate_body,
 )
 from ...notify import EVENT_OPERATOR_WAIT, EVENT_RUN_FAILED, TelegramNotifier, build_message
+from ...pipeline import controls
 from ...pipeline.cost_guard import (
     UsageCostEstimator,
     UsageDelta,
@@ -1820,6 +1821,21 @@ class _OrchestratorBase:
         self._dispatch_run_ids[issue_id] = run_id
         self._operator_wait_run_ids.add(run_id)
         self._implement_failed_run_bindings[run_id] = binding
+        # The park is also a pipeline-control fact: the implement stage's latest
+        # attempt failed (SYM-244). Written in the wait's transaction
+        # (`commit=False`) so a restart can never find one without the other.
+        # `reason` is carried for the operator; what Retry/Skip/Abort the
+        # snapshot offers comes from the outcome alone.
+        await controls.record_stage_outcome(
+            self._conn,
+            issue_id,
+            stage=controls.IMPLEMENT_STAGE,
+            outcome=controls.AttemptOutcome.FAILED,
+            reason=await self._blocked_reason_for_run(run_id) or None,
+            run_id=run_id,
+            at=self._now().isoformat(),
+            commit=False,
+        )
         await db.operator_waits.upsert(
             self._conn,
             issue_id=issue_id,

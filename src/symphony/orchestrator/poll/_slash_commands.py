@@ -40,6 +40,7 @@ from ...linear.templates import (
     skip_acceptance_forced,
     truncate_body,
 )
+from ...pipeline import controls
 from ...tracker import Comment as LinearComment
 from ...tracker import Issue as LinearIssue
 from ._base import (
@@ -60,6 +61,8 @@ log = logging.getLogger(__name__)
 
 
 MANUAL_MERGE_PARKED_RUN_PREFIX = "manual-merge-parked:"
+# Synthetic comment id `_apply_web_command` stamps on a UI-issued command.
+WEB_COMMAND_COMMENT_PREFIX = "web-"
 
 
 def _manual_merge_parked_run_id(pr: db.issue_prs.IssuePR) -> str:
@@ -202,7 +205,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
             return
         intent = SlashIntent(
             kind=kind,
-            comment_id=f"web-{command_id}",
+            comment_id=f"{WEB_COMMAND_COMMENT_PREFIX}{command_id}",
             created_at=self._now().isoformat(),
         )
         await self._handle_slash_intent(issue_id, run_id, intent)
@@ -620,6 +623,44 @@ class _SlashCommandsMixin(_OrchestratorBase):
                 e,
             )
 
+    async def _accept_control_action(
+        self, issue_id: str, action: controls.ControlAction, intent: SlashIntent
+    ) -> controls.ActionResult | None:
+        """Put one operator command through the pipeline-control module.
+
+        Returns the accepted result — the transition is committed, so the
+        caller's side effects run behind a durable decision — or None when the
+        action is rejected (not available in the current state, or this exact
+        command was already applied), having told the operator why."""
+        result = await controls.apply(
+            self._conn,
+            issue_id,
+            action,
+            actor=self._control_actor(intent),
+            action_id=intent.comment_id,
+            at=self._now().isoformat(),
+        )
+        if result.accepted:
+            return result
+        log.info(
+            "pipeline control rejected %s for issue %s: %s",
+            action.value,
+            issue_id,
+            result.rejection,
+        )
+        await self._post_command_rejected(
+            issue_id,
+            self._slash_text(intent),
+            result.rejection or f"{action.value} is not available right now",
+        )
+        return None
+
+    @staticmethod
+    def _control_actor(intent: SlashIntent) -> str:
+        """Who asked. Web-button commands carry a synthetic `web-` comment id."""
+        origin = "web" if intent.comment_id.startswith(WEB_COMMAND_COMMENT_PREFIX) else "tracker"
+        return f"{origin}:{intent.comment_id}"
+
     async def _handle_parked_manual_merge_slash_intent(
         self,
         issue_id: str,
@@ -709,9 +750,25 @@ class _SlashCommandsMixin(_OrchestratorBase):
                     binding.linear_states.ready,
                 )
                 return
+            # The control module decides — and durably records — whether this
+            # retry happens, before anything outside the DB moves (SYM-244).
+            # A command that is no longer valid, or one already applied, stops
+            # here and can never start a second implement attempt. `$approve`
+            # on this park is the same transition, so it goes through the same
+            # gate. The workspace and its committed checkpoint are untouched:
+            # the fresh attempt picks them up on the next dispatch; process and
+            # session state are deliberately not resumed.
+            accepted = await self._accept_control_action(
+                issue_id, controls.ControlAction.RETRY, intent
+            )
+            if accepted is None:
+                return
             try:
                 await tracker.move_issue(tracker_issue_id, ready_id)
             except LinearError as e:
+                # Nothing carried the transition out; release it so the next
+                # poll tick can re-deliver this same command.
+                await controls.release(self._conn, accepted, at=self._now().isoformat())
                 log.warning("could not move %s to ready for retry: %s", issue_id, e)
                 raise SlashHandlerFailure(
                     slash_text=self._slash_text(intent),
