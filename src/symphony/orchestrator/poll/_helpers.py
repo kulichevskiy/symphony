@@ -363,16 +363,17 @@ def _markup_states_per_line(
     """Per-prefix-length (fence closer, HTML-comment-open, raw-HTML-block closer)
     triple for `lines[0:i+1]`.
 
-    Fence, HTML-comment, and raw-HTML-block (types 1, 3-5, and 6) tracking run
-    in a single interleaved forward scan because each must ignore markers
+    Fence, HTML-comment, and raw-HTML-block (types 1, 3-5, 6, and 7) tracking
+    run in a single interleaved forward scan because each must ignore markers
     owned by the others: a fence marker seen while a comment (or raw HTML
     block) is open is inert — an open `<!-- ... -->`, `<pre>...</pre>`,
-    `<?...?>`, or a type-6 wrapper like `<div>...</div>` swallows everything
-    up to its closer (a blank line, for type 6) verbatim, including anything
-    fence-shaped — and a `<!--`/`-->` token seen while a bare fence is open is
-    inert code content, not a real comment delimiter. A type-6 block needs no
-    textual closer of its own (unlike types 1 and 3-5): it always ends at the
-    next blank line, and the blank line the truncation tail always opens with
+    `<?...?>`, a type-6 wrapper like `<div>...</div>`, or a type-7 wrapper
+    like `<x-widget>...</x-widget>` swallows everything up to its closer (a
+    blank line, for types 6 and 7) verbatim, including anything fence-shaped
+    — and a `<!--`/`-->` token seen while a bare fence is open is inert code
+    content, not a real comment delimiter. A type-6/7 block needs no textual
+    closer of its own (unlike types 1 and 3-5): it always ends at the next
+    blank line, and the blank line the truncation tail always opens with
     already supplies that. Tracks CommonMark fence rules across ``` and
     ~~~ fences of any length (3+): a fence is closed only by a same-character
     run at least as long as its opener, indented by at most 3 spaces, with
@@ -452,6 +453,9 @@ def _markup_states_per_line(
                 if not opened and _RAW_HTML_TYPE6_START_RE.match(line):
                     opened = True
                     open_html6 = True
+                if not opened and prev_blank and _TYPE7_TAG_ALONE_RE.match(line):
+                    opened = True
+                    open_html6 = True
                 if not opened and prev_blank and _INDENTED_CODE_LINE_RE.match(line):
                     in_indent = True
                     opened = True
@@ -510,7 +514,7 @@ def _close_dangling_markup(kept: str, char_budget: int, byte_budget: int) -> str
 
 
 def _shorten_line_for_closer(line: str, closer: str, char_budget: int, byte_budget: int) -> str:
-    """Cut *line* down so it fits alongside `closer` within both budgets.
+    """Cut *line* down so it fits alongside a closer within both budgets.
 
     Reached only when the single retained line plus its closer still
     overruns budget at `n == 1` — the line-dropping loop in
@@ -522,6 +526,17 @@ def _shorten_line_for_closer(line: str, closer: str, char_budget: int, byte_budg
     line can be kept alongside it either; the opener is dropped entirely
     rather than returning a result that overruns the budget it was meant to
     respect.
+
+    `closer` (computed from the *un-cut* line) only reserves budget: the cut
+    can land inside the very opener the closer was derived from — e.g. a
+    trailing `<!--` split into a bare `<!-` — leaving a truncated prefix that
+    no longer opens anything. Appending the original closer there would be
+    wrong at best (a stray literal `-->`) and corrupting at worst (a fence
+    opener trimmed below its 3-character minimum, with the closer marker
+    then read back as a *new*, unclosed fence that swallows the truncation
+    notice/footer after it). The actual closer is recomputed from the cut
+    prefix itself, which is always no longer than the reserved one, so it
+    still fits the budget.
     """
     reserve_chars = 1 + len(closer)
     reserve_bytes = 1 + len(closer.encode("utf-8"))
@@ -530,7 +545,11 @@ def _shorten_line_for_closer(line: str, closer: str, char_budget: int, byte_budg
     line_char_budget = char_budget - reserve_chars
     line_byte_budget = byte_budget - reserve_bytes
     prefix = _char_prefix_within_bytes(line, line_char_budget, line_byte_budget)
-    return f"{prefix}\n{closer}"
+    fence_states, comment_states, html_states = _markup_states_per_line([prefix])
+    actual_closer = "\n".join(
+        p for p in (fence_states[-1], html_states[-1], "-->" if comment_states[-1] else None) if p
+    )
+    return f"{prefix}\n{actual_closer}" if actual_closer else prefix
 
 
 def _head_lines_within(text: str, char_budget: int, byte_budget: int) -> str:

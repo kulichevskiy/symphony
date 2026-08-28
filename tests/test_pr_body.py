@@ -12,7 +12,11 @@ from __future__ import annotations
 import time
 
 from symphony.orchestrator.poll import PR_BODY_MAX_BYTES, PR_BODY_MAX_CHARS, build_pr_body
-from symphony.orchestrator.poll._helpers import _linear_rich_links_to_markdown
+from symphony.orchestrator.poll._helpers import (
+    _linear_rich_links_to_markdown,
+    _markup_states_per_line,
+    _shorten_line_for_closer,
+)
 from symphony.tracker import Issue
 
 
@@ -576,6 +580,45 @@ def test_oversized_single_line_of_pure_backticks_is_dropped_rather_than_overflow
     assert len(body.encode("utf-8")) <= PR_BODY_MAX_BYTES
     assert body.endswith(FOOTER)
     assert "Description truncated; see the source ticket" in body
+
+
+def test_type7_raw_html_block_is_tracked_in_the_markup_state_scan() -> None:
+    """`_markup_states_per_line` must swallow a type-7 wrapper the same way it
+    already swallows type-6 (SYM-243 review): fence-shaped text nested inside
+    `<x-widget>...</x-widget>` is inert HTML content, not a real code fence."""
+    fence_states, _, _ = _markup_states_per_line(["<x-widget>", "```", "</x-widget>"])
+    assert fence_states == [None, None, None]
+
+
+def test_fence_shaped_text_inside_a_type7_raw_html_block_is_not_treated_as_dangling() -> None:
+    """A ``` line inside an `<x-widget>...</x-widget>` wrapper (CommonMark raw
+    HTML block type 7) is inert HTML content, not a real code fence — the
+    wrapper swallows it, so no closing ``` should be synthesized."""
+    description = "<x-widget>\n```\n</x-widget>"
+    body = build_pr_body(_issue(description))
+    assert body == f"{description}\n\n{FOOTER}"
+
+
+def test_shortening_a_line_mid_fence_opener_does_not_synthesize_a_stray_fence() -> None:
+    """If the cut lands inside the fence marker itself (e.g. ``` cut down to
+    two backticks), the retained prefix no longer opens a fence at all —
+    appending the closer computed from the un-cut line would strand a stray,
+    unclosed fence marker that swallows everything written after it."""
+    line = "```" + "y" * 1000
+    result = _shorten_line_for_closer(line, "```", char_budget=6, byte_budget=6)
+    assert result == "``"
+    assert "```" not in result
+
+
+def test_shortening_a_line_mid_comment_opener_drops_the_unneeded_closer() -> None:
+    """If the cut lands inside the `<!--` opener itself, the retained prefix
+    never actually opens a comment — the closer computed from the un-cut
+    line must not be appended, or a bare `-->` shows up with nothing to
+    close."""
+    line = "x" * 50 + "<!--" + "z" * 10
+    result = _shorten_line_for_closer(line, "-->", char_budget=57, byte_budget=57)
+    assert result == "x" * 50 + "<!-"
+    assert "-->" not in result
 
 
 def test_rich_link_url_with_an_unbalanced_close_paren_is_wrapped_in_angle_brackets() -> None:

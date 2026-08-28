@@ -164,6 +164,19 @@ async def test_pr_create_omits_base_when_not_provided(fake_gh) -> None:  # type:
     assert "--head" in argv and argv[argv.index("--head") + 1] == "x"
 
 
+async def test_pr_create_redacts_the_body_from_a_command_failure(fake_gh) -> None:  # type: ignore[no-untyped-def]
+    """`_run` formats the full argv into `GitHubError` on a non-zero exit —
+    a tracker description run through as `--body` must not leak into that
+    error message (SYM-243 review)."""
+    fake_gh({"pr create": [1, "boom"]})
+    gh = GitHub()
+    body = "full tracker description that must not leak into logs"
+    with pytest.raises(GitHubError) as exc:
+        await gh.pr_create(title="t", body=body, head="x", repo="org/r")
+    assert body not in str(exc.value)
+    assert "boom" in str(exc.value)
+
+
 # ---- ensure_pr (get-or-create) -------------------------------------
 
 

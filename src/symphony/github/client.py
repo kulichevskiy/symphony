@@ -190,11 +190,20 @@ class GitHub:
         *,
         cwd: Path | None = None,
         allow_exit_codes: tuple[int, ...] = (0,),
+        redact: frozenset[str] = frozenset(),
     ) -> str:
+        """Run *argv*; on a disallowed exit code, raise `GitHubError`.
+
+        `redact` names argv values (e.g. a PR body) to replace with a
+        placeholder in the error message — the failure still needs to be
+        diagnosable, but a tracker description can run to tens of KB and
+        doesn't belong in a log line.
+        """
         stdout, stderr, returncode = await self._run_capture(argv, cwd=cwd)
         if returncode not in allow_exit_codes:
+            shown = ["<redacted>" if arg in redact else arg for arg in argv]
             raise GitHubError(
-                f"gh {' '.join(argv)} exited {returncode}: {stderr.strip() or stdout.strip()}"
+                f"gh {' '.join(shown)} exited {returncode}: {stderr.strip() or stdout.strip()}"
             )
         return stdout
 
@@ -325,7 +334,7 @@ class GitHub:
         )
         if draft:
             argv.append("--draft")
-        out = await self._run(argv)
+        out = await self._run(argv, redact=frozenset({body}) if body else frozenset())
         return out.strip()
 
     async def open_pr_for_head(
