@@ -657,7 +657,11 @@ class _SlashCommandsMixin(_OrchestratorBase):
 
     @staticmethod
     def _control_actor(intent: SlashIntent) -> str:
-        """Who asked. Web-button commands carry a synthetic `web-` comment id."""
+        """Who asked: the comment author when known, else a synthetic
+        `origin:id` (web-button commands carry a synthetic `web-` comment id
+        and no author)."""
+        if intent.author:
+            return intent.author
         origin = "web" if intent.comment_id.startswith(WEB_COMMAND_COMMENT_PREFIX) else "tracker"
         return f"{origin}:{intent.comment_id}"
 

@@ -417,12 +417,13 @@ def _orchestrator(
     return orch
 
 
-def _retry_intent(comment_id: str) -> SlashIntent:
+def _retry_intent(comment_id: str, *, author: str = "") -> SlashIntent:
     return SlashIntent(
         kind=SlashKind.RETRY,
         comment_id=comment_id,
         created_at="2026-08-27T10:00:00+00:00",
         text="$retry",
+        author=author,
     )
 
 
@@ -474,7 +475,9 @@ async def test_implement_retry_records_transition_then_starts_one_fresh_attempt(
         assert [(a.action, a.from_outcome, a.to_mode) for a in actions] == [
             ("retry", "failed", "playing")
         ]
-        assert actions[0].actor
+        # No author on the intent (e.g. a web-button command): the actor falls
+        # back to the synthetic origin:id, not a bare re-encoding of action_id.
+        assert actions[0].actor == "tracker:c-retry"
         assert actions[0].ts
         after = await controls.snapshot(conn, ISSUE_ID)
         assert after.outcome is OUTCOMES.PENDING
@@ -518,6 +521,34 @@ async def test_implement_retry_records_transition_then_starts_one_fresh_attempt(
             r for r in await db.runs.history_for_issue(conn, ISSUE_ID) if r.stage == "implement"
         ]
         assert len(implement_runs) == 2
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_retry_records_the_comment_authors_name_as_actor(tmp_path: Path) -> None:
+    """A tracker comment's author is a real person, not just its comment id.
+    `_control_actor` must record that name so the durable action row
+    identifies who asked, not `action_id` re-encoded."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = _cfg(tmp_path, binding)
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+
+        orch = _orchestrator(cfg, conn, _failing_implement_runner(workspace_path), workspace_path)
+        await _scan_and_wait(orch, binding)
+        failed_run = (await db.runs.history_for_issue(conn, ISSUE_ID))[0]
+
+        await orch._handle_implement_failed_slash_intent(  # noqa: SLF001
+            ISSUE_ID, failed_run.id, _retry_intent("c-retry", author="Jane Operator")
+        )
+
+        actions = await controls.history(conn, ISSUE_ID)
+        assert actions[0].actor == "Jane Operator"
     finally:
         await conn.close()
 
@@ -692,6 +723,21 @@ async def test_startup_sweep_reconciles_interrupted_retry_to_failed(
         assert reconciled.outcome is OUTCOMES.FAILED
         assert ACTIONS.RETRY in reconciled.allowed_actions
         assert reconciled.run_id == "run-1"
+
+        # The ingress that died mid-side-effect will re-deliver the very same
+        # tracker comment on its next tick. The sweep must have dropped the
+        # interrupted retry's own action row so that identical redelivery is
+        # accepted, not rejected as a duplicate of a command whose side effect
+        # never ran.
+        redelivered = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.RETRY,
+            actor="tracker:c-retry",
+            action_id="c-retry",
+            at="2026-08-27T11:00:01+00:00",
+        )
+        assert redelivered.accepted
     finally:
         await conn.close()
 

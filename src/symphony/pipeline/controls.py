@@ -240,6 +240,13 @@ async def reconcile_interrupted_retries(conn: aiosqlite.Connection, *, at: str) 
     any such row back to failed on the way up so Retry/Skip are offered again
     instead of a permanently stuck park.
 
+    The interrupted Retry's own action row is dropped in the same transaction
+    as the reset. It was recorded before the side effect that never ran, so
+    its `action_id` (typically a tracker comment id) is still sitting in the
+    ingress's replay window; leaving the row behind would make `apply` reject
+    that identical re-delivery as a duplicate even though the reset just
+    advertised Retry as available again.
+
     Scoped to startup (rather than folded into `snapshot`) so a still-live
     process — where a wait reappearing while an attempt is genuinely pending
     would be a stale/duplicate signal, not an interrupted retry — keeps
@@ -254,6 +261,22 @@ async def reconcile_interrupted_retries(conn: aiosqlite.Connection, *, at: str) 
             continue
         run = await db.runs.get_with_issue(conn, wait.run_id)
         detail = run.run.termination_detail if run is not None else None
+        interrupted_retry = next(
+            (
+                action
+                for action in reversed(await db.pipeline_controls.list_actions(conn, wait.issue_id))
+                if action.action == str(ControlAction.RETRY)
+                and action.to_outcome == str(AttemptOutcome.PENDING)
+            ),
+            None,
+        )
+        if interrupted_retry is not None:
+            await db.pipeline_controls.delete_action(
+                conn,
+                issue_id=wait.issue_id,
+                action_id=interrupted_retry.action_id,
+                commit=False,
+            )
         await record_stage_outcome(
             conn,
             wait.issue_id,
@@ -262,7 +285,9 @@ async def reconcile_interrupted_retries(conn: aiosqlite.Connection, *, at: str) 
             reason=detail or None,
             run_id=wait.run_id,
             at=at,
+            commit=False,
         )
+        await conn.commit()
 
 
 def _next_mode_and_outcome(
