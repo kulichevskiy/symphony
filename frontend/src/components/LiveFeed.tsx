@@ -332,22 +332,34 @@ export function LiveFeed({
     },
     [],
   );
-  // Tracks the row that was first before the latest commit, so the
-  // compensating scroll is derived from that single row's `offsetTop` shift
-  // — not the container's whole `scrollHeight` delta, which would also pick
-  // up an unrelated `loadMore` bottom append landing in the same commit.
-  const anchorKeyRef = useRef<string | null>(null);
-  const anchorOffsetRef = useRef<number | null>(null);
+  // Two anchors, since a full tail's insertion and eviction shift content
+  // differently on either side of the tail/history boundary: everything
+  // still inside the tail shifts by the inserted row's height alone, while
+  // everything at or below the boundary (in `history`) shifts by the
+  // inserted height *minus* the evicted height (they only fully cancel out
+  // when the two happen to be equal). `topAnchor` (always `items[0]`) gives
+  // the former; `boundaryAnchor` (the first row *not* in `tailItems`, which
+  // eviction never touches) gives the latter. Which one applies is decided
+  // at compensation time against the operator's live `scrollTop`, not
+  // pre-selected a render early — the operator can scroll freely between
+  // commits without a re-render to notice, so only a check against the
+  // current DOM position is guaranteed fresh.
+  const topKeyRef = useRef<string | null>(null);
+  const topOffsetRef = useRef<number | null>(null);
+  const boundaryKeyRef = useRef<string | null>(null);
+  const boundaryOffsetRef = useRef<number | null>(null);
   const prevTailRef = useRef<typeof tailItems>(tailItems);
   useLayoutEffect(() => {
-    anchorKeyRef.current = null;
-    anchorOffsetRef.current = null;
+    topKeyRef.current = null;
+    topOffsetRef.current = null;
+    boundaryKeyRef.current = null;
+    boundaryOffsetRef.current = null;
     prevTailRef.current = tailItems;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runId]);
   // Runs after every render (not just tail insertions), since `history`
-  // growing from a first page load or `loadMore` also moves the anchor row
-  // and must refresh the baseline — otherwise the next tail insertion
+  // growing from a first page load or `loadMore` also moves both anchors and
+  // must refresh the baseline — otherwise the next tail insertion
   // compensates against a stale position and overshoots. Only an actual
   // top-prepend (a new `tailItems` identity) applies the compensating
   // scroll; `loadMore`'s bottom appends must not.
@@ -355,21 +367,30 @@ export function LiveFeed({
     const el = scrollRef.current;
     if (el === null) return;
     const prepended = prevTailRef.current !== tailItems;
-    if (
-      prepended &&
-      anchorKeyRef.current !== null &&
-      anchorOffsetRef.current !== null &&
-      el.scrollTop > 0
-    ) {
-      const anchorEl = rowRefs.current.get(anchorKeyRef.current);
-      if (anchorEl) {
-        el.scrollTop += anchorEl.offsetTop - anchorOffsetRef.current;
+    if (prepended && el.scrollTop > 0) {
+      const belowBoundary =
+        boundaryKeyRef.current !== null &&
+        boundaryOffsetRef.current !== null &&
+        el.scrollTop >= boundaryOffsetRef.current;
+      const anchorKey = belowBoundary ? boundaryKeyRef.current : topKeyRef.current;
+      const anchorOldOffset = belowBoundary ? boundaryOffsetRef.current : topOffsetRef.current;
+      if (anchorKey !== null && anchorOldOffset !== null) {
+        const anchorEl = rowRefs.current.get(anchorKey);
+        if (anchorEl) {
+          el.scrollTop += anchorEl.offsetTop - anchorOldOffset;
+        }
       }
     }
-    const firstKey = items[0]?.key ?? null;
-    const firstEl = firstKey !== null ? (rowRefs.current.get(firstKey) ?? null) : null;
-    anchorKeyRef.current = firstKey;
-    anchorOffsetRef.current = firstEl ? firstEl.offsetTop : null;
+    const topKey = items[0]?.key ?? null;
+    const topEl = topKey !== null ? (rowRefs.current.get(topKey) ?? null) : null;
+    topKeyRef.current = topKey;
+    topOffsetRef.current = topEl ? topEl.offsetTop : null;
+
+    const boundaryItem = items[tailItems.length] ?? null;
+    const boundaryEl = boundaryItem ? (rowRefs.current.get(boundaryItem.key) ?? null) : null;
+    boundaryKeyRef.current = boundaryItem ? boundaryItem.key : null;
+    boundaryOffsetRef.current = boundaryEl ? boundaryEl.offsetTop : null;
+
     prevTailRef.current = tailItems;
   });
 

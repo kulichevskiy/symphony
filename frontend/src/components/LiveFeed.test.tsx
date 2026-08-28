@@ -269,6 +269,46 @@ describe("LiveFeed", () => {
     }
   });
 
+  it("keeps an operator reading history below a full tail steady when eviction offsets the prepend", async () => {
+    const restore = stubScrollGeometry(20);
+    try {
+      fetchRunEventsMock.mockResolvedValue(page({ events: [message("history line", { seq: 0 })] }));
+      const emitters: Array<(event: LiveEvent) => void> = [];
+      streamRunMock.mockImplementation(async (_runId, options) => {
+        emitters.push(options.onEvent);
+        return await neverResolves();
+      });
+
+      const view = render(<LiveFeed runId="run-1" active live />);
+      await screen.findByText("history line");
+      await waitFor(() => expect(emitters.length).toBe(1));
+
+      // Fill the tail to its 100-item cap; none of these evict yet.
+      for (let i = 0; i < 100; i++) {
+        emitters[0]?.({ kind: "message", text: `live ${i}`, ts: null } as LiveEvent);
+      }
+      await waitFor(() =>
+        expect(within(view.container).getByText("live 99")).toBeTruthy(),
+      );
+
+      // Scroll the operator down to the loaded history row, below the tail.
+      const scrollEl = view.container.querySelector(".overflow-y-auto") as HTMLElement;
+      scrollEl.scrollTop = 100 * 20;
+
+      // One more live event prepends a row and evicts the tail's oldest
+      // ("live 0") in the same commit. Below the eviction point the two
+      // shifts cancel out, so the operator's row must not move at all.
+      emitters[0]?.({ kind: "message", text: "live 100", ts: null } as LiveEvent);
+      await waitFor(() =>
+        expect(within(view.container).getByText("live 100")).toBeTruthy(),
+      );
+      expect(within(view.container).queryByText("live 0")).toBeNull();
+      expect(scrollEl.scrollTop).toBe(100 * 20);
+    } finally {
+      restore();
+    }
+  });
+
   it("renders local HH:mm:ss, the date at a day boundary, and — without a timestamp", async () => {
     fetchRunEventsMock.mockResolvedValue(
       page({
