@@ -36,6 +36,186 @@ _ACCEPTANCE_MISSING_WHERE_TO_VERIFY_NOTE = (
     "Acceptance: degraded to code-only — no `Where to verify` in ticket description"
 )
 
+# GitHub rejects PR bodies past this size, so an oversized ticket description
+# is cut rather than failing delivery.
+PR_BODY_MAX_CHARS = 65_536
+# `gh pr create --body` is handed to execve() as a single argv value, which
+# Linux caps well under 128 KiB regardless of character count (e.g. CJK text
+# can blow the byte budget long before the char budget). Stay comfortably
+# under that ceiling.
+PR_BODY_MAX_BYTES = 120_000
+_PR_BODY_TRUNCATION_NOTICE = "Description truncated; see the source ticket"
+# Matches a CommonMark fence marker line: 0-3 spaces of indent, then a run of
+# 3+ backticks or tildes, then the rest of the line (info string when
+# opening, must be blank when closing). Used to track fence open/close state
+# when truncating, so a cut that lands inside a ```, ~~~, or 4+-backtick
+# fence gets closed with a matching marker instead of leaving it dangling.
+_FENCE_MARKER_RE = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})(?P<rest>.*)$")
+# A block quote marker: 0-3 spaces indent, `>`, optional single trailing
+# space/tab, one or more levels deep (`> > `). Used to detect a fenced code
+# block nested inside a block quote, which `_FENCE_MARKER_RE` alone misses
+# since it only allows plain leading spaces before the fence run.
+_BLOCKQUOTE_PREFIX_RE = re.compile(r"^(?: {0,3}>[ \t]?)+")
+# An HTML comment delimiter. CommonMark comments don't nest: the first `-->`
+# after an `<!--` closes it, regardless of any `<!--` seen in between. Used to
+# track comment open/close state when truncating, so a cut that lands inside
+# an otherwise-valid `<!-- ... -->` doesn't strand the truncation notice and
+# footer inside the (now unterminated) comment. Only scanned for outside
+# inline code spans and indented code blocks (see `_markup_states_per_line`),
+# so a literal `<!--` written as an example in code isn't mistaken for a real
+# comment opener.
+_HTML_COMMENT_TOKEN_RE = re.compile(r"<!--|-->")
+# CommonMark indented code block: 4+ spaces or a tab, then non-whitespace.
+_INDENTED_CODE_LINE_RE = re.compile(r"^(?: {4,}|\t)\S")
+# CommonMark "raw HTML block" (type 1): a line starting with `<pre`, `<script`,
+# `<style`, or `<textarea` (case-insensitive), which swallows everything up to
+# a line containing any of the matching close tags — much like an HTML
+# comment, but for these four tags. Used to track open/close state when
+# truncating, so a cut inside a `<pre>...</pre>` block (closed only after the
+# cutoff) gets its own closer instead of leaving the block open across the
+# truncation notice/footer.
+_RAW_HTML_BLOCK_TAGS = ("pre", "script", "style", "textarea")
+_RAW_HTML_BLOCK_START_RE = re.compile(
+    r"^ {0,3}<(?P<tag>" + "|".join(_RAW_HTML_BLOCK_TAGS) + r")(?=[\s>]|$)", re.IGNORECASE
+)
+_RAW_HTML_BLOCK_END_RE = re.compile(
+    r"</(?:" + "|".join(_RAW_HTML_BLOCK_TAGS) + r")>", re.IGNORECASE
+)
+# CommonMark raw HTML blocks types 3-5: a processing instruction (`<?` ...
+# `?>`), a declaration (`<!LETTER` ... `>`), or a CDATA section (`<![CDATA[`
+# ... `]]>`). Like type 1, these swallow everything — fence markers, rich-link
+# tags — up to their closer, so an unterminated one must not be mistaken for
+# closed. Unlike type 1, the closer is an exact literal token rather than a
+# tag-name regex, so `_other_raw_html_block_closer` returns the token itself
+# for a plain substring check instead of a shared end-tag pattern.
+_RAW_CDATA_START_RE = re.compile(r"^ {0,3}<!\[CDATA\[")
+_RAW_DECLARATION_START_RE = re.compile(r"^ {0,3}<![A-Za-z]")
+_RAW_PI_START_RE = re.compile(r"^ {0,3}<\?")
+# CommonMark raw HTML block type 6: a line starting with `<` or `</` followed
+# by one of a fixed list of block-level tag names (case-insensitive), then
+# whitespace, `>`, `/`, or end of line — e.g. `<div>`, `</table>`, `<hr/>`.
+# Unlike type 1, the tag need not close on the same line, or at all: the
+# block simply runs until the next blank line (or end of input). A rich-link
+# tag nested inside such a wrapper (e.g. `<div>\n<issue url="...">…</issue>\n
+# </div>`) must not be mistaken for prose and rewritten, since GitHub renders
+# the whole wrapper as raw HTML rather than reprocessing it as Markdown.
+_RAW_HTML_TYPE6_TAGS = (
+    "address",
+    "article",
+    "aside",
+    "base",
+    "basefont",
+    "blockquote",
+    "body",
+    "caption",
+    "center",
+    "col",
+    "colgroup",
+    "dd",
+    "details",
+    "dialog",
+    "dir",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "frame",
+    "frameset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hr",
+    "html",
+    "iframe",
+    "legend",
+    "li",
+    "link",
+    "main",
+    "menu",
+    "menuitem",
+    "nav",
+    "noframes",
+    "ol",
+    "optgroup",
+    "option",
+    "p",
+    "param",
+    "section",
+    "summary",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "title",
+    "tr",
+    "track",
+    "ul",
+)
+_RAW_HTML_TYPE6_START_RE = re.compile(
+    r"^ {0,3}</?(?:" + "|".join(_RAW_HTML_TYPE6_TAGS) + r")(?=[\s>/]|$)",
+    re.IGNORECASE,
+)
+# CommonMark raw HTML block type 7: a line consisting of nothing but a
+# complete open tag or complete closing tag (any tag name other than the
+# type-1/6 tags already matched above), followed only by trailing
+# whitespace — e.g. `<x-widget>`, `<x-widget attr="1">`, `</x-widget>`.
+# Unlike type 6, this shape cannot interrupt a paragraph, so a caller must
+# only treat it as an opener when the previous line was blank (or this is
+# the first line). `issue`/`pull-request` are excluded by name so a
+# self-closing rich-link tag alone on its own line is still eligible for
+# rewriting rather than being swallowed as an opaque wrapper. Closes the
+# same way type 6 does: at the next blank line.
+_TYPE7_TAG_ALONE_RE = re.compile(
+    r"^ {0,3}</?(?!(?:issue|pull-request)\b)[A-Za-z][A-Za-z0-9-]*"
+    r"(?:\s+[A-Za-z_:][A-Za-z0-9_.:-]*"
+    r"(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'=<>`]+))?)*"
+    r"\s*/?>\s*$",
+    re.IGNORECASE,
+)
+
+
+def _other_raw_html_block_closer(line: str) -> str | None:
+    """Closing token if *line* opens a type 3/4/5 raw HTML block, else None."""
+    if _RAW_CDATA_START_RE.match(line):
+        return "]]>"
+    if _RAW_DECLARATION_START_RE.match(line):
+        return ">"
+    if _RAW_PI_START_RE.match(line):
+        return "?>"
+    return None
+
+
+# Linear rich links: `<issue …>ENG-1</issue>`, `<pull-request … />`. The bare
+# attrs branch excludes quotes *and whitespace* so it can never overlap with
+# either the quoted branches or the `\s+` separator between attrs — each
+# attr token is matched exactly once, so a long whitespace run (or an
+# unbalanced quote) can't be rescanned once per attrs split. `selfclose`
+# short-circuits the trailing text/close-tag group entirely, so a
+# self-closing tag can never reach forward and swallow a later same-name
+# tag. The text group's lookahead is barred from crossing another same-name
+# tag (open or close), so an unpaired/url-less tag matches on its own
+# instead of stretching to the next real tag's close — this also bounds the
+# forward scan per tag.
+_RICH_LINK_TAG_RE = re.compile(
+    r"<(?P<tag>issue|pull-request)"
+    r"(?P<attrs>(?:\s+(?:\"[^\"]*\"|'[^']*'|[^<>\"'\s/]|/(?!\s*>))+)*)"
+    r"\s*(?P<selfclose>/)?>"
+    r"(?(selfclose)|(?:(?P<text>(?:[^<]|<(?!/?(?P=tag)\b))*)</(?P=tag)>)?)",
+    re.IGNORECASE,
+)
+_TAG_ATTR_RE = re.compile(r"([\w-]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')")
+
 
 def _sum_usage(left: UsageDelta, right: UsageDelta) -> UsageDelta:
     return UsageDelta(
@@ -83,10 +263,677 @@ def build_pr_title(issue: LinearIssue) -> str:
 
 
 def build_pr_body(issue: LinearIssue) -> str:
-    """The Linear URL goes through `gh pr_create`'s `linear_url` argument
-    (which appends `Relates to ...`), so the body itself is empty by
-    default. Returning the URL here keeps the format pinned in tests."""
-    return f"Relates to {issue.url}"
+    """Body for a newly created PR: the ticket description plus a footer.
+
+    Built from the issue snapshot the stage already holds — no tracker read.
+    The description is trusted Markdown and passes through untouched (Jira and
+    Linear alike); the only rewrite turns Linear `<issue …>` / `<pull-request …>`
+    rich-link tags into ordinary Markdown links. An empty description leaves
+    only the footer. An oversized description is cut at a line boundary and
+    labelled, so the footer survives and `gh pr create` still accepts the body.
+    """
+    footer = f"Relates to {issue.url}"
+    description = _trim_boundary_blank_lines(_linear_rich_links_to_markdown(issue.description))
+    if not description:
+        return footer
+    description = _close_full_dangling_markup(description)
+    footer = f"---\n\n{footer}"
+    body = f"{description}\n\n{footer}"
+    if len(body) <= PR_BODY_MAX_CHARS and len(body.encode("utf-8")) <= PR_BODY_MAX_BYTES:
+        return body
+    tail = f"\n\n{_PR_BODY_TRUNCATION_NOTICE}\n\n{footer}"
+    char_budget = PR_BODY_MAX_CHARS - len(tail)
+    byte_budget = PR_BODY_MAX_BYTES - len(tail.encode("utf-8"))
+    kept = _head_lines_within(description, char_budget, byte_budget)
+    kept = _close_dangling_markup(kept, char_budget, byte_budget)
+    return f"{kept}{tail}"
+
+
+def _close_full_dangling_markup(text: str) -> str:
+    """Append closer(s) if `text` itself ends inside an unterminated fence and/or HTML comment.
+
+    Covers the direct-return path (a body that fits without truncation): a
+    ticket description that never closes a fence or comment it opened would
+    otherwise swallow the `---`/tracker-link footer inside it. The truncation
+    path doesn't need this — it closes dangling markup at the cut point via
+    `_close_dangling_markup` regardless of whether the source description was
+    itself well-formed.
+    """
+    lines = text.split("\n")
+    fence_states, comment_states, html_states = _markup_states_per_line(lines)
+    parts = [
+        p for p in (fence_states[-1], html_states[-1], "-->" if comment_states[-1] else None) if p
+    ]
+    if not parts:
+        return text
+    return f"{text}\n" + "\n".join(parts)
+
+
+def _trim_boundary_blank_lines(text: str) -> str:
+    """Drop leading/trailing all-blank lines without touching interior indentation.
+
+    `.strip()` eats leading whitespace from the very start of the string,
+    which would strip an indented Markdown code block's opening line right
+    along with it (turning it into unindented prose while later lines in the
+    same block stay indented). Only whole blank lines at each edge are
+    dropped, so a description that opens or closes with an indented line
+    keeps its indentation.
+    """
+    lines = text.split("\n")
+    start = 0
+    while start < len(lines) and lines[start].strip() == "":
+        start += 1
+    end = len(lines)
+    while end > start and lines[end - 1].strip() == "":
+        end -= 1
+    return "\n".join(lines[start:end])
+
+
+def _preceded_by_odd_backslashes(text: str, index: int) -> bool:
+    """True if `text[index]` is escaped by an odd run of backslashes just before it.
+
+    CommonMark backslash-escapes turn the escaped character into a literal
+    (e.g. `\\<` is a literal `<`, `` \\` `` a literal backtick) rather than
+    the delimiter it would otherwise start. A run of backslashes pairs off
+    two at a time (`\\\\` is one literal backslash), so only an odd count
+    leaves `text[index]` itself escaped.
+    """
+    count = 0
+    pos = index - 1
+    while pos >= 0 and text[pos] == "\\":
+        count += 1
+        pos -= 1
+    return count % 2 == 1
+
+
+def _comment_tokens_outside_inline_code(line: str) -> list[str]:
+    """HTML comment delimiter tokens in *line*, ignoring any inside inline
+    code spans or an escaped literal `\\<!--` opener."""
+    stripped = _strip_code_spans(line)
+    return [
+        match[0]
+        for match in _HTML_COMMENT_TOKEN_RE.finditer(stripped)
+        if not (match[0] == "<!--" and _preceded_by_odd_backslashes(stripped, match.start()))
+    ]
+
+
+def _markup_states_per_line(
+    lines: list[str],
+) -> tuple[list[str | None], list[bool], list[str | None]]:
+    """Per-prefix-length (fence closer, HTML-comment-open, raw-HTML-block closer)
+    triple for `lines[0:i+1]`.
+
+    Fence, HTML-comment, and raw-HTML-block (types 1, 3-5, 6, and 7) tracking
+    run in a single interleaved forward scan because each must ignore markers
+    owned by the others: a fence marker seen while a comment (or raw HTML
+    block) is open is inert — an open `<!-- ... -->`, `<pre>...</pre>`,
+    `<?...?>`, a type-6 wrapper like `<div>...</div>`, or a type-7 wrapper
+    like `<x-widget>...</x-widget>` swallows everything up to its closer (a
+    blank line, for types 6 and 7) verbatim, including anything fence-shaped
+    — and a `<!--`/`-->` token seen while a bare fence is open is inert code
+    content, not a real comment delimiter. A type-6/7 block needs no textual
+    closer of its own (unlike types 1 and 3-5): it always ends at the next
+    blank line, and the blank line the truncation tail always opens with
+    already supplies that. Tracks CommonMark fence rules across ``` and
+    ~~~ fences of any length (3+): a fence is closed only by a same-character
+    run at least as long as its opener, indented by at most 3 spaces, with
+    nothing but trailing whitespace after it. A `<!--`/`-->` token inside an
+    inline code span or a 4-space/tab indented code block is likewise inert —
+    it's literal example text, not a real comment delimiter — so those regions
+    are skipped before scanning a line for comment tokens. Computed once via a
+    single forward scan, so a caller trimming the tail one line at a time can
+    look up each prefix's state in O(1) instead of rescanning the retained
+    text on every trimmed line.
+    """
+    fence_states: list[str | None] = []
+    comment_states: list[bool] = []
+    html_states: list[str | None] = []
+    open_char: str | None = None
+    open_len = 0
+    open_indent = ""
+    open_comment = False
+    open_html_closer: str | None = None
+    open_raw_closer: str | None = None
+    open_html6 = False
+    in_indent = False
+    prev_blank = True
+    for line in lines:
+        is_blank = line.strip() == ""
+        if open_comment:
+            for token in _HTML_COMMENT_TOKEN_RE.findall(line):
+                open_comment = token == "<!--"
+        elif open_char is not None:
+            m = _FENCE_MARKER_RE.match(line)
+            if m is not None:
+                marker, rest = m["marker"], m["rest"]
+                if marker[0] == open_char and len(marker) >= open_len and rest.strip() == "":
+                    open_char, open_len, open_indent = None, 0, ""
+        elif open_html_closer is not None:
+            if _RAW_HTML_BLOCK_END_RE.search(line):
+                open_html_closer = None
+        elif open_raw_closer is not None:
+            if open_raw_closer in line:
+                open_raw_closer = None
+        elif open_html6:
+            if is_blank:
+                open_html6 = False
+        else:
+            if in_indent and not (is_blank or _INDENTED_CODE_LINE_RE.match(line)):
+                in_indent = False
+            if not in_indent:
+                m = _FENCE_MARKER_RE.match(line)
+                opened = False
+                if m is not None:
+                    marker, rest = m["marker"], m["rest"]
+                    if not (marker[0] == "`" and "`" in rest):  # backtick info string forbids `
+                        open_char, open_len = marker[0], len(marker)
+                        # A fence nested under a list item (e.g. `- item\n  ```\n
+                        # code`) is still matched here (0-3 leading spaces), but
+                        # closing it with a bare, unindented marker wouldn't
+                        # re-enter the list item per CommonMark — the list item
+                        # would end first, leaving the marker to open a *new*
+                        # root-level fence that then swallows everything after
+                        # it (including the truncation notice/footer). Reusing
+                        # the opener's own indent keeps the closer inside the
+                        # same list item instead.
+                        open_indent = line[: m.start("marker")]
+                        opened = True
+                if not opened:
+                    html_match = _RAW_HTML_BLOCK_START_RE.match(line)
+                    if html_match is not None:
+                        opened = True
+                        if not _RAW_HTML_BLOCK_END_RE.search(line):
+                            open_html_closer = f"</{html_match['tag'].lower()}>"
+                if not opened:
+                    raw_closer = _other_raw_html_block_closer(line)
+                    if raw_closer is not None:
+                        opened = True
+                        if raw_closer not in line:
+                            open_raw_closer = raw_closer
+                if not opened and _RAW_HTML_TYPE6_START_RE.match(line):
+                    opened = True
+                    open_html6 = True
+                if not opened and prev_blank and _TYPE7_TAG_ALONE_RE.match(line):
+                    opened = True
+                    open_html6 = True
+                if not opened and prev_blank and _INDENTED_CODE_LINE_RE.match(line):
+                    in_indent = True
+                    opened = True
+                if not opened:
+                    for token in _comment_tokens_outside_inline_code(line):
+                        open_comment = token == "<!--"
+        fence_states.append(open_indent + open_char * open_len if open_char is not None else None)
+        comment_states.append(open_comment)
+        html_states.append(open_html_closer or open_raw_closer)
+        prev_blank = is_blank
+    return fence_states, comment_states, html_states
+
+
+def _close_dangling_markup(kept: str, char_budget: int, byte_budget: int) -> str:
+    """Append closer(s) for a fence and/or HTML comment `kept` was cut inside of.
+
+    Trims further lines off the tail until whichever closers apply fit
+    alongside the truncation notice/footer that follows. Handling both in one
+    pass (rather than closing the fence, then separately checking for a
+    dangling comment) means a further trim triggered by the comment closer
+    can't undo the fence closer that a prior, longer `n` already accounted
+    for. If the very first line is itself the one filling the budget (e.g. an
+    oversized one-line `<pre>...</pre>` description), dropping it via `n -= 1`
+    would discard the whole description; shortening that line instead keeps a
+    prefix of it alongside the closer.
+    """
+    lines = kept.split("\n")
+    fence_states, comment_states, html_states = _markup_states_per_line(lines)
+    char_len = [0] * (len(lines) + 1)
+    byte_len = [0] * (len(lines) + 1)
+    for i, line in enumerate(lines):
+        sep = 1 if i else 0
+        char_len[i + 1] = char_len[i] + sep + len(line)
+        byte_len[i + 1] = byte_len[i] + sep + len(line.encode("utf-8"))
+
+    n = len(lines)
+    while n > 0:
+        closer_parts = (
+            fence_states[n - 1],
+            html_states[n - 1],
+            "-->" if comment_states[n - 1] else None,
+        )
+        parts = [p for p in closer_parts if p]
+        if not parts:
+            break
+        closer = "\n".join(parts)
+        if (
+            char_len[n] + 1 + len(closer) <= char_budget
+            and byte_len[n] + 1 + len(closer.encode("utf-8")) <= byte_budget
+        ):
+            return "\n".join(lines[:n]) + f"\n{closer}"
+        if n == 1:
+            return _shorten_line_for_closer(lines[0], closer, char_budget, byte_budget)
+        n -= 1
+    return "\n".join(lines[:n])
+
+
+def _shorten_line_for_closer(line: str, closer: str, char_budget: int, byte_budget: int) -> str:
+    """Cut *line* down so it fits alongside a closer within both budgets.
+
+    Reached only when the single retained line plus its closer still
+    overruns budget at `n == 1` — the line-dropping loop in
+    `_close_dangling_markup` would otherwise discard it entirely, leaving no
+    description content at all even though the closer alone leaves room for
+    part of it. But if the closer alone (with an empty line) still doesn't
+    fit — e.g. a single line of 70,000 backticks, whose fence-marker closer
+    is just as long as the opener it was derived from — no prefix of the
+    line can be kept alongside it either; the opener is dropped entirely
+    rather than returning a result that overruns the budget it was meant to
+    respect.
+
+    `closer` (computed from the *un-cut* line) only reserves budget: the cut
+    can land inside the very opener the closer was derived from — e.g. a
+    trailing `<!--` split into a bare `<!-` — leaving a truncated prefix that
+    no longer opens anything. Appending the original closer there would be
+    wrong at best (a stray literal `-->`) and corrupting at worst (a fence
+    opener trimmed below its 3-character minimum, with the closer marker
+    then read back as a *new*, unclosed fence that swallows the truncation
+    notice/footer after it). The actual closer is recomputed from the cut
+    prefix itself, which is always no longer than the reserved one, so it
+    still fits the budget.
+    """
+    reserve_chars = 1 + len(closer)
+    reserve_bytes = 1 + len(closer.encode("utf-8"))
+    if reserve_chars > char_budget or reserve_bytes > byte_budget:
+        return ""
+    line_char_budget = char_budget - reserve_chars
+    line_byte_budget = byte_budget - reserve_bytes
+    prefix = _char_prefix_within_bytes(line, line_char_budget, line_byte_budget)
+    fence_states, comment_states, html_states = _markup_states_per_line([prefix])
+    actual_closer = "\n".join(
+        p for p in (fence_states[-1], html_states[-1], "-->" if comment_states[-1] else None) if p
+    )
+    return f"{prefix}\n{actual_closer}" if actual_closer else prefix
+
+
+def _head_lines_within(text: str, char_budget: int, byte_budget: int) -> str:
+    """Longest line-boundary prefix of `text` that fits both budgets.
+
+    Bodies are also handed to `gh` as a single argv value, so a byte ceiling
+    matters as much as the char ceiling (Unicode text can blow the byte
+    budget well before the char budget). Falls back to a hard cut when even
+    the first line is too long, so a single-line description cannot defeat
+    either limit.
+    """
+    kept: list[str] = []
+    used_chars = 0
+    used_bytes = 0
+    for line in text.split("\n"):
+        sep = 1 if kept else 0
+        used_chars += len(line) + sep
+        used_bytes += len(line.encode("utf-8")) + sep
+        if used_chars > char_budget or used_bytes > byte_budget:
+            break
+        kept.append(line)
+    if kept:
+        return "\n".join(kept)
+    return _char_prefix_within_bytes(text, char_budget, byte_budget)
+
+
+def _char_prefix_within_bytes(text: str, char_budget: int, byte_budget: int) -> str:
+    """Prefix of `text` within `char_budget` chars, cut further to fit `byte_budget`."""
+    prefix = text[: max(char_budget, 0)]
+    encoded = prefix.encode("utf-8")
+    if len(encoded) <= byte_budget:
+        return prefix
+    return encoded[: max(byte_budget, 0)].decode("utf-8", errors="ignore")
+
+
+def _escape_markdown_link_label(label: str) -> str:
+    """Escape `\\`, `[`, `]` so a user-controlled label can't break `[label](url)`."""
+    return label.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+# A bare (unbracketed) CommonMark link destination may only contain
+# parentheses that are balanced, and no whitespace/control characters — an
+# unmatched `)` (e.g. a rich-link URL whose slug ends `fix)-bug`) closes the
+# `(url)` early and spills the rest of the URL into visible text. Wrapping
+# such a URL in `<...>` sidesteps the parenthesis-balance rule entirely.
+_UNSAFE_BARE_LINK_DESTINATION_RE = re.compile(r"[\s\x00-\x1f\x7f]")
+
+
+def _escape_markdown_link_destination(url: str) -> str:
+    """Format `url` so it can't terminate a Markdown `(destination)` early."""
+    if _UNSAFE_BARE_LINK_DESTINATION_RE.search(url) or _parens_unbalanced(url):
+        return f"<{url.replace('<', '%3C').replace('>', '%3E')}>"
+    return url
+
+
+def _parens_unbalanced(url: str) -> bool:
+    depth = 0
+    for ch in url:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return True
+    return depth != 0
+
+
+# Inline code span: a backtick run, then anything but a newline or that same
+# run, up to the next occurrence of that exact run — mirrors CommonMark's
+# "matching backtick count" delimiter rule closely enough to keep a literal
+# `<issue …>` example inside inline code from being rewritten. The leading
+# `(?<!`)` anchors the run to its start so a long backtick run is only ever
+# attempted once (not once per backtick in it), and the possessive `++`/`*+`
+# quantifiers forbid backtracking into an already-matched run — together
+# these keep a long backtick run that never finds its match linear instead of
+# quadratic. The trailing `(?!`)` rejects a closing run that is longer than
+# the opener (e.g. opening on a single backtick but only finding a run of
+# two): CommonMark requires the closer to be a backtick string of *exactly*
+# the opener's length, not merely at least that long, so a too-long run is no
+# closer at all and the possessive body can't backtrack to try a shorter one.
+# The body alternates between non-backtick runs and backtick runs that are
+# *not* a bare same-length closer (checked via the same lookahead as the
+# trailing closer): an interior run of a different length — e.g. a `` `` ``
+# pair inside a single-backtick span — is consumed whole as literal content
+# instead of being tried (and rejected) one backtick at a time, so the
+# possessive body doesn't abandon the match and leave a valid code span
+# undetected.
+_INLINE_CODE_SPAN_RE = re.compile(
+    r"(?<!`)(?P<tick>`++)(?:[^`\n]++|(?!(?P=tick)(?!`))`++)*+(?P=tick)(?!`)"
+)
+
+
+def _code_span_matches(text: str) -> list[tuple[int, int]]:
+    """Absolute (start, end) offsets of real (unescaped) code spans in *text*.
+
+    A backtick immediately preceded by an odd number of backslashes (e.g. a
+    literal `` \\` `` written to show a backtick character) is a
+    backslash-escaped literal per CommonMark, not a delimiter, so it can't
+    open a span there. Retrying the search on the *sliced* remainder — rather
+    than the same string with a later start index — drops that escaped
+    backtick from view entirely, so `_INLINE_CODE_SPAN_RE`'s `(?<!`)`
+    lookbehind doesn't see it and a shorter run starting right after it is
+    still free to open its own span.
+    """
+    matches: list[tuple[int, int]] = []
+    offset = 0
+    remaining = text
+    while True:
+        match = _INLINE_CODE_SPAN_RE.search(remaining)
+        if match is None:
+            return matches
+        start = offset + match.start()
+        if _preceded_by_odd_backslashes(text, start):
+            step = match.start() + 1
+        else:
+            matches.append((start, offset + match.end()))
+            step = match.end()
+        offset += step
+        remaining = remaining[step:]
+
+
+def _strip_code_spans(text: str) -> str:
+    """*text* with each real (unescaped) inline code span removed."""
+    pieces: list[str] = []
+    last = 0
+    for start, end in _code_span_matches(text):
+        pieces.append(text[last:start])
+        last = end
+    pieces.append(text[last:])
+    return "".join(pieces)
+
+
+def _fence_open(line: str) -> tuple[str, int] | None:
+    """(char, length) if *line* opens a bare (non-block-quoted) fence, else None."""
+    m = _FENCE_MARKER_RE.match(line)
+    if m is None or (m["marker"][0] == "`" and "`" in m["rest"]):
+        return None
+    return m["marker"][0], len(m["marker"])
+
+
+def _fence_closes(rest: str, fence_char: str, fence_len: int) -> bool:
+    m = _FENCE_MARKER_RE.match(rest)
+    return (
+        m is not None
+        and m["marker"][0] == fence_char
+        and len(m["marker"]) >= fence_len
+        and m["rest"].strip() == ""
+    )
+
+
+_BLOCKQUOTE_MARKER_RE = re.compile(r"^ {0,3}>[ \t]?")
+
+
+def _strip_blockquote_prefix(line: str, depth: int) -> str | None:
+    """Strip `depth` block-quote markers (`>`, each with an optional trailing
+    space/tab) from `line`, or None if it has fewer than `depth` levels.
+
+    CommonMark treats `>` and `> ` as interchangeable per nesting level — a
+    quoted fence opened with `> ``` ` still continues on a later line quoted
+    with `>` alone (no trailing space). Matching by depth rather than a fixed
+    literal prefix string is what lets a later line drop (or add) the
+    optional space at any level without falsely ending the quoted block.
+    """
+    rest = line
+    for _ in range(depth):
+        m = _BLOCKQUOTE_MARKER_RE.match(rest)
+        if m is None:
+            return None
+        rest = rest[m.end() :]
+    return rest
+
+
+def _quoted_fence_open(line: str) -> tuple[int, str, int] | None:
+    """(block-quote depth, char, length) if *line* opens a fence nested in a
+    block quote (e.g. `> \\`\\`\\``), else None."""
+    bq = _BLOCKQUOTE_PREFIX_RE.match(line)
+    if bq is None or not bq[0]:
+        return None
+    depth = bq[0].count(">")
+    rest = _strip_blockquote_prefix(line, depth)
+    if rest is None:
+        return None
+    opened = _fence_open(rest)
+    if opened is None:
+        return None
+    return depth, opened[0], opened[1]
+
+
+def _split_fenced_code_blocks(text: str) -> list[tuple[bool, list[str]]]:
+    """Partition *text* into line runs, tagging Markdown code regions.
+
+    Covers the shapes that can hide a literal `<issue …>` / `<pull-request
+    …>` example from being mistaken for a real rich link: a bare fenced
+    (``` / ~~~) code block, a fence nested one level inside a block quote
+    (`> \\`\\`\\``), a 4-space/tab indented code block, and CommonMark raw
+    HTML blocks — type 1 (`<pre>`/`<script>`/`<style>`/`<textarea>`, closed
+    by its matching end tag), types 3-5 (processing instruction/declaration/
+    CDATA, closed by a literal token), type 6 (a line opening with a
+    block-level tag name such as `<div>`, closed only by a blank line), and
+    type 7 (a line that is *only* a complete open or close tag of any other
+    name, e.g. `<x-widget>`, preceded by a blank line, also closed only by a
+    blank line). A rich-link tag nested inside a type-7 wrapper is swallowed
+    the same way it is inside a type-6 one. Reuses the same fence and
+    raw-HTML-block open/close rules as `_markup_states_per_line`.
+    """
+    blocks: list[tuple[bool, list[str]]] = []
+    current: list[str] = []
+    mode = "prose"
+    fence_char = ""
+    fence_len = 0
+    quote_depth = 0
+    raw_closer = ""
+    prev_blank = True
+
+    def flush(next_mode: str) -> None:
+        nonlocal current, mode
+        if current:
+            blocks.append((mode != "prose", current))
+        current = []
+        mode = next_mode
+
+    for line in text.split("\n"):
+        if mode == "fence":
+            current.append(line)
+            if _fence_closes(line, fence_char, fence_len):
+                flush("prose")
+            prev_blank = False
+            continue
+        if mode == "quoted_fence":
+            rest = _strip_blockquote_prefix(line, quote_depth)
+            if rest is not None:
+                current.append(line)
+                if _fence_closes(rest, fence_char, fence_len):
+                    flush("prose")
+                prev_blank = False
+                continue
+            flush("prose")
+            # falls through to re-process `line` as prose below
+        if mode == "html":
+            current.append(line)
+            if _RAW_HTML_BLOCK_END_RE.search(line):
+                flush("prose")
+            prev_blank = False
+            continue
+        if mode == "raw_other":
+            current.append(line)
+            if raw_closer in line:
+                flush("prose")
+            prev_blank = False
+            continue
+        if mode == "html6":
+            if line.strip() == "":
+                flush("prose")
+                # falls through to re-process the blank `line` as prose below
+            else:
+                current.append(line)
+                prev_blank = False
+                continue
+        if mode == "indent":
+            if line.strip() == "":
+                current.append(line)
+                prev_blank = True
+                continue
+            if _INDENTED_CODE_LINE_RE.match(line):
+                current.append(line)
+                prev_blank = False
+                continue
+            flush("prose")
+            # falls through to re-process `line` as prose below
+
+        opened = _fence_open(line)
+        if opened is not None:
+            flush("fence")
+            fence_char, fence_len = opened
+            current.append(line)
+            prev_blank = False
+            continue
+        quoted = _quoted_fence_open(line)
+        if quoted is not None:
+            flush("quoted_fence")
+            quote_depth, fence_char, fence_len = quoted
+            current.append(line)
+            prev_blank = False
+            continue
+        html_match = _RAW_HTML_BLOCK_START_RE.match(line)
+        if html_match is not None:
+            flush("html")
+            current.append(line)
+            prev_blank = False
+            if _RAW_HTML_BLOCK_END_RE.search(line):
+                flush("prose")
+            continue
+        other_closer = _other_raw_html_block_closer(line)
+        if other_closer is not None:
+            flush("raw_other")
+            current.append(line)
+            prev_blank = False
+            if other_closer in line:
+                flush("prose")
+            else:
+                raw_closer = other_closer
+            continue
+        if _RAW_HTML_TYPE6_START_RE.match(line):
+            flush("html6")
+            current.append(line)
+            prev_blank = False
+            continue
+        if prev_blank and _TYPE7_TAG_ALONE_RE.match(line):
+            flush("html6")
+            current.append(line)
+            prev_blank = False
+            continue
+        if line.strip() == "":
+            current.append(line)
+            prev_blank = True
+            continue
+        if prev_blank and _INDENTED_CODE_LINE_RE.match(line):
+            flush("indent")
+            current.append(line)
+            prev_blank = False
+            continue
+        current.append(line)
+        prev_blank = False
+    if current:
+        blocks.append((mode != "prose", current))
+    return blocks
+
+
+def _linear_rich_links_to_markdown(description: str) -> str:
+    """Rewrite Linear rich-link tags as `[label](url)`.
+
+    Linear serializes inline issue / PR references as pseudo-HTML tags that
+    GitHub renders as unlinked text (or nothing at all when self-closing).
+    Label preference: tag text, then `identifier`, then `title`, then the URL.
+    A tag without a `url` attribute is not a Linear rich link (or is
+    malformed) and passes through verbatim. A tag preceded by an odd number
+    of backslashes (`\\<issue …>`) is an intentionally escaped literal
+    example, so it's left untouched rather than rewritten — an even number
+    (`\\\\<issue …>`) is itself an escaped backslash, leaving the tag
+    unescaped and eligible for rewriting. Markdown code regions — fenced
+    blocks, fences nested in a block quote, indented code blocks, raw HTML
+    blocks (`<pre>`/`<script>`/`<style>`/`<textarea>`), and inline code
+    spans — are skipped entirely, so a literal tag-shaped example inside any
+    of them is never rewritten.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        attrs: dict[str, str] = {
+            name.lower(): double or single
+            for name, double, single in _TAG_ATTR_RE.findall(match["attrs"] or "")
+        }
+        url = attrs.get("url", "")
+        if not url:
+            return match[0]
+        text = (match["text"] or "").strip()
+        raw_label = text or attrs.get("identifier") or attrs.get("title") or url
+        destination = _escape_markdown_link_destination(url)
+        return f"[{_escape_markdown_link_label(raw_label)}]({destination})"
+
+    def rewrite_tags(text: str) -> str:
+        pieces: list[str] = []
+        last = 0
+        for match in _RICH_LINK_TAG_RE.finditer(text):
+            pieces.append(text[last : match.start()])
+            escaped = _preceded_by_odd_backslashes(text, match.start())
+            pieces.append(match[0] if escaped else replace(match))
+            last = match.end()
+        pieces.append(text[last:])
+        return "".join(pieces)
+
+    def rewrite_outside_inline_code(text: str) -> str:
+        pieces: list[str] = []
+        last = 0
+        for start, end in _code_span_matches(text):
+            pieces.append(rewrite_tags(text[last:start]))
+            pieces.append(text[start:end])
+            last = end
+        pieces.append(rewrite_tags(text[last:]))
+        return "".join(pieces)
+
+    return "\n".join(
+        "\n".join(block) if is_code else rewrite_outside_inline_code("\n".join(block))
+        for is_code, block in _split_fenced_code_blocks(description)
+    )
 
 
 def role_codex_model(role: ResolvedRole) -> str:

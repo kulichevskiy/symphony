@@ -108,7 +108,6 @@ class GitHubClient(Protocol):
         base: str | None = None,
         head: str,
         repo: str | None = None,
-        linear_url: str | None = None,
         draft: bool = False,
     ) -> str: ...
 
@@ -191,11 +190,20 @@ class GitHub:
         *,
         cwd: Path | None = None,
         allow_exit_codes: tuple[int, ...] = (0,),
+        redact: frozenset[str] = frozenset(),
     ) -> str:
+        """Run *argv*; on a disallowed exit code, raise `GitHubError`.
+
+        `redact` names argv values (e.g. a PR body) to replace with a
+        placeholder in the error message — the failure still needs to be
+        diagnosable, but a tracker description can run to tens of KB and
+        doesn't belong in a log line.
+        """
         stdout, stderr, returncode = await self._run_capture(argv, cwd=cwd)
         if returncode not in allow_exit_codes:
+            shown = ["<redacted>" if arg in redact else arg for arg in argv]
             raise GitHubError(
-                f"gh {' '.join(argv)} exited {returncode}: {stderr.strip() or stdout.strip()}"
+                f"gh {' '.join(shown)} exited {returncode}: {stderr.strip() or stdout.strip()}"
             )
         return stdout
 
@@ -300,21 +308,20 @@ class GitHub:
         base: str | None = None,
         head: str,
         repo: str | None = None,
-        linear_url: str | None = None,
         draft: bool = False,
     ) -> str:
-        """Create a PR; return the PR URL printed by `gh`."""
-        full_body = body
-        if linear_url:
-            sep = "\n\n" if full_body and not full_body.endswith("\n\n") else ""
-            full_body = f"{full_body}{sep}Relates to {linear_url}"
+        """Create a PR with `body` verbatim; return the PR URL printed by `gh`.
+
+        The body is rendered by the caller (`build_pr_body` for the delivery
+        path) so tracker context and the size limit live in one place.
+        """
         argv = [
             "pr",
             "create",
             "--title",
             title,
             "--body",
-            full_body,
+            body,
         ]
         if base:
             argv.extend(["--base", base])
@@ -327,7 +334,7 @@ class GitHub:
         )
         if draft:
             argv.append("--draft")
-        out = await self._run(argv)
+        out = await self._run(argv, redact=frozenset({body}) if body else frozenset())
         return out.strip()
 
     async def open_pr_for_head(
@@ -372,7 +379,6 @@ class GitHub:
         base: str | None = None,
         head: str,
         repo: str | None = None,
-        linear_url: str | None = None,
         draft: bool = False,
     ) -> str:
         """Get-or-create the PR for `(repo, head)`; return its URL.
@@ -380,7 +386,9 @@ class GitHub:
         Idempotent: adopts an existing open PR for the head branch instead of
         creating a duplicate, and recovers if `gh pr create` races and fails
         because a PR already exists. This lets every retry or re-dispatch that
-        reaches the PR step converge on the one PR for the branch.
+        reaches the PR step converge on the one PR for the branch. `title` /
+        `body` apply to a created PR only: an adopted or race-recovered PR is
+        returned untouched.
         """
         existing = await self.pr_for_head(head=head, repo=repo)
         if existing:
@@ -392,7 +400,6 @@ class GitHub:
                 base=base,
                 head=head,
                 repo=repo,
-                linear_url=linear_url,
                 draft=draft,
             )
         except GitHubError as e:

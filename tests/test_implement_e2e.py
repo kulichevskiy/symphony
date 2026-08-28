@@ -270,7 +270,16 @@ async def test_implement_dispatch_full_flow(tmp_path: Path) -> None:
         assert kwargs["repo"] == "org/repo"
         assert kwargs["base"] == "trunk"
         assert kwargs["head"] == "symphony/eng-1"
-        assert kwargs["linear_url"] == "https://linear.app/team/issue/ENG-1"
+        # Body carries the ticket description + the tracker-link footer, built
+        # from the snapshot the stage already has (no extra tracker read).
+        assert kwargs["body"] == (
+            "Need OAuth login for the dashboard.\n\n"
+            "---\n\nRelates to https://linear.app/team/issue/ENG-1"
+        )
+        assert "linear_url" not in kwargs
+        # No extra tracker read for the body: still only the one pre-dispatch
+        # lookup the flow already did.
+        assert linear.lookup_issue.await_count == 1
         gh.repo_default_branch.assert_awaited_once_with("org/repo")
 
         # Per-issue cost accumulated from streaming JSON.
