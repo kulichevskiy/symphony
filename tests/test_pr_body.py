@@ -330,6 +330,40 @@ def test_unterminated_quoted_fence_followed_by_prose_rich_link_is_rewritten() ->
     assert result == "> ```\n> still quoted\n[ENG-9](https://l/9)"
 
 
+def test_normal_size_body_closes_an_unterminated_html_comment() -> None:
+    """A short description that itself never closes a `<!--` comment must not
+    swallow the `---`/tracker-link footer inside that comment."""
+    description = "some text <!-- unterminated"
+    body = build_pr_body(_issue(description))
+    assert body == f"{description}\n-->\n\n{FOOTER}"
+
+
+def test_fence_marker_inside_a_closed_html_comment_is_not_treated_as_dangling() -> None:
+    """A fence-shaped line fully inside an already-closed `<!-- -->` comment
+    is inert raw text, not a real (unterminated) code fence."""
+    description = "<!--\n```\n-->"
+    body = build_pr_body(_issue(description))
+    assert body == f"{description}\n\n{FOOTER}"
+    assert body.count("```") == 1
+
+
+def test_backslash_escaped_rich_link_tag_is_left_alone() -> None:
+    """A `\\<issue …>` example is intentionally escaped literal Markdown, not
+    a real Linear rich link, and must not be rewritten."""
+    description = '\\<issue url="https://l/9">ENG-9</issue>'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == description
+
+
+def test_quoted_fence_continues_when_a_later_line_drops_the_optional_space() -> None:
+    """A quoted fence opened with `> ``` ` still continues on a later line
+    quoted with bare `>` (no trailing space) per CommonMark — a rich link
+    tag on that line stays inside the code block and is not rewritten."""
+    description = '> ```\n><issue url="https://l/9">ENG-9</issue>\n> ```'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == description
+
+
 def test_long_backtick_run_in_prose_does_not_backtrack_catastrophically() -> None:
     """A long backtick run with no matching close must not be rescanned once
     per possible delimiter length (previously quadratic in the run length)."""
