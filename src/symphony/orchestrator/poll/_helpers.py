@@ -91,6 +91,81 @@ _RAW_HTML_BLOCK_END_RE = re.compile(
 _RAW_CDATA_START_RE = re.compile(r"^ {0,3}<!\[CDATA\[")
 _RAW_DECLARATION_START_RE = re.compile(r"^ {0,3}<![A-Za-z]")
 _RAW_PI_START_RE = re.compile(r"^ {0,3}<\?")
+# CommonMark raw HTML block type 6: a line starting with `<` or `</` followed
+# by one of a fixed list of block-level tag names (case-insensitive), then
+# whitespace, `>`, `/`, or end of line — e.g. `<div>`, `</table>`, `<hr/>`.
+# Unlike type 1, the tag need not close on the same line, or at all: the
+# block simply runs until the next blank line (or end of input). A rich-link
+# tag nested inside such a wrapper (e.g. `<div>\n<issue url="...">…</issue>\n
+# </div>`) must not be mistaken for prose and rewritten, since GitHub renders
+# the whole wrapper as raw HTML rather than reprocessing it as Markdown.
+_RAW_HTML_TYPE6_TAGS = (
+    "address",
+    "article",
+    "aside",
+    "base",
+    "basefont",
+    "blockquote",
+    "body",
+    "caption",
+    "center",
+    "col",
+    "colgroup",
+    "dd",
+    "details",
+    "dialog",
+    "dir",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "footer",
+    "form",
+    "frame",
+    "frameset",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "head",
+    "header",
+    "hr",
+    "html",
+    "iframe",
+    "legend",
+    "li",
+    "link",
+    "main",
+    "menu",
+    "menuitem",
+    "nav",
+    "noframes",
+    "ol",
+    "optgroup",
+    "option",
+    "p",
+    "param",
+    "section",
+    "summary",
+    "table",
+    "tbody",
+    "td",
+    "tfoot",
+    "th",
+    "thead",
+    "title",
+    "tr",
+    "track",
+    "ul",
+)
+_RAW_HTML_TYPE6_START_RE = re.compile(
+    r"^ {0,3}</?(?:" + "|".join(_RAW_HTML_TYPE6_TAGS) + r")(?=[\s>/]|$)",
+    re.IGNORECASE,
+)
 
 
 def _other_raw_html_block_closer(line: str) -> str | None:
@@ -371,7 +446,10 @@ def _close_dangling_markup(kept: str, char_budget: int, byte_budget: int) -> str
     pass (rather than closing the fence, then separately checking for a
     dangling comment) means a further trim triggered by the comment closer
     can't undo the fence closer that a prior, longer `n` already accounted
-    for.
+    for. If the very first line is itself the one filling the budget (e.g. an
+    oversized one-line `<pre>...</pre>` description), dropping it via `n -= 1`
+    would discard the whole description; shortening that line instead keeps a
+    prefix of it alongside the closer.
     """
     lines = kept.split("\n")
     fence_states, comment_states, html_states = _markup_states_per_line(lines)
@@ -398,8 +476,27 @@ def _close_dangling_markup(kept: str, char_budget: int, byte_budget: int) -> str
             and byte_len[n] + 1 + len(closer.encode("utf-8")) <= byte_budget
         ):
             return "\n".join(lines[:n]) + f"\n{closer}"
+        if n == 1:
+            return _shorten_line_for_closer(lines[0], closer, char_budget, byte_budget)
         n -= 1
     return "\n".join(lines[:n])
+
+
+def _shorten_line_for_closer(line: str, closer: str, char_budget: int, byte_budget: int) -> str:
+    """Cut *line* down so it fits alongside `closer` within both budgets.
+
+    Reached only when the single retained line plus its closer still
+    overruns budget at `n == 1` — the line-dropping loop in
+    `_close_dangling_markup` would otherwise discard it entirely, leaving no
+    description content at all even though the closer alone leaves room for
+    part of it.
+    """
+    reserve_chars = 1 + len(closer)
+    reserve_bytes = 1 + len(closer.encode("utf-8"))
+    line_char_budget = char_budget - reserve_chars
+    line_byte_budget = byte_budget - reserve_bytes
+    prefix = _char_prefix_within_bytes(line, line_char_budget, line_byte_budget)
+    return f"{prefix}\n{closer}"
 
 
 def _head_lines_within(text: str, char_budget: int, byte_budget: int) -> str:
@@ -591,12 +688,16 @@ def _quoted_fence_open(line: str) -> tuple[int, str, int] | None:
 def _split_fenced_code_blocks(text: str) -> list[tuple[bool, list[str]]]:
     """Partition *text* into line runs, tagging Markdown code regions.
 
-    Covers the four shapes that can hide a literal `<issue …>` /
-    `<pull-request …>` example from being mistaken for a real rich link:
-    a bare fenced (``` / ~~~) code block, a fence nested one level inside a
-    block quote (`> \\`\\`\\``), a 4-space/tab indented code block, and a raw
-    HTML block (`<pre>`/`<script>`/`<style>`/`<textarea>`). Reuses the same
-    fence and raw-HTML-block open/close rules as `_markup_states_per_line`.
+    Covers the shapes that can hide a literal `<issue …>` / `<pull-request
+    …>` example from being mistaken for a real rich link: a bare fenced
+    (``` / ~~~) code block, a fence nested one level inside a block quote
+    (`> \\`\\`\\``), a 4-space/tab indented code block, and CommonMark raw
+    HTML blocks — type 1 (`<pre>`/`<script>`/`<style>`/`<textarea>`, closed
+    by its matching end tag), types 3-5 (processing instruction/declaration/
+    CDATA, closed by a literal token), and type 6 (a line opening with a
+    block-level tag name such as `<div>`, closed only by a blank line).
+    Reuses the same fence and raw-HTML-block open/close rules as
+    `_markup_states_per_line`.
     """
     blocks: list[tuple[bool, list[str]]] = []
     current: list[str] = []
@@ -604,6 +705,7 @@ def _split_fenced_code_blocks(text: str) -> list[tuple[bool, list[str]]]:
     fence_char = ""
     fence_len = 0
     quote_depth = 0
+    raw_closer = ""
     prev_blank = True
 
     def flush(next_mode: str) -> None:
@@ -636,6 +738,20 @@ def _split_fenced_code_blocks(text: str) -> list[tuple[bool, list[str]]]:
                 flush("prose")
             prev_blank = False
             continue
+        if mode == "raw_other":
+            current.append(line)
+            if raw_closer in line:
+                flush("prose")
+            prev_blank = False
+            continue
+        if mode == "html6":
+            if line.strip() == "":
+                flush("prose")
+                # falls through to re-process the blank `line` as prose below
+            else:
+                current.append(line)
+                prev_blank = False
+                continue
         if mode == "indent":
             if line.strip() == "":
                 current.append(line)
@@ -669,6 +785,21 @@ def _split_fenced_code_blocks(text: str) -> list[tuple[bool, list[str]]]:
             prev_blank = False
             if _RAW_HTML_BLOCK_END_RE.search(line):
                 flush("prose")
+            continue
+        other_closer = _other_raw_html_block_closer(line)
+        if other_closer is not None:
+            flush("raw_other")
+            current.append(line)
+            prev_blank = False
+            if other_closer in line:
+                flush("prose")
+            else:
+                raw_closer = other_closer
+            continue
+        if _RAW_HTML_TYPE6_START_RE.match(line):
+            flush("html6")
+            current.append(line)
+            prev_blank = False
             continue
         if line.strip() == "":
             current.append(line)
