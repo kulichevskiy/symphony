@@ -519,12 +519,15 @@ class FakeGitHub:
         number = self._sim.next_pr_number()
         key_repo = repo or ""
         url = f"https://github.invalid/{key_repo}/pull/{number}"
-        # The PR body carries the tracker link (`Relates to <url>`), so the
-        # issue↔PR link is derived from it the way a human reader would.
+        # The PR body carries the tracker link (`Relates to <url>`) as its
+        # final line (the footer); a description can itself contain an
+        # unrelated `Relates to <other url>` line (e.g. referencing another
+        # ticket), so only the last line is eligible.
         issue_id = ""
         body_lines = body.splitlines()
+        footer_line = body_lines[-1] if body_lines else ""
         for issue in self._sim.issues.values():
-            if issue.url and f"Relates to {issue.url}" in body_lines:
+            if issue.url and footer_line == f"Relates to {issue.url}":
                 issue_id = issue.id
                 break
         # Prefer the SHA already pushed to the fake origin; fall back to a

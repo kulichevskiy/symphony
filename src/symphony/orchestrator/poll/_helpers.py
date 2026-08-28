@@ -45,11 +45,12 @@ PR_BODY_MAX_CHARS = 65_536
 # under that ceiling.
 PR_BODY_MAX_BYTES = 120_000
 _PR_BODY_TRUNCATION_NOTICE = "Description truncated; see the source ticket"
-# Appended to a truncated description that leaves an odd number of ``` fence
-# markers behind, so the notice/footer that follows isn't swallowed into an
-# unterminated code block. Budgeted for up front (see `build_pr_body`) so
-# adding it can never itself push the body over either size ceiling.
-_FENCE_CLOSER = "\n```"
+# Matches a CommonMark fence marker line: 0-3 spaces of indent, then a run of
+# 3+ backticks or tildes, then the rest of the line (info string when
+# opening, must be blank when closing). Used to track fence open/close state
+# when truncating, so a cut that lands inside a ```, ~~~, or 4+-backtick
+# fence gets closed with a matching marker instead of leaving it dangling.
+_FENCE_MARKER_RE = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})(?P<rest>.*)$")
 # Linear rich links: `<issue …>ENG-1</issue>`, `<pull-request … />`. The bare
 # attrs branch excludes quotes *and whitespace* so it can never overlap with
 # either the quoted branches or the `\s+` separator between attrs — each
@@ -127,7 +128,7 @@ def build_pr_body(issue: LinearIssue) -> str:
     labelled, so the footer survives and `gh pr create` still accepts the body.
     """
     footer = f"Relates to {issue.url}"
-    description = _linear_rich_links_to_markdown(issue.description).strip()
+    description = _trim_boundary_blank_lines(_linear_rich_links_to_markdown(issue.description))
     if not description:
         return footer
     footer = f"---\n\n{footer}"
@@ -135,17 +136,74 @@ def build_pr_body(issue: LinearIssue) -> str:
     if len(body) <= PR_BODY_MAX_CHARS and len(body.encode("utf-8")) <= PR_BODY_MAX_BYTES:
         return body
     tail = f"\n\n{_PR_BODY_TRUNCATION_NOTICE}\n\n{footer}"
-    char_budget = PR_BODY_MAX_CHARS - len(tail) - len(_FENCE_CLOSER)
-    byte_budget = PR_BODY_MAX_BYTES - len(tail.encode("utf-8")) - len(_FENCE_CLOSER.encode("utf-8"))
+    char_budget = PR_BODY_MAX_CHARS - len(tail)
+    byte_budget = PR_BODY_MAX_BYTES - len(tail.encode("utf-8"))
     kept = _head_lines_within(description, char_budget, byte_budget)
-    if _has_unterminated_fence(kept):
-        kept = f"{kept}{_FENCE_CLOSER}"
+    kept = _close_dangling_fence(kept, char_budget, byte_budget)
     return f"{kept}{tail}"
 
 
-def _has_unterminated_fence(text: str) -> bool:
-    """True when *text* ends inside a ``` fence (an odd number of fence lines)."""
-    return sum(1 for line in text.split("\n") if line.startswith("```")) % 2 == 1
+def _trim_boundary_blank_lines(text: str) -> str:
+    """Drop leading/trailing all-blank lines without touching interior indentation.
+
+    `.strip()` eats leading whitespace from the very start of the string,
+    which would strip an indented Markdown code block's opening line right
+    along with it (turning it into unindented prose while later lines in the
+    same block stay indented). Only whole blank lines at each edge are
+    dropped, so a description that opens or closes with an indented line
+    keeps its indentation.
+    """
+    lines = text.split("\n")
+    start = 0
+    while start < len(lines) and lines[start].strip() == "":
+        start += 1
+    end = len(lines)
+    while end > start and lines[end - 1].strip() == "":
+        end -= 1
+    return "\n".join(lines[start:end])
+
+
+def _fence_closer(text: str) -> str | None:
+    """Marker needed to close a fence left open at the end of *text*, else None.
+
+    Tracks CommonMark fence rules across ``` and ~~~ fences of any length
+    (3+): a fence is closed only by a same-character run at least as long as
+    its opener, indented by at most 3 spaces, with nothing but trailing
+    whitespace after it — so a 3-backtick line inside a fence opened with 4
+    backticks (or a same-length line with trailing text) doesn't falsely
+    close it.
+    """
+    open_char: str | None = None
+    open_len = 0
+    for line in text.split("\n"):
+        m = _FENCE_MARKER_RE.match(line)
+        if m is None:
+            continue
+        marker, rest = m["marker"], m["rest"]
+        char, run_len = marker[0], len(marker)
+        if open_char is None:
+            if char == "`" and "`" in rest:
+                continue  # backtick fences forbid a backtick in the info string
+            open_char, open_len = char, run_len
+        elif char == open_char and run_len >= open_len and rest.strip() == "":
+            open_char, open_len = None, 0
+    if open_char is None:
+        return None
+    return open_char * open_len
+
+
+def _close_dangling_fence(kept: str, char_budget: int, byte_budget: int) -> str:
+    """Append the closer for a fence `kept` was cut inside of, trimming further if needed."""
+    closer = _fence_closer(kept)
+    while closer is not None and (
+        len(kept) + 1 + len(closer) > char_budget
+        or len(kept.encode("utf-8")) + 1 + len(closer.encode("utf-8")) > byte_budget
+    ):
+        kept, _, _ = kept.rpartition("\n")
+        closer = _fence_closer(kept)
+    if closer is None:
+        return kept
+    return f"{kept}\n{closer}"
 
 
 def _head_lines_within(text: str, char_budget: int, byte_budget: int) -> str:
@@ -181,6 +239,58 @@ def _char_prefix_within_bytes(text: str, char_budget: int, byte_budget: int) -> 
     return encoded[: max(byte_budget, 0)].decode("utf-8", errors="ignore")
 
 
+def _escape_markdown_link_label(label: str) -> str:
+    """Escape `\\`, `[`, `]` so a user-controlled label can't break `[label](url)`."""
+    return label.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+# Inline code span: a backtick run, then anything but a newline or that same
+# run, up to the next occurrence of that exact run — mirrors CommonMark's
+# "matching backtick count" delimiter rule closely enough to keep a literal
+# `<issue …>` example inside inline code from being rewritten.
+_INLINE_CODE_SPAN_RE = re.compile(r"(?P<tick>`+)(?:(?!(?P=tick))[^\n])*?(?P=tick)")
+
+
+def _split_fenced_code_blocks(text: str) -> list[tuple[bool, list[str]]]:
+    """Partition *text* into line runs, tagging fenced (``` / ~~~) code blocks.
+
+    Reuses the same fence open/close rules as `_fence_closer` so a literal
+    `<issue …>`/`<pull-request …>` example inside a fenced block is left
+    alone rather than rewritten as a link.
+    """
+    blocks: list[tuple[bool, list[str]]] = []
+    current: list[str] = []
+    current_is_code = False
+    fence_char: str | None = None
+    fence_len = 0
+    for line in text.split("\n"):
+        m = _FENCE_MARKER_RE.match(line)
+        if fence_char is None:
+            if m is None or (m["marker"][0] == "`" and "`" in m["rest"]):
+                current.append(line)
+                continue
+            if current:
+                blocks.append((current_is_code, current))
+            fence_char, fence_len = m["marker"][0], len(m["marker"])
+            current = [line]
+            current_is_code = True
+            continue
+        current.append(line)
+        if (
+            m is not None
+            and m["marker"][0] == fence_char
+            and len(m["marker"]) >= fence_len
+            and m["rest"].strip() == ""
+        ):
+            blocks.append((True, current))
+            current = []
+            current_is_code = False
+            fence_char, fence_len = None, 0
+    if current:
+        blocks.append((current_is_code, current))
+    return blocks
+
+
 def _linear_rich_links_to_markdown(description: str) -> str:
     """Rewrite Linear rich-link tags as `[label](url)`.
 
@@ -188,7 +298,9 @@ def _linear_rich_links_to_markdown(description: str) -> str:
     GitHub renders as unlinked text (or nothing at all when self-closing).
     Label preference: tag text, then `identifier`, then `title`, then the URL.
     A tag without a `url` attribute is not a Linear rich link (or is
-    malformed) and passes through verbatim.
+    malformed) and passes through verbatim. Fenced code blocks and inline
+    code spans are skipped entirely, so a literal tag-shaped example inside
+    code is never rewritten.
     """
 
     def replace(match: re.Match[str]) -> str:
@@ -200,10 +312,23 @@ def _linear_rich_links_to_markdown(description: str) -> str:
         if not url:
             return match[0]
         text = (match["text"] or "").strip()
-        label = text or attrs.get("identifier") or attrs.get("title") or url
-        return f"[{label}]({url})"
+        raw_label = text or attrs.get("identifier") or attrs.get("title") or url
+        return f"[{_escape_markdown_link_label(raw_label)}]({url})"
 
-    return _RICH_LINK_TAG_RE.sub(replace, description)
+    def rewrite_outside_inline_code(text: str) -> str:
+        pieces: list[str] = []
+        last = 0
+        for span in _INLINE_CODE_SPAN_RE.finditer(text):
+            pieces.append(_RICH_LINK_TAG_RE.sub(replace, text[last : span.start()]))
+            pieces.append(span[0])
+            last = span.end()
+        pieces.append(_RICH_LINK_TAG_RE.sub(replace, text[last:]))
+        return "".join(pieces)
+
+    return "\n".join(
+        "\n".join(block) if is_code else rewrite_outside_inline_code("\n".join(block))
+        for is_code, block in _split_fenced_code_blocks(description)
+    )
 
 
 def role_codex_model(role: ResolvedRole) -> str:

@@ -204,6 +204,61 @@ def test_truncation_closes_an_unterminated_code_fence() -> None:
     assert body.count("```") % 2 == 0
 
 
+def test_truncation_closes_an_unterminated_tilde_fence() -> None:
+    line = "y" * 99
+    description = "~~~\n" + "\n".join([line] * 2000)
+    body = build_pr_body(_issue(description))
+    assert len(body) <= PR_BODY_MAX_CHARS
+    assert body.endswith(FOOTER)
+    head, _, _ = body.partition("\n\nDescription truncated")
+    assert head.endswith("\n~~~")
+
+
+def test_truncation_closes_an_unterminated_indented_fence() -> None:
+    line = "y" * 99
+    description = "  ```\n" + "\n".join([line] * 2000)
+    body = build_pr_body(_issue(description))
+    assert len(body) <= PR_BODY_MAX_CHARS
+    assert body.endswith(FOOTER)
+    head, _, _ = body.partition("\n\nDescription truncated")
+    assert head.endswith("\n```")
+
+
+def test_truncation_closes_a_four_backtick_fence_without_a_stray_three_backtick_line() -> None:
+    """A ``` line inside a description that opened with 4 backticks is just
+    content (not a closer) — the truncation must still close with 4+."""
+    filler_lines = ["```", "y" * 99] * 1000
+    description = "\n".join(["````", *filler_lines])
+    body = build_pr_body(_issue(description))
+    assert len(body) <= PR_BODY_MAX_CHARS
+    assert body.endswith(FOOTER)
+    head, _, _ = body.partition("\n\nDescription truncated")
+    assert head.endswith("\n````")
+
+
+def test_indented_code_block_at_the_start_keeps_its_indentation() -> None:
+    description = "    def f():\n        return 1"
+    assert build_pr_body(_issue(description)) == f"{description}\n\n{FOOTER}"
+
+
+def test_rich_link_label_with_brackets_is_escaped() -> None:
+    description = '<issue url="https://l/9">weird [label] text</issue>'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == "[weird \\[label\\] text](https://l/9)"
+
+
+def test_rich_link_tag_with_a_url_inside_inline_code_is_left_alone() -> None:
+    description = 'See `<issue url="https://l/9">ENG-9</issue>` for context.'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == description
+
+
+def test_rich_link_tag_with_a_url_inside_a_fenced_block_is_left_alone() -> None:
+    description = '```\n<issue url="https://l/9">ENG-9</issue>\n```'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == description
+
+
 def test_unclosed_url_less_tag_does_not_swallow_a_following_real_rich_link() -> None:
     """A url-less, tag-shaped `<issue …>` in prose must match on its own and
     not stretch its `text` group forward to a later same-name close tag that
