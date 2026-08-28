@@ -19,6 +19,10 @@ import {
 import { cn } from "@/lib/utils";
 
 const RECONNECT_DELAY_MS = 2000;
+// Bounds how many live-arrived events `tailItems` holds before the oldest
+// overflow into `history`. Matches the backend's page size so a chatty,
+// long-open run never grows the tail without limit.
+const MAX_TAIL_ITEMS = 100;
 
 type FeedStatus = "connecting" | "live" | "ended" | "error";
 
@@ -45,8 +49,9 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
  * `live` mode — tails the log from the byte offset that page was read at,
  * inserting fresh events at the top. Because history is paged rather than
  * replayed from byte 0, opening a long run no longer builds its whole DOM up
- * front; live arrivals are kept in full, since dropping the oldest of them
- * would leave a gap between the tail and the loaded pages.
+ * front. Live arrivals past `MAX_TAIL_ITEMS` fold into `history` instead of
+ * being dropped, so a run left open for a long, chatty stretch keeps a
+ * bounded tail without losing any events or opening a gap.
  *
  * In non-live mode (a finished run) the tail drains the log once and never
  * reconnects. Token ticks fold into a single running total instead of feed
@@ -66,6 +71,9 @@ function useActivityFeed(runId: string, enabled: boolean, live: boolean) {
   const [tailFrom, setTailFrom] = useState<{ runId: string; offset: number } | null>(null);
   const streamState = useRef({ runId: "", offset: 0 });
   const localKey = useRef(0);
+  // Authoritative copy of `tailItems`, kept in sync so the tail-bounding
+  // check below has the current length without waiting on a state update.
+  const tailRef = useRef<FeedEntry[]>([]);
   // Owns the lifetime of `loadMore`'s in-flight request: recreated whenever
   // `runId` changes, aborting whatever page fetch was still pending for the
   // previous run.
@@ -93,6 +101,7 @@ function useActivityFeed(runId: string, enabled: boolean, live: boolean) {
     const controller = new AbortController();
     setHistory([]);
     setTailItems([]);
+    tailRef.current = [];
     setTokens(null);
     setNextBefore(null);
     setStatus("connecting");
@@ -142,10 +151,16 @@ function useActivityFeed(runId: string, enabled: boolean, live: boolean) {
               if (event.kind === "tokens") {
                 setTokens((prev) => foldTokenTick(prev, event));
               } else if (event.kind !== "cursor" && event.kind !== "end") {
-                setTailItems((prev) => [
+                const next = [
                   { key: `local-${localKey.current++}`, event },
-                  ...prev,
-                ]);
+                  ...tailRef.current,
+                ];
+                if (next.length > MAX_TAIL_ITEMS) {
+                  const overflow = next.splice(MAX_TAIL_ITEMS);
+                  setHistory((prev) => [...overflow, ...prev]);
+                }
+                tailRef.current = next;
+                setTailItems(next);
               }
             },
           });
