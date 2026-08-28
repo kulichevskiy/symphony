@@ -306,6 +306,12 @@ def test_rich_link_tag_inside_a_fence_nested_in_a_block_quote_is_left_alone() ->
     assert result == description
 
 
+def test_rich_link_tag_inside_a_pre_block_is_left_alone() -> None:
+    description = '<pre>\n<issue url="https://l/9">ENG-9</issue>\n</pre>'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == description
+
+
 def test_indented_code_block_does_not_interrupt_a_paragraph() -> None:
     """A 4-space-indented line right after prose (no blank line separator) is
     a lazy paragraph continuation per CommonMark, not code — so a real rich
@@ -391,6 +397,14 @@ def test_backslash_escaped_rich_link_tag_is_left_alone() -> None:
     description = '\\<issue url="https://l/9">ENG-9</issue>'
     result = _linear_rich_links_to_markdown(description)
     assert result == description
+
+
+def test_double_backslash_escaped_rich_link_tag_is_rewritten() -> None:
+    """`\\\\<issue …>` is an escaped backslash followed by an *unescaped*
+    `<issue …>` per CommonMark, so the tag is still eligible for rewriting."""
+    description = '\\\\<issue url="https://l/9">ENG-9</issue>'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == "\\\\[ENG-9](https://l/9)"
 
 
 def test_quoted_fence_continues_when_a_later_line_drops_the_optional_space() -> None:

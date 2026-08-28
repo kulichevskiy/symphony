@@ -494,11 +494,12 @@ def _quoted_fence_open(line: str) -> tuple[int, str, int] | None:
 def _split_fenced_code_blocks(text: str) -> list[tuple[bool, list[str]]]:
     """Partition *text* into line runs, tagging Markdown code regions.
 
-    Covers the three shapes that can hide a literal `<issue …>` /
+    Covers the four shapes that can hide a literal `<issue …>` /
     `<pull-request …>` example from being mistaken for a real rich link:
     a bare fenced (``` / ~~~) code block, a fence nested one level inside a
-    block quote (`> \\`\\`\\``), and a 4-space/tab indented code block.
-    Reuses the same fence open/close rules as `_markup_states_per_line`.
+    block quote (`> \\`\\`\\``), a 4-space/tab indented code block, and a raw
+    HTML block (`<pre>`/`<script>`/`<style>`/`<textarea>`). Reuses the same
+    fence and raw-HTML-block open/close rules as `_markup_states_per_line`.
     """
     blocks: list[tuple[bool, list[str]]] = []
     current: list[str] = []
@@ -532,6 +533,12 @@ def _split_fenced_code_blocks(text: str) -> list[tuple[bool, list[str]]]:
                 continue
             flush("prose")
             # falls through to re-process `line` as prose below
+        if mode == "html":
+            current.append(line)
+            if _RAW_HTML_BLOCK_END_RE.search(line):
+                flush("prose")
+            prev_blank = False
+            continue
         if mode == "indent":
             if line.strip() == "":
                 current.append(line)
@@ -558,6 +565,14 @@ def _split_fenced_code_blocks(text: str) -> list[tuple[bool, list[str]]]:
             current.append(line)
             prev_blank = False
             continue
+        html_match = _RAW_HTML_BLOCK_START_RE.match(line)
+        if html_match is not None:
+            flush("html")
+            current.append(line)
+            prev_blank = False
+            if _RAW_HTML_BLOCK_END_RE.search(line):
+                flush("prose")
+            continue
         if line.strip() == "":
             current.append(line)
             prev_blank = True
@@ -581,10 +596,13 @@ def _linear_rich_links_to_markdown(description: str) -> str:
     GitHub renders as unlinked text (or nothing at all when self-closing).
     Label preference: tag text, then `identifier`, then `title`, then the URL.
     A tag without a `url` attribute is not a Linear rich link (or is
-    malformed) and passes through verbatim. A tag preceded by a backslash
-    (`\\<issue …>`) is an intentionally escaped literal example, so it's left
-    untouched rather than rewritten. Markdown code regions — fenced blocks,
-    fences nested in a block quote, indented code blocks, and inline code
+    malformed) and passes through verbatim. A tag preceded by an odd number
+    of backslashes (`\\<issue …>`) is an intentionally escaped literal
+    example, so it's left untouched rather than rewritten — an even number
+    (`\\\\<issue …>`) is itself an escaped backslash, leaving the tag
+    unescaped and eligible for rewriting. Markdown code regions — fenced
+    blocks, fences nested in a block quote, indented code blocks, raw HTML
+    blocks (`<pre>`/`<script>`/`<style>`/`<textarea>`), and inline code
     spans — are skipped entirely, so a literal tag-shaped example inside any
     of them is never rewritten.
     """
@@ -607,7 +625,12 @@ def _linear_rich_links_to_markdown(description: str) -> str:
         last = 0
         for match in _RICH_LINK_TAG_RE.finditer(text):
             pieces.append(text[last : match.start()])
-            escaped = match.start() > 0 and text[match.start() - 1] == "\\"
+            backslashes = 0
+            pos = match.start() - 1
+            while pos >= 0 and text[pos] == "\\":
+                backslashes += 1
+                pos -= 1
+            escaped = backslashes % 2 == 1
             pieces.append(match[0] if escaped else replace(match))
             last = match.end()
         pieces.append(text[last:])
