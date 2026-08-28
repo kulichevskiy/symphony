@@ -51,6 +51,7 @@ from ...agent.control_channel import Conversation
 from ...agent.model_usage import ModelUsage, parse_model_usage
 from ...agent.process import parse_event_line
 from ...agent.prompt import implement_prompt
+from ...agent.run_log import RunLogWriter
 from ...agent.runner import Runner, RunnerEvent, RunnerSpec
 from ...agent.runners.local import CLAUDE_AMBIENT_AUTH_ENV, LocalRunner
 from ...claude_login import (
@@ -3974,13 +3975,12 @@ class _OrchestratorBase:
         )
         self._active_run_ids.add(run_id)
         try:
-            with log_path.open("a", encoding="utf-8") as logf:
+            with RunLogWriter(log_path) as logf:
                 async for ev in self._runner.run(dispatch.spec):
                     if ev.kind == "started" and ev.pid is not None:
                         await db.runs.update_pid(self._conn, run_id, ev.pid)
                     elif ev.kind == "stdout" and ev.line is not None:
-                        logf.write(ev.line + "\n")
-                        logf.flush()
+                        logf.write(ev.line)
                         usage = parse_event_line(ev.line)
                         if usage is not None:
                             cumulative_usage = _sum_usage(
@@ -3994,8 +3994,7 @@ class _OrchestratorBase:
                             cumulative_usage=cumulative_usage,
                         )
                     elif ev.kind == "stderr" and ev.line is not None:
-                        logf.write(f"[stderr] {ev.line}\n")
-                        logf.flush()
+                        logf.write(f"[stderr] {ev.line}")
                     elif ev.kind == "tick":
                         await self._record_activity_tick(
                             session=activity,
@@ -4310,13 +4309,12 @@ class _OrchestratorBase:
         )
         self._active_run_ids.add(run_id)
         try:
-            with log_path.open("a", encoding="utf-8") as logf:
+            with RunLogWriter(log_path) as logf:
                 async for ev in self._runner.run(dispatch.spec):
                     if ev.kind == "started" and ev.pid is not None:
                         await db.runs.update_pid(self._conn, run_id, ev.pid)
                     elif ev.kind == "stdout" and ev.line is not None:
-                        logf.write(ev.line + "\n")
-                        logf.flush()
+                        logf.write(ev.line)
                         usage = parse_event_line(ev.line)
                         if usage is not None:
                             cumulative_usage = _sum_usage(
@@ -4330,8 +4328,7 @@ class _OrchestratorBase:
                             cumulative_usage=cumulative_usage,
                         )
                     elif ev.kind == "stderr" and ev.line is not None:
-                        logf.write(f"[stderr] {ev.line}\n")
-                        logf.flush()
+                        logf.write(f"[stderr] {ev.line}")
                     elif ev.kind == "tick":
                         await self._record_activity_tick(
                             session=activity,

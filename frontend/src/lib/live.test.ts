@@ -1,7 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { registerTokenProvider } from "./auth";
-import { foldTokenTick, streamRun, type LiveEvent, type TokenTick } from "./live";
+import {
+  fetchRunEvents,
+  foldTokenTick,
+  streamRun,
+  type LiveEvent,
+  type TokenTick,
+} from "./live";
 
 afterEach(() => {
   registerTokenProvider(null);
@@ -110,6 +116,57 @@ describe("streamRun", () => {
 
     expect(cursors).toEqual([10]);
     expect(result).toEqual({ offset: 10, ended: false });
+  });
+});
+
+describe("fetchRunEvents", () => {
+  function jsonResponse(body: unknown): Response {
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    });
+  }
+
+  it("opens on the newest page and maps the older-page cursor", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({
+        events: [{ kind: "message", text: "newest", seq: 149, ts: "2026-08-27T10:00:00+00:00" }],
+        next_before: 50,
+        offset: 4096,
+        tokens: null,
+      }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await fetchRunEvents("run-1");
+
+    expect((fetchMock.mock.calls[0] as unknown as [string])[0]).toBe("/api/runs/run-1/events");
+    expect(result).toEqual({
+      events: [{ kind: "message", text: "newest", seq: 149, ts: "2026-08-27T10:00:00+00:00" }],
+      nextBefore: 50,
+      offset: 4096,
+      tokens: null,
+    });
+  });
+
+  it("requests older pages from the cursor", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse({ events: [], next_before: null, offset: 10 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await fetchRunEvents("run-1", { before: 50 });
+
+    expect((fetchMock.mock.calls[0] as unknown as [string])[0]).toBe(
+      "/api/runs/run-1/events?before=50",
+    );
+    expect(result.nextBefore).toBeNull();
+  });
+
+  it("throws when the page request fails", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response("nope", { status: 404 })));
+
+    await expect(fetchRunEvents("run-1")).rejects.toThrow();
   });
 });
 

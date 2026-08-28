@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -153,6 +154,31 @@ async def test_tees_stdout_and_stderr_to_log_path(tmp_path: Path) -> None:
     assert out.stderr == "warning: x"
     # The tee'd file interleaves them in arrival order, stderr prefixed.
     assert log_path.read_text(encoding="utf-8") == ("line one\n[stderr] warning: x\nline two\n")
+
+
+@pytest.mark.asyncio
+async def test_tee_records_receipt_times_beside_the_log(tmp_path: Path) -> None:
+    """These runs show up in the UI activity feed too, so each tee'd line gets
+    a receipt time in the sidecar, keyed by the line's end offset."""
+    log_path = tmp_path / "logs" / "rid-2.log"
+    runner = _FakeRunner(
+        [
+            RunnerEvent(kind="stdout", line="one"),
+            RunnerEvent(kind="stderr", line="two"),
+            RunnerEvent(kind="exit", returncode=0),
+        ]
+    )
+    before = datetime.now(UTC)
+    await collect_runner_output(runner, _spec(), log_path=log_path)
+    after = datetime.now(UTC)
+
+    entries = [
+        line.split(" ", 1)
+        for line in (tmp_path / "logs" / "rid-2.log.ts").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [int(offset) for offset, _ in entries] == [len(b"one\n"), len(b"one\n[stderr] two\n")]
+    for _, ts in entries:
+        assert before <= datetime.fromisoformat(ts) <= after
 
 
 @pytest.mark.asyncio

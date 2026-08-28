@@ -18,13 +18,65 @@ export type TokenTick = {
   cost_usd: number;
 };
 
+/** Fields every *visible* feed event carries: its position in the run's
+ *  visible-event sequence (`seq`, present on history pages) and the Symphony
+ *  receipt time of the log line it came from — `null`/absent for logs written
+ *  before receipt times were recorded. */
+type FeedMeta = { seq?: number; ts?: string | null };
+
+export type FeedEvent =
+  | ({ kind: "message"; text: string } & FeedMeta)
+  | ({ kind: "tool_call"; tool: string; detail: string } & FeedMeta)
+  | ({ kind: "file_edit"; tool?: string; files: string[] } & FeedMeta);
+
 export type LiveEvent =
-  | { kind: "message"; text: string }
-  | { kind: "tool_call"; tool: string; detail: string }
-  | { kind: "file_edit"; tool?: string; files: string[] }
+  | FeedEvent
   | TokenTick
   | { kind: "cursor"; offset: number }
   | { kind: "end" };
+
+/** One newest-first page of a run's visible events. `nextBefore` is the
+ *  cursor for the next (older) page, `null` once history is exhausted;
+ *  `offset` is the log byte offset the live tail must resume from so streamed
+ *  events neither duplicate nor skip this page; `tokens` is the usage total
+ *  the page's skipped prefix accounts for (the tail folds onto it). */
+export interface RunEventsPage {
+  events: FeedEvent[];
+  nextBefore: number | null;
+  offset: number;
+  tokens: TokenTick | null;
+}
+
+/** Fetch one page of a run's visible activity, newest first. Omit `before`
+ *  for the newest page; pass a previous page's `nextBefore` to walk older. */
+export async function fetchRunEvents(
+  runId: string,
+  { before, signal }: { before?: number | null; signal?: AbortSignal } = {},
+): Promise<RunEventsPage> {
+  const query =
+    before === undefined || before === null
+      ? ""
+      : `?${new URLSearchParams({ before: String(before) }).toString()}`;
+  const response = await fetch(`/api/runs/${encodeURIComponent(runId)}/events${query}`, {
+    headers: { Accept: "application/json", ...(await authHeaders()) },
+    signal,
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to load run activity (${response.status})`);
+  }
+  const body = (await response.json()) as {
+    events: FeedEvent[];
+    next_before: number | null;
+    offset: number;
+    tokens: TokenTick | null;
+  };
+  return {
+    events: body.events ?? [],
+    nextBefore: body.next_before ?? null,
+    offset: body.offset ?? 0,
+    tokens: body.tokens ?? null,
+  };
+}
 
 /**
  * Fold a new token tick into the running total. Cumulative ticks (claude
