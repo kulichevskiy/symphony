@@ -448,6 +448,68 @@ def test_short_fence_nested_under_a_list_item_is_closed_with_matching_indent() -
     assert body.count("```") % 2 == 0
 
 
+def test_normal_size_body_closes_an_unterminated_processing_instruction() -> None:
+    """A short description that opens a `<?...?>` processing instruction but
+    never closes it must not swallow the `---`/tracker-link footer inside it."""
+    description = '<?xml version="1.0"'
+    body = build_pr_body(_issue(description))
+    assert body == f"{description}\n?>\n\n{FOOTER}"
+
+
+def test_normal_size_body_closes_an_unterminated_declaration() -> None:
+    description = "<!DOCTYPE html"
+    body = build_pr_body(_issue(description))
+    assert body == f"{description}\n>\n\n{FOOTER}"
+
+
+def test_normal_size_body_closes_an_unterminated_cdata_section() -> None:
+    description = "<![CDATA[unterminated"
+    body = build_pr_body(_issue(description))
+    assert body == f"{description}\n]]>\n\n{FOOTER}"
+
+
+def test_fence_marker_inside_a_closed_processing_instruction_is_not_treated_as_dangling() -> None:
+    """A fence-shaped line fully inside an already-closed `<?...?>` block is
+    inert raw text, not a real (unterminated) code fence."""
+    description = "<?xml\n```\n?>"
+    body = build_pr_body(_issue(description))
+    assert body == f"{description}\n\n{FOOTER}"
+    assert body.count("```") == 1
+
+
+def test_backslash_escaped_html_comment_opener_is_not_treated_as_dangling() -> None:
+    """A `\\<!-- example` is an escaped literal `<`, not a real (unterminated)
+    HTML comment opener, per CommonMark backslash-escape rules."""
+    description = "some text \\<!-- example"
+    body = build_pr_body(_issue(description))
+    assert body == f"{description}\n\n{FOOTER}"
+
+
+def test_double_backslash_before_html_comment_opener_still_dangles() -> None:
+    """`\\\\<!--` is an escaped backslash followed by a genuine (unescaped)
+    comment opener, so the dangling `-->` must still be appended."""
+    description = "some text \\\\<!-- example"
+    body = build_pr_body(_issue(description))
+    assert body == f"{description}\n-->\n\n{FOOTER}"
+
+
+def test_backslash_escaped_backtick_does_not_start_a_code_span() -> None:
+    """A `` \\` `` is an escaped literal backtick, not a code-span delimiter,
+    so the rich-link tag between it and a later (real, unpaired) backtick is
+    still in prose and must be rewritten."""
+    description = '\\`<issue url="https://l/9">ENG-9</issue>`'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == "\\`[ENG-9](https://l/9)`"
+
+
+def test_double_backslash_before_backtick_is_a_real_code_span_delimiter() -> None:
+    """`\\\\`` is an escaped backslash followed by a genuine (unescaped)
+    backtick delimiter, so the enclosed tag stays inert code."""
+    description = '\\\\`<issue url="https://l/9">ENG-9</issue>`'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == description
+
+
 def test_rich_link_url_with_an_unbalanced_close_paren_is_wrapped_in_angle_brackets() -> None:
     """A rich-link URL with an unmatched `)` (e.g. a slug ending `fix)-bug`)
     would otherwise terminate the Markdown link destination early and spill

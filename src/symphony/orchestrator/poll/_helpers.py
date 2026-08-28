@@ -81,6 +81,29 @@ _RAW_HTML_BLOCK_START_RE = re.compile(
 _RAW_HTML_BLOCK_END_RE = re.compile(
     r"</(?:" + "|".join(_RAW_HTML_BLOCK_TAGS) + r")>", re.IGNORECASE
 )
+# CommonMark raw HTML blocks types 3-5: a processing instruction (`<?` ...
+# `?>`), a declaration (`<!LETTER` ... `>`), or a CDATA section (`<![CDATA[`
+# ... `]]>`). Like type 1, these swallow everything — fence markers, rich-link
+# tags — up to their closer, so an unterminated one must not be mistaken for
+# closed. Unlike type 1, the closer is an exact literal token rather than a
+# tag-name regex, so `_other_raw_html_block_closer` returns the token itself
+# for a plain substring check instead of a shared end-tag pattern.
+_RAW_CDATA_START_RE = re.compile(r"^ {0,3}<!\[CDATA\[")
+_RAW_DECLARATION_START_RE = re.compile(r"^ {0,3}<![A-Za-z]")
+_RAW_PI_START_RE = re.compile(r"^ {0,3}<\?")
+
+
+def _other_raw_html_block_closer(line: str) -> str | None:
+    """Closing token if *line* opens a type 3/4/5 raw HTML block, else None."""
+    if _RAW_CDATA_START_RE.match(line):
+        return "]]>"
+    if _RAW_DECLARATION_START_RE.match(line):
+        return ">"
+    if _RAW_PI_START_RE.match(line):
+        return "?>"
+    return None
+
+
 # Linear rich links: `<issue …>ENG-1</issue>`, `<pull-request … />`. The bare
 # attrs branch excludes quotes *and whitespace* so it can never overlap with
 # either the quoted branches or the `\s+` separator between attrs — each
@@ -214,9 +237,32 @@ def _trim_boundary_blank_lines(text: str) -> str:
     return "\n".join(lines[start:end])
 
 
+def _preceded_by_odd_backslashes(text: str, index: int) -> bool:
+    """True if `text[index]` is escaped by an odd run of backslashes just before it.
+
+    CommonMark backslash-escapes turn the escaped character into a literal
+    (e.g. `\\<` is a literal `<`, `` \\` `` a literal backtick) rather than
+    the delimiter it would otherwise start. A run of backslashes pairs off
+    two at a time (`\\\\` is one literal backslash), so only an odd count
+    leaves `text[index]` itself escaped.
+    """
+    count = 0
+    pos = index - 1
+    while pos >= 0 and text[pos] == "\\":
+        count += 1
+        pos -= 1
+    return count % 2 == 1
+
+
 def _comment_tokens_outside_inline_code(line: str) -> list[str]:
-    """HTML comment delimiter tokens in *line*, ignoring any inside inline code spans."""
-    return _HTML_COMMENT_TOKEN_RE.findall(_INLINE_CODE_SPAN_RE.sub("", line))
+    """HTML comment delimiter tokens in *line*, ignoring any inside inline
+    code spans or an escaped literal `\\<!--` opener."""
+    stripped = _strip_code_spans(line)
+    return [
+        match[0]
+        for match in _HTML_COMMENT_TOKEN_RE.finditer(stripped)
+        if not (match[0] == "<!--" and _preceded_by_odd_backslashes(stripped, match.start()))
+    ]
 
 
 def _markup_states_per_line(
@@ -225,13 +271,14 @@ def _markup_states_per_line(
     """Per-prefix-length (fence closer, HTML-comment-open, raw-HTML-block closer)
     triple for `lines[0:i+1]`.
 
-    Fence, HTML-comment, and raw-HTML-block tracking run in a single
-    interleaved forward scan because each must ignore markers owned by the
-    others: a fence marker seen while a comment (or raw HTML block) is open is
-    inert — an open `<!-- ... -->` or `<pre>...</pre>` swallows everything up
-    to its closer verbatim, including anything fence-shaped — and a
-    `<!--`/`-->` token seen while a bare fence is open is inert code content,
-    not a real comment delimiter. Tracks CommonMark fence rules across ``` and
+    Fence, HTML-comment, and raw-HTML-block (types 1 and 3-5) tracking run in
+    a single interleaved forward scan because each must ignore markers owned
+    by the others: a fence marker seen while a comment (or raw HTML block) is
+    open is inert — an open `<!-- ... -->`, `<pre>...</pre>`, or `<?...?>`
+    swallows everything up to its closer verbatim, including anything
+    fence-shaped — and a `<!--`/`-->` token seen while a bare fence is open is
+    inert code content, not a real comment delimiter. Tracks CommonMark fence
+    rules across ``` and
     ~~~ fences of any length (3+): a fence is closed only by a same-character
     run at least as long as its opener, indented by at most 3 spaces, with
     nothing but trailing whitespace after it. A `<!--`/`-->` token inside an
@@ -250,6 +297,7 @@ def _markup_states_per_line(
     open_indent = ""
     open_comment = False
     open_html_closer: str | None = None
+    open_raw_closer: str | None = None
     in_indent = False
     prev_blank = True
     for line in lines:
@@ -266,6 +314,9 @@ def _markup_states_per_line(
         elif open_html_closer is not None:
             if _RAW_HTML_BLOCK_END_RE.search(line):
                 open_html_closer = None
+        elif open_raw_closer is not None:
+            if open_raw_closer in line:
+                open_raw_closer = None
         else:
             if in_indent and not (is_blank or _INDENTED_CODE_LINE_RE.match(line)):
                 in_indent = False
@@ -293,6 +344,12 @@ def _markup_states_per_line(
                         opened = True
                         if not _RAW_HTML_BLOCK_END_RE.search(line):
                             open_html_closer = f"</{html_match['tag'].lower()}>"
+                if not opened:
+                    raw_closer = _other_raw_html_block_closer(line)
+                    if raw_closer is not None:
+                        opened = True
+                        if raw_closer not in line:
+                            open_raw_closer = raw_closer
                 if not opened and prev_blank and _INDENTED_CODE_LINE_RE.match(line):
                     in_indent = True
                     opened = True
@@ -301,7 +358,7 @@ def _markup_states_per_line(
                         open_comment = token == "<!--"
         fence_states.append(open_indent + open_char * open_len if open_char is not None else None)
         comment_states.append(open_comment)
-        html_states.append(open_html_closer)
+        html_states.append(open_html_closer or open_raw_closer)
         prev_blank = is_blank
     return fence_states, comment_states, html_states
 
@@ -433,6 +490,46 @@ def _parens_unbalanced(url: str) -> bool:
 _INLINE_CODE_SPAN_RE = re.compile(
     r"(?<!`)(?P<tick>`++)(?:[^`\n]++|(?!(?P=tick)(?!`))`++)*+(?P=tick)(?!`)"
 )
+
+
+def _code_span_matches(text: str) -> list[tuple[int, int]]:
+    """Absolute (start, end) offsets of real (unescaped) code spans in *text*.
+
+    A backtick immediately preceded by an odd number of backslashes (e.g. a
+    literal `` \\` `` written to show a backtick character) is a
+    backslash-escaped literal per CommonMark, not a delimiter, so it can't
+    open a span there. Retrying the search on the *sliced* remainder — rather
+    than the same string with a later start index — drops that escaped
+    backtick from view entirely, so `_INLINE_CODE_SPAN_RE`'s `(?<!`)`
+    lookbehind doesn't see it and a shorter run starting right after it is
+    still free to open its own span.
+    """
+    matches: list[tuple[int, int]] = []
+    offset = 0
+    remaining = text
+    while True:
+        match = _INLINE_CODE_SPAN_RE.search(remaining)
+        if match is None:
+            return matches
+        start = offset + match.start()
+        if _preceded_by_odd_backslashes(text, start):
+            step = match.start() + 1
+        else:
+            matches.append((start, offset + match.end()))
+            step = match.end()
+        offset += step
+        remaining = remaining[step:]
+
+
+def _strip_code_spans(text: str) -> str:
+    """*text* with each real (unescaped) inline code span removed."""
+    pieces: list[str] = []
+    last = 0
+    for start, end in _code_span_matches(text):
+        pieces.append(text[last:start])
+        last = end
+    pieces.append(text[last:])
+    return "".join(pieces)
 
 
 def _fence_open(line: str) -> tuple[str, int] | None:
@@ -625,12 +722,7 @@ def _linear_rich_links_to_markdown(description: str) -> str:
         last = 0
         for match in _RICH_LINK_TAG_RE.finditer(text):
             pieces.append(text[last : match.start()])
-            backslashes = 0
-            pos = match.start() - 1
-            while pos >= 0 and text[pos] == "\\":
-                backslashes += 1
-                pos -= 1
-            escaped = backslashes % 2 == 1
+            escaped = _preceded_by_odd_backslashes(text, match.start())
             pieces.append(match[0] if escaped else replace(match))
             last = match.end()
         pieces.append(text[last:])
@@ -639,10 +731,10 @@ def _linear_rich_links_to_markdown(description: str) -> str:
     def rewrite_outside_inline_code(text: str) -> str:
         pieces: list[str] = []
         last = 0
-        for span in _INLINE_CODE_SPAN_RE.finditer(text):
-            pieces.append(rewrite_tags(text[last : span.start()]))
-            pieces.append(span[0])
-            last = span.end()
+        for start, end in _code_span_matches(text):
+            pieces.append(rewrite_tags(text[last:start]))
+            pieces.append(text[start:end])
+            last = end
         pieces.append(rewrite_tags(text[last:]))
         return "".join(pieces)
 
