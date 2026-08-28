@@ -427,6 +427,18 @@ def _retry_intent(comment_id: str, *, author: str = "") -> SlashIntent:
     )
 
 
+def test_control_actor_falls_back_to_web_origin_for_web_button_commands() -> None:
+    # A web-button command carries a synthetic `web-`-prefixed comment id and
+    # no author; the actor is the origin tag plus that same comment id.
+    intent = SlashIntent(
+        kind=SlashKind.RETRY,
+        comment_id="web-c-retry",
+        created_at="2026-08-27T10:00:00+00:00",
+        text="$retry",
+    )
+    assert Orchestrator._control_actor(intent) == "web:web-c-retry"  # noqa: SLF001
+
+
 def _cfg(tmp_path: Path, binding: object) -> Config:
     return Config(
         repos=[binding],  # type: ignore[list-item]
@@ -475,8 +487,8 @@ async def test_implement_retry_records_transition_then_starts_one_fresh_attempt(
         assert [(a.action, a.from_outcome, a.to_mode) for a in actions] == [
             ("retry", "failed", "playing")
         ]
-        # No author on the intent (e.g. a web-button command): the actor falls
-        # back to the synthetic origin:id, not a bare re-encoding of action_id.
+        # A tracker comment with no resolvable author: the actor falls back to
+        # the synthetic origin:id, not a bare re-encoding of action_id.
         assert actions[0].actor == "tracker:c-retry"
         assert actions[0].ts
         after = await controls.snapshot(conn, ISSUE_ID)

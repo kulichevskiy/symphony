@@ -365,9 +365,12 @@ async def apply(
             commit=False,
         )
     except sqlite3.IntegrityError:
-        # A racing insert of the same action id beat the check above. Same
-        # answer: already applied, and nothing of this call survives.
         await conn.rollback()
+        # Only a racing insert of the same action id is reported as already
+        # applied; any other constraint violation (e.g. a foreign-key failure
+        # on a missing issue) is a real error and must not be swallowed.
+        if await db.pipeline_controls.get_action(conn, issue_id, action_id) is None:
+            raise
         return ActionResult(
             accepted=False,
             snapshot=current,

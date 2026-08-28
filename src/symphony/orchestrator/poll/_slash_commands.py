@@ -769,6 +769,20 @@ class _SlashCommandsMixin(_OrchestratorBase):
                 return
             try:
                 await tracker.move_issue(tracker_issue_id, ready_id)
+                body = resumed(
+                    CommentVars(
+                        stage="implement",
+                        repo=binding.github_repo,
+                        issue=0,
+                        run_id=run_id,
+                        next_stage=binding.linear_states.ready,
+                    )
+                )
+                try:
+                    await tracker.post_comment(tracker_issue_id, truncate_body(body))
+                except LinearError as e:
+                    log.warning("implement retry comment failed for issue %s: %s", issue_id, e)
+                await self._clear_operator_wait(issue_id, run_id)
             except LinearError as e:
                 # Nothing carried the transition out; release it so the next
                 # poll tick can re-deliver this same command.
@@ -780,24 +794,11 @@ class _SlashCommandsMixin(_OrchestratorBase):
                 ) from e
             except BaseException:
                 # Any other failure (malformed payload, cancellation, daemon
-                # death) also means nothing carried the transition out; release
-                # it the same way so the park stays retryable, then propagate.
+                # death, or the operator-wait clear itself failing) also means
+                # the park isn't safely resumed; release it the same way so
+                # the park stays retryable, then propagate.
                 await controls.release(self._conn, accepted, at=self._now().isoformat())
                 raise
-            body = resumed(
-                CommentVars(
-                    stage="implement",
-                    repo=binding.github_repo,
-                    issue=0,
-                    run_id=run_id,
-                    next_stage=binding.linear_states.ready,
-                )
-            )
-            try:
-                await tracker.post_comment(tracker_issue_id, truncate_body(body))
-            except LinearError as e:
-                log.warning("implement retry comment failed for issue %s: %s", issue_id, e)
-            await self._clear_operator_wait(issue_id, run_id)
             return
 
         if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
