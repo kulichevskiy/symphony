@@ -39,11 +39,19 @@ _ACCEPTANCE_MISSING_WHERE_TO_VERIFY_NOTE = (
 # GitHub rejects PR bodies past this size, so an oversized ticket description
 # is cut rather than failing delivery.
 PR_BODY_MAX_CHARS = 65_536
+# `gh pr create --body` is handed to execve() as a single argv value, which
+# Linux caps well under 128 KiB regardless of character count (e.g. CJK text
+# can blow the byte budget long before the char budget). Stay comfortably
+# under that ceiling.
+PR_BODY_MAX_BYTES = 120_000
 _PR_BODY_TRUNCATION_NOTICE = "Description truncated; see the source ticket"
-# Linear rich links: `<issue …>ENG-1</issue>`, `<pull-request … />`.
+# Linear rich links: `<issue …>ENG-1</issue>`, `<pull-request … />`. The bare
+# attrs branch excludes quotes so it can never overlap with the quoted
+# branches — an unbalanced quote then just fails the match instead of
+# backtracking exponentially over the ambiguous alternation.
 _RICH_LINK_TAG_RE = re.compile(
-    r"<(?P<tag>issue|pull-request)(?P<attrs>\s(?:\"[^\"]*\"|'[^']*'|[^<>])*?)?\s*/?>"
-    r"(?:(?P<text>[^<]*)</(?P=tag)>)?",
+    r"<(?P<tag>issue|pull-request)(?P<attrs>\s(?:\"[^\"]*\"|'[^']*'|[^<>\"'])*?)?\s*/?>"
+    r"(?:(?P<text>(?:[^<]|<(?!/(?P=tag)>))*)</(?P=tag)>)?",
     re.IGNORECASE,
 )
 _TAG_ATTR_RE = re.compile(r"([\w-]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')")
@@ -110,27 +118,46 @@ def build_pr_body(issue: LinearIssue) -> str:
         return footer
     footer = f"---\n\n{footer}"
     body = f"{description}\n\n{footer}"
-    if len(body) <= PR_BODY_MAX_CHARS:
+    if len(body) <= PR_BODY_MAX_CHARS and len(body.encode("utf-8")) <= PR_BODY_MAX_BYTES:
         return body
     tail = f"\n\n{_PR_BODY_TRUNCATION_NOTICE}\n\n{footer}"
-    kept = _head_lines_within(description, PR_BODY_MAX_CHARS - len(tail))
+    char_budget = PR_BODY_MAX_CHARS - len(tail)
+    byte_budget = PR_BODY_MAX_BYTES - len(tail.encode("utf-8"))
+    kept = _head_lines_within(description, char_budget, byte_budget)
     return f"{kept}{tail}"
 
 
-def _head_lines_within(text: str, budget: int) -> str:
-    """Longest line-boundary prefix of `text` that fits `budget` characters.
+def _head_lines_within(text: str, char_budget: int, byte_budget: int) -> str:
+    """Longest line-boundary prefix of `text` that fits both budgets.
 
-    Falls back to a hard character cut when even the first line is too long,
-    so a single-line description cannot defeat the size limit.
+    Bodies are also handed to `gh` as a single argv value, so a byte ceiling
+    matters as much as the char ceiling (Unicode text can blow the byte
+    budget well before the char budget). Falls back to a hard cut when even
+    the first line is too long, so a single-line description cannot defeat
+    either limit.
     """
     kept: list[str] = []
-    used = 0
+    used_chars = 0
+    used_bytes = 0
     for line in text.splitlines():
-        used += len(line) + (1 if kept else 0)
-        if used > budget:
+        sep = 1 if kept else 0
+        used_chars += len(line) + sep
+        used_bytes += len(line.encode("utf-8")) + sep
+        if used_chars > char_budget or used_bytes > byte_budget:
             break
         kept.append(line)
-    return "\n".join(kept) if kept else text[: max(budget, 0)]
+    if kept:
+        return "\n".join(kept)
+    return _char_prefix_within_bytes(text, char_budget, byte_budget)
+
+
+def _char_prefix_within_bytes(text: str, char_budget: int, byte_budget: int) -> str:
+    """Prefix of `text` within `char_budget` chars, cut further to fit `byte_budget`."""
+    prefix = text[: max(char_budget, 0)]
+    encoded = prefix.encode("utf-8")
+    if len(encoded) <= byte_budget:
+        return prefix
+    return encoded[: max(byte_budget, 0)].decode("utf-8", errors="ignore")
 
 
 def _linear_rich_links_to_markdown(description: str) -> str:

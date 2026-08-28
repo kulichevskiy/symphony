@@ -9,7 +9,10 @@ body always ends with the tracker link footer.
 
 from __future__ import annotations
 
-from symphony.orchestrator.poll import PR_BODY_MAX_CHARS, build_pr_body
+import time
+
+from symphony.orchestrator.poll import PR_BODY_MAX_BYTES, PR_BODY_MAX_CHARS, build_pr_body
+from symphony.orchestrator.poll._helpers import _linear_rich_links_to_markdown
 from symphony.tracker import Issue
 
 
@@ -57,9 +60,7 @@ def test_linear_rich_link_tags_become_markdown_links() -> None:
 
 
 def test_tag_shaped_text_without_url_passes_through_verbatim() -> None:
-    description = (
-        "The only rewrite converts Linear `<issue …>` and `<pull-request …>` tags."
-    )
+    description = "The only rewrite converts Linear `<issue …>` and `<pull-request …>` tags."
     assert build_pr_body(_issue(description)) == f"{description}\n\n{FOOTER}"
 
 
@@ -108,3 +109,40 @@ def test_oversized_single_line_description_still_fits() -> None:
     assert len(body) <= PR_BODY_MAX_CHARS
     assert body.endswith(FOOTER)
     assert "Description truncated; see the source ticket" in body
+
+
+def test_oversized_cjk_description_is_truncated_within_the_byte_budget() -> None:
+    """A description well under PR_BODY_MAX_CHARS can still blow the argv byte
+    budget: each CJK char is ~3 UTF-8 bytes, so ~44k chars ≈ 131 KB."""
+    line = "汉" * 99
+    description = "\n".join([line] * 500)  # ~50k chars, ~150 KB
+    body = build_pr_body(_issue(description))
+    assert len(body.encode("utf-8")) <= PR_BODY_MAX_BYTES
+    assert body.endswith(FOOTER)
+    assert "Description truncated; see the source ticket" in body
+
+
+def test_oversized_single_line_cjk_description_still_fits_byte_budget() -> None:
+    body = build_pr_body(_issue("汉" * 60_000))
+    assert len(body.encode("utf-8")) <= PR_BODY_MAX_BYTES
+    assert body.endswith(FOOTER)
+    assert "Description truncated; see the source ticket" in body
+
+
+def test_malformed_tag_shaped_input_does_not_backtrack_catastrophically() -> None:
+    """A failing tag-shaped input with many ambiguous quote pairs must not
+    trigger exponential backtracking (previously ~7x slower per two quote
+    pairs added, ~20 minutes at n=22)."""
+    description = "<issue " + ' "a"' * 20 + " <"
+    start = time.monotonic()
+    result = _linear_rich_links_to_markdown(description)
+    elapsed = time.monotonic() - start
+    assert elapsed < 1.0
+    assert result == description
+
+
+def test_rich_link_text_containing_an_angle_bracket_does_not_leak_a_close_tag() -> None:
+    description = '<issue url="https://l/9" identifier="ENG-9">see <https://x.invalid></issue>'
+    body = build_pr_body(_issue(description))
+    assert "</issue>" not in body
+    assert "[see <https://x.invalid>](https://l/9)" in body
