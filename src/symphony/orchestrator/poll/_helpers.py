@@ -51,6 +51,13 @@ _PR_BODY_TRUNCATION_NOTICE = "Description truncated; see the source ticket"
 # when truncating, so a cut that lands inside a ```, ~~~, or 4+-backtick
 # fence gets closed with a matching marker instead of leaving it dangling.
 _FENCE_MARKER_RE = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})(?P<rest>.*)$")
+# A block quote marker: 0-3 spaces indent, `>`, optional single trailing
+# space/tab, one or more levels deep (`> > `). Used to detect a fenced code
+# block nested inside a block quote, which `_FENCE_MARKER_RE` alone misses
+# since it only allows plain leading spaces before the fence run.
+_BLOCKQUOTE_PREFIX_RE = re.compile(r"^(?: {0,3}>[ \t]?)+")
+# CommonMark indented code block: 4+ spaces or a tab, then non-whitespace.
+_INDENTED_CODE_LINE_RE = re.compile(r"^(?: {4,}|\t)\S")
 # Linear rich links: `<issue …>ENG-1</issue>`, `<pull-request … />`. The bare
 # attrs branch excludes quotes *and whitespace* so it can never overlap with
 # either the quoted branches or the `\s+` separator between attrs — each
@@ -163,47 +170,58 @@ def _trim_boundary_blank_lines(text: str) -> str:
     return "\n".join(lines[start:end])
 
 
-def _fence_closer(text: str) -> str | None:
-    """Marker needed to close a fence left open at the end of *text*, else None.
+def _fence_states_per_line(lines: list[str]) -> list[str | None]:
+    """Per-prefix-length fence closer, for `lines[0:i+1]` at index `i`.
 
     Tracks CommonMark fence rules across ``` and ~~~ fences of any length
     (3+): a fence is closed only by a same-character run at least as long as
     its opener, indented by at most 3 spaces, with nothing but trailing
     whitespace after it — so a 3-backtick line inside a fence opened with 4
     backticks (or a same-length line with trailing text) doesn't falsely
-    close it.
+    close it. Computed once via a single forward scan, so a caller trimming
+    the tail one line at a time can look up each prefix's state in O(1)
+    instead of rescanning the retained text on every trimmed line.
     """
+    states: list[str | None] = []
     open_char: str | None = None
     open_len = 0
-    for line in text.split("\n"):
+    for line in lines:
         m = _FENCE_MARKER_RE.match(line)
-        if m is None:
-            continue
-        marker, rest = m["marker"], m["rest"]
-        char, run_len = marker[0], len(marker)
-        if open_char is None:
-            if char == "`" and "`" in rest:
-                continue  # backtick fences forbid a backtick in the info string
-            open_char, open_len = char, run_len
-        elif char == open_char and run_len >= open_len and rest.strip() == "":
-            open_char, open_len = None, 0
-    if open_char is None:
-        return None
-    return open_char * open_len
+        if m is not None:
+            marker, rest = m["marker"], m["rest"]
+            char, run_len = marker[0], len(marker)
+            if open_char is None:
+                if not (char == "`" and "`" in rest):  # backtick info string forbids a backtick
+                    open_char, open_len = char, run_len
+            elif char == open_char and run_len >= open_len and rest.strip() == "":
+                open_char, open_len = None, 0
+        states.append(open_char * open_len if open_char is not None else None)
+    return states
 
 
 def _close_dangling_fence(kept: str, char_budget: int, byte_budget: int) -> str:
     """Append the closer for a fence `kept` was cut inside of, trimming further if needed."""
-    closer = _fence_closer(kept)
-    while closer is not None and (
-        len(kept) + 1 + len(closer) > char_budget
-        or len(kept.encode("utf-8")) + 1 + len(closer.encode("utf-8")) > byte_budget
-    ):
-        kept, _, _ = kept.rpartition("\n")
-        closer = _fence_closer(kept)
-    if closer is None:
-        return kept
-    return f"{kept}\n{closer}"
+    lines = kept.split("\n")
+    states = _fence_states_per_line(lines)
+    char_len = [0] * (len(lines) + 1)
+    byte_len = [0] * (len(lines) + 1)
+    for i, line in enumerate(lines):
+        sep = 1 if i else 0
+        char_len[i + 1] = char_len[i] + sep + len(line)
+        byte_len[i + 1] = byte_len[i] + sep + len(line.encode("utf-8"))
+
+    n = len(lines)
+    while n > 0:
+        closer = states[n - 1]
+        if closer is None:
+            break
+        if (
+            char_len[n] + 1 + len(closer) <= char_budget
+            and byte_len[n] + 1 + len(closer.encode("utf-8")) <= byte_budget
+        ):
+            return "\n".join(lines[:n]) + f"\n{closer}"
+        n -= 1
+    return "\n".join(lines[:n])
 
 
 def _head_lines_within(text: str, char_budget: int, byte_budget: int) -> str:
@@ -251,43 +269,114 @@ def _escape_markdown_link_label(label: str) -> str:
 _INLINE_CODE_SPAN_RE = re.compile(r"(?P<tick>`+)(?:(?!(?P=tick))[^\n])*?(?P=tick)")
 
 
-def _split_fenced_code_blocks(text: str) -> list[tuple[bool, list[str]]]:
-    """Partition *text* into line runs, tagging fenced (``` / ~~~) code blocks.
+def _fence_open(line: str) -> tuple[str, int] | None:
+    """(char, length) if *line* opens a bare (non-block-quoted) fence, else None."""
+    m = _FENCE_MARKER_RE.match(line)
+    if m is None or (m["marker"][0] == "`" and "`" in m["rest"]):
+        return None
+    return m["marker"][0], len(m["marker"])
 
-    Reuses the same fence open/close rules as `_fence_closer` so a literal
-    `<issue …>`/`<pull-request …>` example inside a fenced block is left
-    alone rather than rewritten as a link.
+
+def _fence_closes(rest: str, fence_char: str, fence_len: int) -> bool:
+    m = _FENCE_MARKER_RE.match(rest)
+    return (
+        m is not None
+        and m["marker"][0] == fence_char
+        and len(m["marker"]) >= fence_len
+        and m["rest"].strip() == ""
+    )
+
+
+def _quoted_fence_open(line: str) -> tuple[str, str, int] | None:
+    """(block-quote prefix, char, length) if *line* opens a fence nested in a
+    block quote (e.g. `> \\`\\`\\``), else None."""
+    bq = _BLOCKQUOTE_PREFIX_RE.match(line)
+    if bq is None or not bq[0]:
+        return None
+    opened = _fence_open(line[bq.end() :])
+    if opened is None:
+        return None
+    return bq[0], opened[0], opened[1]
+
+
+def _split_fenced_code_blocks(text: str) -> list[tuple[bool, list[str]]]:
+    """Partition *text* into line runs, tagging Markdown code regions.
+
+    Covers the three shapes that can hide a literal `<issue …>` /
+    `<pull-request …>` example from being mistaken for a real rich link:
+    a bare fenced (``` / ~~~) code block, a fence nested one level inside a
+    block quote (`> \\`\\`\\``), and a 4-space/tab indented code block.
+    Reuses the same fence open/close rules as `_fence_states_per_line`.
     """
     blocks: list[tuple[bool, list[str]]] = []
     current: list[str] = []
-    current_is_code = False
-    fence_char: str | None = None
+    mode = "prose"
+    fence_char = ""
     fence_len = 0
+    quote_prefix = ""
+    prev_blank = True
+
+    def flush(next_mode: str) -> None:
+        nonlocal current, mode
+        if current:
+            blocks.append((mode != "prose", current))
+        current = []
+        mode = next_mode
+
     for line in text.split("\n"):
-        m = _FENCE_MARKER_RE.match(line)
-        if fence_char is None:
-            if m is None or (m["marker"][0] == "`" and "`" in m["rest"]):
+        if mode == "fence":
+            current.append(line)
+            if _fence_closes(line, fence_char, fence_len):
+                flush("prose")
+            prev_blank = False
+            continue
+        if mode == "quoted_fence":
+            current.append(line)
+            if not line.startswith(quote_prefix) or _fence_closes(
+                line[len(quote_prefix) :], fence_char, fence_len
+            ):
+                flush("prose")
+            prev_blank = False
+            continue
+        if mode == "indent":
+            if line.strip() == "":
                 current.append(line)
+                prev_blank = True
                 continue
-            if current:
-                blocks.append((current_is_code, current))
-            fence_char, fence_len = m["marker"][0], len(m["marker"])
-            current = [line]
-            current_is_code = True
+            if _INDENTED_CODE_LINE_RE.match(line):
+                current.append(line)
+                prev_blank = False
+                continue
+            flush("prose")
+            # falls through to re-process `line` as prose below
+
+        opened = _fence_open(line)
+        if opened is not None:
+            flush("fence")
+            fence_char, fence_len = opened
+            current.append(line)
+            prev_blank = False
+            continue
+        quoted = _quoted_fence_open(line)
+        if quoted is not None:
+            flush("quoted_fence")
+            quote_prefix, fence_char, fence_len = quoted
+            current.append(line)
+            prev_blank = False
+            continue
+        if line.strip() == "":
+            current.append(line)
+            prev_blank = True
+            continue
+        if prev_blank and _INDENTED_CODE_LINE_RE.match(line):
+            flush("indent")
+            current.append(line)
+            prev_blank = False
             continue
         current.append(line)
-        if (
-            m is not None
-            and m["marker"][0] == fence_char
-            and len(m["marker"]) >= fence_len
-            and m["rest"].strip() == ""
-        ):
-            blocks.append((True, current))
-            current = []
-            current_is_code = False
-            fence_char, fence_len = None, 0
+        prev_blank = False
     if current:
-        blocks.append((current_is_code, current))
+        blocks.append((mode != "prose", current))
     return blocks
 
 
@@ -298,9 +387,10 @@ def _linear_rich_links_to_markdown(description: str) -> str:
     GitHub renders as unlinked text (or nothing at all when self-closing).
     Label preference: tag text, then `identifier`, then `title`, then the URL.
     A tag without a `url` attribute is not a Linear rich link (or is
-    malformed) and passes through verbatim. Fenced code blocks and inline
-    code spans are skipped entirely, so a literal tag-shaped example inside
-    code is never rewritten.
+    malformed) and passes through verbatim. Markdown code regions — fenced
+    blocks, fences nested in a block quote, indented code blocks, and inline
+    code spans — are skipped entirely, so a literal tag-shaped example inside
+    any of them is never rewritten.
     """
 
     def replace(match: re.Match[str]) -> str:

@@ -259,6 +259,27 @@ def test_rich_link_tag_with_a_url_inside_a_fenced_block_is_left_alone() -> None:
     assert result == description
 
 
+def test_rich_link_tag_inside_an_indented_code_block_is_left_alone() -> None:
+    description = '    <issue url="https://l/9">ENG-9</issue>'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == description
+
+
+def test_rich_link_tag_inside_a_fence_nested_in_a_block_quote_is_left_alone() -> None:
+    description = '> ```\n> <issue url="https://l/9">ENG-9</issue>\n> ```'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == description
+
+
+def test_indented_code_block_does_not_interrupt_a_paragraph() -> None:
+    """A 4-space-indented line right after prose (no blank line separator) is
+    a lazy paragraph continuation per CommonMark, not code — so a real rich
+    link written that way still gets rewritten."""
+    description = 'Blocked by\n    <issue url="https://l/9">ENG-9</issue>'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == "Blocked by\n    [ENG-9](https://l/9)"
+
+
 def test_unclosed_url_less_tag_does_not_swallow_a_following_real_rich_link() -> None:
     """A url-less, tag-shaped `<issue …>` in prose must match on its own and
     not stretch its `text` group forward to a later same-name close tag that
