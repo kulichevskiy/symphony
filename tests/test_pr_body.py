@@ -215,13 +215,16 @@ def test_truncation_closes_an_unterminated_tilde_fence() -> None:
 
 
 def test_truncation_closes_an_unterminated_indented_fence() -> None:
+    """The closer reuses the opener's own indent (rather than a bare ```)
+    so a fence nested under a list item stays inside that list item instead
+    of dedenting out of it and opening a stray new root-level fence."""
     line = "y" * 99
     description = "  ```\n" + "\n".join([line] * 2000)
     body = build_pr_body(_issue(description))
     assert len(body) <= PR_BODY_MAX_CHARS
     assert body.endswith(FOOTER)
     head, _, _ = body.partition("\n\nDescription truncated")
-    assert head.endswith("\n```")
+    assert head.endswith("\n  ```")
 
 
 def test_truncation_closes_a_four_backtick_fence_without_a_stray_three_backtick_line() -> None:
@@ -408,3 +411,33 @@ def test_long_backtick_run_in_prose_does_not_backtrack_catastrophically() -> Non
     elapsed = time.monotonic() - start
     assert elapsed < 1.0
     assert result == description
+
+
+def test_rich_link_tag_inside_a_code_span_with_an_interior_double_backtick_is_left_alone() -> None:
+    """A valid single-backtick code span may contain a `` `` `` run before its
+    eventual single-backtick closer — that interior run must not be mistaken
+    for (and rejected as) a mismatched closer, which would otherwise abandon
+    the match and leave a real code span undetected."""
+    description = 'See `text ``x`` <issue url="https://l/9">ENG-9</issue>` done.'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == description
+
+
+def test_short_fence_nested_under_a_list_item_is_closed_with_matching_indent() -> None:
+    """A fence nested under a list item must be closed with the same indent
+    it opened with — a bare, unindented closer would fall outside the list
+    item per CommonMark and reopen as a stray new root-level fence that
+    swallows everything after it (including the footer)."""
+    description = "- item\n  ```\n  code"
+    body = build_pr_body(_issue(description))
+    assert body == f"{description}\n  ```\n\n{FOOTER}"
+    assert body.count("```") % 2 == 0
+
+
+def test_rich_link_url_with_an_unbalanced_close_paren_is_wrapped_in_angle_brackets() -> None:
+    """A rich-link URL with an unmatched `)` (e.g. a slug ending `fix)-bug`)
+    would otherwise terminate the Markdown link destination early and spill
+    the remainder of the URL into visible text."""
+    description = '<issue url="https://l/9/fix)-bug" identifier="ENG-9">ENG-9</issue>'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == "[ENG-9](<https://l/9/fix)-bug>)"

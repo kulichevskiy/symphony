@@ -247,6 +247,7 @@ def _markup_states_per_line(
     html_states: list[str | None] = []
     open_char: str | None = None
     open_len = 0
+    open_indent = ""
     open_comment = False
     open_html_closer: str | None = None
     in_indent = False
@@ -261,7 +262,7 @@ def _markup_states_per_line(
             if m is not None:
                 marker, rest = m["marker"], m["rest"]
                 if marker[0] == open_char and len(marker) >= open_len and rest.strip() == "":
-                    open_char, open_len = None, 0
+                    open_char, open_len, open_indent = None, 0, ""
         elif open_html_closer is not None:
             if _RAW_HTML_BLOCK_END_RE.search(line):
                 open_html_closer = None
@@ -275,6 +276,16 @@ def _markup_states_per_line(
                     marker, rest = m["marker"], m["rest"]
                     if not (marker[0] == "`" and "`" in rest):  # backtick info string forbids `
                         open_char, open_len = marker[0], len(marker)
+                        # A fence nested under a list item (e.g. `- item\n  ```\n
+                        # code`) is still matched here (0-3 leading spaces), but
+                        # closing it with a bare, unindented marker wouldn't
+                        # re-enter the list item per CommonMark — the list item
+                        # would end first, leaving the marker to open a *new*
+                        # root-level fence that then swallows everything after
+                        # it (including the truncation notice/footer). Reusing
+                        # the opener's own indent keeps the closer inside the
+                        # same list item instead.
+                        open_indent = line[: m.start("marker")]
                         opened = True
                 if not opened:
                     html_match = _RAW_HTML_BLOCK_START_RE.match(line)
@@ -288,7 +299,7 @@ def _markup_states_per_line(
                 if not opened:
                     for token in _comment_tokens_outside_inline_code(line):
                         open_comment = token == "<!--"
-        fence_states.append(open_char * open_len if open_char is not None else None)
+        fence_states.append(open_indent + open_char * open_len if open_char is not None else None)
         comment_states.append(open_comment)
         html_states.append(open_html_closer)
         prev_blank = is_blank
@@ -372,6 +383,33 @@ def _escape_markdown_link_label(label: str) -> str:
     return label.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
 
+# A bare (unbracketed) CommonMark link destination may only contain
+# parentheses that are balanced, and no whitespace/control characters — an
+# unmatched `)` (e.g. a rich-link URL whose slug ends `fix)-bug`) closes the
+# `(url)` early and spills the rest of the URL into visible text. Wrapping
+# such a URL in `<...>` sidesteps the parenthesis-balance rule entirely.
+_UNSAFE_BARE_LINK_DESTINATION_RE = re.compile(r"[\s\x00-\x1f\x7f]")
+
+
+def _escape_markdown_link_destination(url: str) -> str:
+    """Format `url` so it can't terminate a Markdown `(destination)` early."""
+    if _UNSAFE_BARE_LINK_DESTINATION_RE.search(url) or _parens_unbalanced(url):
+        return f"<{url.replace('<', '%3C').replace('>', '%3E')}>"
+    return url
+
+
+def _parens_unbalanced(url: str) -> bool:
+    depth = 0
+    for ch in url:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth < 0:
+                return True
+    return depth != 0
+
+
 # Inline code span: a backtick run, then anything but a newline or that same
 # run, up to the next occurrence of that exact run — mirrors CommonMark's
 # "matching backtick count" delimiter rule closely enough to keep a literal
@@ -385,7 +423,16 @@ def _escape_markdown_link_label(label: str) -> str:
 # two): CommonMark requires the closer to be a backtick string of *exactly*
 # the opener's length, not merely at least that long, so a too-long run is no
 # closer at all and the possessive body can't backtrack to try a shorter one.
-_INLINE_CODE_SPAN_RE = re.compile(r"(?<!`)(?P<tick>`++)(?:(?!(?P=tick))[^\n])*+(?P=tick)(?!`)")
+# The body alternates between non-backtick runs and backtick runs that are
+# *not* a bare same-length closer (checked via the same lookahead as the
+# trailing closer): an interior run of a different length — e.g. a `` `` ``
+# pair inside a single-backtick span — is consumed whole as literal content
+# instead of being tried (and rejected) one backtick at a time, so the
+# possessive body doesn't abandon the match and leave a valid code span
+# undetected.
+_INLINE_CODE_SPAN_RE = re.compile(
+    r"(?<!`)(?P<tick>`++)(?:[^`\n]++|(?!(?P=tick)(?!`))`++)*+(?P=tick)(?!`)"
+)
 
 
 def _fence_open(line: str) -> tuple[str, int] | None:
@@ -552,7 +599,8 @@ def _linear_rich_links_to_markdown(description: str) -> str:
             return match[0]
         text = (match["text"] or "").strip()
         raw_label = text or attrs.get("identifier") or attrs.get("title") or url
-        return f"[{_escape_markdown_link_label(raw_label)}]({url})"
+        destination = _escape_markdown_link_destination(url)
+        return f"[{_escape_markdown_link_label(raw_label)}]({destination})"
 
     def rewrite_tags(text: str) -> str:
         pieces: list[str] = []
