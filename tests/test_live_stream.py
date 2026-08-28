@@ -831,9 +831,7 @@ async def test_events_service_and_token_lines_do_not_consume_page_size(
 
     # Message m_i is the (4*i + 3)-th appended line; the page holds m50..m149
     # newest-first, so its `ts` values must line up with those exact stamps.
-    assert [e["ts"] for e in body["events"]] == [
-        stamps[4 * i + 3][1] for i in range(149, 49, -1)
-    ]
+    assert [e["ts"] for e in body["events"]] == [stamps[4 * i + 3][1] for i in range(149, 49, -1)]
 
 
 @pytest.mark.asyncio
