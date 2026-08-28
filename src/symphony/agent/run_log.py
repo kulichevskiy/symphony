@@ -12,10 +12,13 @@ Logs written before the sidecar existed simply have none; lookups then return
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
 from typing import IO
+
+log = logging.getLogger(__name__)
 
 RECEIPTS_SUFFIX = ".ts"
 
@@ -33,7 +36,11 @@ class RunLogWriter:
     """Append lines to a run log, recording each line's receipt time.
 
     Both files are flushed per line so a live tail sees output (and its time)
-    while the run is still in progress.
+    while the run is still in progress. The log is the contract other
+    consumers replay; the receipts sidecar is best-effort, so a sidecar that
+    can't be opened (its directory disallows new files, the process is out
+    of file descriptors, ...) does not stop the log itself from being
+    written — the run just gets no receipt times for that sidecar's lines.
     """
 
     def __init__(self, log_path: Path) -> None:
@@ -49,14 +56,22 @@ class RunLogWriter:
         self._receipts: IO[str] | None = None
 
     def open(self) -> RunLogWriter:
-        """Open both files for append. Also the `with`-statement entry point."""
+        """Open both files for append. Also the `with`-statement entry point.
+
+        A failure opening the receipts sidecar is logged and swallowed
+        rather than raised: the log itself is still appendable, and losing
+        receipt times for one run is far cheaper than losing the run log.
+        """
         self._log = self._log_path.open("a", encoding="utf-8")
         try:
             self._receipts = receipts_path(self._log_path).open("a", encoding="utf-8")
-        except BaseException:
-            self._log.close()
-            self._log = None
-            raise
+        except OSError:
+            log.warning(
+                "receipts sidecar unavailable for %s; run log continues without receipt times",
+                self._log_path,
+                exc_info=True,
+            )
+            self._receipts = None
         return self
 
     def close(self) -> None:
@@ -86,13 +101,18 @@ class RunLogWriter:
         on disk. A sidecar entry for a not-yet-visible log line is harmless;
         a visible log line with no receipt entry yet is a permanent `ts:
         null`, since the stream emits each event once and never re-asks.
+
+        If the sidecar failed to open (see `open`), `self._receipts` is
+        `None` and this simply skips the receipt line — the log write below
+        still happens.
         """
-        if self._log is None or self._receipts is None:
+        if self._log is None:
             raise RuntimeError("RunLogWriter used outside its context")
         data = line + "\n"
         offset = self._offset + len(data.encode("utf-8"))
-        self._receipts.write(f"{offset} {self._now().isoformat()}\n")
-        self._receipts.flush()
+        if self._receipts is not None:
+            self._receipts.write(f"{offset} {self._now().isoformat()}\n")
+            self._receipts.flush()
         self._log.write(data)
         self._log.flush()
         self._offset = offset

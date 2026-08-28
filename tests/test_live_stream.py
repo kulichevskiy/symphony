@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 from symphony import db
+from symphony.agent.run_log import RunLogWriter
 from symphony.agent.runner import RunnerEvent, RunnerSpec
 from symphony.app import create_app
 from symphony.auth import Auth0Settings
@@ -1114,3 +1115,21 @@ async def test_run_log_records_receipt_time_per_line(tmp_path: Path) -> None:
     # the line.
     for _, ts in entries:
         assert before <= datetime.fromisoformat(ts) <= after
+
+
+def test_run_log_writer_keeps_logging_when_receipts_sidecar_cannot_open(
+    tmp_path: Path,
+) -> None:
+    """If the `.log.ts` sidecar can't be opened (e.g. its path is blocked by
+    something else on disk), the run log itself must keep appending rather
+    than the whole writer refusing to open."""
+    log_path = tmp_path / "run.log"
+    # Occupy the sidecar's path with a directory so opening it for append
+    # raises OSError, simulating "directory disallows new files".
+    (tmp_path / "run.log.ts").mkdir()
+
+    with RunLogWriter(log_path) as writer:
+        writer.write("hello")
+        writer.write("world")
+
+    assert log_path.read_text() == "hello\nworld\n"
