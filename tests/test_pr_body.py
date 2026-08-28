@@ -56,6 +56,31 @@ def test_linear_rich_link_tags_become_markdown_links() -> None:
     assert body.endswith(FOOTER)
 
 
+def test_tag_shaped_text_without_url_passes_through_verbatim() -> None:
+    description = (
+        "The only rewrite converts Linear `<issue …>` and `<pull-request …>` tags."
+    )
+    assert build_pr_body(_issue(description)) == f"{description}\n\n{FOOTER}"
+
+
+def test_tag_shaped_text_without_url_survives_inside_a_fenced_block() -> None:
+    description = "```xml\n<issue>\n  <id>1</id>\n</issue>\n```"
+    assert build_pr_body(_issue(description)) == f"{description}\n\n{FOOTER}"
+
+
+def test_angle_bracket_inside_a_quoted_attribute_does_not_end_the_tag() -> None:
+    description = '<issue id="u1" title="Fix A > B" url="https://l/9">ENG-9</issue>'
+    body = build_pr_body(_issue(description))
+    assert "[ENG-9](https://l/9)" in body
+    assert "url=" not in body
+
+
+def test_apostrophe_inside_a_double_quoted_title_is_not_truncated() -> None:
+    description = '<pull-request id="u2" title="Bob\'s fix" url="https://g/7"/>'
+    body = build_pr_body(_issue(description))
+    assert "[Bob's fix](https://g/7)" in body
+
+
 def test_trusted_github_markdown_is_left_alone() -> None:
     description = "cc @octocat, see org/repo#12. Fixes #3."
     assert description in build_pr_body(_issue(description))

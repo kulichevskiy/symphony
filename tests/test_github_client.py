@@ -7,7 +7,7 @@ mocking `asyncio.subprocess` and catches real argv-construction bugs.
 
 Covers:
 - argv shape for each method (no shell injection — list-form invocation)
-- `pr_create` body always carries `Relates to <linear-url>` when supplied
+- `pr_create` forwards `--body` verbatim (the footer is `build_pr_body`'s job)
 - `pr_checks` parses JSON output into a typed `PRChecks` object
 - `pr_merge(strategy="squash")` enables auto-merge with the right flag
 - non-zero exit raises `GitHubError`

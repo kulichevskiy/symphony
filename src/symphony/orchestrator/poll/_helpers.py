@@ -42,10 +42,11 @@ PR_BODY_MAX_CHARS = 65_536
 _PR_BODY_TRUNCATION_NOTICE = "Description truncated; see the source ticket"
 # Linear rich links: `<issue …>ENG-1</issue>`, `<pull-request … />`.
 _RICH_LINK_TAG_RE = re.compile(
-    r"<(?P<tag>issue|pull-request)(?P<attrs>\s[^<>]*?)?\s*/?>(?:(?P<text>[^<]*)</(?P=tag)>)?",
+    r"<(?P<tag>issue|pull-request)(?P<attrs>\s(?:\"[^\"]*\"|'[^']*'|[^<>])*?)?\s*/?>"
+    r"(?:(?P<text>[^<]*)</(?P=tag)>)?",
     re.IGNORECASE,
 )
-_TAG_ATTR_RE = re.compile(r"([\w-]+)\s*=\s*[\"']([^\"']*)[\"']")
+_TAG_ATTR_RE = re.compile(r"([\w-]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')")
 
 
 def _sum_usage(left: UsageDelta, right: UsageDelta) -> UsageDelta:
@@ -137,15 +138,21 @@ def _linear_rich_links_to_markdown(description: str) -> str:
 
     Linear serializes inline issue / PR references as pseudo-HTML tags that
     GitHub renders as nothing. Label preference: tag text, then `identifier`,
-    then `title`, then the URL. A tag without a URL degrades to its label.
+    then `title`, then the URL. A tag without a `url` attribute is not a
+    Linear rich link (or is malformed) and passes through verbatim.
     """
 
     def replace(match: re.Match[str]) -> str:
-        attrs: dict[str, str] = dict(_TAG_ATTR_RE.findall(match["attrs"] or ""))
-        text = (match["text"] or "").strip()
-        label = text or attrs.get("identifier") or attrs.get("title") or attrs.get("url", "")
+        attrs: dict[str, str] = {
+            name: double or single
+            for name, double, single in _TAG_ATTR_RE.findall(match["attrs"] or "")
+        }
         url = attrs.get("url", "")
-        return f"[{label}]({url})" if url else label
+        if not url:
+            return match[0]
+        text = (match["text"] or "").strip()
+        label = text or attrs.get("identifier") or attrs.get("title") or url
+        return f"[{label}]({url})"
 
     return _RICH_LINK_TAG_RE.sub(replace, description)
 

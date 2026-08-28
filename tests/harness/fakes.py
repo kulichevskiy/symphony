@@ -522,8 +522,9 @@ class FakeGitHub:
         # The PR body carries the tracker link (`Relates to <url>`), so the
         # issue↔PR link is derived from it the way a human reader would.
         issue_id = ""
+        body_lines = body.splitlines()
         for issue in self._sim.issues.values():
-            if issue.url and issue.url in body:
+            if issue.url and f"Relates to {issue.url}" in body_lines:
                 issue_id = issue.id
                 break
         # Prefer the SHA already pushed to the fake origin; fall back to a
