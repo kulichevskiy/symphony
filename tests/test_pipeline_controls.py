@@ -575,6 +575,128 @@ async def test_retry_whose_side_effect_fails_releases_the_transition(
 
 
 @pytest.mark.asyncio
+async def test_retry_whose_side_effect_raises_non_linear_error_is_still_retryable(
+    tmp_path: Path,
+) -> None:
+    """A side effect failure that isn't a `LinearError` — a malformed payload,
+    cancellation, plain daemon death — must release the accepted transition
+    exactly like a `LinearError` does, instead of leaving a park stuck at a
+    pending outcome that no longer offers Retry."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = _cfg(tmp_path, binding)
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+
+        orch = _orchestrator(cfg, conn, _failing_implement_runner(workspace_path), workspace_path)
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+        await orch._track_implement_failed_wait(ISSUE_ID, "run-1", binding)  # noqa: SLF001
+        tracker = orch.tracker(binding)
+        tracker.move_issue.side_effect = RuntimeError("boom")  # type: ignore[attr-defined]
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await orch._handle_implement_failed_slash_intent(  # noqa: SLF001
+                ISSUE_ID, "run-1", _retry_intent("c-retry")
+            )
+
+        assert await controls.history(conn, ISSUE_ID) == []
+        released = await controls.snapshot(conn, ISSUE_ID)
+        assert released.outcome is OUTCOMES.FAILED
+        assert ACTIONS.RETRY in released.allowed_actions
+        assert await db.operator_waits.get(conn, ISSUE_ID) is not None
+
+        # The re-delivered command lands this time.
+        tracker.move_issue.side_effect = None  # type: ignore[attr-defined]
+        await orch._handle_implement_failed_slash_intent(  # noqa: SLF001
+            ISSUE_ID, "run-1", _retry_intent("c-retry-fresh")
+        )
+        assert [a.action for a in await controls.history(conn, ISSUE_ID)] == ["retry"]
+        assert await db.operator_waits.get(conn, ISSUE_ID) is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_sweep_reconciles_interrupted_retry_to_failed(
+    tmp_path: Path,
+) -> None:
+    """A process death between Retry's commit and the wait being cleared (the
+    tracker move landed, but the daemon died before `_clear_operator_wait` ran)
+    leaves a control row pending with the implement-failed park still open on
+    restart. The startup sweep must reconcile that back to failed so
+    Retry/Skip are offered again instead of a permanently stuck park — without
+    changing what a still-live process does with the same shape of row (see
+    `test_implement_retry_records_transition_then_starts_one_fresh_attempt`'s
+    duplicate-rejection check)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "run-1",
+            "failed",
+            ended_at="2026-08-27T09:05:00+00:00",
+            kind="agent_error",
+            detail="agent exited 2",
+        )
+        await _record_implement(conn, outcome=OUTCOMES.FAILED, reason="agent exited 2")
+        # The park predates the retry, same as the real ingress: created once,
+        # by the original implement failure.
+        await db.operator_waits.upsert(
+            conn,
+            issue_id=ISSUE_ID,
+            run_id="run-1",
+            kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="eng-1",
+            created_at="2026-08-27T09:05:00+00:00",
+        )
+        result = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.RETRY,
+            actor="tracker:c-retry",
+            action_id="c-retry",
+            at="2026-08-27T10:05:00+00:00",
+        )
+        assert result.accepted
+        # The side effect and `_clear_operator_wait` never ran: the park is
+        # still open, exactly as it would be after a crash right after commit.
+        pending = await controls.snapshot(conn, ISSUE_ID)
+        assert pending.outcome is OUTCOMES.PENDING
+
+        await controls.reconcile_interrupted_retries(conn, at="2026-08-27T11:00:00+00:00")
+
+        reconciled = await controls.snapshot(conn, ISSUE_ID)
+        assert reconciled.outcome is OUTCOMES.FAILED
+        assert ACTIONS.RETRY in reconciled.allowed_actions
+        assert reconciled.run_id == "run-1"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_implement_retry_the_control_model_rejects_changes_nothing(
     tmp_path: Path,
 ) -> None:

@@ -1122,6 +1122,7 @@ class _OrchestratorBase:
         """The single long-lived task. Cancellation-safe."""
         await self.warmup()
         await self._restore_operator_waits()
+        await controls.reconcile_interrupted_retries(self._conn, at=self._now().isoformat())
         await self._reconcile_orphaned_merge_runs(reason="startup")
         await self._reconcile_auto_recoverable_merge_waits(reason="startup")
         self._merge_wait_reconcile_task = asyncio.create_task(
@@ -1823,32 +1824,37 @@ class _OrchestratorBase:
         self._implement_failed_run_bindings[run_id] = binding
         # The park is also a pipeline-control fact: the implement stage's latest
         # attempt failed (SYM-244). Written in the wait's transaction
-        # (`commit=False`) so a restart can never find one without the other.
-        # `reason` is carried for the operator; what Retry/Skip/Abort the
-        # snapshot offers comes from the outcome alone.
-        await controls.record_stage_outcome(
-            self._conn,
-            issue_id,
-            stage=controls.IMPLEMENT_STAGE,
-            outcome=controls.AttemptOutcome.FAILED,
-            reason=await self._blocked_reason_for_run(run_id) or None,
-            run_id=run_id,
-            at=self._now().isoformat(),
-            commit=False,
-        )
-        await db.operator_waits.upsert(
-            self._conn,
-            issue_id=issue_id,
-            run_id=run_id,
-            kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
-            linear_team_key=binding.linear_team_key,
-            github_repo=binding.github_repo,
-            issue_label=binding.issue_label or "",
-            created_at=self._now().isoformat(),
-            provider=binding.provider,
-            tracker_provider=binding.tracker_provider,
-            tracker_site=binding.tracker_site,
-        )
+        # (`commit=False`, rolled back together on failure) so a restart can
+        # never find one without the other. `reason` is carried for the
+        # operator; what Retry/Skip/Abort the snapshot offers comes from the
+        # outcome alone.
+        try:
+            await controls.record_stage_outcome(
+                self._conn,
+                issue_id,
+                stage=controls.IMPLEMENT_STAGE,
+                outcome=controls.AttemptOutcome.FAILED,
+                reason=await self._blocked_reason_for_run(run_id) or None,
+                run_id=run_id,
+                at=self._now().isoformat(),
+                commit=False,
+            )
+            await db.operator_waits.upsert(
+                self._conn,
+                issue_id=issue_id,
+                run_id=run_id,
+                kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+                linear_team_key=binding.linear_team_key,
+                github_repo=binding.github_repo,
+                issue_label=binding.issue_label or "",
+                created_at=self._now().isoformat(),
+                provider=binding.provider,
+                tracker_provider=binding.tracker_provider,
+                tracker_site=binding.tracker_site,
+            )
+        except Exception:
+            await self._conn.rollback()
+            raise
 
     async def _track_implement_blocked_wait(
         self, issue_id: str, run_id: str, binding: RepoBinding

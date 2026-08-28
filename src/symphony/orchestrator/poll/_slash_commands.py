@@ -774,6 +774,12 @@ class _SlashCommandsMixin(_OrchestratorBase):
                     slash_text=self._slash_text(intent),
                     reason=f"could not move issue to ready state for retry: {e}",
                 ) from e
+            except BaseException:
+                # Any other failure (malformed payload, cancellation, daemon
+                # death) also means nothing carried the transition out; release
+                # it the same way so the park stays retryable, then propagate.
+                await controls.release(self._conn, accepted, at=self._now().isoformat())
+                raise
             body = resumed(
                 CommentVars(
                     stage="implement",

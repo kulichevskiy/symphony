@@ -232,6 +232,39 @@ async def record_stage_outcome(
     )
 
 
+async def reconcile_interrupted_retries(conn: aiosqlite.Connection, *, at: str) -> None:
+    """Startup sweep for a daemon that died between an accepted Retry's commit
+    and its side effect (moving the issue to ready, then clearing the park):
+    that leaves a `pipeline_controls` row pending with the implement-failed
+    wait still open, and nothing else will ever revisit it on its own. Reset
+    any such row back to failed on the way up so Retry/Skip are offered again
+    instead of a permanently stuck park.
+
+    Scoped to startup (rather than folded into `snapshot`) so a still-live
+    process — where a wait reappearing while an attempt is genuinely pending
+    would be a stale/duplicate signal, not an interrupted retry — keeps
+    rejecting it.
+    """
+    for wait in await db.operator_waits.list_all(conn):
+        if wait.kind != db.operator_waits.KIND_IMPLEMENT_FAILED:
+            continue
+        row = await db.pipeline_controls.get(conn, wait.issue_id)
+        pending = row is not None and row.outcome == str(AttemptOutcome.PENDING)
+        if row is None or row.stage != IMPLEMENT_STAGE or not pending:
+            continue
+        run = await db.runs.get_with_issue(conn, wait.run_id)
+        detail = run.run.termination_detail if run is not None else None
+        await record_stage_outcome(
+            conn,
+            wait.issue_id,
+            stage=IMPLEMENT_STAGE,
+            outcome=AttemptOutcome.FAILED,
+            reason=detail or None,
+            run_id=wait.run_id,
+            at=at,
+        )
+
+
 def _next_mode_and_outcome(
     current: ControlSnapshot, action: ControlAction
 ) -> tuple[PipelineMode, AttemptOutcome]:
@@ -306,6 +339,16 @@ async def apply(
             ts=at,
             commit=False,
         )
+    except sqlite3.IntegrityError:
+        # A racing insert of the same action id beat the check above. Same
+        # answer: already applied, and nothing of this call survives.
+        await conn.rollback()
+        return ActionResult(
+            accepted=False,
+            snapshot=current,
+            rejection=f"{action.value} {action_id} was already applied",
+        )
+    try:
         await db.pipeline_controls.put(
             conn,
             issue_id=issue_id,
@@ -319,15 +362,6 @@ async def apply(
             commit=False,
         )
         await conn.commit()
-    except sqlite3.IntegrityError:
-        # A racing insert of the same action id beat the check above. Same
-        # answer: already applied, and nothing of this call survives.
-        await conn.rollback()
-        return ActionResult(
-            accepted=False,
-            snapshot=current,
-            rejection=f"{action.value} {action_id} was already applied",
-        )
     except Exception:
         # Never leave half a transition behind for a later unrelated commit to
         # flush: either both rows land or neither does.
@@ -407,6 +441,7 @@ __all__ = [
     "allowed_actions",
     "apply",
     "history",
+    "reconcile_interrupted_retries",
     "record_stage_outcome",
     "release",
     "snapshot",
