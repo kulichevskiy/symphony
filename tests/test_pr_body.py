@@ -236,6 +236,38 @@ def test_truncation_closes_a_four_backtick_fence_without_a_stray_three_backtick_
     assert head.endswith("\n````")
 
 
+def test_normal_size_body_closes_an_unterminated_code_fence() -> None:
+    """A short description that itself never closes a ``` fence must not
+    swallow the `---`/tracker-link footer inside that code block."""
+    description = "```\nsome code"
+    body = build_pr_body(_issue(description))
+    assert body == f"{description}\n```\n\n{FOOTER}"
+    assert body.count("```") % 2 == 0
+
+
+def test_truncation_closes_an_html_comment_left_open_by_the_cut() -> None:
+    """The full description properly closes its `<!-- -->` comment, but the
+    truncation cut lands between the opener and the closer — the retained
+    prefix must get its own `-->` so the notice/footer aren't swallowed."""
+    line = "y" * 99
+    description = "<!--\n" + "\n".join([line] * 2000) + "\n-->"
+    body = build_pr_body(_issue(description))
+    assert len(body) <= PR_BODY_MAX_CHARS
+    assert body.endswith(FOOTER)
+    head, _, _ = body.partition("\n\nDescription truncated")
+    assert head.endswith("\n-->")
+    assert head.count("<!--") == head.count("-->")
+
+
+def test_backtick_delimited_tag_with_a_longer_closing_run_is_rewritten() -> None:
+    """A single opening backtick followed only by a longer (double) backtick
+    run has no CommonMark code span — the tag is in prose, not code, and must
+    still be converted to a Markdown link."""
+    description = '`<issue url="https://l/9">ENG-9</issue>``'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == "`[ENG-9](https://l/9)``"
+
+
 def test_indented_code_block_at_the_start_keeps_its_indentation() -> None:
     description = "    def f():\n        return 1"
     assert build_pr_body(_issue(description)) == f"{description}\n\n{FOOTER}"

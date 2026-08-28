@@ -56,6 +56,12 @@ _FENCE_MARKER_RE = re.compile(r"^ {0,3}(?P<marker>`{3,}|~{3,})(?P<rest>.*)$")
 # block nested inside a block quote, which `_FENCE_MARKER_RE` alone misses
 # since it only allows plain leading spaces before the fence run.
 _BLOCKQUOTE_PREFIX_RE = re.compile(r"^(?: {0,3}>[ \t]?)+")
+# An HTML comment delimiter. CommonMark comments don't nest: the first `-->`
+# after an `<!--` closes it, regardless of any `<!--` seen in between. Used to
+# track comment open/close state when truncating, so a cut that lands inside
+# an otherwise-valid `<!-- ... -->` doesn't strand the truncation notice and
+# footer inside the (now unterminated) comment.
+_HTML_COMMENT_TOKEN_RE = re.compile(r"<!--|-->")
 # CommonMark indented code block: 4+ spaces or a tab, then non-whitespace.
 _INDENTED_CODE_LINE_RE = re.compile(r"^(?: {4,}|\t)\S")
 # Linear rich links: `<issue …>ENG-1</issue>`, `<pull-request … />`. The bare
@@ -138,6 +144,7 @@ def build_pr_body(issue: LinearIssue) -> str:
     description = _trim_boundary_blank_lines(_linear_rich_links_to_markdown(issue.description))
     if not description:
         return footer
+    description = _close_full_dangling_fence(description)
     footer = f"---\n\n{footer}"
     body = f"{description}\n\n{footer}"
     if len(body) <= PR_BODY_MAX_CHARS and len(body.encode("utf-8")) <= PR_BODY_MAX_BYTES:
@@ -146,8 +153,25 @@ def build_pr_body(issue: LinearIssue) -> str:
     char_budget = PR_BODY_MAX_CHARS - len(tail)
     byte_budget = PR_BODY_MAX_BYTES - len(tail.encode("utf-8"))
     kept = _head_lines_within(description, char_budget, byte_budget)
-    kept = _close_dangling_fence(kept, char_budget, byte_budget)
+    kept = _close_dangling_markup(kept, char_budget, byte_budget)
     return f"{kept}{tail}"
+
+
+def _close_full_dangling_fence(text: str) -> str:
+    """Append the fence closer if `text` itself ends inside an unterminated bare fence.
+
+    Covers the direct-return path (a body that fits without truncation): a
+    ticket description that never closes a fence it opened would otherwise
+    swallow the `---`/tracker-link footer inside that code block. The
+    truncation path doesn't need this — it closes a fence at the cut point
+    via `_close_dangling_markup` regardless of whether the source description
+    was itself well-formed.
+    """
+    lines = text.split("\n")
+    closer = _fence_states_per_line(lines)[-1]
+    if closer is None:
+        return text
+    return f"{text}\n{closer}"
 
 
 def _trim_boundary_blank_lines(text: str) -> str:
@@ -199,10 +223,39 @@ def _fence_states_per_line(lines: list[str]) -> list[str | None]:
     return states
 
 
-def _close_dangling_fence(kept: str, char_budget: int, byte_budget: int) -> str:
-    """Append the closer for a fence `kept` was cut inside of, trimming further if needed."""
+def _html_comment_states_per_line(lines: list[str], fence_states: list[str | None]) -> list[bool]:
+    """Per-prefix-length HTML-comment-open flag for `lines[0:i+1]` at index `i`.
+
+    Mirrors `_fence_states_per_line`'s single-forward-scan shape: comment
+    state carries across lines, toggling on each `<!--`/`-->` token in
+    document order (CommonMark comments don't nest, so a `-->` always closes
+    regardless of intervening `<!--`). `fence_states` (aligned 1:1 with
+    `lines`) skips lines covered by an open bare fence, since a literal
+    `<!--`/`-->` inside fenced code is not an HTML comment.
+    """
+    states: list[bool] = []
+    open_comment = False
+    for line, fence_state in zip(lines, fence_states, strict=True):
+        if fence_state is None:
+            for token in _HTML_COMMENT_TOKEN_RE.findall(line):
+                open_comment = token == "<!--"
+        states.append(open_comment)
+    return states
+
+
+def _close_dangling_markup(kept: str, char_budget: int, byte_budget: int) -> str:
+    """Append closer(s) for a fence and/or HTML comment `kept` was cut inside of.
+
+    Trims further lines off the tail until whichever closers apply fit
+    alongside the truncation notice/footer that follows. Handling both in one
+    pass (rather than closing the fence, then separately checking for a
+    dangling comment) means a further trim triggered by the comment closer
+    can't undo the fence closer that a prior, longer `n` already accounted
+    for.
+    """
     lines = kept.split("\n")
-    states = _fence_states_per_line(lines)
+    fence_states = _fence_states_per_line(lines)
+    comment_states = _html_comment_states_per_line(lines, fence_states)
     char_len = [0] * (len(lines) + 1)
     byte_len = [0] * (len(lines) + 1)
     for i, line in enumerate(lines):
@@ -212,9 +265,10 @@ def _close_dangling_fence(kept: str, char_budget: int, byte_budget: int) -> str:
 
     n = len(lines)
     while n > 0:
-        closer = states[n - 1]
-        if closer is None:
+        parts = [p for p in (fence_states[n - 1], "-->" if comment_states[n - 1] else None) if p]
+        if not parts:
             break
+        closer = "\n".join(parts)
         if (
             char_len[n] + 1 + len(closer) <= char_budget
             and byte_len[n] + 1 + len(closer.encode("utf-8")) <= byte_budget
@@ -270,8 +324,12 @@ def _escape_markdown_link_label(label: str) -> str:
 # attempted once (not once per backtick in it), and the possessive `++`/`*+`
 # quantifiers forbid backtracking into an already-matched run — together
 # these keep a long backtick run that never finds its match linear instead of
-# quadratic.
-_INLINE_CODE_SPAN_RE = re.compile(r"(?<!`)(?P<tick>`++)(?:(?!(?P=tick))[^\n])*+(?P=tick)")
+# quadratic. The trailing `(?!`)` rejects a closing run that is longer than
+# the opener (e.g. opening on a single backtick but only finding a run of
+# two): CommonMark requires the closer to be a backtick string of *exactly*
+# the opener's length, not merely at least that long, so a too-long run is no
+# closer at all and the possessive body can't backtrack to try a shorter one.
+_INLINE_CODE_SPAN_RE = re.compile(r"(?<!`)(?P<tick>`++)(?:(?!(?P=tick))[^\n])*+(?P=tick)(?!`)")
 
 
 def _fence_open(line: str) -> tuple[str, int] | None:
