@@ -1133,3 +1133,23 @@ def test_run_log_writer_keeps_logging_when_receipts_sidecar_cannot_open(
         writer.write("world")
 
     assert log_path.read_text() == "hello\nworld\n"
+
+
+def test_run_log_writer_keeps_logging_when_receipts_write_fails(
+    tmp_path: Path,
+) -> None:
+    """If the sidecar opens fine but a later write raises `OSError` (a
+    transient filesystem error, a per-process file limit, ...), the run log
+    must keep appending rather than the write blowing up the whole run."""
+    log_path = tmp_path / "run.log"
+
+    with RunLogWriter(log_path) as writer:
+        writer.write("hello")
+        broken = MagicMock()
+        broken.write.side_effect = OSError("disk full")
+        writer._receipts = broken  # noqa: SLF001
+        writer.write("world")
+        assert writer._receipts is None  # noqa: SLF001
+        writer.write("again")
+
+    assert log_path.read_text() == "hello\nworld\nagain\n"

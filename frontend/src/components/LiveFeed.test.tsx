@@ -206,7 +206,7 @@ describe("LiveFeed", () => {
     expect(text.indexOf("fresh line")).toBeLessThan(text.indexOf("history line"));
   });
 
-  it("bounds the live tail, folding old overflow into history instead of growing forever", async () => {
+  it("bounds the live tail by evicting the oldest overflow instead of growing forever", async () => {
     fetchRunEventsMock.mockResolvedValue(page({ events: [message("history line")] }));
     const emitters: Array<(event: LiveEvent) => void> = [];
     streamRunMock.mockImplementation(async (_runId, options) => {
@@ -225,14 +225,12 @@ describe("LiveFeed", () => {
       expect(within(view.container).getByText("live 100")).toBeTruthy(),
     );
 
-    // The oldest live event (live 0) overflowed out of the tail and into
-    // history, alongside the original page — both still render, in order,
-    // with nothing lost and no gap opened.
-    expect(within(view.container).getByText("live 0")).toBeTruthy();
+    // The oldest live event (live 0) was evicted out of the tail, not folded
+    // into history — the page below it is untouched and unaffected in size.
+    expect(within(view.container).queryByText("live 0")).toBeNull();
     expect(within(view.container).getByText("history line")).toBeTruthy();
     const text = view.container.textContent ?? "";
-    expect(text.indexOf("live 100")).toBeLessThan(text.indexOf("live 0"));
-    expect(text.indexOf("live 0")).toBeLessThan(text.indexOf("history line"));
+    expect(text.indexOf("live 100")).toBeLessThan(text.indexOf("history line"));
   });
 
   it("keeps the operator's scroll offset on a live prepend, but not on a load-more append", async () => {

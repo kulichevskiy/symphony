@@ -19,9 +19,9 @@ import {
 import { cn } from "@/lib/utils";
 
 const RECONNECT_DELAY_MS = 2000;
-// Bounds how many live-arrived events `tailItems` holds before the oldest
-// overflow into `history`. Matches the backend's page size so a chatty,
-// long-open run never grows the tail without limit.
+// Bounds how many live-arrived events `tailItems` holds; the oldest are
+// evicted once the tail grows past this, so a chatty, long-open run never
+// grows `items` without limit. Matches the backend's page size.
 const MAX_TAIL_ITEMS = 100;
 
 type FeedStatus = "connecting" | "live" | "ended" | "error";
@@ -49,9 +49,9 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
  * `live` mode — tails the log from the byte offset that page was read at,
  * inserting fresh events at the top. Because history is paged rather than
  * replayed from byte 0, opening a long run no longer builds its whole DOM up
- * front. Live arrivals past `MAX_TAIL_ITEMS` fold into `history` instead of
- * being dropped, so a run left open for a long, chatty stretch keeps a
- * bounded tail without losing any events or opening a gap.
+ * front. Live arrivals past `MAX_TAIL_ITEMS` evict the oldest tail item
+ * rather than folding into `history`, so a run left open for a long, chatty
+ * stretch keeps `items` bounded instead of growing without limit.
  *
  * In non-live mode (a finished run) the tail drains the log once and never
  * reconnects. Token ticks fold into a single running total instead of feed
@@ -155,10 +155,7 @@ function useActivityFeed(runId: string, enabled: boolean, live: boolean) {
                   { key: `local-${localKey.current++}`, event },
                   ...tailRef.current,
                 ];
-                if (next.length > MAX_TAIL_ITEMS) {
-                  const overflow = next.splice(MAX_TAIL_ITEMS);
-                  setHistory((prev) => [...overflow, ...prev]);
-                }
+                next.length = Math.min(next.length, MAX_TAIL_ITEMS);
                 tailRef.current = next;
                 setTailItems(next);
               }

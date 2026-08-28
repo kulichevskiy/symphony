@@ -38,9 +38,10 @@ class RunLogWriter:
     Both files are flushed per line so a live tail sees output (and its time)
     while the run is still in progress. The log is the contract other
     consumers replay; the receipts sidecar is best-effort, so a sidecar that
-    can't be opened (its directory disallows new files, the process is out
-    of file descriptors, ...) does not stop the log itself from being
-    written — the run just gets no receipt times for that sidecar's lines.
+    can't be opened or fails on a later write (its directory disallows new
+    files, the process is out of file descriptors, a transient filesystem
+    error, ...) does not stop the log itself from being written — the run
+    just gets no receipt times for that sidecar's lines from that point on.
     """
 
     def __init__(self, log_path: Path) -> None:
@@ -104,15 +105,27 @@ class RunLogWriter:
 
         If the sidecar failed to open (see `open`), `self._receipts` is
         `None` and this simply skips the receipt line — the log write below
-        still happens.
+        still happens. A sidecar that opened fine but fails on a later write
+        or flush (transient filesystem error, descriptor limit, ...) is
+        handled the same way: the failure is logged and the sidecar is
+        disabled for the rest of the run rather than raised, since losing
+        receipt times must never stop the run log itself from being written.
         """
         if self._log is None:
             raise RuntimeError("RunLogWriter used outside its context")
         data = line + "\n"
         offset = self._offset + len(data.encode("utf-8"))
         if self._receipts is not None:
-            self._receipts.write(f"{offset} {self._now().isoformat()}\n")
-            self._receipts.flush()
+            try:
+                self._receipts.write(f"{offset} {self._now().isoformat()}\n")
+                self._receipts.flush()
+            except OSError:
+                log.warning(
+                    "receipts sidecar write failed for %s; disabling receipt times for this run",
+                    self._log_path,
+                    exc_info=True,
+                )
+                self._receipts = None
         self._log.write(data)
         self._log.flush()
         self._offset = offset
