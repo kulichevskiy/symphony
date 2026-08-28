@@ -99,9 +99,15 @@ def _write_fix_log(fix_log_path: Path | None, text: str) -> None:
         # it and its receipt-time sidecar first — otherwise a stale sidecar
         # left by a preceding tee (`collect_runner_output`) would key an
         # entry at the note's new, smaller end offset and reuse a much older
-        # receipt time instead of stamping this write's real one.
+        # receipt time instead of stamping this write's real one. The sidecar
+        # deletion is best-effort: a directory that allows writes but
+        # forbids deletes would otherwise raise here and abort before the
+        # log itself gets truncated and rewritten below.
+        try:
+            receipts_path(fix_log_path).unlink(missing_ok=True)  # noqa: ASYNC240
+        except OSError:
+            pass
         fix_log_path.write_text("", encoding="utf-8")  # noqa: ASYNC240
-        receipts_path(fix_log_path).unlink(missing_ok=True)  # noqa: ASYNC240
         with RunLogWriter(fix_log_path) as writer:
             writer.write(text)
     except OSError:
