@@ -48,10 +48,16 @@ _PR_BODY_TRUNCATION_NOTICE = "Description truncated; see the source ticket"
 # Linear rich links: `<issue …>ENG-1</issue>`, `<pull-request … />`. The bare
 # attrs branch excludes quotes so it can never overlap with the quoted
 # branches — an unbalanced quote then just fails the match instead of
-# backtracking exponentially over the ambiguous alternation.
+# backtracking exponentially over the ambiguous alternation. `selfclose`
+# short-circuits the trailing text/close-tag group entirely, so a
+# self-closing tag can never reach forward and swallow a later same-name
+# tag. The text group's lookahead is barred from crossing another same-name
+# tag (open or close), so an unpaired/url-less tag matches on its own
+# instead of stretching to the next real tag's close — this also bounds the
+# forward scan per tag.
 _RICH_LINK_TAG_RE = re.compile(
-    r"<(?P<tag>issue|pull-request)(?P<attrs>\s(?:\"[^\"]*\"|'[^']*'|[^<>\"'])*?)?\s*/?>"
-    r"(?:(?P<text>(?:[^<]|<(?!/(?P=tag)>))*)</(?P=tag)>)?",
+    r"<(?P<tag>issue|pull-request)(?P<attrs>\s(?:\"[^\"]*\"|'[^']*'|[^<>\"'])*?)?\s*(?P<selfclose>/)?>"
+    r"(?(selfclose)|(?:(?P<text>(?:[^<]|<(?!/?(?P=tag)\b))*)</(?P=tag)>)?)",
     re.IGNORECASE,
 )
 _TAG_ATTR_RE = re.compile(r"([\w-]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)')")
@@ -171,7 +177,7 @@ def _linear_rich_links_to_markdown(description: str) -> str:
 
     def replace(match: re.Match[str]) -> str:
         attrs: dict[str, str] = {
-            name: double or single
+            name.lower(): double or single
             for name, double, single in _TAG_ATTR_RE.findall(match["attrs"] or "")
         }
         url = attrs.get("url", "")

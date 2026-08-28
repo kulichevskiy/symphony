@@ -146,3 +146,23 @@ def test_rich_link_text_containing_an_angle_bracket_does_not_leak_a_close_tag() 
     body = build_pr_body(_issue(description))
     assert "</issue>" not in body
     assert "[see <https://x.invalid>](https://l/9)" in body
+
+
+def test_self_closing_tag_does_not_swallow_a_later_same_name_tag() -> None:
+    """A self-closing `<issue … />` must not reach forward and consume a
+    later, unrelated paired `<issue …>…</issue>` of the same name."""
+    description = '<issue url="https://l/1"/> and <issue url="https://l/2">ENG-2</issue>'
+    result = _linear_rich_links_to_markdown(description)
+    assert result == "[https://l/1](https://l/1) and [ENG-2](https://l/2)"
+
+
+def test_unclosed_url_less_tag_does_not_swallow_a_following_real_rich_link() -> None:
+    """A url-less, tag-shaped `<issue …>` in prose must match on its own and
+    not stretch its `text` group forward to a later same-name close tag that
+    belongs to a genuine rich link."""
+    description = (
+        "Convert `<issue …>` tags. Blocked by "
+        '<issue url="https://l/9">ENG-9</issue>.'
+    )
+    result = _linear_rich_links_to_markdown(description)
+    assert result == "Convert `<issue …>` tags. Blocked by [ENG-9](https://l/9)."
