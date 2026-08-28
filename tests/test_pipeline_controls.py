@@ -839,6 +839,95 @@ async def test_concurrent_retries_cannot_both_be_accepted(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_concurrent_applies_for_different_issues_do_not_corrupt_each_other(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`apply` for two *different* issues is only serialized by the per-issue
+    lock, which does not stop them from racing on the one connection's
+    SAVEPOINT-to-commit window. A failure in one call's `put` must roll back
+    only that call's own writes, must leave the other issue's action and
+    control rows untouched, and must not raise `sqlite3.OperationalError` out
+    of either call."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        issue_a, issue_b = ISSUE_ID, "iss-2"
+        await _seed_issue(conn)
+        await db.issues.upsert(
+            conn,
+            id=issue_b,
+            identifier="ENG-2",
+            title="Add authorization",
+            team_key="ENG",
+        )
+        await controls.record_stage_outcome(
+            conn,
+            issue_a,
+            stage="implement",
+            outcome=OUTCOMES.FAILED,
+            reason=None,
+            run_id="run-1",
+            at="2026-08-27T10:00:00+00:00",
+        )
+        await controls.record_stage_outcome(
+            conn,
+            issue_b,
+            stage="implement",
+            outcome=OUTCOMES.FAILED,
+            reason=None,
+            run_id="run-2",
+            at="2026-08-27T10:00:00+00:00",
+        )
+
+        real_put = db.pipeline_controls.put
+        failed_once = False
+
+        async def _flaky_put(
+            conn: aiosqlite.Connection, *, issue_id: str, **kwargs: object
+        ) -> None:
+            nonlocal failed_once
+            if issue_id == issue_b and not failed_once:
+                failed_once = True
+                raise RuntimeError("boom")
+            await real_put(conn, issue_id=issue_id, **kwargs)
+
+        monkeypatch.setattr(db.pipeline_controls, "put", _flaky_put)
+
+        results = await asyncio.gather(
+            controls.apply(
+                conn,
+                issue_a,
+                ACTIONS.RETRY,
+                actor="tracker:c-1",
+                action_id="c-1",
+                at="2026-08-27T10:01:00+00:00",
+            ),
+            controls.apply(
+                conn,
+                issue_b,
+                ACTIONS.RETRY,
+                actor="tracker:c-2",
+                action_id="c-2",
+                at="2026-08-27T10:01:01+00:00",
+            ),
+            return_exceptions=True,
+        )
+
+        for result in results:
+            if isinstance(result, BaseException):
+                assert isinstance(result, RuntimeError)
+
+        row_a = await db.pipeline_controls.get(conn, issue_a)
+        assert row_a is not None and row_a.outcome == str(OUTCOMES.PENDING)
+        assert [row.action_id for row in await controls.history(conn, issue_a)] == ["c-1"]
+
+        row_b = await db.pipeline_controls.get(conn, issue_b)
+        assert row_b is not None and row_b.outcome == str(OUTCOMES.FAILED)
+        assert await controls.history(conn, issue_b) == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_track_implement_failed_wait_rolls_back_on_upsert_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1828,6 +1828,15 @@ class _OrchestratorBase:
         # never find one without the other. `reason` is carried for the
         # operator; what Retry/Skip/Abort the snapshot offers comes from the
         # outcome alone.
+        #
+        # A uniquely-named SAVEPOINT scopes the undo to just these two writes:
+        # `self._conn` is shared by the whole daemon, and `controls.apply` can
+        # be mid-transition on it (inside its own SAVEPOINT, not under
+        # `_comment_event_lock`) when this dispatch-task handler runs. A bare
+        # `self._conn.rollback()` would end the *whole* transaction, wiping out
+        # that in-flight apply along with its own still-open SAVEPOINT.
+        savepoint = f"implement_failed_wait_{uuid.uuid4().hex}"
+        await self._conn.execute(f"SAVEPOINT {savepoint}")
         try:
             await controls.record_stage_outcome(
                 self._conn,
@@ -1851,10 +1860,14 @@ class _OrchestratorBase:
                 provider=binding.provider,
                 tracker_provider=binding.tracker_provider,
                 tracker_site=binding.tracker_site,
+                commit=False,
             )
         except Exception:
-            await self._conn.rollback()
+            await self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            await self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
             raise
+        await self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        await self._conn.commit()
 
     async def _track_implement_blocked_wait(
         self, issue_id: str, run_id: str, binding: RepoBinding

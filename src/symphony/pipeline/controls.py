@@ -20,7 +20,12 @@ Two rules hold the design together:
     action" or "action recorded" — never a dispatched command with no trace.
     `action_id` (the ingress's own request identity, e.g. a tracker comment id)
     is part of the actions primary key, so a replay is rejected instead of
-    dispatched twice.
+    dispatched twice. This is guaranteed against other `apply`/`release` calls
+    in this module — including ones for a different issue, which is why the
+    module also serializes their SAVEPOINT-to-commit windows against each
+    other — but not against an unrelated `commit=True` DAO call elsewhere on
+    the same shared connection; such a call still flushes whatever this
+    module has written so far as part of its own commit.
 
 Only the implement stage records outcomes today — the tracer through an
 implement failure. Later slices extend `record_stage_outcome` to the remaining
@@ -32,6 +37,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -50,6 +56,18 @@ _issue_locks: dict[str, asyncio.Lock] = {}
 
 def _lock(issue_id: str) -> asyncio.Lock:
     return _issue_locks.setdefault(issue_id, asyncio.Lock())
+
+
+# `apply`/`release` for *different* issues are only serialized by `_lock`
+# per-issue, but they all run their SAVEPOINT-to-COMMIT window on the one
+# `conn` shared by the whole daemon. A savepoint name alone is not enough to
+# keep two such windows from colliding: a foreign call's ROLLBACK TO/RELEASE
+# for the same name can target the wrong (innermost) nested savepoint, and
+# even with unique names, a foreign call's `conn.commit()` mid-window ends the
+# whole transaction and destroys a still-open savepoint out from under it.
+# This lock forces every apply/release savepoint window in the daemon to run
+# one at a time, regardless of issue, so no such interleaving can happen.
+_write_lock = asyncio.Lock()
 
 
 class PipelineMode(StrEnum):
@@ -370,58 +388,65 @@ async def apply(
         # A SAVEPOINT scopes the undo to just these two writes: `conn` is one
         # connection shared by the whole daemon, so a bare `conn.rollback()`
         # would discard any other, unrelated work some other coroutine has
-        # written to the same not-yet-committed transaction.
-        await conn.execute("SAVEPOINT control_apply")
-        try:
-            await db.pipeline_controls.record_action(
-                conn,
-                issue_id=issue_id,
-                action_id=action_id,
-                action=str(action),
-                actor=actor,
-                from_mode=str(current.mode),
-                to_mode=str(mode),
-                from_outcome=str(current.outcome),
-                to_outcome=str(outcome),
-                stage=current.stage,
-                run_id=current.run_id,
-                ts=at,
-                commit=False,
-            )
-        except sqlite3.IntegrityError:
-            await conn.execute("ROLLBACK TO SAVEPOINT control_apply")
-            await conn.execute("RELEASE SAVEPOINT control_apply")
-            # Only a racing insert of the same action id is reported as already
-            # applied; any other constraint violation (e.g. a foreign-key failure
-            # on a missing issue) is a real error and must not be swallowed.
-            if await db.pipeline_controls.get_action(conn, issue_id, action_id) is None:
+        # written to the same not-yet-committed transaction. The name is
+        # unique per call and the whole window runs under `_write_lock` (see
+        # its docstring) so a concurrent apply/release for a *different* issue
+        # can neither steal this ROLLBACK TO/RELEASE nor commit out from under
+        # this still-open savepoint.
+        savepoint = f"control_apply_{uuid.uuid4().hex}"
+        async with _write_lock:
+            await conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                await db.pipeline_controls.record_action(
+                    conn,
+                    issue_id=issue_id,
+                    action_id=action_id,
+                    action=str(action),
+                    actor=actor,
+                    from_mode=str(current.mode),
+                    to_mode=str(mode),
+                    from_outcome=str(current.outcome),
+                    to_outcome=str(outcome),
+                    stage=current.stage,
+                    run_id=current.run_id,
+                    ts=at,
+                    commit=False,
+                )
+            except sqlite3.IntegrityError:
+                await conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                await conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                # Only a racing insert of the same action id is reported as
+                # already applied; any other constraint violation (e.g. a
+                # foreign-key failure on a missing issue) is a real error and
+                # must not be swallowed.
+                if await db.pipeline_controls.get_action(conn, issue_id, action_id) is None:
+                    raise
+                return ActionResult(
+                    accepted=False,
+                    snapshot=current,
+                    rejection=f"{action.value} {action_id} was already applied",
+                )
+            try:
+                await db.pipeline_controls.put(
+                    conn,
+                    issue_id=issue_id,
+                    mode=str(mode),
+                    stage=current.stage,
+                    outcome=str(outcome),
+                    reason=reason,
+                    run_id=run_id,
+                    actor=actor,
+                    updated_at=at,
+                    commit=False,
+                )
+            except Exception:
+                # Never leave half a transition behind for a later unrelated
+                # commit to flush: either both rows land or neither does.
+                await conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                await conn.execute(f"RELEASE SAVEPOINT {savepoint}")
                 raise
-            return ActionResult(
-                accepted=False,
-                snapshot=current,
-                rejection=f"{action.value} {action_id} was already applied",
-            )
-        try:
-            await db.pipeline_controls.put(
-                conn,
-                issue_id=issue_id,
-                mode=str(mode),
-                stage=current.stage,
-                outcome=str(outcome),
-                reason=reason,
-                run_id=run_id,
-                actor=actor,
-                updated_at=at,
-                commit=False,
-            )
-        except Exception:
-            # Never leave half a transition behind for a later unrelated commit
-            # to flush: either both rows land or neither does.
-            await conn.execute("ROLLBACK TO SAVEPOINT control_apply")
-            await conn.execute("RELEASE SAVEPOINT control_apply")
-            raise
-        await conn.execute("RELEASE SAVEPOINT control_apply")
-        await conn.commit()
+            await conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            await conn.commit()
         return ActionResult(
             accepted=True,
             snapshot=_snapshot(
@@ -458,33 +483,37 @@ async def release(
         # Scoped like `apply`'s SAVEPOINT: `conn` is the one connection shared
         # by the whole daemon, so a bare `conn.rollback()` here would discard
         # any other, unrelated work some other coroutine has written to the
-        # same not-yet-committed transaction.
-        await conn.execute("SAVEPOINT control_release")
-        try:
-            await db.pipeline_controls.delete_action(
-                conn,
-                issue_id=result.snapshot.issue_id,
-                action_id=result.action_id,
-                commit=False,
-            )
-            await db.pipeline_controls.put(
-                conn,
-                issue_id=previous.issue_id,
-                mode=str(previous.mode),
-                stage=previous.stage,
-                outcome=str(previous.outcome),
-                reason=previous.reason,
-                run_id=previous.run_id,
-                actor=None,
-                updated_at=at,
-                commit=False,
-            )
-        except Exception:
-            await conn.execute("ROLLBACK TO SAVEPOINT control_release")
-            await conn.execute("RELEASE SAVEPOINT control_release")
-            raise
-        await conn.execute("RELEASE SAVEPOINT control_release")
-        await conn.commit()
+        # same not-yet-committed transaction. Unique name plus `_write_lock`
+        # for the same reason `apply` needs both — see `_write_lock`'s
+        # docstring.
+        savepoint = f"control_release_{uuid.uuid4().hex}"
+        async with _write_lock:
+            await conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                await db.pipeline_controls.delete_action(
+                    conn,
+                    issue_id=result.snapshot.issue_id,
+                    action_id=result.action_id,
+                    commit=False,
+                )
+                await db.pipeline_controls.put(
+                    conn,
+                    issue_id=previous.issue_id,
+                    mode=str(previous.mode),
+                    stage=previous.stage,
+                    outcome=str(previous.outcome),
+                    reason=previous.reason,
+                    run_id=previous.run_id,
+                    actor=None,
+                    updated_at=at,
+                    commit=False,
+                )
+            except Exception:
+                await conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                await conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
+            await conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            await conn.commit()
 
 
 async def history(
