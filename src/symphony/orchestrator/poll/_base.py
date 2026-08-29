@@ -1835,39 +1835,44 @@ class _OrchestratorBase:
         # `_comment_event_lock`) when this dispatch-task handler runs. A bare
         # `self._conn.rollback()` would end the *whole* transaction, wiping out
         # that in-flight apply along with its own still-open SAVEPOINT.
+        # `controls.guard_writes` puts this whole window under the same
+        # per-issue lock plus shared write lock `controls.apply`/`release`
+        # use, so this SAVEPOINT and one of theirs for the same issue can
+        # never interleave on the connection either.
         savepoint = f"implement_failed_wait_{uuid.uuid4().hex}"
-        await self._conn.execute(f"SAVEPOINT {savepoint}")
-        try:
-            await controls.record_stage_outcome(
-                self._conn,
-                issue_id,
-                stage=controls.IMPLEMENT_STAGE,
-                outcome=controls.AttemptOutcome.FAILED,
-                reason=await self._blocked_reason_for_run(run_id) or None,
-                run_id=run_id,
-                at=self._now().isoformat(),
-                commit=False,
-            )
-            await db.operator_waits.upsert(
-                self._conn,
-                issue_id=issue_id,
-                run_id=run_id,
-                kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
-                linear_team_key=binding.linear_team_key,
-                github_repo=binding.github_repo,
-                issue_label=binding.issue_label or "",
-                created_at=self._now().isoformat(),
-                provider=binding.provider,
-                tracker_provider=binding.tracker_provider,
-                tracker_site=binding.tracker_site,
-                commit=False,
-            )
-        except Exception:
-            await self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        async with controls.guard_writes(issue_id):
+            await self._conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                await controls.record_stage_outcome(
+                    self._conn,
+                    issue_id,
+                    stage=controls.IMPLEMENT_STAGE,
+                    outcome=controls.AttemptOutcome.FAILED,
+                    reason=await self._blocked_reason_for_run(run_id) or None,
+                    run_id=run_id,
+                    at=self._now().isoformat(),
+                    commit=False,
+                )
+                await db.operator_waits.upsert(
+                    self._conn,
+                    issue_id=issue_id,
+                    run_id=run_id,
+                    kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+                    linear_team_key=binding.linear_team_key,
+                    github_repo=binding.github_repo,
+                    issue_label=binding.issue_label or "",
+                    created_at=self._now().isoformat(),
+                    provider=binding.provider,
+                    tracker_provider=binding.tracker_provider,
+                    tracker_site=binding.tracker_site,
+                    commit=False,
+                )
+            except Exception:
+                await self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                await self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
             await self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-            raise
-        await self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
-        await self._conn.commit()
+            await self._conn.commit()
 
     async def _track_implement_blocked_wait(
         self, issue_id: str, run_id: str, binding: RepoBinding

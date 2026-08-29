@@ -430,14 +430,15 @@ def _retry_intent(comment_id: str, *, author: str = "") -> SlashIntent:
 
 def test_control_actor_falls_back_to_web_origin_for_web_button_commands() -> None:
     # A web-button command carries a synthetic `web-`-prefixed comment id and
-    # no author; the actor is the origin tag plus that same comment id.
+    # no author; the actor is the origin tag plus the comment id with that
+    # prefix stripped, not a doubled `web-` re-encoding of it.
     intent = SlashIntent(
         kind=SlashKind.RETRY,
         comment_id="web-c-retry",
         created_at="2026-08-27T10:00:00+00:00",
         text="$retry",
     )
-    assert Orchestrator._control_actor(intent) == "web:web-c-retry"  # noqa: SLF001
+    assert Orchestrator._control_actor(intent) == "web:c-retry"  # noqa: SLF001
 
 
 def _cfg(tmp_path: Path, binding: object) -> Config:
@@ -923,6 +924,69 @@ async def test_concurrent_applies_for_different_issues_do_not_corrupt_each_other
         row_b = await db.pipeline_controls.get(conn, issue_b)
         assert row_b is not None and row_b.outcome == str(OUTCOMES.FAILED)
         assert await controls.history(conn, issue_b) == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_apply_tolerates_a_foreign_commit_inside_its_savepoint_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wholly unrelated coroutine's ordinary `commit=True` DAO write (e.g.
+    the park writer, or a plain `db.runs.update_status`) can land on the one
+    shared connection between `apply`'s `record_action` and its own `RELEASE
+    SAVEPOINT`. That foreign commit ends the whole transaction and destroys
+    `apply`'s still-open savepoint out from under it — which used to surface
+    as a bare `sqlite3.OperationalError: no such savepoint`, leaving both the
+    action and control rows durably written but the caller with no
+    `ActionResult` to run its side effect or `release` behind. `apply` must
+    instead return the normal accepted result, with the action and control
+    rows landed exactly once and the foreign write itself intact."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+        await _record_implement(conn, outcome=OUTCOMES.FAILED, reason="boom")
+
+        real_record_action = db.pipeline_controls.record_action
+
+        async def _record_action_then_foreign_commit(
+            conn: aiosqlite.Connection, **kwargs: object
+        ) -> None:
+            await real_record_action(conn, **kwargs)
+            # An unrelated coroutine's ordinary write, landing mid-window.
+            await db.runs.update_status(conn, "run-1", "completed")
+
+        monkeypatch.setattr(
+            db.pipeline_controls, "record_action", _record_action_then_foreign_commit
+        )
+
+        result = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.RETRY,
+            actor="tracker:c-1",
+            action_id="c-1",
+            at="2026-08-27T10:01:00+00:00",
+        )
+
+        assert result.accepted
+        assert result.snapshot.outcome is OUTCOMES.PENDING
+
+        row = await db.pipeline_controls.get(conn, ISSUE_ID)
+        assert row is not None and row.outcome == str(OUTCOMES.PENDING)
+        assert [a.action_id for a in await controls.history(conn, ISSUE_ID)] == ["c-1"]
+
+        run = (await db.runs.history_for_issue(conn, ISSUE_ID))[0]
+        assert run.status == "completed"
     finally:
         await conn.close()
 

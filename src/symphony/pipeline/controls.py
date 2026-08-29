@@ -20,12 +20,22 @@ Two rules hold the design together:
     action" or "action recorded" — never a dispatched command with no trace.
     `action_id` (the ingress's own request identity, e.g. a tracker comment id)
     is part of the actions primary key, so a replay is rejected instead of
-    dispatched twice. This is guaranteed against other `apply`/`release` calls
-    in this module — including ones for a different issue, which is why the
-    module also serializes their SAVEPOINT-to-commit windows against each
-    other — but not against an unrelated `commit=True` DAO call elsewhere on
-    the same shared connection; such a call still flushes whatever this
-    module has written so far as part of its own commit.
+    dispatched twice. Concurrent `apply`/`release` calls in this module are
+    guarded against each other — including ones for a different issue, which
+    is why the module also serializes their SAVEPOINT-to-commit windows
+    against each other, and `guard_writes` lets a caller elsewhere in the
+    daemon join that same serialization for its own SAVEPOINT-to-commit
+    window — but nothing stops an unrelated `commit=True` DAO call elsewhere
+    on the same shared connection from landing mid-window. Such a call ends
+    the whole transaction and destroys the still-open SAVEPOINT out from
+    under it. On the success path that is harmless: both rows are already
+    durable as part of that foreign commit, so a `RELEASE SAVEPOINT` that
+    fails with "no such savepoint" is treated as success instead of an
+    error. On an error path it means whatever this call had already written
+    landed durably as part of that foreign commit, so a `ROLLBACK TO
+    SAVEPOINT` failing the same way triggers an explicit compensating write
+    (deleting the just-inserted action row and restoring the previous
+    control row) instead of propagating a bare `sqlite3.OperationalError`.
 
 Only the implement stage records outcomes today — the tracer through an
 implement failure. Later slices extend `record_stage_outcome` to the remaining
@@ -38,6 +48,8 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -65,9 +77,69 @@ def _lock(issue_id: str) -> asyncio.Lock:
 # for the same name can target the wrong (innermost) nested savepoint, and
 # even with unique names, a foreign call's `conn.commit()` mid-window ends the
 # whole transaction and destroys a still-open savepoint out from under it.
-# This lock forces every apply/release savepoint window in the daemon to run
-# one at a time, regardless of issue, so no such interleaving can happen.
+# This lock forces every apply/release savepoint window in the daemon — plus
+# any other caller's window joined in through `guard_writes` — to run one at
+# a time, regardless of issue, so no such interleaving can happen.
 _write_lock = asyncio.Lock()
+
+
+@asynccontextmanager
+async def guard_writes(issue_id: str) -> AsyncIterator[None]:
+    """Let a caller outside this module run its own SAVEPOINT-to-commit
+    window on the shared connection under the same serialization `apply`/
+    `release` use for that issue.
+
+    Acquires `_lock(issue_id)` and then `_write_lock`, in that order — the
+    same order `apply`/`release` acquire them in, so nesting can never
+    deadlock. Use this around any other SAVEPOINT-to-commit block that
+    touches this issue's control row (or that otherwise must not land its
+    `conn.commit()` inside `apply`/`release`'s own window), rather than
+    inventing a second lock.
+    """
+    async with _lock(issue_id):
+        async with _write_lock:
+            yield
+
+
+def _is_missing_savepoint_error(exc: sqlite3.OperationalError) -> bool:
+    return "no such savepoint" in str(exc)
+
+
+async def _rollback_to_savepoint(conn: aiosqlite.Connection, savepoint: str) -> bool:
+    """Undo everything written since `savepoint` was opened.
+
+    Returns `False` when a foreign `commit=True` DAO call elsewhere on the
+    shared connection already ended the whole transaction and destroyed this
+    savepoint out from under it — in which case whatever this call had
+    already written landed durably as part of that foreign commit, and there
+    is nothing left here to roll back. The caller must compensate explicitly
+    in that case instead of treating this as a successful undo.
+    """
+    try:
+        await conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        await conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        return True
+    except sqlite3.OperationalError as exc:
+        if not _is_missing_savepoint_error(exc):
+            raise
+        return False
+
+
+async def _release_savepoint(conn: aiosqlite.Connection, savepoint: str) -> bool:
+    """Release `savepoint`, keeping everything written since it opened.
+
+    Returns `False` when a foreign `commit=True` DAO call already ended the
+    transaction and released this savepoint as part of its own commit: the
+    rows written under it are already durable, so the caller should treat
+    that exactly like committing itself, not as an error.
+    """
+    try:
+        await conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        return True
+    except sqlite3.OperationalError as exc:
+        if not _is_missing_savepoint_error(exc):
+            raise
+        return False
 
 
 class PipelineMode(StrEnum):
@@ -413,8 +485,11 @@ async def apply(
                     commit=False,
                 )
             except sqlite3.IntegrityError:
-                await conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                await conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                # `record_action`'s own INSERT never succeeded, so there is
+                # nothing of ours for a foreign commit to have flushed here;
+                # a missing-savepoint ROLLBACK just means it beat us to
+                # ending the transaction, not that we need to compensate.
+                await _rollback_to_savepoint(conn, savepoint)
                 # Only a racing insert of the same action id is reported as
                 # already applied; any other constraint violation (e.g. a
                 # foreign-key failure on a missing issue) is a real error and
@@ -440,12 +515,39 @@ async def apply(
                     commit=False,
                 )
             except Exception:
-                # Never leave half a transition behind for a later unrelated
-                # commit to flush: either both rows land or neither does.
-                await conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                await conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                if not await _rollback_to_savepoint(conn, savepoint):
+                    # A foreign commit already flushed the action row
+                    # `record_action` inserted above before this `put` failed
+                    # to land the matching control row: `ROLLBACK TO` has
+                    # nothing left to undo. Compensate explicitly — delete
+                    # the now-durable action row and restore the control row
+                    # to what it was before this call — instead of leaving a
+                    # durable action with no matching transition.
+                    await db.pipeline_controls.delete_action(
+                        conn, issue_id=issue_id, action_id=action_id, commit=False
+                    )
+                    await db.pipeline_controls.put(
+                        conn,
+                        issue_id=issue_id,
+                        mode=str(current.mode),
+                        stage=current.stage,
+                        outcome=str(current.outcome),
+                        reason=current.reason,
+                        run_id=current.run_id,
+                        actor=None,
+                        updated_at=at,
+                        commit=True,
+                    )
                 raise
-            await conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            await _release_savepoint(conn, savepoint)
+            # Unconditional and safe either way: a normal `RELEASE` still
+            # needs this to finalize the outer transaction to disk, and it is
+            # a no-op if a foreign commit already finalized everything. If
+            # that foreign commit instead landed between `record_action` and
+            # `put` (so `put` opened a fresh implicit transaction of its
+            # own), this is what commits *that* transaction — `_release_savepoint`
+            # having nothing to release does not mean there is nothing left
+            # to commit.
             await conn.commit()
         return ActionResult(
             accepted=True,
@@ -509,10 +611,34 @@ async def release(
                     commit=False,
                 )
             except Exception:
-                await conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                await conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+                if not await _rollback_to_savepoint(conn, savepoint):
+                    # A foreign commit already flushed part of this undo
+                    # before the rest failed: finish it explicitly instead of
+                    # leaving the control row wherever the failed write left
+                    # it. `delete_action` is idempotent and re-`put`ting the
+                    # same previous values is a no-op if they already landed.
+                    await db.pipeline_controls.delete_action(
+                        conn,
+                        issue_id=result.snapshot.issue_id,
+                        action_id=result.action_id,
+                        commit=False,
+                    )
+                    await db.pipeline_controls.put(
+                        conn,
+                        issue_id=previous.issue_id,
+                        mode=str(previous.mode),
+                        stage=previous.stage,
+                        outcome=str(previous.outcome),
+                        reason=previous.reason,
+                        run_id=previous.run_id,
+                        actor=None,
+                        updated_at=at,
+                        commit=True,
+                    )
                 raise
-            await conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            # Unconditional and safe either way — see the matching comment in
+            # `apply`.
+            await _release_savepoint(conn, savepoint)
             await conn.commit()
 
 
@@ -532,6 +658,7 @@ __all__ = [
     "PipelineMode",
     "allowed_actions",
     "apply",
+    "guard_writes",
     "history",
     "reconcile_interrupted_retries",
     "record_stage_outcome",

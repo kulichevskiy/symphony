@@ -662,8 +662,9 @@ class _SlashCommandsMixin(_OrchestratorBase):
         and no author)."""
         if intent.author:
             return intent.author
-        origin = "web" if intent.comment_id.startswith(WEB_COMMAND_COMMENT_PREFIX) else "tracker"
-        return f"{origin}:{intent.comment_id}"
+        if intent.comment_id.startswith(WEB_COMMAND_COMMENT_PREFIX):
+            return f"web:{intent.comment_id.removeprefix(WEB_COMMAND_COMMENT_PREFIX)}"
+        return f"tracker:{intent.comment_id}"
 
     async def _handle_parked_manual_merge_slash_intent(
         self,
