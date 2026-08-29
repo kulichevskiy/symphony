@@ -1716,6 +1716,13 @@ class _MergeMixin(_OrchestratorBase):
         review-failed park's Retry uses — the park kind decides which stage is
         retried, not which command handler the comment happened to reach
         (SYM-245).
+
+        This does not reset `review_state.iteration`, which is already at the
+        cap: a CHANGES_REQUESTED verdict on the resumed monitor re-parks
+        immediately without dispatching a fix run (`_review_fix_dispatch_gate`),
+        so this Retry deliberately buys exactly one more verdict, not a fresh
+        fix-run budget. Only an APPROVED verdict makes progress; a second
+        CHANGES_REQUESTED needs another operator Retry (or a Skip).
         """
         tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
         try:
@@ -1772,6 +1779,17 @@ class _MergeMixin(_OrchestratorBase):
             # what retrying a review-cap park intends. `$approve` still
             # force-advances to merge and `$reject` still stops (SYM-245).
             await self._retry_review_cap_park(issue_id, run_id, intent, binding)
+            return
+        if (
+            intent.kind is SlashKind.SKIP_REVIEW
+            and wait is not None
+            and wait.kind == db.operator_waits.KIND_REVIEW_CAP
+        ):
+            # A review-cap park is a modeled review-stage failure, so Skip is
+            # on offer for it same as `review_failed`/`review_stopped` — route
+            # it through the same canonical Skip rather than falling into the
+            # `ignored` branch below (SYM-245 review).
+            await self._skip_failed_review(issue_id, run_id, intent, binding)
             return
         if intent.kind is SlashKind.APPROVE:
             parked_pr = await db.issue_prs.get(
@@ -1850,7 +1868,23 @@ class _MergeMixin(_OrchestratorBase):
         )
 
         async def on_merge_started(new_run_id: str) -> None:
-            await self._clear_operator_wait(issue_id, run_id)
+            if wait is not None and wait.kind == db.operator_waits.KIND_REVIEW_CAP:
+                # `$approve` here force-advances a review-cap park straight to
+                # merge without another review pass — the operator's judgement
+                # steps over review, the same as any other validation-stage
+                # Skip — so settle that stage's control row instead of the
+                # plain `_clear_operator_wait` a non-modeled merge park uses;
+                # otherwise it durably keeps reporting review as failed with
+                # Retry/Skip on offer for a park that no longer exists
+                # (SYM-245 review).
+                await self._clear_stage_park(
+                    issue_id,
+                    run_id,
+                    kind=wait.kind,
+                    outcome=controls.AttemptOutcome.SKIPPED,
+                )
+            else:
+                await self._clear_operator_wait(issue_id, run_id)
             try:
                 await tracker.post_comment(
                     tracker_issue_id,

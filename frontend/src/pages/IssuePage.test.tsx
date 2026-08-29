@@ -96,10 +96,24 @@ describe("applicability", () => {
   for (const [status, kind] of [
     ["halted", "review_failed"],
     ["paused", "review_stopped"],
+  ] as const) {
+    it(`enables every exit the daemon honors for a ${kind} park, including skip-review`, () => {
+      const { en } = applicability(status, kind);
+      expect(en.approve).toBe(true);
+      expect(en.retry).toBe(true);
+      expect(en["skip-review"]).toBe(true);
+      expect(en.reject).toBe(true);
+      expect(en.stop).toBe(true);
+      expect(en["skip-acceptance"]).toBe(false);
+      expect(en["retry-acceptance"]).toBe(false);
+    });
+  }
+
+  for (const [status, kind] of [
     ["halted", "implement_failed"],
     ["halted", "deliver_failed"],
   ] as const) {
-    it(`enables every exit the daemon honors for a ${kind} park`, () => {
+    it(`enables every exit the daemon honors for a ${kind} park (mandatory stage, no skip)`, () => {
       const { en, why } = applicability(status, kind);
       expect(en.approve).toBe(true);
       expect(en.retry).toBe(true);
@@ -111,6 +125,11 @@ describe("applicability", () => {
       expect(why["skip-review"]).toContain("park");
     });
   }
+
+  it("enables Retry for a review-cap park in awaiting-merge", () => {
+    const { en } = applicability("awaiting_merge", "review_cap");
+    expect(en.retry).toBe(true);
+  });
 
   it("falls back to retry-only for a halted park with no known wait kind", () => {
     const { en } = applicability("halted");

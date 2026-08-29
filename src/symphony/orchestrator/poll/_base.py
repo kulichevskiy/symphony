@@ -2006,10 +2006,15 @@ class _OrchestratorBase:
         )
 
     async def _stage_park_clear_landed_durably(
-        self, issue_id: str, run_id: str, *, stage: str
+        self,
+        issue_id: str,
+        run_id: str,
+        *,
+        stage: str,
+        outcome: controls.AttemptOutcome = controls.AttemptOutcome.SKIPPED,
     ) -> bool:
         """Whether `_clear_stage_park`'s writes — the control row settled to
-        `skipped` and the operator wait dropped — are actually on disk for this
+        `outcome` and the operator wait dropped — are actually on disk for this
         run, used after a `release_savepoint` miss to tell a foreign *commit*
         (rows durable, nothing to do) apart from a foreign *rollback* (rows
         destroyed) since both raise the identical "no such savepoint"."""
@@ -2019,15 +2024,21 @@ class _OrchestratorBase:
             (wait_row is None or wait_row.run_id != run_id)
             and control_row is not None
             and control_row.stage == stage
-            and control_row.outcome == str(controls.AttemptOutcome.SKIPPED)
+            and control_row.outcome == str(outcome)
             and control_row.run_id == run_id
         )
 
     async def _clear_stage_park(
-        self, issue_id: str, run_id: str, *, kind: str, reason: str | None = None
+        self,
+        issue_id: str,
+        run_id: str,
+        *,
+        kind: str,
+        reason: str | None = None,
+        outcome: controls.AttemptOutcome = controls.AttemptOutcome.SKIPPED,
     ) -> None:
         """Drop a park that is going away with no retry behind it, settling the
-        stage's control row to a terminal outcome in the same transaction.
+        stage's control row to a terminal `outcome` in the same transaction.
 
         `$reject`/`$stop` halts an issue to Blocked: the wait disappears, and
         without this the control row would keep reporting the stage as failed
@@ -2035,6 +2046,12 @@ class _OrchestratorBase:
         park that no longer exists (SYM-244 review, generalized to every
         modeled stage in SYM-245). A park kind this slice does not model as a
         stage attempt just drops its wait.
+
+        `outcome` defaults to `SKIPPED` for that reject/stop case. A caller can
+        pass `SUCCEEDED` instead when the park is going away because the stage
+        it was guarding actually completed (e.g. the delivery-handoff recovery
+        wait once the handoff lands) — `SKIPPED` would misreport a successful
+        attempt as stepped-over.
 
         A uniquely-named SAVEPOINT scopes the undo to just these two writes,
         mirroring `_record_stage_park`: `self._conn` is shared by the whole
@@ -2066,7 +2083,7 @@ class _OrchestratorBase:
                 self._conn,
                 issue_id,
                 stage=stage,
-                outcome=controls.AttemptOutcome.SKIPPED,
+                outcome=outcome,
                 reason=reason,
                 run_id=run_id,
                 at=self._now().isoformat(),
@@ -2083,7 +2100,7 @@ class _OrchestratorBase:
                 if not await controls.rollback_to_savepoint(
                     self._conn, savepoint
                 ) and not await self._stage_park_clear_landed_durably(
-                    issue_id, run_id, stage=stage
+                    issue_id, run_id, stage=stage, outcome=outcome
                 ):
                     # The savepoint is gone — a foreign commit or a foreign
                     # rollback landed mid-window — and this call's own writes
@@ -2099,7 +2116,9 @@ class _OrchestratorBase:
             # above, and a foreign `conn.rollback()` landing there destroys
             # both writes without `release_savepoint` ever seeing a missing
             # savepoint (SYM-244 review).
-            if not await self._stage_park_clear_landed_durably(issue_id, run_id, stage=stage):
+            if not await self._stage_park_clear_landed_durably(
+                issue_id, run_id, stage=stage, outcome=outcome
+            ):
                 await _settle(commit=True)
 
     async def _track_implement_blocked_wait(

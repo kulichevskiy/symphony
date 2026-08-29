@@ -352,6 +352,98 @@ async def test_park_records_its_stage_outcome_with_the_wait(
         await conn.close()
 
 
+@pytest.mark.asyncio
+async def test_acceptance_blocked_park_records_its_reason_through_the_new_plumbing(
+    tmp_path: Path,
+) -> None:
+    """`_track_acceptance_blocked_wait` is the one park writer that passes a
+    non-default `reason` through `_record_stage_park` — it must survive."""
+    from symphony.pipeline.acceptance_classifier import AcceptanceVerdict
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id=RUN_ID,
+            issue_id=ISSUE_ID,
+            stage="acceptance",
+            status="running",
+            pid=None,
+            started_at="2026-08-28T09:00:00+00:00",
+        )
+        orch = _orch(conn, tmp_path)
+        verdict = AcceptanceVerdict(
+            kind="blocked",
+            criteria=[],
+            cost=0.0,
+            hero_screenshot_url="",
+            details="needs a human call on scope",
+        )
+        await orch._track_acceptance_blocked_wait(  # noqa: SLF001
+            binding=_binding(),
+            issue=_issue(),
+            pr_number=42,
+            run_id=RUN_ID,
+            verdict=verdict,
+        )
+
+        row = await db.pipeline_controls.get(conn, ISSUE_ID)
+        assert row is not None
+        assert (row.stage, row.outcome, row.run_id) == (
+            controls.ACCEPTANCE_STAGE,
+            "failed",
+            RUN_ID,
+        )
+        assert row.reason == "needs a human call on scope"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_cap_park_records_its_reason_and_created_at_through_the_new_plumbing(
+    tmp_path: Path,
+) -> None:
+    """The review-cap park (`_review.py`'s stuck-loop handoff) is the other
+    park writer that passes non-default `reason`/`created_at` through
+    `_record_stage_park` — both must survive."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id=RUN_ID,
+            issue_id=ISSUE_ID,
+            stage="review",
+            status="running",
+            pid=None,
+            started_at="2026-08-28T09:00:00+00:00",
+        )
+        orch = _orch(conn, tmp_path)
+        await orch._record_stage_park(  # noqa: SLF001
+            ISSUE_ID,
+            RUN_ID,
+            _binding(),
+            kind=db.operator_waits.KIND_REVIEW_CAP,
+            reason="review hit the 3-iteration cap",
+            created_at="2026-08-28T09:05:00+00:00",
+        )
+
+        row = await db.pipeline_controls.get(conn, ISSUE_ID)
+        assert row is not None
+        assert (row.stage, row.outcome, row.run_id) == (
+            controls.REVIEW_STAGE,
+            "failed",
+            RUN_ID,
+        )
+        assert row.reason == "review hit the 3-iteration cap"
+        wait = await db.operator_waits.get(conn, ISSUE_ID)
+        assert wait is not None
+        assert wait.created_at == "2026-08-28T09:05:00+00:00"
+    finally:
+        await conn.close()
+
+
 # --------------------------------------------------------------------------
 # Command handlers route through the canonical transition
 # --------------------------------------------------------------------------
@@ -452,6 +544,56 @@ async def test_failed_review_exposes_skip_and_it_advances_to_merge(tmp_path: Pat
         assert (await controls.snapshot(conn, ISSUE_ID, fingerprint="sha-new")).outcome is (
             OUTCOMES.FAILED
         )
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_skip_failed_review_releases_the_accepted_skip_when_a_side_effect_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If a side effect after the accepted Skip raises, the accepted
+    transition must be released — not left `SKIPPED` with no Retry/Skip on
+    offer and no daemon-restart recovery path (`reconcile_interrupted_retries`
+    only resets `PENDING` rows), which is strictly worse than a stuck Retry
+    (SYM-245 review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_operator_wait(
+            conn, kind=db.operator_waits.KIND_REVIEW_FAILED, stage="review", status="failed"
+        )
+        await _seed_review_state(conn)
+        await controls.record_stage_outcome(
+            conn,
+            ISSUE_ID,
+            stage=controls.REVIEW_STAGE,
+            outcome=OUTCOMES.FAILED,
+            reason="CI red",
+            run_id=RUN_ID,
+            at="2026-08-28T09:30:00+00:00",
+        )
+
+        orch = _orch(conn, tmp_path)
+        orch._review_failed_run_bindings[RUN_ID] = _binding()  # noqa: SLF001
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(return_value={"headRefOid": "sha-old"})
+        orch._gh_client = AsyncMock(return_value=gh)  # type: ignore[method-assign]  # noqa: SLF001
+
+        async def _boom(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("db died mid-skip")
+
+        monkeypatch.setattr(db.issue_prs, "mark_review_bypassed", _boom)
+
+        with pytest.raises(RuntimeError, match="db died mid-skip"):
+            await orch._handle_review_failed_slash_intent(  # noqa: SLF001
+                ISSUE_ID, RUN_ID, _intent(SlashKind.SKIP_REVIEW, comment_id="c-skip")
+            )
+
+        snap = await controls.snapshot(conn, ISSUE_ID)
+        assert snap.outcome is OUTCOMES.FAILED
+        assert ACTIONS.SKIP in snap.allowed_actions
+        assert ACTIONS.RETRY in snap.allowed_actions
+        assert await db.operator_waits.get(conn, ISSUE_ID) is not None
     finally:
         await conn.close()
 

@@ -647,6 +647,111 @@ async def test_review_cap_approve_schedules_merge(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_review_cap_approve_settles_the_review_stage_control_row(tmp_path: Path) -> None:
+    """`$approve` on a review-cap park force-advances to merge without another
+    review pass, so the review stage's control row must settle too — the same
+    way `$reject`/`$stop` on this park already does — instead of leaving
+    `pipeline_controls` durably reporting `review`/`failed` (Retry/Skip
+    offered) for a park that `_schedule_merge` already dispatched past
+    (SYM-245 review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("$approve")])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_operator_wait(
+            conn,
+            run_id="review-run",
+            kind=db.operator_waits.KIND_REVIEW_CAP,
+            stage="review",
+            status="completed",
+        )
+        await _seed_review_state(conn, pr_number=166)
+        await controls.record_stage_outcome(
+            conn,
+            "iss-1",
+            stage=controls.REVIEW_STAGE,
+            outcome=controls.AttemptOutcome.FAILED,
+            reason="review hit the 3-iteration cap",
+            run_id="review-run",
+            at="2026-05-26T13:00:00Z",
+        )
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        # `_schedule_merge` is mocked, so its `on_started` callback — the one
+        # that settles the park when the real merge dispatch actually begins —
+        # never fires on its own; invoke it directly, as the real
+        # `_schedule_merge` would once the merge task starts.
+        _, kwargs = orch._schedule_merge.call_args  # type: ignore[attr-defined]  # noqa: SLF001
+        on_started = kwargs["on_started"]
+        await on_started("merge-run")
+
+        snapshot = await controls.snapshot(conn, "iss-1")
+        assert snapshot.outcome is not controls.AttemptOutcome.FAILED
+        assert controls.ControlAction.RETRY not in snapshot.allowed_actions
+        assert controls.ControlAction.SKIP not in snapshot.allowed_actions
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_review_cap_skip_review_advances_to_merge(tmp_path: Path) -> None:
+    """A review-cap park is a modeled review-stage failure, so `allowed_actions`
+    advertises Skip for it same as `review_failed`/`review_stopped`. Before
+    SYM-245's review fix, `$skip-review` reaching the merge-needs-approval
+    handler fell through to the `ignored` branch — no transition, no merge —
+    because only `$approve`/`$retry`/`$reject`/`$stop` were handled there."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("$skip-review")])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_operator_wait(
+            conn,
+            run_id="review-run",
+            kind=db.operator_waits.KIND_REVIEW_CAP,
+            stage="review",
+            status="completed",
+        )
+        await _seed_review_state(conn, pr_number=166)
+        await controls.record_stage_outcome(
+            conn,
+            "iss-1",
+            stage=controls.REVIEW_STAGE,
+            outcome=controls.AttemptOutcome.FAILED,
+            reason="review hit the 3-iteration cap",
+            run_id="review-run",
+            at="2026-05-26T13:00:00Z",
+        )
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        _, kwargs = orch._schedule_merge.call_args  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["pr_number"] == 166
+        assert kwargs["skip_review"] is True
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        snapshot = await controls.snapshot(conn, "iss-1")
+        assert snapshot.outcome is controls.AttemptOutcome.SKIPPED
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_review_cap_reject_moves_to_blocked_and_clears_wait(tmp_path: Path) -> None:
     """SYM-114: `$reject`/`$stop` on a review-cap park moves the issue to
     blocked and clears the wait instead of leaving it stranded."""

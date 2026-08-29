@@ -87,7 +87,13 @@ class _SlashCommandsMixin(_OrchestratorBase):
         ) -> None: ...
 
         async def _clear_stage_park(
-            self, issue_id: str, run_id: str, *, kind: str, reason: str | None = None
+            self,
+            issue_id: str,
+            run_id: str,
+            *,
+            kind: str,
+            reason: str | None = None,
+            outcome: controls.AttemptOutcome = ...,
         ) -> None: ...
 
         async def _clear_review_rearm_retry(self, run_id: str) -> None: ...
@@ -989,7 +995,19 @@ class _SlashCommandsMixin(_OrchestratorBase):
             await tracker.post_comment(tracker_issue_id, truncate_body(body))
         except LinearError as e:
             log.warning("implement resume comment failed for issue %s: %s", issue_id, e)
-        await self._clear_operator_wait(issue_id, run_id)
+        try:
+            await self._clear_operator_wait(issue_id, run_id)
+        except BaseException:
+            # `_clear_operator_wait` already popped the dispatch gate and this
+            # run's binding before its own DB delete failed; re-arm both so a
+            # webhook-driven dispatch can't slip in and start a second
+            # implement attempt before the released park is restored (mirrors
+            # the implement-failed retry above).
+            self._dispatch_run_ids[issue_id] = run_id
+            self._operator_wait_run_ids.add(run_id)
+            self._implement_blocked_run_bindings[run_id] = binding
+            await controls.release(self._conn, accepted, at=self._now().isoformat())
+            raise
 
     async def _stop_blocked_implement(
         self,
@@ -1103,8 +1121,18 @@ class _SlashCommandsMixin(_OrchestratorBase):
                     "could not move issue to an active Linear state; keeping acceptance blocked",
                 )
                 return
-            await db.acceptance_state.reset(self._conn, issue_id)
-            await self._clear_operator_wait(issue_id, run_id)
+            try:
+                await db.acceptance_state.reset(self._conn, issue_id)
+                await self._clear_operator_wait(issue_id, run_id)
+            except BaseException:
+                # `_clear_operator_wait` pops the dispatch gate for this run
+                # before its own DB delete can fail; re-arm it so a
+                # webhook-driven dispatch can't slip in before the released
+                # park is restored (mirrors the implement-failed retry above).
+                self._dispatch_run_ids[issue_id] = run_id
+                self._operator_wait_run_ids.add(run_id)
+                await controls.release(self._conn, accepted, at=self._now().isoformat())
+                raise
             body = acceptance_retry_requested(
                 CommentVars(
                     stage="acceptance",
@@ -1140,40 +1168,47 @@ class _SlashCommandsMixin(_OrchestratorBase):
             # Acceptance is a validation stage, so Skip is on offer — scoped to
             # the PR head it approves, so a later push requires acceptance again
             # (SYM-245).
-            if (
-                await self._accept_control_action(
-                    issue_id,
-                    controls.ControlAction.SKIP,
-                    intent,
-                    fingerprint=state.pr_head_sha or None,
-                )
-            ) is None:
-                return
-            await db.acceptance_state.record_verdict(
-                self._conn,
+            accepted = await self._accept_control_action(
                 issue_id,
-                verdict="pass",
-                artifacts_url=state.last_artifacts_url,
+                controls.ControlAction.SKIP,
+                intent,
+                fingerprint=state.pr_head_sha or None,
             )
-            await self._clear_operator_wait(issue_id, run_id)
-            if _needs_human_approval_label_present(issue):
-                await self._open_merge_wait_for_human_approval_label(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=state.pr_url,
+            if accepted is None:
+                return
+            try:
+                await db.acceptance_state.record_verdict(
+                    self._conn,
+                    issue_id,
+                    verdict="pass",
+                    artifacts_url=state.last_artifacts_url,
                 )
-            else:
-                # Reserve while holding `config_write_lock` so the drain
-                # guard's `scheduled_slots` sample can't miss this
-                # reservation (SYM-193 review; see `_review_fix_dispatch_slot`
-                # in `_dispatch.py`).
-                async with self._config_write_lock:
-                    self._schedule_merge(
+                await self._clear_operator_wait(issue_id, run_id)
+                if _needs_human_approval_label_present(issue):
+                    await self._open_merge_wait_for_human_approval_label(
                         binding=binding,
                         issue=issue,
-                        pr_number=state.pr_number,
                         pr_url=state.pr_url,
                     )
+                else:
+                    # Reserve while holding `config_write_lock` so the drain
+                    # guard's `scheduled_slots` sample can't miss this
+                    # reservation (SYM-193 review; see `_review_fix_dispatch_slot`
+                    # in `_dispatch.py`).
+                    async with self._config_write_lock:
+                        self._schedule_merge(
+                            binding=binding,
+                            issue=issue,
+                            pr_number=state.pr_number,
+                            pr_url=state.pr_url,
+                        )
+            except BaseException:
+                # Nothing carried the accepted Skip through to a scheduled
+                # merge; release it so the next poll tick can re-deliver the
+                # same `$skip-acceptance` instead of leaving a `SKIPPED` park
+                # that offers neither Retry nor Skip (SYM-245 review).
+                await controls.release(self._conn, accepted, at=self._now().isoformat())
+                raise
             body = acceptance_skipped(
                 CommentVars(
                     stage="acceptance",
@@ -1416,22 +1451,35 @@ class _SlashCommandsMixin(_OrchestratorBase):
                 log.warning("skip-acceptance comment failed for %s: %s", issue_id, e)
             return
 
-        if (
-            await self._accept_control_action(issue_id, controls.ControlAction.RETRY, intent)
-        ) is None:
+        accepted = await self._accept_control_action(
+            issue_id, controls.ControlAction.RETRY, intent
+        )
+        if accepted is None:
             return
-        await self._clear_operator_wait(issue_id, run_id)
-        await db.acceptance_state.reset(self._conn, issue_id)
-        # See the `SKIP_ACCEPTANCE` branch above for why this reservation is
-        # made under `config_write_lock` (SYM-193 review).
-        async with self._config_write_lock:
-            self._schedule_acceptance(
-                binding=binding,
-                issue=issue,
-                pr_number=pr_number,
-                pr_url=pr_url,
-                pr_head_sha=state.pr_head_sha,
-            )
+        try:
+            await self._clear_operator_wait(issue_id, run_id)
+            await db.acceptance_state.reset(self._conn, issue_id)
+            # See the `SKIP_ACCEPTANCE` branch above for why this reservation is
+            # made under `config_write_lock` (SYM-193 review).
+            async with self._config_write_lock:
+                self._schedule_acceptance(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    pr_head_sha=state.pr_head_sha,
+                )
+        except BaseException:
+            # `_clear_operator_wait` pops `_dispatch_run_ids`/
+            # `_operator_wait_run_ids`/`_acceptance_rejected_run_bindings`
+            # before its own DB delete can fail; re-arm them so a
+            # webhook-driven dispatch can't slip in before the released park
+            # is restored (SYM-245 review).
+            self._dispatch_run_ids[issue_id] = run_id
+            self._operator_wait_run_ids.add(run_id)
+            self._acceptance_rejected_run_bindings[run_id] = binding
+            await controls.release(self._conn, accepted, at=self._now().isoformat())
+            raise
         body = retry_acceptance_requested(
             CommentVars(
                 stage="acceptance",
@@ -1521,12 +1569,21 @@ class _SlashCommandsMixin(_OrchestratorBase):
         accepted = await self._accept_control_action(issue_id, controls.ControlAction.RETRY, intent)
         if accepted is None:
             return
-        # Keep the durable wait until delivery reaches success. If this retry
-        # crashes or raises before re-parking, the existing operator wait still
-        # gives the issue a retryable home.
+        # The accepted transition already committed the control row to
+        # `pending`, dropping Retry from `allowed_actions` — the operator wait
+        # row alone no longer gives the issue a retryable home. Each of
+        # `_deliver_implement_run`'s own `_park_deliver_failed` handlers
+        # re-parks the stage as `failed` on the failure it catches, but an
+        # exception escaping all of them needs this release, or the row is
+        # stuck `pending` with nothing able to answer it until a daemon
+        # restart's `reconcile_interrupted_retries` (SYM-245 review).
         self._pending_deliveries.pop(run_id, None)
         try:
-            await self._deliver_implement_run(ctx=ctx)
+            try:
+                await self._deliver_implement_run(ctx=ctx)
+            except BaseException:
+                await controls.release(self._conn, accepted, at=self._now().isoformat())
+                raise
             run = await db.runs.get_with_issue(self._conn, run_id)
             if run is not None and run.run.status in db.runs.SUCCESS_STATUSES:
                 await self._clear_operator_wait(issue_id, run_id)

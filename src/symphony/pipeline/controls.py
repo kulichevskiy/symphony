@@ -580,7 +580,8 @@ async def snapshot(
     if row is None:
         return await _derived_snapshot(conn, issue_id)
     outcome = AttemptOutcome(row.outcome)
-    if _skip_has_expired(row, fingerprint):
+    expired = _skip_has_expired(row, fingerprint)
+    if expired:
         outcome = AttemptOutcome.FAILED
     return _snapshot(
         issue_id,
@@ -589,7 +590,7 @@ async def snapshot(
         outcome=outcome,
         reason=row.reason,
         run_id=row.run_id,
-        fingerprint=row.fingerprint,
+        fingerprint=None if expired else row.fingerprint,
     )
 
 

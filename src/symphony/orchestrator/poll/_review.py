@@ -3108,38 +3108,57 @@ class _ReviewMixin(_OrchestratorBase):
                 slash_text=self._slash_text(intent),
                 reason=f"could not look up issue for skip-review: {e}",
             ) from e
-        if (
-            await self._accept_control_action(
-                issue_id,
-                controls.ControlAction.SKIP,
-                intent,
-                fingerprint=await self._pr_head_sha_or_none(binding, state.pr_number),
-            )
-        ) is None:
-            return
-        await db.issue_prs.mark_review_bypassed(
-            self._conn,
-            issue_id=issue_id,
-            github_repo=binding.github_repo,
-            pr_number=state.pr_number,
+        accepted = await self._accept_control_action(
+            issue_id,
+            controls.ControlAction.SKIP,
+            intent,
+            fingerprint=await self._pr_head_sha_or_none(binding, state.pr_number),
         )
-        await self._clear_operator_wait(issue_id, run_id)
-        # See the sibling reservations in `_slash_commands.py`: taken under
-        # `config_write_lock` so the drain guard's `scheduled_slots` sample
-        # cannot miss it (SYM-193 review).
-        async with self._config_write_lock:
-            self._schedule_merge(
-                binding=binding,
-                issue=issue,
+        if accepted is None:
+            return
+        try:
+            await db.issue_prs.mark_review_bypassed(
+                self._conn,
+                issue_id=issue_id,
+                github_repo=binding.github_repo,
                 pr_number=state.pr_number,
-                pr_url=state.pr_url,
-                skip_review=True,
             )
+            await self._clear_operator_wait(issue_id, run_id)
+            # See the sibling reservations in `_slash_commands.py`: taken under
+            # `config_write_lock` so the drain guard's `scheduled_slots` sample
+            # cannot miss it (SYM-193 review).
+            async with self._config_write_lock:
+                self._schedule_merge(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=state.pr_number,
+                    pr_url=state.pr_url,
+                    skip_review=True,
+                )
+        except BaseException:
+            # Nothing carried the accepted Skip through to a scheduled merge;
+            # release it so the next poll tick can re-deliver the same
+            # `$skip-review` instead of leaving a `SKIPPED` park that offers
+            # neither Retry nor Skip (SYM-245 review).
+            await controls.release(self._conn, accepted, at=self._now().isoformat())
+            raise
         log.info(
             "skip-review: advancing parked %s (PR #%d) directly to merge",
             issue.identifier,
             state.pr_number,
         )
+        v = CommentVars(
+            stage="review",
+            repo=binding.github_repo,
+            issue=state.pr_number,
+            pr_url=state.pr_url,
+            run_id=run_id,
+            next_stage="merge",
+        )
+        try:
+            await self.tracker(binding).post_comment(issue.id, truncate_body(skip_review_forced(v)))
+        except LinearError as e:
+            log.warning("could not post skip-review comment for %s: %s", issue.identifier, e)
 
     async def _resume_review_monitor(
         self,

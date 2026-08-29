@@ -2548,6 +2548,65 @@ async def test_hybrid_orphan_open_pr_adoption_uses_remote_review_lane(
 
 
 @pytest.mark.asyncio
+async def test_orphan_adoption_settles_the_old_stage_for_the_needs_approval_sub_case(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The needs-approval sub-case upserts its own fresh `KIND_REVIEW_FAILED`
+    wait over `issue_id` instead of deleting the old one. A settle check that
+    re-reads the wait *after* that upsert would never match the original
+    `implement_failed` wait's `run_id`/`kind` again and would silently skip
+    settling every time, leaving `pipeline_controls` durably reporting
+    `implement`/`failed` (Retry offered) behind what is actually now a
+    `review_failed` park (SYM-245 review)."""
+    from symphony.pipeline import controls
+
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        await controls.record_stage_outcome(
+            conn,
+            "iss-1",
+            stage=controls.IMPLEMENT_STAGE,
+            outcome=controls.AttemptOutcome.FAILED,
+            reason="agent exited 2",
+            run_id="run-iss-1",
+            at="2026-05-17T10:01:00Z",
+        )
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        binding = _binding(local_review=True, remote_review=False)
+        reconciler = Reconciler(
+            Config(repos=[binding]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        control_snapshot = await controls.snapshot(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert wait is not None
+    assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
+    assert control_snapshot.stage == controls.IMPLEMENT_STAGE
+    assert control_snapshot.outcome is controls.AttemptOutcome.SUCCEEDED
+    assert controls.ControlAction.RETRY not in control_snapshot.allowed_actions
+
+
+@pytest.mark.asyncio
 async def test_local_only_orphan_open_pr_without_local_review_parks_for_approval(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

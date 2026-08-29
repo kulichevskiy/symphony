@@ -45,8 +45,8 @@ const ALL_CMDS: CommandId[] = COMMAND_ORDER;
  *  review-failed park routes `$approve` and `$retry` to the same resume, and
  *  `$reject`/`$stop` to Blocked. */
 const PARK_COMMANDS: Record<string, CommandId[]> = {
-  review_failed: ["approve", "retry", "reject", "stop"],
-  review_stopped: ["approve", "retry", "reject", "stop"],
+  review_failed: ["approve", "retry", "skip-review", "reject", "stop"],
+  review_stopped: ["approve", "retry", "skip-review", "reject", "stop"],
   implement_failed: ["approve", "retry", "reject", "stop"],
   deliver_failed: ["approve", "retry", "reject", "stop"],
 };
@@ -108,7 +108,14 @@ export function applicability(status: string, waitingOn?: string | null): Applic
         on("retry-acceptance");
       }
       off("skip-review", "Review already complete");
-      off("retry", "Nothing has failed");
+      // A review-cap park is a modeled review-stage failure, so Retry is on
+      // offer for it same as review_failed/review_stopped — everything else
+      // reaching this status has nothing failed to retry.
+      if (waitingOn === "review_cap") {
+        on("retry");
+      } else {
+        off("retry", "Nothing has failed");
+      }
       break;
     case "running":
       on("stop");

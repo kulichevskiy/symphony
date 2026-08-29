@@ -1794,6 +1794,83 @@ async def test_first_handoff_persists_recovery_wait_before_completed(
 
 
 @pytest.mark.asyncio
+async def test_successful_first_handoff_settles_the_recovery_wait_to_succeeded(
+    tmp_path: Path,
+) -> None:
+    """`_track_delivery_handoff_recovery_wait` records the delivery stage as
+    `failed` before the first handoff runs, purely as a restart-recovery
+    checkpoint. Once that handoff actually succeeds, `pipeline_controls` must
+    not keep durably reporting delivery as failed with Retry offered — the
+    exact invariant `_record_stage_park`'s docstring claims can never happen
+    (SYM-245 review)."""
+    from symphony.pipeline import controls
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace_with_base(workspace_path)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_clone = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+        push_fn = AsyncMock()
+
+        def _commit(spec: RunnerSpec) -> None:
+            if spec.stage == "implement":
+                advance_head(spec.workspace_path)
+
+        runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(kind="exit", returncode=0),
+            ],
+            on_run=_commit,
+        )
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[0].status == "completed"
+        snapshot = await controls.snapshot(conn, "iss-1")
+        assert snapshot.outcome is controls.AttemptOutcome.SUCCEEDED
+        assert controls.ControlAction.RETRY not in snapshot.allowed_actions
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_no_review_deliver_retry_skips_stage_done_when_handoff_metadata_absent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -1122,6 +1122,7 @@ class Reconciler:
             issue_label=binding.issue_label,
             commit=False,
         )
+        own_wait_upsert = False
         if review_configured:
             review_run_status = "running"
             if local_review_configured and not remote_review_configured:
@@ -1159,6 +1160,13 @@ class Reconciler:
                     tracker_site=binding.tracker_site,
                     commit=False,
                 )
+                # This upsert just replaced whatever wait `issue_id` had with
+                # a fresh `KIND_REVIEW_FAILED` one of our own — not an
+                # external actor — so the settle check below must not compare
+                # a post-upsert re-read against the original `wait` (it would
+                # never match `wait.run_id` again and silently skip settling
+                # every time). Settle against the control row alone instead.
+                own_wait_upsert = True
         else:
             # No review configured: the success path routes straight to merge
             # with review_bypassed=True and starts no review stage. Land the
@@ -1196,23 +1204,36 @@ class Reconciler:
             # `run_id`) but the ingress only clears the wait afterwards, once
             # its own tracker move and comment succeed — so the *wait* can
             # still match `wait.run_id` here even though the control row it
-            # backs has already moved on (SYM-244 review). Re-read the control
-            # row too and require it still reports the `failed` outcome this
-            # call observed before settling to `succeeded`.
+            # backs has already moved on (SYM-244 review). Require the control
+            # row to still report the `failed` outcome this call observed
+            # before settling to `succeeded`.
+            #
+            # The needs-approval sub-case is different: it already upserted
+            # its own fresh `KIND_REVIEW_FAILED` wait over this row above
+            # (`own_wait_upsert`), not an external actor, so a post-upsert
+            # re-read of the *wait* would never match `wait.run_id`/`wait.kind`
+            # again and this settle would silently no-op for that sub-case
+            # every time (SYM-245 review). Check the control row alone there —
+            # it still catches a genuine external race (e.g. a Retry accepted
+            # concurrently moves it to `pending` before this read).
             current_wait = await db.operator_waits.get(self._conn, issue_id)
             control_row = await db.pipeline_controls.get(self._conn, issue_id)
-            if (
-                current_wait is not None
-                and current_wait.run_id == wait.run_id
-                and current_wait.kind == wait.kind
-                and (
-                    control_row is None
-                    or (
-                        control_row.outcome == str(controls.AttemptOutcome.FAILED)
-                        and control_row.run_id == wait.run_id
-                    )
+            still_parked = (
+                control_row is not None
+                and control_row.outcome == str(controls.AttemptOutcome.FAILED)
+                and control_row.run_id == wait.run_id
+            )
+            settle = (
+                still_parked
+                if own_wait_upsert
+                else (
+                    current_wait is not None
+                    and current_wait.run_id == wait.run_id
+                    and current_wait.kind == wait.kind
+                    and (control_row is None or still_parked)
                 )
-            ):
+            )
+            if settle:
                 await controls.record_stage_outcome(
                     self._conn,
                     issue_id,
