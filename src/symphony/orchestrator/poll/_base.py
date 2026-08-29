@@ -94,6 +94,7 @@ from ...linear.templates import (
     truncate_body,
 )
 from ...notify import EVENT_OPERATOR_WAIT, EVENT_RUN_FAILED, TelegramNotifier, build_message
+from ...pipeline import controls
 from ...pipeline.cost_guard import (
     UsageCostEstimator,
     UsageDelta,
@@ -1121,6 +1122,7 @@ class _OrchestratorBase:
         """The single long-lived task. Cancellation-safe."""
         await self.warmup()
         await self._restore_operator_waits()
+        await controls.reconcile_interrupted_retries(self._conn, at=self._now().isoformat())
         await self._reconcile_orphaned_merge_runs(reason="startup")
         await self._reconcile_auto_recoverable_merge_waits(reason="startup")
         self._merge_wait_reconcile_task = asyncio.create_task(
@@ -1820,18 +1822,171 @@ class _OrchestratorBase:
         self._dispatch_run_ids[issue_id] = run_id
         self._operator_wait_run_ids.add(run_id)
         self._implement_failed_run_bindings[run_id] = binding
-        await db.operator_waits.upsert(
-            self._conn,
-            issue_id=issue_id,
-            run_id=run_id,
-            kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
-            linear_team_key=binding.linear_team_key,
-            github_repo=binding.github_repo,
-            issue_label=binding.issue_label or "",
-            created_at=self._now().isoformat(),
-            provider=binding.provider,
-            tracker_provider=binding.tracker_provider,
-            tracker_site=binding.tracker_site,
+        # The park is also a pipeline-control fact: the implement stage's latest
+        # attempt failed (SYM-244). Written in the wait's transaction
+        # (`commit=False`, rolled back together on failure) so a restart can
+        # never find one without the other. `reason` is carried for the
+        # operator; what Retry/Skip/Abort the snapshot offers comes from the
+        # outcome alone.
+        #
+        # A uniquely-named SAVEPOINT scopes the undo to just these two writes:
+        # `self._conn` is shared by the whole daemon, and `controls.apply` can
+        # be mid-transition on it (inside its own SAVEPOINT, not under
+        # `_comment_event_lock`) when this dispatch-task handler runs. A bare
+        # `self._conn.rollback()` would end the *whole* transaction, wiping out
+        # that in-flight apply along with its own still-open SAVEPOINT.
+        # `controls.guard_writes` puts this whole window under the same
+        # per-issue lock plus shared write lock `controls.apply`/`release`
+        # use, so this SAVEPOINT and one of theirs for the same issue can
+        # never interleave on the connection either. `guard_writes` only
+        # serializes *this module's* SAVEPOINT-to-commit windows against each
+        # other, though — it does not stop some unrelated `commit=True` DAO
+        # call elsewhere on the same shared connection from landing mid-window
+        # and ending the whole transaction out from under this SAVEPOINT.
+        # `controls.rollback_to_savepoint`/`release_savepoint` tolerate that
+        # ("no such savepoint") instead of letting a bare `sqlite3.
+        # OperationalError` abort the rest of park handling. A missing
+        # `RELEASE SAVEPOINT` raises that identical text whether the foreign
+        # call was a commit (both rows already durable) or a rollback (both
+        # rows destroyed along with it), so `_implement_failed_wait_landed_durably`
+        # re-reads them below rather than assuming the former.
+        savepoint = f"implement_failed_wait_{uuid.uuid4().hex}"
+        async with controls.guard_writes(issue_id):
+            previous_control = await db.pipeline_controls.get(self._conn, issue_id)
+            await self._conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                await controls.record_stage_outcome(
+                    self._conn,
+                    issue_id,
+                    stage=controls.IMPLEMENT_STAGE,
+                    outcome=controls.AttemptOutcome.FAILED,
+                    reason=await self._blocked_reason_for_run(run_id) or None,
+                    run_id=run_id,
+                    at=self._now().isoformat(),
+                    commit=False,
+                )
+                await db.operator_waits.upsert(
+                    self._conn,
+                    issue_id=issue_id,
+                    run_id=run_id,
+                    kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+                    linear_team_key=binding.linear_team_key,
+                    github_repo=binding.github_repo,
+                    issue_label=binding.issue_label or "",
+                    created_at=self._now().isoformat(),
+                    provider=binding.provider,
+                    tracker_provider=binding.tracker_provider,
+                    tracker_site=binding.tracker_site,
+                    commit=False,
+                )
+            except BaseException:
+                # `BaseException`, not `Exception`: this task can be cancelled
+                # (e.g. daemon shutdown) between the SAVEPOINT and the commit
+                # below, and that must roll back the same as any other
+                # failure — an `Exception`-only catch would skip the rollback
+                # and leave these rows dangling in the open transaction for a
+                # later foreign commit to make durable with no matching
+                # transition.
+                if not await controls.rollback_to_savepoint(self._conn, savepoint):
+                    # The savepoint is gone — a foreign commit already made
+                    # (some of) our writes durable, or a foreign rollback
+                    # destroyed them along with itself; indistinguishable
+                    # here. Compensate explicitly either way, mirroring
+                    # `apply`'s own foreign-commit compensation (controls.py):
+                    # restore the control row to what it was before this call
+                    # (or drop it if none existed) and drop the operator
+                    # wait, so a durable "failed" control row can never be
+                    # left standing with no operator wait to explain it.
+                    if previous_control is None:
+                        await db.pipeline_controls.delete(self._conn, issue_id, commit=False)
+                    else:
+                        await db.pipeline_controls.put(
+                            self._conn,
+                            issue_id=issue_id,
+                            mode=previous_control.mode,
+                            stage=previous_control.stage,
+                            outcome=previous_control.outcome,
+                            reason=previous_control.reason,
+                            run_id=previous_control.run_id,
+                            actor=previous_control.actor,
+                            updated_at=self._now().isoformat(),
+                            commit=False,
+                        )
+                    await db.operator_waits.delete(self._conn, issue_id, run_id, commit=True)
+                raise
+            await controls.release_savepoint(self._conn, savepoint)
+            await self._conn.commit()
+            # Re-read unconditionally rather than only on a missing-savepoint
+            # miss: a *successful* `RELEASE SAVEPOINT` still leaves an
+            # unprotected suspension point at the `await self._conn.commit()`
+            # above, and a foreign `conn.rollback()` landing there (some
+            # unguarded write elsewhere on this shared connection) destroys
+            # both writes without `release_savepoint` ever seeing a missing
+            # savepoint (SYM-244 review).
+            if not await self._implement_failed_wait_landed_durably(issue_id, run_id):
+                # The control row and the operator wait along with it were
+                # destroyed by a foreign rollback, so what should have been
+                # a durable park is currently nothing at all — a restart
+                # would find no wait and no reason to offer Retry. Redo both
+                # writes for real instead of returning as if they landed.
+                await controls.record_stage_outcome(
+                    self._conn,
+                    issue_id,
+                    stage=controls.IMPLEMENT_STAGE,
+                    outcome=controls.AttemptOutcome.FAILED,
+                    reason=await self._blocked_reason_for_run(run_id) or None,
+                    run_id=run_id,
+                    at=self._now().isoformat(),
+                    commit=False,
+                )
+                await db.operator_waits.upsert(
+                    self._conn,
+                    issue_id=issue_id,
+                    run_id=run_id,
+                    kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+                    linear_team_key=binding.linear_team_key,
+                    github_repo=binding.github_repo,
+                    issue_label=binding.issue_label or "",
+                    created_at=self._now().isoformat(),
+                    provider=binding.provider,
+                    tracker_provider=binding.tracker_provider,
+                    tracker_site=binding.tracker_site,
+                    commit=True,
+                )
+
+    async def _implement_failed_wait_landed_durably(self, issue_id: str, run_id: str) -> bool:
+        """Whether `_track_implement_failed_wait`'s control row and operator
+        wait are actually on disk for this run — used after a
+        `release_savepoint` miss to tell a foreign *commit* (rows durable,
+        nothing to do) apart from a foreign *rollback* (rows destroyed)
+        since both raise the identical "no such savepoint"."""
+        wait_row = await db.operator_waits.get(self._conn, issue_id)
+        control_row = await db.pipeline_controls.get(self._conn, issue_id)
+        return (
+            wait_row is not None
+            and wait_row.run_id == run_id
+            and wait_row.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+            and control_row is not None
+            and control_row.stage == controls.IMPLEMENT_STAGE
+            and control_row.outcome == str(controls.AttemptOutcome.FAILED)
+            and control_row.run_id == run_id
+        )
+
+    async def _implement_failed_clear_landed_durably(self, issue_id: str, run_id: str) -> bool:
+        """Whether `_handle_implement_failed_slash_intent`'s stop/reject clear
+        — the control row settled to `skipped` and the operator wait dropped —
+        is actually on disk for this run, used after a `release_savepoint`
+        miss to tell a foreign *commit* (rows durable, nothing to do) apart
+        from a foreign *rollback* (rows destroyed) since both raise the
+        identical "no such savepoint"."""
+        wait_row = await db.operator_waits.get(self._conn, issue_id)
+        control_row = await db.pipeline_controls.get(self._conn, issue_id)
+        return (
+            (wait_row is None or wait_row.run_id != run_id)
+            and control_row is not None
+            and control_row.stage == controls.IMPLEMENT_STAGE
+            and control_row.outcome == str(controls.AttemptOutcome.SKIPPED)
+            and control_row.run_id == run_id
         )
 
     async def _track_implement_blocked_wait(
@@ -2005,7 +2160,9 @@ class _OrchestratorBase:
                 return binding
         return None
 
-    async def _clear_operator_wait(self, issue_id: str, run_id: str) -> None:
+    async def _clear_operator_wait(
+        self, issue_id: str, run_id: str, *, commit: bool = True
+    ) -> None:
         if self._dispatch_run_ids.get(issue_id) == run_id:
             self._dispatch_run_ids.pop(issue_id, None)
         self._operator_wait_run_ids.discard(run_id)
@@ -2016,7 +2173,7 @@ class _OrchestratorBase:
         self._merge_needs_approval_bindings.pop(run_id, None)
         self._acceptance_rejected_run_bindings.pop(run_id, None)
         self._budget_exceeded_run_bindings.pop(run_id, None)
-        await db.operator_waits.delete(self._conn, issue_id, run_id)
+        await db.operator_waits.delete(self._conn, issue_id, run_id, commit=commit)
 
     async def _token_budget_ceiling(self, issue_id: str, binding: RepoBinding) -> float | None:
         """Soft ceiling = `per_issue_token_budget + granted_token_budget`.

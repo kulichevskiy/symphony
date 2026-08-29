@@ -40,6 +40,7 @@ from ...linear.templates import (
     skip_acceptance_forced,
     truncate_body,
 )
+from ...pipeline import controls
 from ...tracker import Comment as LinearComment
 from ...tracker import Issue as LinearIssue
 from ._base import (
@@ -60,6 +61,8 @@ log = logging.getLogger(__name__)
 
 
 MANUAL_MERGE_PARKED_RUN_PREFIX = "manual-merge-parked:"
+# Synthetic comment id `_apply_web_command` stamps on a UI-issued command.
+WEB_COMMAND_COMMENT_PREFIX = "web-"
 
 
 def _manual_merge_parked_run_id(pr: db.issue_prs.IssuePR) -> str:
@@ -79,7 +82,13 @@ class _SlashCommandsMixin(_OrchestratorBase):
 
         async def _blocked_reason_for_run(self, run_id: str) -> str: ...
 
-        async def _clear_operator_wait(self, issue_id: str, run_id: str) -> None: ...
+        async def _clear_operator_wait(
+            self, issue_id: str, run_id: str, *, commit: bool = True
+        ) -> None: ...
+
+        async def _implement_failed_clear_landed_durably(
+            self, issue_id: str, run_id: str
+        ) -> bool: ...
 
         async def _clear_review_rearm_retry(self, run_id: str) -> None: ...
 
@@ -202,7 +211,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
             return
         intent = SlashIntent(
             kind=kind,
-            comment_id=f"web-{command_id}",
+            comment_id=f"{WEB_COMMAND_COMMENT_PREFIX}{command_id}",
             created_at=self._now().isoformat(),
         )
         await self._handle_slash_intent(issue_id, run_id, intent)
@@ -620,6 +629,49 @@ class _SlashCommandsMixin(_OrchestratorBase):
                 e,
             )
 
+    async def _accept_control_action(
+        self, issue_id: str, action: controls.ControlAction, intent: SlashIntent
+    ) -> controls.ActionResult | None:
+        """Put one operator command through the pipeline-control module.
+
+        Returns the accepted result — the transition is committed, so the
+        caller's side effects run behind a durable decision — or None when the
+        action is rejected (not available in the current state, or this exact
+        command was already applied), having told the operator why."""
+        result = await controls.apply(
+            self._conn,
+            issue_id,
+            action,
+            actor=self._control_actor(intent),
+            action_id=intent.comment_id,
+            at=self._now().isoformat(),
+        )
+        if result.accepted:
+            return result
+        log.info(
+            "pipeline control rejected %s for issue %s: %s",
+            action.value,
+            issue_id,
+            result.rejection,
+        )
+        await self._post_command_rejected(
+            issue_id,
+            self._slash_text(intent),
+            result.rejection or f"{action.value} is not available right now",
+        )
+        return None
+
+    @staticmethod
+    def _control_actor(intent: SlashIntent) -> str:
+        """Who asked: the comment author when known, else a synthetic
+        `origin:id` (web-button commands carry a synthetic `web-` comment id
+        and no author)."""
+        if intent.author:
+            return intent.author
+        if intent.comment_id.startswith(WEB_COMMAND_COMMENT_PREFIX):
+            return f"web:{intent.comment_id.removeprefix(WEB_COMMAND_COMMENT_PREFIX)}"
+        return f"tracker:{intent.comment_id}"
+
     async def _handle_parked_manual_merge_slash_intent(
         self,
         issue_id: str,
@@ -709,14 +761,48 @@ class _SlashCommandsMixin(_OrchestratorBase):
                     binding.linear_states.ready,
                 )
                 return
+            # The control module decides — and durably records — whether this
+            # retry happens, before anything outside the DB moves (SYM-244).
+            # A command that is no longer valid, or one already applied, stops
+            # here and can never start a second implement attempt. `$approve`
+            # on this park is the same transition, so it goes through the same
+            # gate. The workspace and its committed checkpoint are untouched:
+            # the fresh attempt picks them up on the next dispatch; process and
+            # session state are deliberately not resumed.
+            accepted = await self._accept_control_action(
+                issue_id, controls.ControlAction.RETRY, intent
+            )
+            if accepted is None:
+                return
             try:
                 await tracker.move_issue(tracker_issue_id, ready_id)
             except LinearError as e:
+                # Nothing carried the transition out; release it so the next
+                # poll tick can re-deliver this same command.
+                await controls.release(self._conn, accepted, at=self._now().isoformat())
                 log.warning("could not move %s to ready for retry: %s", issue_id, e)
                 raise SlashHandlerFailure(
                     slash_text=self._slash_text(intent),
                     reason=f"could not move issue to ready state for retry: {e}",
                 ) from e
+            except BaseException:
+                # Any other failure (malformed payload, cancellation, daemon
+                # death) also means the park isn't safely resumed; release it
+                # the same way so the park stays retryable, then propagate.
+                await controls.release(self._conn, accepted, at=self._now().isoformat())
+                raise
+            # The issue has already moved to ready, but the transition is only
+            # truly un-releasable once `_clear_operator_wait` below commits:
+            # until then the park is still open and dispatch is still blocked
+            # by `_dispatch_run_ids` (set when the park was created), so a
+            # failure anywhere before that call still needs to release the
+            # transition for the next poll tick to re-deliver the same
+            # `$retry`. `_clear_operator_wait` itself pops `_dispatch_run_ids`/
+            # `_operator_wait_run_ids`/`_implement_failed_run_bindings` before
+            # its own DB delete, so a failure inside it leaves the in-memory
+            # gate already open with the wait row still present (SYM-244
+            # review) — its `except` below re-arms that tracking before
+            # releasing so the gate stays shut until the wait is actually gone.
             body = resumed(
                 CommentVars(
                     stage="implement",
@@ -730,7 +816,21 @@ class _SlashCommandsMixin(_OrchestratorBase):
                 await tracker.post_comment(tracker_issue_id, truncate_body(body))
             except LinearError as e:
                 log.warning("implement retry comment failed for issue %s: %s", issue_id, e)
-            await self._clear_operator_wait(issue_id, run_id)
+            except BaseException:
+                await controls.release(self._conn, accepted, at=self._now().isoformat())
+                raise
+            try:
+                await self._clear_operator_wait(issue_id, run_id)
+            except BaseException:
+                # `_clear_operator_wait` already popped the dispatch gate for
+                # this run before its DB delete failed; re-arm it so a
+                # webhook-driven dispatch can't slip in and start a second
+                # implement attempt before the released park is restored.
+                self._dispatch_run_ids[issue_id] = run_id
+                self._operator_wait_run_ids.add(run_id)
+                self._implement_failed_run_bindings[run_id] = binding
+                await controls.release(self._conn, accepted, at=self._now().isoformat())
+                raise
             return
 
         if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
@@ -766,7 +866,92 @@ class _SlashCommandsMixin(_OrchestratorBase):
                     slash_text=self._slash_text(intent),
                     reason=f"could not move issue to blocked state: {e}",
                 ) from e
-            await self._clear_operator_wait(issue_id, run_id)
+            # The park is going away with no retry behind it: settle the
+            # control row to a terminal, non-retryable outcome in the same
+            # transaction as the wait delete below, so `controls.snapshot`
+            # never keeps advertising Retry for a blocked issue with nothing
+            # parked to retry (SYM-244 review).
+            #
+            # A uniquely-named SAVEPOINT scopes the undo to just these two
+            # writes, mirroring `_track_implement_failed_wait`
+            # (`poll/_base.py`): `self._conn` is shared by the whole daemon,
+            # and `controls.apply` can be mid-transition on it when this
+            # handler runs. `controls.guard_writes` serializes this
+            # SAVEPOINT-to-commit window against `apply`/`release`'s own for
+            # the same issue, but not against some unrelated `commit=True` DAO
+            # call elsewhere on the same connection landing mid-window and
+            # ending the whole transaction out from under this SAVEPOINT.
+            # `controls.rollback_to_savepoint`/`release_savepoint` tolerate
+            # that ("no such savepoint") instead of raising a bare
+            # `sqlite3.OperationalError`.
+            #
+            # Unlike `_track_implement_failed_wait` (which is *creating* a
+            # park that didn't exist before), this call is *clearing* one that
+            # did: the safe, always-correct convergence when a savepoint goes
+            # missing is therefore not "restore the old row", it is "finish
+            # the clear" — settle the control row to skipped and drop the
+            # wait for real — since that is exactly the durable state this
+            # branch is trying to reach regardless of which foreign write
+            # interfered. `_implement_failed_clear_landed_durably` tells
+            # "already landed, nothing to do" apart from "redo for real".
+            savepoint = f"implement_failed_clear_{uuid.uuid4().hex}"
+            reason = await self._blocked_reason_for_run(run_id) or None
+
+            async def _finish_implement_blocked_clear() -> None:
+                await controls.record_stage_outcome(
+                    self._conn,
+                    issue_id,
+                    stage=controls.IMPLEMENT_STAGE,
+                    outcome=controls.AttemptOutcome.SKIPPED,
+                    reason=reason,
+                    run_id=run_id,
+                    at=self._now().isoformat(),
+                    commit=False,
+                )
+                await self._clear_operator_wait(issue_id, run_id, commit=True)
+
+            async with controls.guard_writes(issue_id):
+                await self._conn.execute(f"SAVEPOINT {savepoint}")
+                try:
+                    await controls.record_stage_outcome(
+                        self._conn,
+                        issue_id,
+                        stage=controls.IMPLEMENT_STAGE,
+                        outcome=controls.AttemptOutcome.SKIPPED,
+                        reason=reason,
+                        run_id=run_id,
+                        at=self._now().isoformat(),
+                        commit=False,
+                    )
+                    await self._clear_operator_wait(issue_id, run_id, commit=False)
+                except BaseException:
+                    if not await controls.rollback_to_savepoint(
+                        self._conn, savepoint
+                    ) and not await self._implement_failed_clear_landed_durably(issue_id, run_id):
+                        # The savepoint is gone — a foreign commit or a
+                        # foreign rollback landed mid-window, and this call's
+                        # own writes did not fully land either way. Finish
+                        # the clear for real rather than leaving a stuck park
+                        # behind: a durable `skipped` outcome with the wait
+                        # still open (SYM-244 review).
+                        await _finish_implement_blocked_clear()
+                    raise
+                await controls.release_savepoint(self._conn, savepoint)
+                await self._conn.commit()
+                # Re-read unconditionally rather than only on a
+                # missing-savepoint miss: a *successful* `RELEASE SAVEPOINT`
+                # still leaves an unprotected suspension point at the
+                # `await self._conn.commit()` above, and a foreign
+                # `conn.rollback()` landing there destroys both writes
+                # without `release_savepoint` ever seeing a missing savepoint
+                # (SYM-244 review).
+                if not await self._implement_failed_clear_landed_durably(issue_id, run_id):
+                    # A foreign rollback destroyed the control row and the
+                    # operator wait delete along with itself, so the park
+                    # that should be gone by now is still sitting there. Redo
+                    # both writes for real instead of returning as if they
+                    # landed.
+                    await _finish_implement_blocked_clear()
             return
 
         log.info(

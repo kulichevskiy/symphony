@@ -54,6 +54,9 @@ class SlashIntent:
     # The operator's full comment text (e.g. `$retry <token>`). Carried so a
     # blocked-resume handoff can pass any tokens/instructions to the fresh run.
     text: str = ""
+    # Who posted the comment, for durable actor attribution on the control
+    # row this intent eventually drives.
+    author: str = ""
 
 
 def _is_thumbs_up(body: str) -> bool:
@@ -97,6 +100,7 @@ def parse(comments: Sequence[Comment]) -> list[SlashIntent]:
                     comment_id=c.id,
                     created_at=c.created_at,
                     text=body,
+                    author=c.author_name,
                 )
             )
             continue
@@ -112,6 +116,7 @@ def parse(comments: Sequence[Comment]) -> list[SlashIntent]:
                 comment_id=c.id,
                 created_at=c.created_at,
                 text=command_text,
+                author=c.author_name,
             )
         )
     return out

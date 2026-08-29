@@ -9,6 +9,7 @@ external Linear completion in the timeline.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ from ..config import Config, RepoBinding
 from ..github.client import GitHubClient, GitHubError
 from ..github.webhook import GitHubWebhookEvent
 from ..linear.client import LinearError
+from ..pipeline import controls
 from ..tracker import (
     DEFAULT_PROVIDER,
     DEFAULT_SITE,
@@ -608,67 +610,97 @@ class Reconciler:
     ) -> tuple[_PostCommitReviewRequest | None, bool]:
         post_commit_review_request: _PostCommitReviewRequest | None = None
         post_cancel_comment = False
-        try:
-            await db.external_observations.insert(
-                self._conn,
-                issue_id=issue_id,
-                source=SOURCE_LINEAR,
-                observed_at=inputs.observed_at,
-                payload_json=_json_payload({**observation.linear_payload, "reason": reason}),
-                drift_kind=observation.linear_drift,
-                action_taken=plan.linear_action,
-                commit=False,
-            )
-            await db.external_observations.insert(
-                self._conn,
-                issue_id=issue_id,
-                source=SOURCE_GITHUB,
-                observed_at=inputs.observed_at,
-                payload_json=_json_payload({**observation.github_payload, "reason": reason}),
-                drift_kind=observation.github_drift,
-                action_taken=plan.github_action,
-                commit=False,
-            )
-            if plan.linear_action == ACTION_NOTED and observation.linear_issue is not None:
-                await self._note_external_state_change(
+        writes_control_row = (
+            plan.linear_action == ACTION_CLEARED
+            and observation.linear_drift == DRIFT_LINEAR_CANCELED
+            and observation.linear_issue is not None
+        )
+        # Only the DRIFT_LINEAR_CANCELED clear below writes `pipeline_controls`,
+        # and only that write needs `controls.guard_writes`'s serialization
+        # against `controls.apply`/`release`'s own SAVEPOINT-to-commit windows
+        # for the same issue — see `guard_writes`' and the `controls` module
+        # docstring's foreign-interference notes (SYM-244 review). That branch
+        # never coincides with `ACTION_ADOPTED` in the same call:
+        # `_observe_reconcile_sources` forces `orphans` empty whenever
+        # `linear_drift` is `DRIFT_LINEAR_CANCELED`, and `github_adoptable`
+        # requires a non-empty `orphans`. So holding the guard's daemon-wide
+        # write lock here never overlaps with `_adopt_orphan_prs`'s tracker
+        # calls (`_move_issue_to_state`, up to a 20s HTTP timeout each), which
+        # would otherwise stall every other issue's `controls.apply`/`release`/
+        # park write for as long as Linear takes to answer. The other write
+        # paths below (github clear, adoption) rely on the module's documented
+        # foreign-commit/foreign-rollback tolerance instead.
+        guard = controls.guard_writes(issue_id) if writes_control_row else contextlib.nullcontext()
+        async with guard:
+            try:
+                await db.external_observations.insert(
+                    self._conn,
                     issue_id=issue_id,
                     source=SOURCE_LINEAR,
-                    state_name=observation.linear_issue.state_name,
-                    ts=inputs.observed_at,
-                )
-            if (
-                plan.linear_action == ACTION_CLEARED
-                and observation.linear_drift == DRIFT_LINEAR_CANCELED
-                and observation.linear_issue is not None
-            ):
-                await self._apply_linear_canceled_clear(
-                    issue_id=issue_id,
-                    wait=inputs.wait,
-                    state_name=observation.linear_issue.state_name,
-                    ts=inputs.observed_at,
-                )
-                post_cancel_comment = True
-            if plan.github_action == ACTION_CLEARED:
-                await self._apply_github_clear(
-                    issue_id=issue_id,
-                    wait=inputs.wait,
-                    drift_kind=observation.github_drift,
-                    github_prs=observation.drift_prs,
-                )
-            elif plan.github_action == ACTION_ADOPTED:
-                post_commit_review_request = await self._adopt_orphan_prs(
-                    issue_id=issue_id,
-                    tracker_issue_id=inputs.tracker_issue_id,
-                    tracker_ctx=inputs.tracker_ctx,
-                    team_key=str(inputs.issue_row["team_key"]),
-                    wait=inputs.wait,
-                    orphans=observation.orphans,
                     observed_at=inputs.observed_at,
+                    payload_json=_json_payload({**observation.linear_payload, "reason": reason}),
+                    drift_kind=observation.linear_drift,
+                    action_taken=plan.linear_action,
+                    commit=False,
                 )
-            await self._conn.commit()
-        except Exception:
-            await self._conn.rollback()
-            raise
+                await db.external_observations.insert(
+                    self._conn,
+                    issue_id=issue_id,
+                    source=SOURCE_GITHUB,
+                    observed_at=inputs.observed_at,
+                    payload_json=_json_payload({**observation.github_payload, "reason": reason}),
+                    drift_kind=observation.github_drift,
+                    action_taken=plan.github_action,
+                    commit=False,
+                )
+                if plan.linear_action == ACTION_NOTED and observation.linear_issue is not None:
+                    await self._note_external_state_change(
+                        issue_id=issue_id,
+                        source=SOURCE_LINEAR,
+                        state_name=observation.linear_issue.state_name,
+                        ts=inputs.observed_at,
+                    )
+                if (
+                    plan.linear_action == ACTION_CLEARED
+                    and observation.linear_drift == DRIFT_LINEAR_CANCELED
+                    and observation.linear_issue is not None
+                ):
+                    await self._apply_linear_canceled_clear(
+                        issue_id=issue_id,
+                        wait=inputs.wait,
+                        state_name=observation.linear_issue.state_name,
+                        ts=inputs.observed_at,
+                    )
+                    post_cancel_comment = True
+                if plan.github_action == ACTION_CLEARED:
+                    await self._apply_github_clear(
+                        issue_id=issue_id,
+                        wait=inputs.wait,
+                        drift_kind=observation.github_drift,
+                        github_prs=observation.drift_prs,
+                    )
+                elif plan.github_action == ACTION_ADOPTED:
+                    post_commit_review_request = await self._adopt_orphan_prs(
+                        issue_id=issue_id,
+                        tracker_issue_id=inputs.tracker_issue_id,
+                        tracker_ctx=inputs.tracker_ctx,
+                        team_key=str(inputs.issue_row["team_key"]),
+                        wait=inputs.wait,
+                        orphans=observation.orphans,
+                        observed_at=inputs.observed_at,
+                    )
+                await self._conn.commit()
+            except BaseException:
+                # `BaseException`, not `Exception`: this task can be cancelled
+                # (e.g. daemon shutdown) between the writes above and the
+                # commit, and that must roll back the same as any other
+                # failure — an `Exception`-only catch would skip the rollback
+                # and leave the cancel-clear's wait delete and control-row
+                # write (or the adoption/github-clear writes) dangling in the
+                # open transaction for a later foreign commit to land as a
+                # half-state (SYM-244 review).
+                await self._conn.rollback()
+                raise
         return post_commit_review_request, post_cancel_comment
 
     async def _post_reconcile_notifications(
@@ -1139,6 +1171,56 @@ class Reconciler:
             team_key=team_key,
             state_name=target_state,
         )
+        if wait is not None and wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
+            # Settle the durable control row before the wait it backs is
+            # deleted or overwritten below, so `pipeline_controls` never keeps
+            # reporting `implement`/`failed` (Retry offered, no park behind
+            # it) for an issue whose implement work actually landed a PR
+            # (SYM-244 review). Covers both sub-cases: the explicit delete
+            # right below, and the needs-approval sub-case that instead
+            # upserts a `KIND_REVIEW_FAILED` wait over this row without ever
+            # calling `delete`.
+            #
+            # `wait` was captured back in `_reconcile_inputs`, before this
+            # call's GitHub/tracker I/O above, and nothing serializes this
+            # write against a concurrent Retry or Stop accepted on the same
+            # park in that window — `_adopt_orphan_prs` deliberately never
+            # takes `controls.guard_writes` (see
+            # `test_orphan_adoption_does_not_hold_the_controls_write_lock`).
+            # An accepted Stop settles the control row to `skipped` and drops
+            # the wait in the same transaction, so re-reading the wait alone
+            # catches that. An accepted Retry does not: `_accept_control_action`
+            # commits the control row straight to `pending` (dropping its
+            # `run_id`) but the ingress only clears the wait afterwards, once
+            # its own tracker move and comment succeed — so the *wait* can
+            # still match `wait.run_id` here even though the control row it
+            # backs has already moved on (SYM-244 review). Re-read the control
+            # row too and require it still reports the `failed` outcome this
+            # call observed before settling to `succeeded`.
+            current_wait = await db.operator_waits.get(self._conn, issue_id)
+            control_row = await db.pipeline_controls.get(self._conn, issue_id)
+            if (
+                current_wait is not None
+                and current_wait.run_id == wait.run_id
+                and current_wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+                and (
+                    control_row is None
+                    or (
+                        control_row.outcome == str(controls.AttemptOutcome.FAILED)
+                        and control_row.run_id == wait.run_id
+                    )
+                )
+            ):
+                await controls.record_stage_outcome(
+                    self._conn,
+                    issue_id,
+                    stage=controls.IMPLEMENT_STAGE,
+                    outcome=controls.AttemptOutcome.SUCCEEDED,
+                    reason=f"orphan PR adopted ({obs.github_repo}#{obs.pr_number})",
+                    run_id=wait.run_id,
+                    at=observed_at,
+                    commit=False,
+                )
         if wait is not None and not (
             local_review_configured and not remote_review_configured and not local_only_review_ready
         ):
@@ -1380,6 +1462,13 @@ class Reconciler:
         cancellation for the audit timeline. All writes stay in the caller's
         transaction (``commit=False``) so a later failure rolls the whole clear
         back.
+
+        A `KIND_IMPLEMENT_FAILED` wait is also the durable park behind a
+        `pipeline_controls` row's `failed` outcome (`controls.snapshot`'s
+        `_derived_snapshot` fallback and the tracer that writes it): clearing
+        that wait without also settling the control row would leave
+        `allowed_actions` advertising Retry for an issue that is now canceled
+        with no park behind it (SYM-244 review).
         """
         if wait is None:
             raise RuntimeError("cannot clear canceled drift without an operator wait")
@@ -1389,6 +1478,17 @@ class Reconciler:
             wait.run_id,
             commit=False,
         )
+        if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
+            await controls.record_stage_outcome(
+                self._conn,
+                issue_id,
+                stage=controls.IMPLEMENT_STAGE,
+                outcome=controls.AttemptOutcome.SKIPPED,
+                reason=f"tracker issue canceled (state: {state_name})",
+                run_id=wait.run_id,
+                at=ts,
+                commit=False,
+            )
         await self._supersede_canceled_runs(issue_id=issue_id, ts=ts)
         await self._note_external_state_change(
             issue_id=issue_id,

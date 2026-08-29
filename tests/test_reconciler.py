@@ -1030,6 +1030,58 @@ async def test_active_linear_canceled_clears_wait_and_supersedes_run(
 
 
 @pytest.mark.asyncio
+async def test_active_linear_canceled_clear_settles_the_control_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clearing an `implement_failed` park for a now-canceled issue must not
+    leave `pipeline_controls` still advertising Retry with no park behind it
+    (SYM-244 review)."""
+    from symphony.pipeline import controls
+
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        # The real tracer (`_track_implement_failed_wait`) writes this durable
+        # row when the run first fails; seed it directly here rather than
+        # driving a full dispatch, so the pre-existing `pipeline_controls`
+        # row — not just the derived-from-wait fallback — is what the
+        # cancel-clear must settle.
+        await controls.record_stage_outcome(
+            conn,
+            "iss-1",
+            stage=controls.IMPLEMENT_STAGE,
+            outcome=controls.AttemptOutcome.FAILED,
+            reason="boom",
+            run_id="run-iss-1",
+            at="2026-05-17T10:00:30Z",
+        )
+        parked = await controls.snapshot(conn, "iss-1")
+        assert controls.ControlAction.RETRY in parked.allowed_actions
+
+        fake = _FakeLinear(state_name="Canceled", state_type="canceled")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        settled = await controls.snapshot(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert controls.ControlAction.RETRY not in settled.allowed_actions
+    assert settled.outcome is controls.AttemptOutcome.SKIPPED
+
+
+@pytest.mark.asyncio
 async def test_active_linear_canceled_supersedes_older_failed_run_too(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2168,11 +2220,27 @@ async def test_active_orphan_open_pr_adopted_and_routed_to_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Adopting an orphan PR clears the `implement_failed` park it landed
+    behind; the durable control row must settle with it. Otherwise
+    `pipeline_controls` keeps reporting `implement`/`failed` with Retry
+    offered for an issue that has already moved on to review (SYM-244
+    review)."""
+    from symphony.pipeline import controls
+
     monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
     conn = await db.connect(tmp_path / "state.sqlite")
     try:
         await _seed_issue(conn)
         await _seed_implement_failed_wait(conn)
+        await controls.record_stage_outcome(
+            conn,
+            "iss-1",
+            stage=controls.IMPLEMENT_STAGE,
+            outcome=controls.AttemptOutcome.FAILED,
+            reason="agent exited 2",
+            run_id="run-iss-1",
+            at="2026-05-17T10:01:00Z",
+        )
         fake_gh = _FakeGitHub(
             open_prs_by_head={
                 "symphony/eng-1": {
@@ -2199,6 +2267,7 @@ async def test_active_orphan_open_pr_adopted_and_routed_to_review(
         pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
         review = await db.review_state.get(conn, "iss-1")
         merge_candidates = await db.issue_prs.list_merge_candidates(conn)
+        control_snapshot = await controls.snapshot(conn, "iss-1")
     finally:
         await conn.close()
 
@@ -2210,11 +2279,237 @@ async def test_active_orphan_open_pr_adopted_and_routed_to_review(
     assert review.pr_number == 326
     assert [c.pr_number for c in merge_candidates] == [326]
     assert fake_gh.comments == [(326, "@codex review", "org/repo")]
+    assert control_snapshot.outcome is controls.AttemptOutcome.SUCCEEDED
+    assert controls.ControlAction.RETRY not in control_snapshot.allowed_actions
     # Default binding is remote-review (code_review="Needs Approval"); adoption
     # moves the issue into that lane so `_review_issue_is_active` accepts it.
     assert linear.moves == [("iss-1", "state-needs-approval")]
     assert rows[1][1] == DRIFT_ORPHAN_PR_OPEN
     assert rows[1][2] == ACTION_ADOPTED
+
+
+@pytest.mark.asyncio
+async def test_orphan_adoption_does_not_settle_a_wait_superseded_mid_flight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`wait` is captured in `_reconcile_inputs`, before `_adopt_orphan_prs`'s
+    GitHub/tracker I/O. If an operator's Stop is accepted on that same
+    `implement_failed` park while that I/O is in flight, it settles the
+    control row to `skipped` and drops the wait before adoption ever reaches
+    its own settle. Adoption must not clobber that with a stale `succeeded`
+    for a park that no longer exists (SYM-244 review)."""
+    from symphony.pipeline import controls
+
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        await controls.record_stage_outcome(
+            conn,
+            "iss-1",
+            stage=controls.IMPLEMENT_STAGE,
+            outcome=controls.AttemptOutcome.FAILED,
+            reason="agent exited 2",
+            run_id="run-iss-1",
+            at="2026-05-17T10:01:00Z",
+        )
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        real_move_issue_to_state = reconciler._move_issue_to_state
+
+        async def _move_issue_to_state_then_race(**kwargs: Any) -> None:
+            # Simulate a `$stop` accepted on the same park while this call's
+            # tracker I/O was in flight: it settles the control row and
+            # drops the wait in its own already-committed transaction, same
+            # as `_handle_implement_failed_slash_intent`'s STOP path.
+            await controls.record_stage_outcome(
+                conn,
+                "iss-1",
+                stage=controls.IMPLEMENT_STAGE,
+                outcome=controls.AttemptOutcome.SKIPPED,
+                reason="stopped by operator",
+                run_id="run-iss-1",
+                at="2026-05-17T10:02:00Z",
+            )
+            await db.operator_waits.delete(conn, "iss-1", "run-iss-1")
+            await real_move_issue_to_state(**kwargs)
+
+        monkeypatch.setattr(reconciler, "_move_issue_to_state", _move_issue_to_state_then_race)
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        control_snapshot = await controls.snapshot(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert pr is not None
+    assert pr.pr_number == 326
+    assert control_snapshot.outcome is controls.AttemptOutcome.SKIPPED
+    assert controls.ControlAction.RETRY not in control_snapshot.allowed_actions
+
+
+@pytest.mark.asyncio
+async def test_orphan_adoption_does_not_settle_a_retry_accepted_mid_flight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unlike Stop, an accepted Retry does not drop the wait in the same
+    transaction as its control-row transition: `_accept_control_action`
+    commits the control row straight to `pending` first, and only the
+    ingress's later tracker move/comment clear the wait. So while that side
+    effect is still in flight the wait can still match `wait.run_id` even
+    though the control row it used to back has already moved on to a fresh
+    attempt. Re-reading the wait alone (as the prior fix for the Stop race
+    did) does not catch this — adoption must also re-check the control row
+    itself before settling to `succeeded` (SYM-244 review)."""
+    from symphony.pipeline import controls
+
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        await controls.record_stage_outcome(
+            conn,
+            "iss-1",
+            stage=controls.IMPLEMENT_STAGE,
+            outcome=controls.AttemptOutcome.FAILED,
+            reason="agent exited 2",
+            run_id="run-iss-1",
+            at="2026-05-17T10:01:00Z",
+        )
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        real_move_issue_to_state = reconciler._move_issue_to_state
+
+        async def _move_issue_to_state_then_race(**kwargs: Any) -> None:
+            # Simulate an accepted `$retry` on the same park while this
+            # call's tracker I/O was in flight: `controls.apply` commits the
+            # control row to `pending` (dropping its `run_id`, per
+            # `_next_mode_and_outcome`) but the wait itself is left in place
+            # until the ingress's own tracker move/comment succeed later.
+            await controls.record_stage_outcome(
+                conn,
+                "iss-1",
+                stage=controls.IMPLEMENT_STAGE,
+                outcome=controls.AttemptOutcome.PENDING,
+                reason=None,
+                run_id=None,
+                at="2026-05-17T10:02:00Z",
+            )
+            await real_move_issue_to_state(**kwargs)
+
+        monkeypatch.setattr(reconciler, "_move_issue_to_state", _move_issue_to_state_then_race)
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        control_snapshot = await controls.snapshot(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert pr is not None
+    assert pr.pr_number == 326
+    assert control_snapshot.outcome is controls.AttemptOutcome.PENDING
+    assert wait is None
+
+
+@pytest.mark.asyncio
+async def test_orphan_adoption_does_not_hold_the_controls_write_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_persist_reconcile_actions` used to wrap its whole write+commit window
+    in `controls.guard_writes`, including `_adopt_orphan_prs`'s tracker calls
+    (`_move_issue_to_state`'s `team_states`/`move_issue`, up to a 20s HTTP
+    timeout each) — holding the module's one daemon-wide write lock for as
+    long as Linear took to answer, stalling every other issue's
+    `controls.apply`/`release`/park write, including the operator's `$retry`
+    (SYM-244 review). `ACTION_ADOPTED` does write a control row when it clears
+    an `implement_failed` park (settling it to `SUCCEEDED` so a stale row
+    doesn't keep offering Retry after the issue moves on — SYM-244 review),
+    but relies on the module's documented foreign-commit/foreign-rollback
+    tolerance instead of `guard_writes`'s serialization: that write never
+    coincides with the `DRIFT_LINEAR_CANCELED` clear's own guarded write in
+    the same tick (`_observe_reconcile_sources` forces `orphans` empty
+    whenever `linear_drift` is `DRIFT_LINEAR_CANCELED`) — so an adoption tick
+    must not enter `guard_writes` at all."""
+    from collections.abc import AsyncIterator
+    from contextlib import asynccontextmanager
+
+    from symphony.pipeline import controls
+
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        guard_entries: list[str] = []
+        real_guard_writes = controls.guard_writes
+
+        @asynccontextmanager
+        async def _tracking_guard_writes(issue_id: str) -> AsyncIterator[None]:
+            guard_entries.append(issue_id)
+            async with real_guard_writes(issue_id):
+                yield
+
+        monkeypatch.setattr(controls, "guard_writes", _tracking_guard_writes)
+
+        assert await reconciler.tick() == 2
+        assert guard_entries == []
+    finally:
+        await conn.close()
 
 
 @pytest.mark.asyncio
