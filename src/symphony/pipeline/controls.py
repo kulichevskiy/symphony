@@ -681,12 +681,16 @@ async def apply(
             if not released and not await _apply_landed_durably(
                 conn, issue_id, action_id, mode=mode, outcome=outcome, run_id=run_id
             ):
-                # The missing savepoint was a foreign *rollback*, not a
-                # foreign commit: it destroyed both writes above along with
-                # itself, so what should have been an accepted, durable
-                # transition is currently nothing at all. Redo both writes
-                # for real and commit them on their own, rather than handing
-                # the caller an `accepted=True` result with nothing on disk.
+                # The missing savepoint means either write above did not land
+                # as intended — a foreign rollback destroyed both, or a
+                # foreign commit landed only the action row before a later
+                # foreign rollback took out `put`. `delete_action` first makes
+                # the redo idempotent either way: a no-op if the action row
+                # was never durable, and a cleanup of the stale row if it was,
+                # so the re-`record_action` below can't collide with it.
+                await db.pipeline_controls.delete_action(
+                    conn, issue_id=issue_id, action_id=action_id, commit=False
+                )
                 await db.pipeline_controls.record_action(
                     conn,
                     issue_id=issue_id,

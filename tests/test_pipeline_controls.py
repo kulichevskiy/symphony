@@ -757,6 +757,82 @@ async def test_startup_sweep_reconciles_interrupted_retry_to_failed(
 
 
 @pytest.mark.asyncio
+async def test_startup_sweep_recovers_from_a_foreign_rollback_inside_its_savepoint_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirror of `test_apply_recovers_from_a_foreign_rollback_inside_its_savepoint_window`
+    for the startup sweep's own reset: a foreign `conn.rollback()` landing
+    inside `reconcile_interrupted_retries`'s savepoint window destroys the
+    reset back to failed instead of making it durable. Before this fix, the
+    sweep would treat the missing `RELEASE SAVEPOINT` as if a foreign commit
+    had already landed its rows and return with the control row still
+    `pending` and the interrupted retry's action row still on disk — a park
+    the sweep can never revisit, since it only repairs rows still in that
+    exact shape."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "run-1",
+            "failed",
+            ended_at="2026-08-27T09:05:00+00:00",
+            kind="agent_error",
+            detail="agent exited 2",
+        )
+        await _record_implement(conn, outcome=OUTCOMES.FAILED, reason="agent exited 2")
+        await db.operator_waits.upsert(
+            conn,
+            issue_id=ISSUE_ID,
+            run_id="run-1",
+            kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="eng-1",
+            created_at="2026-08-27T09:05:00+00:00",
+        )
+        result = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.RETRY,
+            actor="tracker:c-retry",
+            action_id="c-retry",
+            at="2026-08-27T10:05:00+00:00",
+        )
+        assert result.accepted
+        pending = await controls.snapshot(conn, ISSUE_ID)
+        assert pending.outcome is OUTCOMES.PENDING
+
+        real_put = db.pipeline_controls.put
+
+        async def _put_then_foreign_rollback(
+            conn: aiosqlite.Connection, **kwargs: object
+        ) -> None:
+            await real_put(conn, **kwargs)
+            await conn.rollback()
+
+        monkeypatch.setattr(db.pipeline_controls, "put", _put_then_foreign_rollback)
+
+        await controls.reconcile_interrupted_retries(conn, at="2026-08-27T11:00:00+00:00")
+
+        reconciled = await controls.snapshot(conn, ISSUE_ID)
+        assert reconciled.outcome is OUTCOMES.FAILED
+        assert reconciled.run_id == "run-1"
+        assert await db.pipeline_controls.get_action(conn, ISSUE_ID, "c-retry") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_run_wires_the_interrupted_retry_sweep_into_startup(
     tmp_path: Path,
 ) -> None:
@@ -934,15 +1010,16 @@ async def test_concurrent_retries_cannot_both_be_accepted(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
-async def test_concurrent_applies_for_different_issues_do_not_corrupt_each_other(
+async def test_apply_failure_for_one_issue_does_not_corrupt_another_issue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`apply` for two *different* issues is only serialized by the per-issue
-    lock, which does not stop them from racing on the one connection's
-    SAVEPOINT-to-commit window. A failure in one call's `put` must roll back
-    only that call's own writes, must leave the other issue's action and
-    control rows untouched, and must not raise `sqlite3.OperationalError` out
-    of either call."""
+    """`_write_lock` fully serializes `apply`'s SAVEPOINT-to-commit window
+    across issues (see its docstring), so two concurrent `apply` calls for
+    different issues never interleave on the connection. What this exercises
+    is per-issue isolation under that serialization: a failure in one call's
+    `put` must roll back only that call's own writes, must leave the other
+    issue's action and control rows untouched, and must not raise
+    `sqlite3.OperationalError` out of either call."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         issue_a, issue_b = ISSUE_ID, "iss-2"
@@ -1465,5 +1542,52 @@ async def test_track_implement_failed_wait_tolerates_a_foreign_commit_inside_its
 
         run = (await db.runs.history_for_issue(conn, ISSUE_ID))[0]
         assert run.status == "completed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_track_implement_failed_wait_recovers_from_a_foreign_rollback_in_its_savepoint_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirror of `test_apply_recovers_from_a_foreign_rollback_inside_its_savepoint_window`
+    for the park path: a foreign `conn.rollback()` landing inside
+    `_track_implement_failed_wait`'s savepoint window destroys the control
+    row and the operator wait instead of making them durable. Before this
+    fix, the missing `RELEASE SAVEPOINT` would be treated the same as a
+    foreign commit and the method would return with neither row on disk — a
+    restart would find no wait and no reason to offer Retry."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = _cfg(tmp_path, binding)
+        orch = _orchestrator(cfg, conn, AsyncMock(), tmp_path)
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+
+        real_upsert = db.operator_waits.upsert
+
+        async def _upsert_then_foreign_rollback(
+            conn: aiosqlite.Connection, **kwargs: object
+        ) -> None:
+            await real_upsert(conn, **kwargs)
+            await conn.rollback()
+
+        monkeypatch.setattr(db.operator_waits, "upsert", _upsert_then_foreign_rollback)
+
+        await orch._track_implement_failed_wait(ISSUE_ID, "run-1", binding)  # noqa: SLF001
+
+        snap = await controls.snapshot(conn, ISSUE_ID)
+        assert snap.outcome is OUTCOMES.FAILED
+        assert await db.operator_waits.get(conn, ISSUE_ID) is not None
     finally:
         await conn.close()
