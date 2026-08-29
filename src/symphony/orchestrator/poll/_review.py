@@ -74,6 +74,7 @@ from ...linear.templates import (
     truncate_body,
 )
 from ...notify import EVENT_RUN_FAILED
+from ...pipeline import controls
 from ...pipeline.cost_guard import UsageDelta
 from ...pipeline.local_review import (
     StreamApiError,
@@ -559,6 +560,15 @@ class _ReviewMixin(_OrchestratorBase):
             result: LoopResult | None,
             operator_wait: bool = False,
         ) -> None: ...
+
+        async def _accept_control_action(
+            self,
+            issue_id: str,
+            action: controls.ControlAction,
+            intent: SlashIntent,
+            *,
+            fingerprint: str | None = None,
+        ) -> controls.ActionResult | None: ...
 
         async def _post_command_rejected(
             self, issue_id: str, slash_text: str, reason: str
@@ -2936,18 +2946,11 @@ class _ReviewMixin(_OrchestratorBase):
         self._dispatch_run_ids[issue_id] = run_id
         self._operator_wait_run_ids.add(run_id)
         self._review_failed_run_bindings[run_id] = binding
-        await db.operator_waits.upsert(
-            self._conn,
-            issue_id=issue_id,
-            run_id=run_id,
+        await self._record_stage_park(
+            issue_id,
+            run_id,
+            binding,
             kind=db.operator_waits.KIND_REVIEW_FAILED,
-            linear_team_key=binding.linear_team_key,
-            github_repo=binding.github_repo,
-            issue_label=binding.issue_label or "",
-            created_at=self._now().isoformat(),
-            provider=binding.provider,
-            tracker_provider=binding.tracker_provider,
-            tracker_site=binding.tracker_site,
         )
 
     async def _track_review_stopped_wait(
@@ -2956,18 +2959,11 @@ class _ReviewMixin(_OrchestratorBase):
         self._dispatch_run_ids[issue_id] = run_id
         self._operator_wait_run_ids.add(run_id)
         self._review_failed_run_bindings[run_id] = binding
-        await db.operator_waits.upsert(
-            self._conn,
-            issue_id=issue_id,
-            run_id=run_id,
+        await self._record_stage_park(
+            issue_id,
+            run_id,
+            binding,
             kind=db.operator_waits.KIND_REVIEW_STOPPED,
-            linear_team_key=binding.linear_team_key,
-            github_repo=binding.github_repo,
-            issue_label=binding.issue_label or "",
-            created_at=self._now().isoformat(),
-            provider=binding.provider,
-            tracker_provider=binding.tracker_provider,
-            tracker_site=binding.tracker_site,
         )
 
     async def _handle_review_failed_slash_intent(
@@ -2988,6 +2984,9 @@ class _ReviewMixin(_OrchestratorBase):
                 return
         tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
         tracker = self.tracker(binding)
+        if intent.kind is SlashKind.SKIP_REVIEW:
+            await self._skip_failed_review(issue_id, run_id, intent, binding)
+            return
         if intent.kind not in (SlashKind.RETRY, SlashKind.APPROVE):
             if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
                 states = await self._states_for_binding(binding)
@@ -3009,7 +3008,16 @@ class _ReviewMixin(_OrchestratorBase):
                             slash_text=self._slash_text(intent),
                             reason=f"could not move issue to blocked state: {e}",
                         ) from e
-                await self._clear_operator_wait(issue_id, run_id)
+                # The park is going away with no retry behind it, so settle the
+                # review stage's control row terminally in the same transaction
+                # (SYM-245) — otherwise the snapshot keeps offering Retry/Skip
+                # for a blocked issue with nothing parked.
+                wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
+                await self._clear_stage_park(
+                    issue_id,
+                    run_id,
+                    kind=(wait.kind if wait is not None else db.operator_waits.KIND_REVIEW_FAILED),
+                )
             else:
                 log.info("slash %s for review-failed run %s ignored", intent.kind, run_id)
             return
@@ -3028,12 +3036,109 @@ class _ReviewMixin(_OrchestratorBase):
                 slash_text=self._slash_text(intent),
                 reason=f"could not look up issue for retry: {e}",
             ) from e
-        await self._resume_review_monitor(
-            binding=binding,
-            issue=issue,
+        # The canonical Retry: one durable decision, recorded before the fresh
+        # review attempt starts, so a stale or re-delivered command cannot run
+        # review twice (SYM-245). `$approve` on this park is the same
+        # transition, so it goes through the same gate.
+        accepted = await self._accept_control_action(issue_id, controls.ControlAction.RETRY, intent)
+        if accepted is None:
+            return
+        try:
+            await self._resume_review_monitor(
+                binding=binding,
+                issue=issue,
+                issue_id=issue_id,
+                tracker_issue_id=tracker_issue_id,
+                run_id=run_id,
+            )
+        except BaseException:
+            # Nothing carried the transition through to a live monitor;
+            # release it so the next poll tick can re-deliver the command.
+            await controls.release(self._conn, accepted, at=self._now().isoformat())
+            raise
+
+    async def _pr_head_sha_or_none(self, binding: RepoBinding, pr_number: int) -> str | None:
+        """The PR's current head SHA, or None when GitHub cannot say.
+
+        This is the review stage's input fingerprint: a Skip approves the
+        commits that were on the PR when the operator judged it, so pushing
+        new ones expires it (SYM-245). `None` records an unscoped skip rather
+        than failing the command outright — a GitHub hiccup should not swallow
+        an operator's decision.
+        """
+        try:
+            view = await (await self._gh_client()).pr_view(pr_number, repo=binding.github_repo)
+        except Exception as e:  # noqa: BLE001 — an unscoped skip beats a lost command
+            log.warning(
+                "could not read PR head for %s#%d to scope the skip: %s",
+                binding.github_repo,
+                pr_number,
+                e,
+            )
+            return None
+        return str(view.get("headRefOid") or "") or None
+
+    async def _skip_failed_review(
+        self, issue_id: str, run_id: str, intent: SlashIntent, binding: RepoBinding
+    ) -> None:
+        """Canonical Skip for a failed review park: record the operator's
+        judgement and advance to merge.
+
+        Review is one of the two validation stages, so an operator who has
+        judged the PR by hand may step over it rather than only retrying it
+        (SYM-245). The skip is a control-model transition first — recorded
+        durably, and rejected outright if the park is stale or the command was
+        already applied — and only then the merge bypass the live-monitor
+        `$skip-review` path already performs.
+        """
+        state = await db.review_state.get(self._conn, issue_id)
+        if state.pr_number is None:
+            await self._post_command_rejected(
+                issue_id,
+                self._slash_text(intent),
+                "no PR found for this issue",
+            )
+            return
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
+        try:
+            issue = await self.tracker(binding).lookup_issue(tracker_issue_id)
+        except LinearError as e:
+            log.warning("could not look up %s for skip-review: %s", issue_id, e)
+            raise SlashHandlerFailure(
+                slash_text=self._slash_text(intent),
+                reason=f"could not look up issue for skip-review: {e}",
+            ) from e
+        if (
+            await self._accept_control_action(
+                issue_id,
+                controls.ControlAction.SKIP,
+                intent,
+                fingerprint=await self._pr_head_sha_or_none(binding, state.pr_number),
+            )
+        ) is None:
+            return
+        await db.issue_prs.mark_review_bypassed(
+            self._conn,
             issue_id=issue_id,
-            tracker_issue_id=tracker_issue_id,
-            run_id=run_id,
+            github_repo=binding.github_repo,
+            pr_number=state.pr_number,
+        )
+        await self._clear_operator_wait(issue_id, run_id)
+        # See the sibling reservations in `_slash_commands.py`: taken under
+        # `config_write_lock` so the drain guard's `scheduled_slots` sample
+        # cannot miss it (SYM-193 review).
+        async with self._config_write_lock:
+            self._schedule_merge(
+                binding=binding,
+                issue=issue,
+                pr_number=state.pr_number,
+                pr_url=state.pr_url,
+                skip_review=True,
+            )
+        log.info(
+            "skip-review: advancing parked %s (PR #%d) directly to merge",
+            issue.identifier,
+            state.pr_number,
         )
 
     async def _resume_review_monitor(
@@ -3230,6 +3335,13 @@ class _ReviewMixin(_OrchestratorBase):
         This bypasses the Codex review verdict and is useful when the operator
         trusts the PR as-is. Valid whenever a review monitor is active for the
         issue — even if a concurrent review_fix run is the active dispatch run.
+
+        This is the *live-monitor* bypass, not an answer to a park: the review
+        stage has not failed, and nothing records it as the pipeline's current
+        stage yet, so there is no control-model state for the canonical Skip to
+        move (SYM-245). Skipping a review that *has* failed goes through
+        `_skip_failed_review` instead. Unifying this path waits on a later
+        slice recording a live stage attempt.
         """
         # A review_fix run may be active at the same time as the review monitor.
         # run_id may point to the fix run, not the monitor. Always look up the
@@ -3713,18 +3825,13 @@ class _ReviewMixin(_OrchestratorBase):
         self._operator_wait_run_ids.add(run.id)
         self._merge_needs_approval_bindings[run.id] = binding
         try:
-            await db.operator_waits.upsert(
-                self._conn,
-                issue_id=run.issue_id,
-                run_id=run.id,
+            await self._record_stage_park(
+                run.issue_id,
+                run.id,
+                binding,
                 kind=db.operator_waits.KIND_REVIEW_CAP,
-                linear_team_key=binding.linear_team_key,
-                github_repo=binding.github_repo,
-                issue_label=binding.issue_label or "",
+                reason=f"review hit the {state.iteration}-iteration cap",
                 created_at=wait_created_at,
-                provider=binding.provider,
-                tracker_provider=binding.tracker_provider,
-                tracker_site=binding.tracker_site,
             )
         except Exception:  # noqa: BLE001 — a persistence hiccup must not crash the poll loop
             log.warning(

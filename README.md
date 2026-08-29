@@ -320,6 +320,14 @@ Steer a run by leaving a **top-level Linear comment** that starts with `$`
 Commands are context-specific (they act on whatever the issue is currently
 waiting on). Free-form comments are **not** steering — only `$`-prefixed ones.
 
+`$retry` carries **no instructions**: a retried attempt re-reads the issue
+description and comments, so put anything the agent now needs (a token, a
+decision, a correction) in the issue itself rather than in the `$retry`
+comment. Skipping is only offered for the two validation stages — review and
+acceptance — and a skip covers the PR head it was given: pushing new commits
+invalidates it and that stage has to run again. Implement, delivery and merge
+can only be retried.
+
 The web dashboard renders these same commands as per-issue buttons, enabled
 only when valid for the issue's current status.
 

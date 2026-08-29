@@ -68,6 +68,7 @@ from ...linear.templates import (
     truncate_body,
 )
 from ...notify import EVENT_OPERATOR_WAIT, EVENT_PR_MERGED
+from ...pipeline import controls
 from ...pipeline.cost_guard import UsageDelta
 from ...pipeline.local_review_loop import (
     LoopOutcome,
@@ -1706,6 +1707,40 @@ class _MergeMixin(_OrchestratorBase):
                 issue_id,
             )
 
+    async def _retry_review_cap_park(
+        self, issue_id: str, run_id: str, intent: SlashIntent, binding: RepoBinding
+    ) -> None:
+        """Canonical Retry for a review-cap park: one more review pass.
+
+        Same transition, same durable gate and same resume path a
+        review-failed park's Retry uses — the park kind decides which stage is
+        retried, not which command handler the comment happened to reach
+        (SYM-245).
+        """
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
+        try:
+            issue = await self.tracker(binding).lookup_issue(tracker_issue_id)
+        except LinearError as e:
+            log.warning("could not look up %s for review-cap retry: %s", issue_id, e)
+            raise SlashHandlerFailure(
+                slash_text=self._slash_text(intent),
+                reason=f"could not look up issue for review-cap retry: {e}",
+            ) from e
+        accepted = await self._accept_control_action(issue_id, controls.ControlAction.RETRY, intent)
+        if accepted is None:
+            return
+        try:
+            await self._resume_review_monitor(
+                binding=binding,
+                issue=issue,
+                issue_id=issue_id,
+                tracker_issue_id=tracker_issue_id,
+                run_id=run_id,
+            )
+        except BaseException:
+            await controls.release(self._conn, accepted, at=self._now().isoformat())
+            raise
+
     async def _handle_merge_needs_approval_slash_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
     ) -> None:
@@ -1731,16 +1766,12 @@ class _MergeMixin(_OrchestratorBase):
             and wait is not None
             and wait.kind == db.operator_waits.KIND_REVIEW_CAP
         ):
-            # The review-cap park only advertises `$approve` (force-advance) and
-            # `$reject` (stop) — `$retry` falling into the shared "re-dispatch the
-            # merge" path below would merge without another review pass, which is
-            # not what an operator retrying a review-cap park intends.
-            await self._post_command_rejected(
-                issue_id,
-                self._slash_text(intent),
-                "$retry is not supported for a review-cap park; reply $approve to "
-                "force-advance or $reject to stop",
-            )
+            # A review-cap park is a *review* stage failure, so its Retry means
+            # "review again", not the shared "re-dispatch the merge" path below
+            # — which would merge without another review pass, the opposite of
+            # what retrying a review-cap park intends. `$approve` still
+            # force-advances to merge and `$reject` still stops (SYM-245).
+            await self._retry_review_cap_park(issue_id, run_id, intent, binding)
             return
         if intent.kind is SlashKind.APPROVE:
             parked_pr = await db.issue_prs.get(
@@ -1784,7 +1815,14 @@ class _MergeMixin(_OrchestratorBase):
                         slash_text=self._slash_text(intent),
                         reason=f"could not move issue to blocked state: {e}",
                     ) from e
-            await self._clear_operator_wait(issue_id, run_id)
+            # A review-cap park is a modeled review-stage failure, so clearing
+            # it must settle that stage's control row too; a plain merge park
+            # is not modeled and just drops its wait (SYM-245).
+            await self._clear_stage_park(
+                issue_id,
+                run_id,
+                kind=(wait.kind if wait is not None else db.operator_waits.KIND_MERGE),
+            )
             return
         if intent.kind not in (SlashKind.APPROVE, SlashKind.RETRY):
             log.info("slash %s for merge-needs-approval run %s ignored", intent.kind, run_id)

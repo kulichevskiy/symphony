@@ -161,10 +161,14 @@ BindingKey = tuple[str, str, str, str, str]
 
 @dataclass(frozen=True)
 class _ImplementHandoff:
-    """Context carried from a blocked-run `$retry` to the fresh implement run."""
+    """Context carried from a blocked-run Retry to the fresh implement run.
+
+    The verbatim blocked reason only — a Retry carries no command-text payload
+    (SYM-245). Instructions belong in the tracker, which the fresh attempt
+    re-reads on dispatch.
+    """
 
     blocked_reason: str
-    operator_comment: str
 
 
 @dataclass(frozen=True)
@@ -1822,7 +1826,60 @@ class _OrchestratorBase:
         self._dispatch_run_ids[issue_id] = run_id
         self._operator_wait_run_ids.add(run_id)
         self._implement_failed_run_bindings[run_id] = binding
-        # The park is also a pipeline-control fact: the implement stage's latest
+        await self._record_stage_park(
+            issue_id,
+            run_id,
+            binding,
+            kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+        )
+
+    async def _record_stage_park(
+        self,
+        issue_id: str,
+        run_id: str,
+        binding: RepoBinding,
+        *,
+        kind: str,
+        reason: str | None = None,
+        created_at: str | None = None,
+        local_review_outcome: str | None = None,
+    ) -> None:
+        """Open a durable operator park and record the stage failure behind it,
+        in one transaction.
+
+        Every park an operator can answer with the canonical Retry (and, for a
+        validation stage, Skip) goes through here, so the control row and the
+        wait can never disagree about whether the pipeline is parked
+        (SYM-245). `reason` defaults to the run's own termination detail.
+        """
+        stage = controls.stage_for_wait_kind(kind)
+        if reason is None:
+            reason = await self._blocked_reason_for_run(run_id) or None
+        created_at = created_at or self._now().isoformat()
+
+        async def _upsert_wait(*, commit: bool) -> None:
+            await db.operator_waits.upsert(
+                self._conn,
+                issue_id=issue_id,
+                run_id=run_id,
+                kind=kind,
+                linear_team_key=binding.linear_team_key,
+                github_repo=binding.github_repo,
+                issue_label=binding.issue_label or "",
+                created_at=created_at,
+                provider=binding.provider,
+                tracker_provider=binding.tracker_provider,
+                tracker_site=binding.tracker_site,
+                local_review_outcome=local_review_outcome,
+                commit=commit,
+            )
+
+        if stage is None:
+            # A park this slice does not model as a stage attempt (merge,
+            # budget): no control row to keep in step, so no window to guard.
+            await _upsert_wait(commit=True)
+            return
+        # The park is also a pipeline-control fact: this stage's latest
         # attempt failed (SYM-244). Written in the wait's transaction
         # (`commit=False`, rolled back together on failure) so a restart can
         # never find one without the other. `reason` is carried for the
@@ -1848,9 +1905,9 @@ class _OrchestratorBase:
         # OperationalError` abort the rest of park handling. A missing
         # `RELEASE SAVEPOINT` raises that identical text whether the foreign
         # call was a commit (both rows already durable) or a rollback (both
-        # rows destroyed along with it), so `_implement_failed_wait_landed_durably`
+        # rows destroyed along with it), so `_stage_park_landed_durably`
         # re-reads them below rather than assuming the former.
-        savepoint = f"implement_failed_wait_{uuid.uuid4().hex}"
+        savepoint = f"stage_park_wait_{uuid.uuid4().hex}"
         async with controls.guard_writes(issue_id):
             previous_control = await db.pipeline_controls.get(self._conn, issue_id)
             await self._conn.execute(f"SAVEPOINT {savepoint}")
@@ -1858,27 +1915,14 @@ class _OrchestratorBase:
                 await controls.record_stage_outcome(
                     self._conn,
                     issue_id,
-                    stage=controls.IMPLEMENT_STAGE,
+                    stage=stage,
                     outcome=controls.AttemptOutcome.FAILED,
-                    reason=await self._blocked_reason_for_run(run_id) or None,
+                    reason=reason,
                     run_id=run_id,
                     at=self._now().isoformat(),
                     commit=False,
                 )
-                await db.operator_waits.upsert(
-                    self._conn,
-                    issue_id=issue_id,
-                    run_id=run_id,
-                    kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
-                    linear_team_key=binding.linear_team_key,
-                    github_repo=binding.github_repo,
-                    issue_label=binding.issue_label or "",
-                    created_at=self._now().isoformat(),
-                    provider=binding.provider,
-                    tracker_provider=binding.tracker_provider,
-                    tracker_site=binding.tracker_site,
-                    commit=False,
-                )
+                await _upsert_wait(commit=False)
             except BaseException:
                 # `BaseException`, not `Exception`: this task can be cancelled
                 # (e.g. daemon shutdown) between the SAVEPOINT and the commit
@@ -1923,7 +1967,7 @@ class _OrchestratorBase:
             # unguarded write elsewhere on this shared connection) destroys
             # both writes without `release_savepoint` ever seeing a missing
             # savepoint (SYM-244 review).
-            if not await self._implement_failed_wait_landed_durably(issue_id, run_id):
+            if not await self._stage_park_landed_durably(issue_id, run_id, kind=kind, stage=stage):
                 # The control row and the operator wait along with it were
                 # destroyed by a foreign rollback, so what should have been
                 # a durable park is currently nothing at all — a restart
@@ -1932,62 +1976,131 @@ class _OrchestratorBase:
                 await controls.record_stage_outcome(
                     self._conn,
                     issue_id,
-                    stage=controls.IMPLEMENT_STAGE,
+                    stage=stage,
                     outcome=controls.AttemptOutcome.FAILED,
-                    reason=await self._blocked_reason_for_run(run_id) or None,
+                    reason=reason,
                     run_id=run_id,
                     at=self._now().isoformat(),
                     commit=False,
                 )
-                await db.operator_waits.upsert(
-                    self._conn,
-                    issue_id=issue_id,
-                    run_id=run_id,
-                    kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
-                    linear_team_key=binding.linear_team_key,
-                    github_repo=binding.github_repo,
-                    issue_label=binding.issue_label or "",
-                    created_at=self._now().isoformat(),
-                    provider=binding.provider,
-                    tracker_provider=binding.tracker_provider,
-                    tracker_site=binding.tracker_site,
-                    commit=True,
-                )
+                await _upsert_wait(commit=True)
 
-    async def _implement_failed_wait_landed_durably(self, issue_id: str, run_id: str) -> bool:
-        """Whether `_track_implement_failed_wait`'s control row and operator
-        wait are actually on disk for this run — used after a
-        `release_savepoint` miss to tell a foreign *commit* (rows durable,
-        nothing to do) apart from a foreign *rollback* (rows destroyed)
-        since both raise the identical "no such savepoint"."""
+    async def _stage_park_landed_durably(
+        self, issue_id: str, run_id: str, *, kind: str, stage: str
+    ) -> bool:
+        """Whether `_record_stage_park`'s control row and operator wait are
+        actually on disk for this run — used after a `release_savepoint` miss
+        to tell a foreign *commit* (rows durable, nothing to do) apart from a
+        foreign *rollback* (rows destroyed) since both raise the identical
+        "no such savepoint"."""
         wait_row = await db.operator_waits.get(self._conn, issue_id)
         control_row = await db.pipeline_controls.get(self._conn, issue_id)
         return (
             wait_row is not None
             and wait_row.run_id == run_id
-            and wait_row.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+            and wait_row.kind == kind
             and control_row is not None
-            and control_row.stage == controls.IMPLEMENT_STAGE
+            and control_row.stage == stage
             and control_row.outcome == str(controls.AttemptOutcome.FAILED)
             and control_row.run_id == run_id
         )
 
-    async def _implement_failed_clear_landed_durably(self, issue_id: str, run_id: str) -> bool:
-        """Whether `_handle_implement_failed_slash_intent`'s stop/reject clear
-        — the control row settled to `skipped` and the operator wait dropped —
-        is actually on disk for this run, used after a `release_savepoint`
-        miss to tell a foreign *commit* (rows durable, nothing to do) apart
-        from a foreign *rollback* (rows destroyed) since both raise the
-        identical "no such savepoint"."""
+    async def _stage_park_clear_landed_durably(
+        self, issue_id: str, run_id: str, *, stage: str
+    ) -> bool:
+        """Whether `_clear_stage_park`'s writes — the control row settled to
+        `skipped` and the operator wait dropped — are actually on disk for this
+        run, used after a `release_savepoint` miss to tell a foreign *commit*
+        (rows durable, nothing to do) apart from a foreign *rollback* (rows
+        destroyed) since both raise the identical "no such savepoint"."""
         wait_row = await db.operator_waits.get(self._conn, issue_id)
         control_row = await db.pipeline_controls.get(self._conn, issue_id)
         return (
             (wait_row is None or wait_row.run_id != run_id)
             and control_row is not None
-            and control_row.stage == controls.IMPLEMENT_STAGE
+            and control_row.stage == stage
             and control_row.outcome == str(controls.AttemptOutcome.SKIPPED)
             and control_row.run_id == run_id
         )
+
+    async def _clear_stage_park(
+        self, issue_id: str, run_id: str, *, kind: str, reason: str | None = None
+    ) -> None:
+        """Drop a park that is going away with no retry behind it, settling the
+        stage's control row to a terminal outcome in the same transaction.
+
+        `$reject`/`$stop` halts an issue to Blocked: the wait disappears, and
+        without this the control row would keep reporting the stage as failed
+        and keep advertising Retry (and, for a validation stage, Skip) for a
+        park that no longer exists (SYM-244 review, generalized to every
+        modeled stage in SYM-245). A park kind this slice does not model as a
+        stage attempt just drops its wait.
+
+        A uniquely-named SAVEPOINT scopes the undo to just these two writes,
+        mirroring `_record_stage_park`: `self._conn` is shared by the whole
+        daemon, and `controls.apply` can be mid-transition on it when this
+        handler runs. `controls.guard_writes` serializes this window against
+        `apply`/`release`'s own for the same issue, but not against an
+        unrelated `commit=True` DAO call elsewhere on the same connection
+        landing mid-window and ending the whole transaction out from under
+        this SAVEPOINT; `controls.rollback_to_savepoint`/`release_savepoint`
+        tolerate that ("no such savepoint") instead of raising a bare
+        `sqlite3.OperationalError`.
+
+        Unlike `_record_stage_park` (which *creates* a park that did not exist
+        before), this call *clears* one that did: the safe convergence when a
+        savepoint goes missing is therefore not "restore the old row", it is
+        "finish the clear" — settle the control row and drop the wait for real
+        — since that is the durable state this call is trying to reach
+        whichever foreign write interfered.
+        """
+        stage = controls.stage_for_wait_kind(kind)
+        if stage is None:
+            await self._clear_operator_wait(issue_id, run_id)
+            return
+        if reason is None:
+            reason = await self._blocked_reason_for_run(run_id) or None
+
+        async def _settle(*, commit: bool) -> None:
+            await controls.record_stage_outcome(
+                self._conn,
+                issue_id,
+                stage=stage,
+                outcome=controls.AttemptOutcome.SKIPPED,
+                reason=reason,
+                run_id=run_id,
+                at=self._now().isoformat(),
+                commit=False,
+            )
+            await self._clear_operator_wait(issue_id, run_id, commit=commit)
+
+        savepoint = f"stage_park_clear_{uuid.uuid4().hex}"
+        async with controls.guard_writes(issue_id):
+            await self._conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                await _settle(commit=False)
+            except BaseException:
+                if not await controls.rollback_to_savepoint(
+                    self._conn, savepoint
+                ) and not await self._stage_park_clear_landed_durably(
+                    issue_id, run_id, stage=stage
+                ):
+                    # The savepoint is gone — a foreign commit or a foreign
+                    # rollback landed mid-window — and this call's own writes
+                    # did not fully land either way. Finish the clear for real
+                    # rather than leaving a stuck park behind.
+                    await _settle(commit=True)
+                raise
+            await controls.release_savepoint(self._conn, savepoint)
+            await self._conn.commit()
+            # Re-read unconditionally rather than only on a missing-savepoint
+            # miss: a *successful* `RELEASE SAVEPOINT` still leaves an
+            # unprotected suspension point at the `await self._conn.commit()`
+            # above, and a foreign `conn.rollback()` landing there destroys
+            # both writes without `release_savepoint` ever seeing a missing
+            # savepoint (SYM-244 review).
+            if not await self._stage_park_clear_landed_durably(issue_id, run_id, stage=stage):
+                await _settle(commit=True)
 
     async def _track_implement_blocked_wait(
         self, issue_id: str, run_id: str, binding: RepoBinding
@@ -1995,18 +2108,11 @@ class _OrchestratorBase:
         self._dispatch_run_ids[issue_id] = run_id
         self._operator_wait_run_ids.add(run_id)
         self._implement_blocked_run_bindings[run_id] = binding
-        await db.operator_waits.upsert(
-            self._conn,
-            issue_id=issue_id,
-            run_id=run_id,
+        await self._record_stage_park(
+            issue_id,
+            run_id,
+            binding,
             kind=db.operator_waits.KIND_IMPLEMENT_BLOCKED,
-            linear_team_key=binding.linear_team_key,
-            github_repo=binding.github_repo,
-            issue_label=binding.issue_label or "",
-            created_at=self._now().isoformat(),
-            provider=binding.provider,
-            tracker_provider=binding.tracker_provider,
-            tracker_site=binding.tracker_site,
         )
 
     async def _blocked_reason_for_run(self, run_id: str) -> str:
@@ -3086,15 +3192,17 @@ class _OrchestratorBase:
         """
         storage_issue_id = storage_issue_id or issue.id
         # Consume a pending blocked-resume handoff (set when the operator
-        # `$retry`d an IMPLEMENT_BLOCKED wait), so the fresh run's prompt carries
-        # the original block reason + the operator's resume instructions.
+        # `$retry`d an IMPLEMENT_BLOCKED wait), so the fresh run's prompt
+        # carries the original block reason as diagnostic context. The
+        # operator's own command text is deliberately not carried: the fresh
+        # attempt refreshes its instructions from the tracker instead
+        # (SYM-245).
         handoff = self._implement_handoffs.pop(storage_issue_id, None)
         prompt = implement_prompt(
             issue_title=issue.title,
             issue_body=issue.description,
             labels=list(issue.labels),
             blocked_reason=handoff.blocked_reason if handoff else "",
-            operator_comment=handoff.operator_comment if handoff else "",
         )
         role = binding.resolved_role("implement", self.config.roles)
         command = build_runner_command(
@@ -5065,18 +5173,11 @@ class _OrchestratorBase:
         self._dispatch_run_ids[issue_id] = run_id
         self._operator_wait_run_ids.add(run_id)
         self._deliver_failed_run_bindings[run_id] = binding
-        await db.operator_waits.upsert(
-            self._conn,
-            issue_id=issue_id,
-            run_id=run_id,
+        await self._record_stage_park(
+            issue_id,
+            run_id,
+            binding,
             kind=db.operator_waits.KIND_DELIVER_FAILED,
-            linear_team_key=binding.linear_team_key,
-            github_repo=binding.github_repo,
-            issue_label=binding.issue_label or "",
-            created_at=self._now().isoformat(),
-            provider=binding.provider,
-            tracker_provider=binding.tracker_provider,
-            tracker_site=binding.tracker_site,
             local_review_outcome=local_review_outcome,
         )
 

@@ -316,18 +316,12 @@ class _AcceptanceMixin(_OrchestratorBase):
 
         self._dispatch_run_ids[issue.id] = run_id
         self._operator_wait_run_ids.add(run_id)
-        await db.operator_waits.upsert(
-            self._conn,
-            issue_id=issue.id,
-            run_id=run_id,
+        await self._record_stage_park(
+            issue.id,
+            run_id,
+            binding,
             kind=db.operator_waits.KIND_ACCEPTANCE_BLOCKED,
-            linear_team_key=binding.linear_team_key,
-            github_repo=binding.github_repo,
-            issue_label=binding.issue_label or "",
-            created_at=self._now().isoformat(),
-            provider=binding.provider,
-            tracker_provider=binding.tracker_provider,
-            tracker_site=binding.tracker_site,
+            reason=verdict.details or None,
         )
         await self._notify_attention(
             event=EVENT_OPERATOR_WAIT,
@@ -343,18 +337,11 @@ class _AcceptanceMixin(_OrchestratorBase):
         self._dispatch_run_ids[issue_id] = run_id
         self._operator_wait_run_ids.add(run_id)
         self._acceptance_rejected_run_bindings[run_id] = binding
-        await db.operator_waits.upsert(
-            self._conn,
-            issue_id=issue_id,
-            run_id=run_id,
+        await self._record_stage_park(
+            issue_id,
+            run_id,
+            binding,
             kind=db.operator_waits.KIND_ACCEPTANCE_REJECTED,
-            linear_team_key=binding.linear_team_key,
-            github_repo=binding.github_repo,
-            issue_label=binding.issue_label or "",
-            created_at=self._now().isoformat(),
-            provider=binding.provider,
-            tracker_provider=binding.tracker_provider,
-            tracker_site=binding.tracker_site,
         )
 
     async def _acceptance_pr_url(self, issue_id: str) -> str:

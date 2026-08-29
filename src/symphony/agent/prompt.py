@@ -74,33 +74,33 @@ COMPLETION_CONTRACT_ALREADY_DONE = (
 )
 
 
-def implement_handoff_block(*, blocked_reason: str = "", operator_comment: str = "") -> str:
+def implement_handoff_block(*, blocked_reason: str = "") -> str:
     """Render the operator-handoff section for a blocked-run resume.
 
     Returns "" when there is no handoff context. Otherwise it states the
-    original `SYMPHONY_BLOCKED` reason, the operator's `$retry` comment text
-    (which may carry tokens/instructions the agent now needs), and tells the
-    fresh run that prior work is preserved in the workspace.
+    original `SYMPHONY_BLOCKED` reason and tells the fresh run that prior work
+    is preserved in the workspace.
+
+    The operator's own Retry command text is deliberately not part of this
+    block: Retry carries no instruction payload (SYM-245). Anything the fresh
+    attempt needs to know belongs in the tracker issue, which this prompt
+    re-reads in full on every attempt.
     """
     blocked_reason = (blocked_reason or "").strip()
-    operator_comment = (operator_comment or "").strip()
-    if not blocked_reason and not operator_comment:
+    if not blocked_reason:
         return ""
-    parts = [
-        "# Operator handoff (resumed after a block)\n\n",
+    return (
+        "# Operator handoff (resumed after a block)\n\n"
         "A prior run on this issue stopped blocked on a human action. The "
-        "operator has since acted and resumed you with `$retry`.\n\n",
-    ]
-    if blocked_reason:
-        parts.append(f"## Original blocked reason\n\n{blocked_reason}\n\n")
-    if operator_comment:
-        parts.append(f"## Operator's resume instructions\n\n{operator_comment}\n\n")
-    parts.append(
+        "operator has since acted and resumed you.\n\n"
+        f"## Original blocked reason\n\n{blocked_reason}\n\n"
+        "The issue text above/below is freshly re-read for this attempt — if "
+        "the operator supplied anything (a token, a decision, a correction), "
+        "it is there, not in this block.\n\n"
         "Prior work from the blocked run is preserved in this workspace (it was "
         "NOT reset). Start with `git status` and review the diff before making "
         "changes, then continue from where the prior run left off.\n\n"
     )
-    return "".join(parts)
 
 
 def implement_prompt(
@@ -109,7 +109,6 @@ def implement_prompt(
     issue_body: str,
     labels: list[str],
     blocked_reason: str = "",
-    operator_comment: str = "",
 ) -> str:
     """Build the system+user prompt for the Implement stage.
 
@@ -118,14 +117,12 @@ def implement_prompt(
     current branch — the orchestrator pushes after the run, but does not
     do its own commits.
 
-    On a blocked-run resume, `blocked_reason` / `operator_comment` populate a
-    handoff block placed before the issue so the agent sees it first.
+    On a blocked-run resume, `blocked_reason` populates a handoff block placed
+    before the issue so the agent sees it first.
     """
     label_line = ", ".join(labels) if labels else "(no labels)"
     body = issue_body.strip() if issue_body else "(no description)"
-    handoff = implement_handoff_block(
-        blocked_reason=blocked_reason, operator_comment=operator_comment
-    )
+    handoff = implement_handoff_block(blocked_reason=blocked_reason)
     return (
         "You are Symphony's Implement-stage agent.\n"
         "Make the code changes that satisfy the following Linear issue.\n\n"

@@ -23,6 +23,7 @@ from symphony.github import GitHubError
 from symphony.linear.client import LinearComment, LinearError, LinearIssue
 from symphony.linear.slash import SlashIntent, SlashKind
 from symphony.orchestrator.poll import Orchestrator, SlashHandlerFailure
+from symphony.pipeline import controls
 from symphony.pipeline.local_review_loop import LoopOutcome, LoopResult
 
 
@@ -681,9 +682,11 @@ async def test_review_cap_reject_moves_to_blocked_and_clears_wait(tmp_path: Path
 
 
 @pytest.mark.asyncio
-async def test_review_cap_retry_rejected_without_redispatch(tmp_path: Path) -> None:
-    """SYM-114: `$retry` isn't a supported reply on a review-cap park — it
-    must be rejected, not silently re-dispatch a merge."""
+async def test_review_cap_retry_reviews_again_instead_of_merging(tmp_path: Path) -> None:
+    """SYM-114 + SYM-245: `$retry` on a review-cap park must never re-dispatch
+    the merge (that would advance without another review pass). It is the
+    canonical Retry of the *review* stage the park belongs to, so it starts one
+    more review pass and leaves the merge alone."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         cfg = Config(repos=[_binding()])
@@ -703,13 +706,16 @@ async def test_review_cap_retry_rejected_without_redispatch(tmp_path: Path) -> N
 
         orch = _make_orch(cfg, linear, conn)
         orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+        orch._schedule_review_poll = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
 
         await orch._poll_slash_commands()  # noqa: SLF001
 
         orch._schedule_merge.assert_not_called()  # type: ignore[attr-defined]  # noqa: SLF001
-        bodies = [str(c.args[1]) for c in linear.post_comment.await_args_list]
-        assert any("$retry" in body and "not supported" in body for body in bodies)
-        assert await db.operator_waits.get(conn, "iss-1") is not None
+        orch._schedule_review_poll.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        assert [(a.action, a.stage) for a in await controls.history(conn, "iss-1")] == [
+            ("retry", controls.REVIEW_STAGE)
+        ]
+        assert await db.operator_waits.get(conn, "iss-1") is None
     finally:
         await conn.close()
 

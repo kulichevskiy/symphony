@@ -427,7 +427,20 @@ async def test_pause_and_abort_of_a_failed_attempt_land_paused(tmp_path: Path) -
         # Stopping the pipeline does not rewrite what the last attempt did.
         assert aborted.snapshot.outcome is OUTCOMES.FAILED
         assert ACTIONS.PLAY in aborted.snapshot.allowed_actions
+        # Implement is a mandatory stage — there is nothing to step over.
+        assert ACTIONS.SKIP not in aborted.snapshot.allowed_actions
 
+        # Skip only exists for a validation stage (SYM-245), so move the failed
+        # attempt onto one; the paused mode carries over untouched.
+        await controls.record_stage_outcome(
+            conn,
+            ISSUE_ID,
+            stage=controls.REVIEW_STAGE,
+            outcome=OUTCOMES.FAILED,
+            reason="boom",
+            run_id="run-1",
+            at="2026-08-27T10:01:30+00:00",
+        )
         skipped = await controls.apply(
             conn,
             ISSUE_ID,

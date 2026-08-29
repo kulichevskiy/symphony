@@ -1171,12 +1171,14 @@ class Reconciler:
             team_key=team_key,
             state_name=target_state,
         )
-        if wait is not None and wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
+        adopted_stage = None if wait is None else controls.stage_for_wait_kind(wait.kind)
+        if wait is not None and adopted_stage is not None:
             # Settle the durable control row before the wait it backs is
             # deleted or overwritten below, so `pipeline_controls` never keeps
-            # reporting `implement`/`failed` (Retry offered, no park behind
-            # it) for an issue whose implement work actually landed a PR
-            # (SYM-244 review). Covers both sub-cases: the explicit delete
+            # reporting that stage as `failed` (Retry offered, no park behind
+            # it) for an issue whose work actually landed a PR (SYM-244
+            # review; every modeled park kind since SYM-245 — `_PARKED_WAIT_KINDS`
+            # also probes `deliver_failed`). Covers both sub-cases: the explicit delete
             # right below, and the needs-approval sub-case that instead
             # upserts a `KIND_REVIEW_FAILED` wait over this row without ever
             # calling `delete`.
@@ -1202,7 +1204,7 @@ class Reconciler:
             if (
                 current_wait is not None
                 and current_wait.run_id == wait.run_id
-                and current_wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+                and current_wait.kind == wait.kind
                 and (
                     control_row is None
                     or (
@@ -1214,7 +1216,7 @@ class Reconciler:
                 await controls.record_stage_outcome(
                     self._conn,
                     issue_id,
-                    stage=controls.IMPLEMENT_STAGE,
+                    stage=adopted_stage,
                     outcome=controls.AttemptOutcome.SUCCEEDED,
                     reason=f"orphan PR adopted ({obs.github_repo}#{obs.pr_number})",
                     run_id=wait.run_id,
@@ -1463,12 +1465,13 @@ class Reconciler:
         transaction (``commit=False``) so a later failure rolls the whole clear
         back.
 
-        A `KIND_IMPLEMENT_FAILED` wait is also the durable park behind a
-        `pipeline_controls` row's `failed` outcome (`controls.snapshot`'s
-        `_derived_snapshot` fallback and the tracer that writes it): clearing
-        that wait without also settling the control row would leave
-        `allowed_actions` advertising Retry for an issue that is now canceled
-        with no park behind it (SYM-244 review).
+        A park this module models as a stage attempt (`stage_for_wait_kind`) is
+        also the durable park behind a `pipeline_controls` row's `failed`
+        outcome (`controls.snapshot`'s `_derived_snapshot` fallback and the
+        park writers): clearing that wait without also settling the control row
+        would leave `allowed_actions` advertising Retry (and, for a validation
+        stage, Skip) for an issue that is now canceled with no park behind it
+        (SYM-244 review, generalized to every modeled stage in SYM-245).
         """
         if wait is None:
             raise RuntimeError("cannot clear canceled drift without an operator wait")
@@ -1478,11 +1481,12 @@ class Reconciler:
             wait.run_id,
             commit=False,
         )
-        if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
+        parked_stage = controls.stage_for_wait_kind(wait.kind)
+        if parked_stage is not None:
             await controls.record_stage_outcome(
                 self._conn,
                 issue_id,
-                stage=controls.IMPLEMENT_STAGE,
+                stage=parked_stage,
                 outcome=controls.AttemptOutcome.SKIPPED,
                 reason=f"tracker issue canceled (state: {state_name})",
                 run_id=wait.run_id,

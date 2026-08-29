@@ -1288,7 +1288,10 @@ async def test_blocked_run_opens_wait_then_retry_resumes_fresh_run_with_handoff(
         assert fresh_runner.specs, "expected a fresh implement run to be dispatched"
         fresh_prompt = fresh_runner.specs[-1].command[-1]
         assert reason in fresh_prompt
-        assert "token=sk-operator-123" in fresh_prompt
+        # Retry carries no command-text payload: the operator's `$retry` body
+        # never becomes an instruction for the fresh attempt, which re-reads
+        # the issue from the tracker instead (SYM-245).
+        assert "token=sk-operator-123" not in fresh_prompt
         assert "git status" in fresh_prompt
     finally:
         await conn.close()
@@ -3096,7 +3099,6 @@ async def test_branch_ahead_with_pending_handoff_runs_agent_and_consumes_prompt(
         orch._states = {"ENG": _states()}  # noqa: SLF001
         orch._implement_handoffs["iss-1"] = _ImplementHandoff(  # noqa: SLF001
             blocked_reason="authorize the deployment OAuth URL",
-            operator_comment="$retry token=available",
         )
 
         await orch._dispatch_one(binding, _issue())  # noqa: SLF001
@@ -3104,7 +3106,8 @@ async def test_branch_ahead_with_pending_handoff_runs_agent_and_consumes_prompt(
         assert [s.stage for s in runner.specs] == ["implement"]
         prompt = runner.specs[0].command[-1]
         assert "authorize the deployment OAuth URL" in prompt
-        assert "$retry token=available" in prompt
+        # Retry carries no command-text payload (SYM-245).
+        assert "$retry" not in prompt
         assert "iss-1" not in orch._implement_handoffs  # noqa: SLF001
         push_fn.assert_awaited_once()
         gh.ensure_pr.assert_awaited_once()
