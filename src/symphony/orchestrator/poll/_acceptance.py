@@ -181,7 +181,9 @@ class _AcceptanceMixin(_OrchestratorBase):
     if TYPE_CHECKING:
         # Cross-domain methods inherited from `Orchestrator` at runtime; declared
         # here so `mypy --strict` resolves the acceptance flow's `self.<m>` calls.
-        async def _clear_operator_wait(self, issue_id: str, run_id: str) -> None: ...
+        async def _clear_operator_wait(
+            self, issue_id: str, run_id: str, *, commit: bool = True
+        ) -> None: ...
         async def _complete_review_monitors_for_merge(self, issue: LinearIssue) -> None: ...
         def _dispatch_task_done(
             self, task: asyncio.Task[None], issue_id: str, binding_key: BindingKey

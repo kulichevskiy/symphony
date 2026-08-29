@@ -9,6 +9,7 @@ external Linear completion in the timeline.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -609,14 +610,28 @@ class Reconciler:
     ) -> tuple[_PostCommitReviewRequest | None, bool]:
         post_commit_review_request: _PostCommitReviewRequest | None = None
         post_cancel_comment = False
-        # This whole commit=False window shares `self._conn` with
-        # `controls.apply`/`release`'s own SAVEPOINT-to-commit windows for the
-        # same issue: `controls.guard_writes` joins the same per-issue lock
-        # plus write lock those use, so this transaction's writes and commit
-        # can never land in the middle of one of theirs and roll it back (or
-        # get rolled back by it) — see `guard_writes`' and the `controls`
-        # module docstring's foreign-interference notes (SYM-244 review).
-        async with controls.guard_writes(issue_id):
+        writes_control_row = (
+            plan.linear_action == ACTION_CLEARED
+            and observation.linear_drift == DRIFT_LINEAR_CANCELED
+            and observation.linear_issue is not None
+        )
+        # Only the DRIFT_LINEAR_CANCELED clear below writes `pipeline_controls`,
+        # and only that write needs `controls.guard_writes`'s serialization
+        # against `controls.apply`/`release`'s own SAVEPOINT-to-commit windows
+        # for the same issue — see `guard_writes`' and the `controls` module
+        # docstring's foreign-interference notes (SYM-244 review). That branch
+        # never coincides with `ACTION_ADOPTED` in the same call:
+        # `_observe_reconcile_sources` forces `orphans` empty whenever
+        # `linear_drift` is `DRIFT_LINEAR_CANCELED`, and `github_adoptable`
+        # requires a non-empty `orphans`. So holding the guard's daemon-wide
+        # write lock here never overlaps with `_adopt_orphan_prs`'s tracker
+        # calls (`_move_issue_to_state`, up to a 20s HTTP timeout each), which
+        # would otherwise stall every other issue's `controls.apply`/`release`/
+        # park write for as long as Linear takes to answer. The other write
+        # paths below (github clear, adoption) rely on the module's documented
+        # foreign-commit/foreign-rollback tolerance instead.
+        guard = controls.guard_writes(issue_id) if writes_control_row else contextlib.nullcontext()
+        async with guard:
             try:
                 await db.external_observations.insert(
                     self._conn,
@@ -675,7 +690,15 @@ class Reconciler:
                         observed_at=inputs.observed_at,
                     )
                 await self._conn.commit()
-            except Exception:
+            except BaseException:
+                # `BaseException`, not `Exception`: this task can be cancelled
+                # (e.g. daemon shutdown) between the writes above and the
+                # commit, and that must roll back the same as any other
+                # failure — an `Exception`-only catch would skip the rollback
+                # and leave the cancel-clear's wait delete and control-row
+                # write (or the adoption/github-clear writes) dangling in the
+                # open transaction for a later foreign commit to land as a
+                # half-state (SYM-244 review).
                 await self._conn.rollback()
                 raise
         return post_commit_review_request, post_cancel_comment

@@ -101,7 +101,9 @@ class _LifecycleMixin(_OrchestratorBase):
             returncode: int | None = None,
         ) -> None: ...
 
-        async def _clear_operator_wait(self, issue_id: str, run_id: str) -> None: ...
+        async def _clear_operator_wait(
+            self, issue_id: str, run_id: str, *, commit: bool = True
+        ) -> None: ...
 
         async def _complete_already_satisfied_run(
             self,

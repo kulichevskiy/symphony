@@ -2270,6 +2270,66 @@ async def test_active_orphan_open_pr_adopted_and_routed_to_review(
 
 
 @pytest.mark.asyncio
+async def test_orphan_adoption_does_not_hold_the_controls_write_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_persist_reconcile_actions` used to wrap its whole write+commit window
+    in `controls.guard_writes`, including `_adopt_orphan_prs`'s tracker calls
+    (`_move_issue_to_state`'s `team_states`/`move_issue`, up to a 20s HTTP
+    timeout each) — holding the module's one daemon-wide write lock for as
+    long as Linear took to answer, stalling every other issue's
+    `controls.apply`/`release`/park write, including the operator's `$retry`
+    (SYM-244 review). `ACTION_ADOPTED` never writes a control row itself —
+    only the `DRIFT_LINEAR_CANCELED` clear does, and the two never coincide
+    (`_observe_reconcile_sources` forces `orphans` empty whenever
+    `linear_drift` is `DRIFT_LINEAR_CANCELED`) — so an adoption tick must not
+    enter `guard_writes` at all."""
+    from collections.abc import AsyncIterator
+    from contextlib import asynccontextmanager
+
+    from symphony.pipeline import controls
+
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        guard_entries: list[str] = []
+        real_guard_writes = controls.guard_writes
+
+        @asynccontextmanager
+        async def _tracking_guard_writes(issue_id: str) -> AsyncIterator[None]:
+            guard_entries.append(issue_id)
+            async with real_guard_writes(issue_id):
+                yield
+
+        monkeypatch.setattr(controls, "guard_writes", _tracking_guard_writes)
+
+        assert await reconciler.tick() == 2
+        assert guard_entries == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_hybrid_orphan_open_pr_adoption_uses_remote_review_lane(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

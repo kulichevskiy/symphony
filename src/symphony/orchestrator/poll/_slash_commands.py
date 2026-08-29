@@ -82,7 +82,13 @@ class _SlashCommandsMixin(_OrchestratorBase):
 
         async def _blocked_reason_for_run(self, run_id: str) -> str: ...
 
-        async def _clear_operator_wait(self, issue_id: str, run_id: str) -> None: ...
+        async def _clear_operator_wait(
+            self, issue_id: str, run_id: str, *, commit: bool = True
+        ) -> None: ...
+
+        async def _implement_blocked_clear_landed_durably(
+            self, issue_id: str, run_id: str
+        ) -> bool: ...
 
         async def _clear_review_rearm_retry(self, run_id: str) -> None: ...
 
@@ -841,18 +847,82 @@ class _SlashCommandsMixin(_OrchestratorBase):
             # transaction as the wait delete below, so `controls.snapshot`
             # never keeps advertising Retry for a blocked issue with nothing
             # parked to retry (SYM-244 review).
-            async with controls.guard_writes(issue_id):
+            #
+            # A uniquely-named SAVEPOINT scopes the undo to just these two
+            # writes, mirroring `_track_implement_failed_wait`
+            # (`poll/_base.py`): `self._conn` is shared by the whole daemon,
+            # and `controls.apply` can be mid-transition on it when this
+            # handler runs. `controls.guard_writes` serializes this
+            # SAVEPOINT-to-commit window against `apply`/`release`'s own for
+            # the same issue, but not against some unrelated `commit=True` DAO
+            # call elsewhere on the same connection landing mid-window and
+            # ending the whole transaction out from under this SAVEPOINT.
+            # `controls.rollback_to_savepoint`/`release_savepoint` tolerate
+            # that ("no such savepoint") instead of raising a bare
+            # `sqlite3.OperationalError`.
+            #
+            # Unlike `_track_implement_failed_wait` (which is *creating* a
+            # park that didn't exist before), this call is *clearing* one that
+            # did: the safe, always-correct convergence when a savepoint goes
+            # missing is therefore not "restore the old row", it is "finish
+            # the clear" — settle the control row to skipped and drop the
+            # wait for real — since that is exactly the durable state this
+            # branch is trying to reach regardless of which foreign write
+            # interfered. `_implement_blocked_clear_landed_durably` tells
+            # "already landed, nothing to do" apart from "redo for real".
+            savepoint = f"implement_blocked_clear_{uuid.uuid4().hex}"
+            reason = await self._blocked_reason_for_run(run_id) or None
+
+            async def _finish_implement_blocked_clear() -> None:
                 await controls.record_stage_outcome(
                     self._conn,
                     issue_id,
                     stage=controls.IMPLEMENT_STAGE,
                     outcome=controls.AttemptOutcome.SKIPPED,
-                    reason=await self._blocked_reason_for_run(run_id) or None,
+                    reason=reason,
                     run_id=run_id,
                     at=self._now().isoformat(),
                     commit=False,
                 )
-                await self._clear_operator_wait(issue_id, run_id)
+                await self._clear_operator_wait(issue_id, run_id, commit=True)
+
+            async with controls.guard_writes(issue_id):
+                await self._conn.execute(f"SAVEPOINT {savepoint}")
+                try:
+                    await controls.record_stage_outcome(
+                        self._conn,
+                        issue_id,
+                        stage=controls.IMPLEMENT_STAGE,
+                        outcome=controls.AttemptOutcome.SKIPPED,
+                        reason=reason,
+                        run_id=run_id,
+                        at=self._now().isoformat(),
+                        commit=False,
+                    )
+                    await self._clear_operator_wait(issue_id, run_id, commit=False)
+                except BaseException:
+                    if not await controls.rollback_to_savepoint(
+                        self._conn, savepoint
+                    ) and not await self._implement_blocked_clear_landed_durably(issue_id, run_id):
+                        # The savepoint is gone — a foreign commit or a
+                        # foreign rollback landed mid-window, and this call's
+                        # own writes did not fully land either way. Finish
+                        # the clear for real rather than leaving a stuck park
+                        # behind: a durable `skipped` outcome with the wait
+                        # still open (SYM-244 review).
+                        await _finish_implement_blocked_clear()
+                    raise
+                released = await controls.release_savepoint(self._conn, savepoint)
+                await self._conn.commit()
+                if not released and not await self._implement_blocked_clear_landed_durably(
+                    issue_id, run_id
+                ):
+                    # The missing savepoint was a foreign *rollback*: it
+                    # destroyed the control row and the operator wait delete
+                    # along with itself, so the park that should be gone by
+                    # now is still sitting there. Redo both writes for real
+                    # instead of returning as if they landed.
+                    await _finish_implement_blocked_clear()
             return
 
         log.info(

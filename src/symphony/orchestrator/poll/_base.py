@@ -1968,6 +1968,23 @@ class _OrchestratorBase:
             and control_row.run_id == run_id
         )
 
+    async def _implement_blocked_clear_landed_durably(self, issue_id: str, run_id: str) -> bool:
+        """Whether `_handle_implement_failed_slash_intent`'s stop/reject clear
+        — the control row settled to `skipped` and the operator wait dropped —
+        is actually on disk for this run, used after a `release_savepoint`
+        miss to tell a foreign *commit* (rows durable, nothing to do) apart
+        from a foreign *rollback* (rows destroyed) since both raise the
+        identical "no such savepoint"."""
+        wait_row = await db.operator_waits.get(self._conn, issue_id)
+        control_row = await db.pipeline_controls.get(self._conn, issue_id)
+        return (
+            (wait_row is None or wait_row.run_id != run_id)
+            and control_row is not None
+            and control_row.stage == controls.IMPLEMENT_STAGE
+            and control_row.outcome == str(controls.AttemptOutcome.SKIPPED)
+            and control_row.run_id == run_id
+        )
+
     async def _track_implement_blocked_wait(
         self, issue_id: str, run_id: str, binding: RepoBinding
     ) -> None:
@@ -2139,7 +2156,9 @@ class _OrchestratorBase:
                 return binding
         return None
 
-    async def _clear_operator_wait(self, issue_id: str, run_id: str) -> None:
+    async def _clear_operator_wait(
+        self, issue_id: str, run_id: str, *, commit: bool = True
+    ) -> None:
         if self._dispatch_run_ids.get(issue_id) == run_id:
             self._dispatch_run_ids.pop(issue_id, None)
         self._operator_wait_run_ids.discard(run_id)
@@ -2150,7 +2169,7 @@ class _OrchestratorBase:
         self._merge_needs_approval_bindings.pop(run_id, None)
         self._acceptance_rejected_run_bindings.pop(run_id, None)
         self._budget_exceeded_run_bindings.pop(run_id, None)
-        await db.operator_waits.delete(self._conn, issue_id, run_id)
+        await db.operator_waits.delete(self._conn, issue_id, run_id, commit=commit)
 
     async def _token_budget_ceiling(self, issue_id: str, binding: RepoBinding) -> float | None:
         """Soft ceiling = `per_issue_token_budget + granted_token_budget`.

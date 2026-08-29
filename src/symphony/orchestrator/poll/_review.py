@@ -513,7 +513,9 @@ class _ReviewMixin(_OrchestratorBase):
             force_local_review_resume: bool = False,
         ) -> None: ...
 
-        async def _clear_operator_wait(self, issue_id: str, run_id: str) -> None: ...
+        async def _clear_operator_wait(
+            self, issue_id: str, run_id: str, *, commit: bool = True
+        ) -> None: ...
 
         async def _interrupt_stale_merge_needs_approval_for_state(
             self,

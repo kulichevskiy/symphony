@@ -771,6 +771,169 @@ async def test_stop_settles_the_control_row_so_it_stops_offering_retry(
         await conn.close()
 
 
+async def _parked_for_stop(
+    conn: aiosqlite.Connection, tmp_path: Path
+) -> tuple[Orchestrator, object]:
+    binding = _no_review_binding(auto_merge=False)
+    cfg = _cfg(tmp_path, binding)
+    orch = _orchestrator(cfg, conn, AsyncMock(), tmp_path)
+    await _seed_issue(conn)
+    await db.runs.create(
+        conn,
+        id="run-1",
+        issue_id=ISSUE_ID,
+        stage="implement",
+        status="failed",
+        pid=None,
+        started_at="2026-08-27T09:00:00+00:00",
+    )
+    await orch._track_implement_failed_wait(ISSUE_ID, "run-1", binding)  # noqa: SLF001
+    return orch, binding
+
+
+@pytest.mark.asyncio
+async def test_stop_clear_recovers_when_the_wait_delete_fails_with_no_foreign_interference(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reproduces the reviewer's proof of a stuck park: before the SAVEPOINT
+    fix, `record_stage_outcome(commit=False)` and the wait delete shared no
+    transactional boundary of their own, so a delete failure left the
+    `skipped` control write sitting uncommitted with nothing to undo it —
+    a later unrelated `commit=True` DAO call would make it durable while the
+    wait stayed open forever (`allowed_actions` never offering Retry again).
+    With the SAVEPOINT in place, a delete failure with no other interference
+    now rolls back cleanly to the pre-clear, still-retryable park."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        orch, _binding = await _parked_for_stop(conn, tmp_path)
+        monkeypatch.setattr(
+            db.operator_waits,
+            "delete",
+            AsyncMock(side_effect=RuntimeError("boom")),
+        )
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await orch._handle_implement_failed_slash_intent(  # noqa: SLF001
+                ISSUE_ID, "run-1", _stop_intent("c-stop")
+            )
+
+        snap = await controls.snapshot(conn, ISSUE_ID)
+        assert snap.outcome is OUTCOMES.FAILED
+        assert ACTIONS.RETRY in snap.allowed_actions
+        wait = await db.operator_waits.get(conn, ISSUE_ID)
+        assert wait is not None
+        assert wait.run_id == "run-1"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_clear_finishes_for_real_when_a_foreign_commit_lands_and_the_delete_then_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same shape as
+    `test_track_implement_failed_wait_compensates_when_upsert_fails_after_a_foreign_commit`,
+    but for the clear path, and the reviewer's exact proof: an unrelated
+    `commit=True` DAO write (e.g. `db.issues.upsert`) lands mid-window,
+    destroying this SAVEPOINT, immediately before the wait delete itself
+    fails. Unlike the *create* path in `_track_implement_failed_wait` (whose
+    correct undo is "restore the previous row, no park existed before"),
+    this call is *clearing* a park that did exist — so the always-correct
+    convergence here is finishing the clear for real (`skipped`, wait gone),
+    not restoring `failed` with the wait already gone underneath it, which
+    would just be the stuck shape with the labels swapped."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        orch, _binding = await _parked_for_stop(conn, tmp_path)
+
+        real_delete = db.operator_waits.delete
+        calls = 0
+
+        async def _foreign_commit_then_boom_once(
+            conn: aiosqlite.Connection, issue_id: str, run_id: str | None = None, **kwargs: object
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                # The redo triggered by this call's own compensation must
+                # actually succeed for the clear to converge — only the
+                # first attempt hits the foreign interference.
+                await real_delete(conn, issue_id, run_id, **kwargs)
+                return
+            await db.issues.upsert(
+                conn,
+                id=ISSUE_ID,
+                identifier="ENG-1",
+                title="Add authentication",
+                team_key="ENG",
+            )
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(db.operator_waits, "delete", _foreign_commit_then_boom_once)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await orch._handle_implement_failed_slash_intent(  # noqa: SLF001
+                ISSUE_ID, "run-1", _stop_intent("c-stop")
+            )
+
+        snap = await controls.snapshot(conn, ISSUE_ID)
+        assert snap.outcome is OUTCOMES.SKIPPED
+        assert ACTIONS.RETRY not in snap.allowed_actions
+        assert await db.operator_waits.get(conn, ISSUE_ID) is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_clear_recovers_from_a_foreign_rollback_in_its_savepoint_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirror of
+    `test_track_implement_failed_wait_recovers_from_a_foreign_rollback_in_its_savepoint_window`
+    for the clear path: a foreign `conn.rollback()` landing inside the clear's
+    savepoint window destroys the control-row write and the wait delete
+    without an exception of its own. Before this fix's `release_savepoint`
+    miss handling, that would return as if the clear had landed, leaving the
+    park (and its Retry) intact despite the issue already being moved to
+    blocked in the tracker."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        orch, _binding = await _parked_for_stop(conn, tmp_path)
+
+        real_delete = db.operator_waits.delete
+        calls = 0
+
+        async def _delete_then_foreign_rollback_once(
+            conn: aiosqlite.Connection, issue_id: str, run_id: str | None = None, **kwargs: object
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                # The redo triggered by the rollback's `release_savepoint`
+                # miss must actually succeed for the clear to converge —
+                # only the first attempt hits the foreign rollback.
+                await real_delete(conn, issue_id, run_id, **kwargs)
+                return
+            await real_delete(conn, issue_id, run_id, commit=False)
+            await conn.rollback()
+
+        monkeypatch.setattr(db.operator_waits, "delete", _delete_then_foreign_rollback_once)
+
+        await orch._handle_implement_failed_slash_intent(  # noqa: SLF001
+            ISSUE_ID, "run-1", _stop_intent("c-stop")
+        )
+
+        snap = await controls.snapshot(conn, ISSUE_ID)
+        assert snap.outcome is OUTCOMES.SKIPPED
+        assert ACTIONS.RETRY not in snap.allowed_actions
+        assert await db.operator_waits.get(conn, ISSUE_ID) is None
+    finally:
+        await conn.close()
+
+
 @pytest.mark.asyncio
 async def test_retry_whose_side_effect_fails_releases_the_transition(
     tmp_path: Path,
