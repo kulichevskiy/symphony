@@ -28,14 +28,23 @@ Two rules hold the design together:
     window — but nothing stops an unrelated `commit=True` DAO call elsewhere
     on the same shared connection from landing mid-window. Such a call ends
     the whole transaction and destroys the still-open SAVEPOINT out from
-    under it. On the success path that is harmless: both rows are already
-    durable as part of that foreign commit, so a `RELEASE SAVEPOINT` that
-    fails with "no such savepoint" is treated as success instead of an
-    error. On an error path it means whatever this call had already written
-    landed durably as part of that foreign commit, so a `ROLLBACK TO
-    SAVEPOINT` failing the same way triggers an explicit compensating write
-    (deleting the just-inserted action row and restoring the previous
-    control row) instead of propagating a bare `sqlite3.OperationalError`.
+    under it, and `RELEASE SAVEPOINT`/`ROLLBACK TO SAVEPOINT` then fail with
+    the identical "no such savepoint" whether that foreign call was a
+    *commit* (this call's rows already durable) or a *rollback* (this call's
+    rows destroyed along with it) — the error text alone cannot tell those
+    apart, and treating a missing savepoint as always meaning "a foreign
+    commit already landed it" would let a foreign rollback masquerade as a
+    successful, durable `apply`/`release`. So a missing `RELEASE SAVEPOINT`
+    is followed by a re-read of the rows this call just wrote: if they match
+    what was intended, that was a foreign commit and there is nothing left to
+    do; otherwise it was a foreign rollback, and the same writes are redone
+    and committed for real. A missing `ROLLBACK TO SAVEPOINT` on an error
+    path is simpler, since undoing and a foreign commit converge on the same
+    end state either way: whatever this call had already written landed
+    durably as part of that foreign commit, so it triggers an explicit
+    compensating write (deleting the just-inserted action row and restoring
+    the previous control row) instead of propagating a bare
+    `sqlite3.OperationalError`.
 
 Only the implement stage records outcomes today — the tracer through an
 implement failure. Later slices extend `record_stage_outcome` to the remaining
@@ -105,6 +114,75 @@ def _is_missing_savepoint_error(exc: sqlite3.OperationalError) -> bool:
     return "no such savepoint" in str(exc)
 
 
+async def _apply_landed_durably(
+    conn: aiosqlite.Connection,
+    issue_id: str,
+    action_id: str,
+    *,
+    mode: PipelineMode,
+    outcome: AttemptOutcome,
+    run_id: str | None,
+) -> bool:
+    """Whether `apply`'s action row and control row are actually on disk with
+    the values this call wrote — used after a `release_savepoint` miss to
+    tell a foreign *commit* (rows durable, nothing to do) apart from a
+    foreign *rollback* (rows destroyed) since both raise the identical "no
+    such savepoint"."""
+    action_row = await db.pipeline_controls.get_action(conn, issue_id, action_id)
+    control_row = await db.pipeline_controls.get(conn, issue_id)
+    return (
+        action_row is not None
+        and control_row is not None
+        and control_row.mode == str(mode)
+        and control_row.outcome == str(outcome)
+        and control_row.run_id == run_id
+    )
+
+
+async def _release_landed_durably(
+    conn: aiosqlite.Connection,
+    issue_id: str,
+    action_id: str,
+    previous: ControlSnapshot,
+) -> bool:
+    """Mirror of `_apply_landed_durably` for `release`'s undo: the action row
+    must be gone and the control row must equal `previous`."""
+    action_row = await db.pipeline_controls.get_action(conn, issue_id, action_id)
+    control_row = await db.pipeline_controls.get(conn, issue_id)
+    return (
+        action_row is None
+        and control_row is not None
+        and control_row.mode == str(previous.mode)
+        and control_row.outcome == str(previous.outcome)
+        and control_row.run_id == previous.run_id
+    )
+
+
+async def _sweep_landed_durably(
+    conn: aiosqlite.Connection,
+    issue_id: str,
+    interrupted_retry: db.pipeline_controls.ControlActionRow | None,
+    *,
+    run_id: str,
+) -> bool:
+    """Mirror of `_apply_landed_durably` for `reconcile_interrupted_retries`'s
+    per-wait reset: the interrupted retry's action row (if any) must be gone
+    and the control row must show the reset back to failed."""
+    if interrupted_retry is not None:
+        action_row = await db.pipeline_controls.get_action(
+            conn, issue_id, interrupted_retry.action_id
+        )
+        if action_row is not None:
+            return False
+    control_row = await db.pipeline_controls.get(conn, issue_id)
+    return (
+        control_row is not None
+        and control_row.stage == IMPLEMENT_STAGE
+        and control_row.outcome == str(AttemptOutcome.FAILED)
+        and control_row.run_id == run_id
+    )
+
+
 async def rollback_to_savepoint(conn: aiosqlite.Connection, savepoint: str) -> bool:
     """Undo everything written since `savepoint` was opened.
 
@@ -129,9 +207,12 @@ async def release_savepoint(conn: aiosqlite.Connection, savepoint: str) -> bool:
     """Release `savepoint`, keeping everything written since it opened.
 
     Returns `False` when a foreign `commit=True` DAO call already ended the
-    transaction and released this savepoint as part of its own commit: the
-    rows written under it are already durable, so the caller should treat
-    that exactly like committing itself, not as an error.
+    transaction and released this savepoint out from under it — which can
+    equally mean the rows written under it are already durable (a foreign
+    *commit*) or that they were just destroyed (a foreign *rollback*): the
+    "no such savepoint" text is identical either way. The caller must re-read
+    what it wrote and compare against what it intended before treating a
+    `False` return as success.
     """
     try:
         await conn.execute(f"RELEASE SAVEPOINT {savepoint}")
@@ -373,24 +454,65 @@ async def reconcile_interrupted_retries(conn: aiosqlite.Connection, *, at: str) 
             ),
             None,
         )
-        if interrupted_retry is not None:
-            await db.pipeline_controls.delete_action(
-                conn,
-                issue_id=wait.issue_id,
-                action_id=interrupted_retry.action_id,
-                commit=False,
-            )
-        await record_stage_outcome(
-            conn,
-            wait.issue_id,
-            stage=IMPLEMENT_STAGE,
-            outcome=AttemptOutcome.FAILED,
-            reason=detail or None,
-            run_id=wait.run_id,
-            at=at,
-            commit=False,
-        )
-        await conn.commit()
+        # Scoped like `apply`/`release`'s own windows: `conn` is the one
+        # connection shared by the whole daemon, and `guard_writes` joins
+        # this sweep's SAVEPOINT-to-commit window into the same
+        # serialization `apply`/`release` use so a concurrent web command for
+        # this issue can neither steal this ROLLBACK TO/RELEASE nor commit
+        # out from under this still-open savepoint. A foreign write for a
+        # *different* issue can still land mid-window and end the whole
+        # transaction, hence the same missing-savepoint tolerance and
+        # durability re-read `apply`/`release` use below.
+        savepoint = f"controls_sweep_{uuid.uuid4().hex}"
+        async with guard_writes(wait.issue_id):
+            await conn.execute(f"SAVEPOINT {savepoint}")
+            try:
+                if interrupted_retry is not None:
+                    await db.pipeline_controls.delete_action(
+                        conn,
+                        issue_id=wait.issue_id,
+                        action_id=interrupted_retry.action_id,
+                        commit=False,
+                    )
+                await record_stage_outcome(
+                    conn,
+                    wait.issue_id,
+                    stage=IMPLEMENT_STAGE,
+                    outcome=AttemptOutcome.FAILED,
+                    reason=detail or None,
+                    run_id=wait.run_id,
+                    at=at,
+                    commit=False,
+                )
+            except BaseException:
+                await rollback_to_savepoint(conn, savepoint)
+                raise
+            released = await release_savepoint(conn, savepoint)
+            await conn.commit()
+            if not released and not await _sweep_landed_durably(
+                conn, wait.issue_id, interrupted_retry, run_id=wait.run_id
+            ):
+                # Foreign rollback, not foreign commit: redo the reset for
+                # real instead of leaving the pending row (and the
+                # interrupted retry's action row) exactly where the sweep
+                # found them.
+                if interrupted_retry is not None:
+                    await db.pipeline_controls.delete_action(
+                        conn,
+                        issue_id=wait.issue_id,
+                        action_id=interrupted_retry.action_id,
+                        commit=False,
+                    )
+                await record_stage_outcome(
+                    conn,
+                    wait.issue_id,
+                    stage=IMPLEMENT_STAGE,
+                    outcome=AttemptOutcome.FAILED,
+                    reason=detail or None,
+                    run_id=wait.run_id,
+                    at=at,
+                    commit=True,
+                )
 
 
 def _next_mode_and_outcome(
@@ -546,7 +668,7 @@ async def apply(
                         commit=True,
                     )
                 raise
-            await release_savepoint(conn, savepoint)
+            released = await release_savepoint(conn, savepoint)
             # Unconditional and safe either way: a normal `RELEASE` still
             # needs this to finalize the outer transaction to disk, and it is
             # a no-op if a foreign commit already finalized everything. If
@@ -556,6 +678,42 @@ async def apply(
             # having nothing to release does not mean there is nothing left
             # to commit.
             await conn.commit()
+            if not released and not await _apply_landed_durably(
+                conn, issue_id, action_id, mode=mode, outcome=outcome, run_id=run_id
+            ):
+                # The missing savepoint was a foreign *rollback*, not a
+                # foreign commit: it destroyed both writes above along with
+                # itself, so what should have been an accepted, durable
+                # transition is currently nothing at all. Redo both writes
+                # for real and commit them on their own, rather than handing
+                # the caller an `accepted=True` result with nothing on disk.
+                await db.pipeline_controls.record_action(
+                    conn,
+                    issue_id=issue_id,
+                    action_id=action_id,
+                    action=str(action),
+                    actor=actor,
+                    from_mode=str(current.mode),
+                    to_mode=str(mode),
+                    from_outcome=str(current.outcome),
+                    to_outcome=str(outcome),
+                    stage=current.stage,
+                    run_id=current.run_id,
+                    ts=at,
+                    commit=False,
+                )
+                await db.pipeline_controls.put(
+                    conn,
+                    issue_id=issue_id,
+                    mode=str(mode),
+                    stage=current.stage,
+                    outcome=str(outcome),
+                    reason=reason,
+                    run_id=run_id,
+                    actor=actor,
+                    updated_at=at,
+                    commit=True,
+                )
         return ActionResult(
             accepted=True,
             snapshot=_snapshot(
@@ -647,8 +805,34 @@ async def release(
                 raise
             # Unconditional and safe either way — see the matching comment in
             # `apply`.
-            await release_savepoint(conn, savepoint)
+            released = await release_savepoint(conn, savepoint)
             await conn.commit()
+            if not released and not await _release_landed_durably(
+                conn, result.snapshot.issue_id, result.action_id, previous
+            ):
+                # Same misclassification as `apply`: the missing savepoint
+                # was a foreign rollback that destroyed this undo, not a
+                # foreign commit that already landed it. Redo it for real
+                # instead of returning as if the previous state were
+                # restored.
+                await db.pipeline_controls.delete_action(
+                    conn,
+                    issue_id=result.snapshot.issue_id,
+                    action_id=result.action_id,
+                    commit=False,
+                )
+                await db.pipeline_controls.put(
+                    conn,
+                    issue_id=previous.issue_id,
+                    mode=str(previous.mode),
+                    stage=previous.stage,
+                    outcome=str(previous.outcome),
+                    reason=previous.reason,
+                    run_id=previous.run_id,
+                    actor=None,
+                    updated_at=at,
+                    commit=True,
+                )
 
 
 async def history(

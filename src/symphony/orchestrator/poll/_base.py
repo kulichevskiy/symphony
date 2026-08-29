@@ -1845,8 +1845,11 @@ class _OrchestratorBase:
         # and ending the whole transaction out from under this SAVEPOINT.
         # `controls.rollback_to_savepoint`/`release_savepoint` tolerate that
         # ("no such savepoint") instead of letting a bare `sqlite3.
-        # OperationalError` abort the rest of park handling even though both
-        # rows are already durable as part of that foreign commit.
+        # OperationalError` abort the rest of park handling. A missing
+        # `RELEASE SAVEPOINT` raises that identical text whether the foreign
+        # call was a commit (both rows already durable) or a rollback (both
+        # rows destroyed along with it), so `_implement_failed_wait_landed_durably`
+        # re-reads them below rather than assuming the former.
         savepoint = f"implement_failed_wait_{uuid.uuid4().hex}"
         async with controls.guard_writes(issue_id):
             await self._conn.execute(f"SAVEPOINT {savepoint}")
@@ -1885,8 +1888,59 @@ class _OrchestratorBase:
                 # transition.
                 await controls.rollback_to_savepoint(self._conn, savepoint)
                 raise
-            await controls.release_savepoint(self._conn, savepoint)
+            released = await controls.release_savepoint(self._conn, savepoint)
             await self._conn.commit()
+            if not released and not await self._implement_failed_wait_landed_durably(
+                issue_id, run_id
+            ):
+                # The missing savepoint was a foreign *rollback*, not a
+                # foreign commit: it destroyed the control row and the
+                # operator wait along with itself, so what should have been
+                # a durable park is currently nothing at all — a restart
+                # would find no wait and no reason to offer Retry. Redo both
+                # writes for real instead of returning as if they landed.
+                await controls.record_stage_outcome(
+                    self._conn,
+                    issue_id,
+                    stage=controls.IMPLEMENT_STAGE,
+                    outcome=controls.AttemptOutcome.FAILED,
+                    reason=await self._blocked_reason_for_run(run_id) or None,
+                    run_id=run_id,
+                    at=self._now().isoformat(),
+                    commit=False,
+                )
+                await db.operator_waits.upsert(
+                    self._conn,
+                    issue_id=issue_id,
+                    run_id=run_id,
+                    kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+                    linear_team_key=binding.linear_team_key,
+                    github_repo=binding.github_repo,
+                    issue_label=binding.issue_label or "",
+                    created_at=self._now().isoformat(),
+                    provider=binding.provider,
+                    tracker_provider=binding.tracker_provider,
+                    tracker_site=binding.tracker_site,
+                    commit=True,
+                )
+
+    async def _implement_failed_wait_landed_durably(self, issue_id: str, run_id: str) -> bool:
+        """Whether `_track_implement_failed_wait`'s control row and operator
+        wait are actually on disk for this run — used after a
+        `release_savepoint` miss to tell a foreign *commit* (rows durable,
+        nothing to do) apart from a foreign *rollback* (rows destroyed)
+        since both raise the identical "no such savepoint"."""
+        wait_row = await db.operator_waits.get(self._conn, issue_id)
+        control_row = await db.pipeline_controls.get(self._conn, issue_id)
+        return (
+            wait_row is not None
+            and wait_row.run_id == run_id
+            and wait_row.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+            and control_row is not None
+            and control_row.stage == controls.IMPLEMENT_STAGE
+            and control_row.outcome == str(controls.AttemptOutcome.FAILED)
+            and control_row.run_id == run_id
+        )
 
     async def _track_implement_blocked_wait(
         self, issue_id: str, run_id: str, binding: RepoBinding

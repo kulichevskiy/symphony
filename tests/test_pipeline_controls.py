@@ -1261,6 +1261,121 @@ async def test_apply_tolerates_a_foreign_commit_inside_its_savepoint_window(
 
 
 @pytest.mark.asyncio
+async def test_apply_recovers_from_a_foreign_rollback_inside_its_savepoint_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirror-image bug of the foreign-commit case above: a foreign
+    `conn.rollback()` landing mid-window raises the identical "no such
+    savepoint" as a foreign commit, but means the opposite — both writes
+    destroyed, not durable. Before this fix, `apply` treated any missing
+    savepoint as if a foreign commit had already landed its rows and
+    returned `accepted=True` with nothing on disk, so the caller would go on
+    to dispatch a retry that no action row explained. `apply` must instead
+    notice the rows never landed and redo them for real."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+        await _record_implement(conn, outcome=OUTCOMES.FAILED, reason="boom")
+
+        real_put = db.pipeline_controls.put
+
+        async def _put_then_foreign_rollback(
+            conn: aiosqlite.Connection, **kwargs: object
+        ) -> None:
+            await real_put(conn, **kwargs)
+            # Unlike the foreign-commit case, this destroys everything
+            # written since the transaction began instead of making it
+            # durable — including `record_action`'s insert just above it.
+            await conn.rollback()
+
+        monkeypatch.setattr(db.pipeline_controls, "put", _put_then_foreign_rollback)
+
+        result = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.RETRY,
+            actor="tracker:c-1",
+            action_id="c-1",
+            at="2026-08-27T10:01:00+00:00",
+        )
+
+        assert result.accepted
+        assert result.snapshot.outcome is OUTCOMES.PENDING
+
+        action_row = await db.pipeline_controls.get_action(conn, ISSUE_ID, "c-1")
+        assert action_row is not None
+
+        row = await db.pipeline_controls.get(conn, ISSUE_ID)
+        assert row is not None and row.outcome == str(OUTCOMES.PENDING)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_release_recovers_from_a_foreign_rollback_inside_its_savepoint_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirror of `test_apply_recovers_from_a_foreign_rollback_inside_its_savepoint_window`
+    for `release`'s own undo: a foreign `conn.rollback()` landing mid-window
+    destroys the undo instead of making it durable — before this fix,
+    `release` would return as if the previous state had been restored while
+    the action row it was supposed to delete was still sitting there
+    (rolled back right along with the undo's own `delete_action`), leaving
+    the park stuck with RETRY no longer offered and the re-delivered command
+    rejected as a duplicate."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+        await _record_implement(conn, outcome=OUTCOMES.FAILED, reason="boom")
+
+        result = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.RETRY,
+            actor="tracker:c-1",
+            action_id="c-1",
+            at="2026-08-27T10:01:00+00:00",
+        )
+        assert result.accepted
+
+        real_put = db.pipeline_controls.put
+
+        async def _put_then_foreign_rollback(
+            conn: aiosqlite.Connection, **kwargs: object
+        ) -> None:
+            await real_put(conn, **kwargs)
+            await conn.rollback()
+
+        monkeypatch.setattr(db.pipeline_controls, "put", _put_then_foreign_rollback)
+
+        await controls.release(conn, result, at="2026-08-27T10:02:00+00:00")
+
+        assert await db.pipeline_controls.get_action(conn, ISSUE_ID, "c-1") is None
+        row = await db.pipeline_controls.get(conn, ISSUE_ID)
+        assert row is not None and row.outcome == str(OUTCOMES.FAILED)
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_track_implement_failed_wait_rolls_back_on_upsert_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
