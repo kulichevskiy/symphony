@@ -1187,18 +1187,29 @@ class Reconciler:
             # park in that window — `_adopt_orphan_prs` deliberately never
             # takes `controls.guard_writes` (see
             # `test_orphan_adoption_does_not_hold_the_controls_write_lock`).
-            # An accepted Retry already moved the control row on to a fresh
-            # `pending` attempt; an accepted Stop already settled it to
-            # `skipped` and dropped the wait. Settling to `succeeded` here
-            # with the now-stale `wait.run_id` would stomp either of those
-            # with data describing a park that no longer exists (SYM-244
-            # review), so re-read the wait immediately before writing and
-            # only settle if it is still the same one this call captured.
+            # An accepted Stop settles the control row to `skipped` and drops
+            # the wait in the same transaction, so re-reading the wait alone
+            # catches that. An accepted Retry does not: `_accept_control_action`
+            # commits the control row straight to `pending` (dropping its
+            # `run_id`) but the ingress only clears the wait afterwards, once
+            # its own tracker move and comment succeed — so the *wait* can
+            # still match `wait.run_id` here even though the control row it
+            # backs has already moved on (SYM-244 review). Re-read the control
+            # row too and require it still reports the `failed` outcome this
+            # call observed before settling to `succeeded`.
             current_wait = await db.operator_waits.get(self._conn, issue_id)
+            control_row = await db.pipeline_controls.get(self._conn, issue_id)
             if (
                 current_wait is not None
                 and current_wait.run_id == wait.run_id
                 and current_wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+                and (
+                    control_row is None
+                    or (
+                        control_row.outcome == str(controls.AttemptOutcome.FAILED)
+                        and control_row.run_id == wait.run_id
+                    )
+                )
             ):
                 await controls.record_stage_outcome(
                     self._conn,
