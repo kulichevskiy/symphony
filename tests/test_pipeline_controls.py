@@ -757,6 +757,100 @@ async def test_startup_sweep_reconciles_interrupted_retry_to_failed(
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_run_wires_the_interrupted_retry_sweep_into_startup(
+    tmp_path: Path,
+) -> None:
+    """`reconcile_interrupted_retries` is only exercised above as a bare
+    function call; nothing proves `Orchestrator.run()` actually calls it on
+    startup, so deleting that wiring would leave the suite green. Drive
+    `run()` itself — with no configured repos, so the poll loop it enters has
+    nothing to scan — and observe the same interrupted retry get reset to
+    failed before the daemon is shut down."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(
+            repos=[],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+            poll_interval_secs=300,
+        )
+        orch = Orchestrator(
+            cfg,
+            AsyncMock(),
+            conn,
+            runner=AsyncMock(),
+            gh=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+        await _record_implement(conn, outcome=OUTCOMES.FAILED, reason="agent exited 2")
+        await db.operator_waits.upsert(
+            conn,
+            issue_id=ISSUE_ID,
+            run_id="run-1",
+            kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="eng-1",
+            created_at="2026-08-27T09:05:00+00:00",
+        )
+        result = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.RETRY,
+            actor="tracker:c-retry",
+            action_id="c-retry",
+            at="2026-08-27T10:05:00+00:00",
+        )
+        assert result.accepted
+        pending = await controls.snapshot(conn, ISSUE_ID)
+        assert pending.outcome is OUTCOMES.PENDING
+
+        run_task = asyncio.create_task(orch.run())
+        try:
+            for _ in range(200):
+                if (await controls.snapshot(conn, ISSUE_ID)).outcome is OUTCOMES.FAILED:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail("orchestrator.run() never reconciled the interrupted retry")
+        finally:
+            await orch.shutdown()
+            await asyncio.wait_for(run_task, timeout=1)
+
+        reconciled = await controls.snapshot(conn, ISSUE_ID)
+        assert reconciled.outcome is OUTCOMES.FAILED
+        assert ACTIONS.RETRY in reconciled.allowed_actions
+        assert reconciled.run_id == "run-1"
+
+        # The dropped action row (same guarantee as the bare-function test
+        # above) proves this went through the real `reconcile_interrupted_retries`
+        # codepath, not just a coincidentally-failed snapshot.
+        redelivered = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.RETRY,
+            actor="tracker:c-retry",
+            action_id="c-retry",
+            at="2026-08-27T11:00:01+00:00",
+        )
+        assert redelivered.accepted
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_implement_retry_the_control_model_rejects_changes_nothing(
     tmp_path: Path,
 ) -> None:
@@ -929,6 +1023,181 @@ async def test_concurrent_applies_for_different_issues_do_not_corrupt_each_other
 
 
 @pytest.mark.asyncio
+async def test_apply_cancelled_mid_window_leaves_no_orphan_action_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The poll-loop task can be cancelled at any `await` — including one
+    inside `apply`'s SAVEPOINT window, between `record_action` and `put` — on
+    daemon shutdown. An `except Exception` catch there would let
+    `asyncio.CancelledError` skip the rollback entirely and leave the action
+    row behind in the still-open transaction; a later, unrelated foreign
+    `conn.commit()` would then make it durable with no matching control-row
+    transition, and the redelivered command would be rejected forever as
+    "already applied" since `reconcile_interrupted_retries` only repairs a
+    `pending` outcome, not this orphan shape. `apply` must catch
+    `BaseException` so cancellation rolls back (or, once a foreign commit has
+    already flushed part of the write, compensates) exactly like any other
+    failure."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+        await _record_implement(conn, outcome=OUTCOMES.FAILED, reason="boom")
+
+        real_put = db.pipeline_controls.put
+        calls = 0
+
+        async def _foreign_commit_then_cancel_once(
+            conn: aiosqlite.Connection, **kwargs: object
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                # The compensating call `apply`'s except block makes once the
+                # SAVEPOINT is gone: let it actually restore the row.
+                await real_put(conn, **kwargs)
+                return
+            # An unrelated coroutine's ordinary write, landing mid-window,
+            # immediately followed by this task's own cancellation.
+            await db.runs.update_status(conn, "run-1", "completed")
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(db.pipeline_controls, "put", _foreign_commit_then_cancel_once)
+
+        with pytest.raises(asyncio.CancelledError):
+            await controls.apply(
+                conn,
+                ISSUE_ID,
+                ACTIONS.RETRY,
+                actor="tracker:c-1",
+                action_id="c-1",
+                at="2026-08-27T10:01:00+00:00",
+            )
+
+        assert await controls.history(conn, ISSUE_ID) == []
+        row = await db.pipeline_controls.get(conn, ISSUE_ID)
+        assert row is not None and row.outcome == str(OUTCOMES.FAILED)
+
+        run = (await db.runs.history_for_issue(conn, ISSUE_ID))[0]
+        assert run.status == "completed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_release_cancelled_mid_window_leaves_no_orphan_action_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same shape as `test_apply_cancelled_mid_window_leaves_no_orphan_action_row`,
+    for `release`'s own undo block: a cancellation between `delete_action` and
+    the restoring `put`, with an unrelated foreign commit landing first, must
+    still finish the undo (compensating explicitly once the SAVEPOINT is
+    gone) instead of leaving the action row behind."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+        await _record_implement(conn, outcome=OUTCOMES.FAILED, reason="boom")
+
+        result = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.RETRY,
+            actor="tracker:c-1",
+            action_id="c-1",
+            at="2026-08-27T10:01:00+00:00",
+        )
+        assert result.accepted
+
+        real_put = db.pipeline_controls.put
+        calls = 0
+
+        async def _foreign_commit_then_cancel_once(
+            conn: aiosqlite.Connection, **kwargs: object
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                # The compensating call `release`'s except block makes once
+                # the SAVEPOINT is gone: let it actually restore the row.
+                await real_put(conn, **kwargs)
+                return
+            await db.runs.update_status(conn, "run-1", "completed")
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(db.pipeline_controls, "put", _foreign_commit_then_cancel_once)
+
+        with pytest.raises(asyncio.CancelledError):
+            await controls.release(conn, result, at="2026-08-27T10:02:00+00:00")
+
+        assert await controls.history(conn, ISSUE_ID) == []
+        row = await db.pipeline_controls.get(conn, ISSUE_ID)
+        assert row is not None and row.outcome == str(OUTCOMES.FAILED)
+
+        run = (await db.runs.history_for_issue(conn, ISSUE_ID))[0]
+        assert run.status == "completed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_track_implement_failed_wait_cancelled_mid_window_rolls_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same shape as `test_apply_cancelled_mid_window_leaves_no_orphan_action_row`,
+    for the park path: a cancellation between `record_stage_outcome` and
+    `operator_waits.upsert` must still roll back the control row it already
+    wrote, exactly like `test_track_implement_failed_wait_rolls_back_on_upsert_failure`
+    does for an ordinary exception. An `except Exception` catch there would
+    let `asyncio.CancelledError` skip the rollback and leave a "failed"
+    control row behind with no matching operator wait."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = _cfg(tmp_path, binding)
+        orch = _orchestrator(cfg, conn, AsyncMock(), tmp_path)
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+
+        async def _cancel(*args: object, **kwargs: object) -> None:
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(db.operator_waits, "upsert", _cancel)
+
+        with pytest.raises(asyncio.CancelledError):
+            await orch._track_implement_failed_wait(ISSUE_ID, "run-1", binding)  # noqa: SLF001
+
+        assert await db.pipeline_controls.get(conn, ISSUE_ID) is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_apply_tolerates_a_foreign_commit_inside_its_savepoint_window(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1026,5 +1295,60 @@ async def test_track_implement_failed_wait_rolls_back_on_upsert_failure(
             await orch._track_implement_failed_wait(ISSUE_ID, "run-1", binding)  # noqa: SLF001
 
         assert await db.pipeline_controls.get(conn, ISSUE_ID) is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_track_implement_failed_wait_tolerates_a_foreign_commit_inside_its_savepoint_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same shape as `test_apply_tolerates_a_foreign_commit_inside_its_savepoint_window`,
+    but for the park path: an ordinary `commit=True` DAO write from an
+    unrelated coroutine (e.g. `db.runs.update_status`) can land on the shared
+    connection between `_track_implement_failed_wait`'s own writes and its
+    `RELEASE SAVEPOINT`. `guard_writes` only serializes this module's own
+    SAVEPOINT-to-commit windows against each other — it does not stop a
+    foreign write elsewhere from landing mid-window, ending the whole
+    transaction and destroying this SAVEPOINT out from under it. Before this
+    fix, that surfaced as a bare `sqlite3.OperationalError: no such
+    savepoint`, aborting the rest of park handling even though both the
+    control row and the operator wait were already durable."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = _cfg(tmp_path, binding)
+        orch = _orchestrator(cfg, conn, AsyncMock(), tmp_path)
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+
+        real_upsert = db.operator_waits.upsert
+
+        async def _upsert_then_foreign_commit(
+            conn: aiosqlite.Connection, **kwargs: object
+        ) -> None:
+            await real_upsert(conn, **kwargs)
+            # An unrelated coroutine's ordinary write, landing mid-window.
+            await db.runs.update_status(conn, "run-1", "completed")
+
+        monkeypatch.setattr(db.operator_waits, "upsert", _upsert_then_foreign_commit)
+
+        await orch._track_implement_failed_wait(ISSUE_ID, "run-1", binding)  # noqa: SLF001
+
+        snap = await controls.snapshot(conn, ISSUE_ID)
+        assert snap.outcome is OUTCOMES.FAILED
+        assert await db.operator_waits.get(conn, ISSUE_ID) is not None
+
+        run = (await db.runs.history_for_issue(conn, ISSUE_ID))[0]
+        assert run.status == "completed"
     finally:
         await conn.close()

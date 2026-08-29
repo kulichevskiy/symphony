@@ -105,7 +105,7 @@ def _is_missing_savepoint_error(exc: sqlite3.OperationalError) -> bool:
     return "no such savepoint" in str(exc)
 
 
-async def _rollback_to_savepoint(conn: aiosqlite.Connection, savepoint: str) -> bool:
+async def rollback_to_savepoint(conn: aiosqlite.Connection, savepoint: str) -> bool:
     """Undo everything written since `savepoint` was opened.
 
     Returns `False` when a foreign `commit=True` DAO call elsewhere on the
@@ -125,7 +125,7 @@ async def _rollback_to_savepoint(conn: aiosqlite.Connection, savepoint: str) -> 
         return False
 
 
-async def _release_savepoint(conn: aiosqlite.Connection, savepoint: str) -> bool:
+async def release_savepoint(conn: aiosqlite.Connection, savepoint: str) -> bool:
     """Release `savepoint`, keeping everything written since it opened.
 
     Returns `False` when a foreign `commit=True` DAO call already ended the
@@ -489,7 +489,7 @@ async def apply(
                 # nothing of ours for a foreign commit to have flushed here;
                 # a missing-savepoint ROLLBACK just means it beat us to
                 # ending the transaction, not that we need to compensate.
-                await _rollback_to_savepoint(conn, savepoint)
+                await rollback_to_savepoint(conn, savepoint)
                 # Only a racing insert of the same action id is reported as
                 # already applied; any other constraint violation (e.g. a
                 # foreign-key failure on a missing issue) is a real error and
@@ -514,8 +514,15 @@ async def apply(
                     updated_at=at,
                     commit=False,
                 )
-            except Exception:
-                if not await _rollback_to_savepoint(conn, savepoint):
+            except BaseException:
+                # `BaseException`, not `Exception`: a task cancellation lands
+                # here too (the poll loop's task is cancelled on shutdown, and
+                # every `await` in this block is a cancellation point), and it
+                # must undo the same as any other failure — an `Exception`-only
+                # catch would let it skip the rollback and leave the action row
+                # dangling in the open transaction for a later foreign commit
+                # to make durable with no matching control-row transition.
+                if not await rollback_to_savepoint(conn, savepoint):
                     # A foreign commit already flushed the action row
                     # `record_action` inserted above before this `put` failed
                     # to land the matching control row: `ROLLBACK TO` has
@@ -539,13 +546,13 @@ async def apply(
                         commit=True,
                     )
                 raise
-            await _release_savepoint(conn, savepoint)
+            await release_savepoint(conn, savepoint)
             # Unconditional and safe either way: a normal `RELEASE` still
             # needs this to finalize the outer transaction to disk, and it is
             # a no-op if a foreign commit already finalized everything. If
             # that foreign commit instead landed between `record_action` and
             # `put` (so `put` opened a fresh implicit transaction of its
-            # own), this is what commits *that* transaction — `_release_savepoint`
+            # own), this is what commits *that* transaction — `release_savepoint`
             # having nothing to release does not mean there is nothing left
             # to commit.
             await conn.commit()
@@ -610,8 +617,10 @@ async def release(
                     updated_at=at,
                     commit=False,
                 )
-            except Exception:
-                if not await _rollback_to_savepoint(conn, savepoint):
+            except BaseException:
+                # See the matching comment in `apply`: a cancellation must
+                # undo this window too, not skip straight past the rollback.
+                if not await rollback_to_savepoint(conn, savepoint):
                     # A foreign commit already flushed part of this undo
                     # before the rest failed: finish it explicitly instead of
                     # leaving the control row wherever the failed write left
@@ -638,7 +647,7 @@ async def release(
                 raise
             # Unconditional and safe either way — see the matching comment in
             # `apply`.
-            await _release_savepoint(conn, savepoint)
+            await release_savepoint(conn, savepoint)
             await conn.commit()
 
 
@@ -663,5 +672,7 @@ __all__ = [
     "reconcile_interrupted_retries",
     "record_stage_outcome",
     "release",
+    "release_savepoint",
+    "rollback_to_savepoint",
     "snapshot",
 ]

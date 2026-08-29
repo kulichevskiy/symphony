@@ -1838,7 +1838,15 @@ class _OrchestratorBase:
         # `controls.guard_writes` puts this whole window under the same
         # per-issue lock plus shared write lock `controls.apply`/`release`
         # use, so this SAVEPOINT and one of theirs for the same issue can
-        # never interleave on the connection either.
+        # never interleave on the connection either. `guard_writes` only
+        # serializes *this module's* SAVEPOINT-to-commit windows against each
+        # other, though — it does not stop some unrelated `commit=True` DAO
+        # call elsewhere on the same shared connection from landing mid-window
+        # and ending the whole transaction out from under this SAVEPOINT.
+        # `controls.rollback_to_savepoint`/`release_savepoint` tolerate that
+        # ("no such savepoint") instead of letting a bare `sqlite3.
+        # OperationalError` abort the rest of park handling even though both
+        # rows are already durable as part of that foreign commit.
         savepoint = f"implement_failed_wait_{uuid.uuid4().hex}"
         async with controls.guard_writes(issue_id):
             await self._conn.execute(f"SAVEPOINT {savepoint}")
@@ -1867,11 +1875,17 @@ class _OrchestratorBase:
                     tracker_site=binding.tracker_site,
                     commit=False,
                 )
-            except Exception:
-                await self._conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
-                await self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except BaseException:
+                # `BaseException`, not `Exception`: this task can be cancelled
+                # (e.g. daemon shutdown) between the SAVEPOINT and the commit
+                # below, and that must roll back the same as any other
+                # failure — an `Exception`-only catch would skip the rollback
+                # and leave these rows dangling in the open transaction for a
+                # later foreign commit to make durable with no matching
+                # transition.
+                await controls.rollback_to_savepoint(self._conn, savepoint)
                 raise
-            await self._conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+            await controls.release_savepoint(self._conn, savepoint)
             await self._conn.commit()
 
     async def _track_implement_blocked_wait(
