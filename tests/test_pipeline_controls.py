@@ -1392,9 +1392,7 @@ async def test_startup_sweep_recovers_from_a_foreign_rollback_inside_its_savepoi
 
         real_put = db.pipeline_controls.put
 
-        async def _put_then_foreign_rollback(
-            conn: aiosqlite.Connection, **kwargs: object
-        ) -> None:
+        async def _put_then_foreign_rollback(conn: aiosqlite.Connection, **kwargs: object) -> None:
             await real_put(conn, **kwargs)
             await conn.rollback()
 
@@ -2187,9 +2185,7 @@ async def test_apply_recovers_from_a_foreign_rollback_inside_its_savepoint_windo
 
         real_put = db.pipeline_controls.put
 
-        async def _put_then_foreign_rollback(
-            conn: aiosqlite.Connection, **kwargs: object
-        ) -> None:
+        async def _put_then_foreign_rollback(conn: aiosqlite.Connection, **kwargs: object) -> None:
             await real_put(conn, **kwargs)
             # Unlike the foreign-commit case, this destroys everything
             # written since the transaction began instead of making it
@@ -2257,9 +2253,7 @@ async def test_release_recovers_from_a_foreign_rollback_inside_its_savepoint_win
 
         real_put = db.pipeline_controls.put
 
-        async def _put_then_foreign_rollback(
-            conn: aiosqlite.Connection, **kwargs: object
-        ) -> None:
+        async def _put_then_foreign_rollback(conn: aiosqlite.Connection, **kwargs: object) -> None:
             await real_put(conn, **kwargs)
             await conn.rollback()
 
@@ -2400,9 +2394,7 @@ async def test_track_implement_failed_wait_tolerates_a_foreign_commit_inside_its
 
         real_upsert = db.operator_waits.upsert
 
-        async def _upsert_then_foreign_commit(
-            conn: aiosqlite.Connection, **kwargs: object
-        ) -> None:
+        async def _upsert_then_foreign_commit(conn: aiosqlite.Connection, **kwargs: object) -> None:
             await real_upsert(conn, **kwargs)
             # An unrelated coroutine's ordinary write, landing mid-window.
             await db.runs.update_status(conn, "run-1", "completed")
