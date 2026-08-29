@@ -240,10 +240,11 @@ async def rollback_to_savepoint(conn: aiosqlite.Connection, savepoint: str) -> b
 
     Returns `False` when a foreign `commit=True` DAO call elsewhere on the
     shared connection already ended the whole transaction and destroyed this
-    savepoint out from under it — in which case whatever this call had
-    already written landed durably as part of that foreign commit, and there
-    is nothing left here to roll back. The caller must compensate explicitly
-    in that case instead of treating this as a successful undo.
+    savepoint out from under it — the savepoint is gone, and a foreign commit
+    or a foreign rollback are indistinguishable here (both raise the identical
+    "no such savepoint" error). The caller must compensate explicitly in that
+    case: the compensating writes below are written to converge on the same
+    end state whichever one actually happened.
     """
     try:
         await conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
@@ -442,14 +443,21 @@ async def record_stage_outcome(
     """Record where the pipeline is and how its latest attempt ended.
 
     Operator intent (`mode`) is left alone: a paused pipeline reporting a
-    failed attempt is still paused. `commit=False` lets the caller fold this
-    into the transaction that records the matching park.
+    failed attempt is still paused. The one exception is `PAUSING`, which is
+    not an operator intent but a transient "stop requested while an attempt
+    was still live" state — once that attempt actually finishes (with any
+    outcome other than `RUNNING`), it resolves to `PAUSED` so the pipeline's
+    durable mode never sticks on a transient value. `commit=False` lets the
+    caller fold this into the transaction that records the matching park.
     """
     current = await snapshot(conn, issue_id)
+    mode = current.mode
+    if mode is PipelineMode.PAUSING and outcome is not AttemptOutcome.RUNNING:
+        mode = PipelineMode.PAUSED
     await db.pipeline_controls.put(
         conn,
         issue_id=issue_id,
-        mode=str(current.mode),
+        mode=str(mode),
         stage=stage,
         outcome=str(outcome),
         reason=reason,
@@ -460,7 +468,7 @@ async def record_stage_outcome(
     )
     return _snapshot(
         issue_id,
-        mode=current.mode,
+        mode=mode,
         stage=stage,
         outcome=outcome,
         reason=reason,
@@ -697,13 +705,13 @@ async def apply(
                 # dangling in the open transaction for a later foreign commit
                 # to make durable with no matching control-row transition.
                 if not await rollback_to_savepoint(conn, savepoint):
-                    # A foreign commit already flushed the action row
-                    # `record_action` inserted above before this `put` failed
-                    # to land the matching control row: `ROLLBACK TO` has
-                    # nothing left to undo. Compensate explicitly — delete
-                    # the now-durable action row and restore the control row
-                    # to what it was before this call — instead of leaving a
-                    # durable action with no matching transition.
+                    # The savepoint is gone — a foreign commit or a foreign
+                    # rollback, indistinguishable here — so `ROLLBACK TO` may
+                    # have had nothing left to undo. Compensate explicitly
+                    # either way: delete the action row and restore the
+                    # control row to what it was before this call converges
+                    # on the same end state whether the row was durably
+                    # flushed by a foreign commit or never landed at all.
                     await db.pipeline_controls.delete_action(
                         conn, issue_id=issue_id, action_id=action_id, commit=False
                     )
@@ -835,11 +843,13 @@ async def release(
                 # See the matching comment in `apply`: a cancellation must
                 # undo this window too, not skip straight past the rollback.
                 if not await rollback_to_savepoint(conn, savepoint):
-                    # A foreign commit already flushed part of this undo
-                    # before the rest failed: finish it explicitly instead of
-                    # leaving the control row wherever the failed write left
-                    # it. `delete_action` is idempotent and re-`put`ting the
-                    # same previous values is a no-op if they already landed.
+                    # The savepoint is gone — a foreign commit or a foreign
+                    # rollback, indistinguishable here — so part of this undo
+                    # may already have landed durably. Finish it explicitly
+                    # instead of leaving the control row wherever the failed
+                    # write left it: `delete_action` is idempotent and
+                    # re-`put`ting the same previous values is a no-op if
+                    # they already landed.
                     await db.pipeline_controls.delete_action(
                         conn,
                         issue_id=result.snapshot.issue_id,

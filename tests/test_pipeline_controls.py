@@ -229,8 +229,8 @@ async def test_replaying_an_already_applied_action_id_is_rejected_as_a_duplicate
     """Unlike `test_duplicate_action_id_is_applied_exactly_once` above, this
     replays an action that is still *allowed* after it lands — Abort stays
     allowed in every mode/outcome — so the replay reaches `apply`'s duplicate
-    `action_id` guard (controls.py:622) instead of being turned away earlier
-    by the disallowed-action check on state alone."""
+    `action_id` pre-check instead of being turned away earlier by the
+    disallowed-action check on state alone."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_issue(conn)
@@ -265,13 +265,13 @@ async def test_replaying_an_already_applied_action_id_is_rejected_as_a_duplicate
 async def test_duplicate_action_id_that_slips_past_the_precheck_is_still_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`apply`'s pre-check (controls.py:622) is what normally turns a
+    """`apply`'s duplicate `action_id` pre-check is what normally turns a
     replayed `action_id` into a clean rejection before any write is
     attempted. This forces that pre-check to miss the existing row — as a
     race the per-issue lock doesn't cover could — so the duplicate instead
-    hits `record_action`'s primary-key `IntegrityError`, and asserts the
-    `except` block at controls.py:660 turns that into the same clean
-    rejection rather than raising."""
+    hits `record_action`'s primary-key `IntegrityError`, and asserts that
+    `apply`'s `record_action` `IntegrityError` fallback turns that into the
+    same clean rejection rather than raising."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_issue(conn)
@@ -317,7 +317,7 @@ async def test_duplicate_action_id_that_slips_past_the_precheck_is_still_rejecte
 
 @pytest.mark.asyncio
 async def test_non_duplicate_integrity_error_still_propagates(tmp_path: Path) -> None:
-    """The `IntegrityError` fallback at controls.py:660 only exists to
+    """`apply`'s `record_action` `IntegrityError` fallback only exists to
     reclassify a replayed `action_id`; a genuine constraint violation on the
     same INSERT — here, `record_action`'s foreign key on an issue that was
     never seeded — must not be swallowed as a false "already applied"."""
@@ -368,6 +368,42 @@ async def test_pause_while_running_is_pausing_then_play_resumes(tmp_path: Path) 
         assert resumed.accepted
         assert resumed.snapshot.mode is MODES.PLAYING
         assert ACTIONS.PLAY not in resumed.snapshot.allowed_actions
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_pausing_settles_to_paused_once_the_live_attempt_finishes(
+    tmp_path: Path,
+) -> None:
+    """`PAUSING` is a transient "stop requested while an attempt was still
+    live" state, not an operator intent: once that attempt finishes — here,
+    with a failure — `record_stage_outcome` must resolve it to `PAUSED`
+    instead of leaving the durable mode stuck on `pausing` forever."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _record_implement(conn, outcome=OUTCOMES.RUNNING)
+        paused = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.PAUSE,
+            actor="web:a-1",
+            action_id="a-1",
+            at="2026-08-27T10:01:00+00:00",
+        )
+        assert paused.accepted
+        assert paused.snapshot.mode is MODES.PAUSING
+
+        await _record_implement(
+            conn,
+            outcome=OUTCOMES.FAILED,
+            reason="boom",
+            at="2026-08-27T10:02:00+00:00",
+        )
+        snap = await controls.snapshot(conn, ISSUE_ID)
+        assert snap.mode is MODES.PAUSED
+        assert snap.outcome is OUTCOMES.FAILED
     finally:
         await conn.close()
 

@@ -63,6 +63,14 @@ def test_intent_captures_operator_comment_text() -> None:
     assert "use this to authorize" in intent.text
 
 
+def test_intent_captures_comment_author() -> None:
+    [retry] = parse([_c("$retry")])
+    assert retry.author == "user"
+
+    [thumbs_up] = parse([_c("👍")])
+    assert thumbs_up.author == "user"
+
+
 def test_skip_local_review_is_unknown_command() -> None:
     assert parse([_c("$skip-local-review", cid="a")]) == []
 
