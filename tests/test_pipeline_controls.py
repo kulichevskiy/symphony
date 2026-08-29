@@ -1040,6 +1040,198 @@ async def test_retry_whose_side_effect_raises_non_linear_error_is_still_retryabl
 
 
 @pytest.mark.asyncio
+async def test_retry_whose_post_comment_fails_after_move_issue_succeeds_is_still_recoverable(
+    tmp_path: Path,
+) -> None:
+    """Every other side-effect-failure test injects the failure into
+    `move_issue` itself, which the retry handler already released around —
+    but once `move_issue` succeeds, the transition happened and the tail
+    (`post_comment` then `_clear_operator_wait`) can still fail. The wait is
+    still open and dispatch is still blocked at that point, so a failure
+    there must release the transition too, instead of leaving a control row
+    stuck `pending` with the park never actually resolved (SYM-244 review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = _cfg(tmp_path, binding)
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+
+        orch = _orchestrator(cfg, conn, _failing_implement_runner(workspace_path), workspace_path)
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+        await orch._track_implement_failed_wait(ISSUE_ID, "run-1", binding)  # noqa: SLF001
+        tracker = orch.tracker(binding)
+        tracker.post_comment.side_effect = RuntimeError("boom")  # type: ignore[attr-defined]
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await orch._handle_implement_failed_slash_intent(  # noqa: SLF001
+                ISSUE_ID, "run-1", _retry_intent("c-retry")
+            )
+
+        assert await controls.history(conn, ISSUE_ID) == []
+        released = await controls.snapshot(conn, ISSUE_ID)
+        assert released.outcome is OUTCOMES.FAILED
+        assert ACTIONS.RETRY in released.allowed_actions
+        assert await db.operator_waits.get(conn, ISSUE_ID) is not None
+
+        # The re-delivered command lands this time.
+        tracker.post_comment.side_effect = None  # type: ignore[attr-defined]
+        await orch._handle_implement_failed_slash_intent(  # noqa: SLF001
+            ISSUE_ID, "run-1", _retry_intent("c-retry-fresh")
+        )
+        assert [a.action for a in await controls.history(conn, ISSUE_ID)] == ["retry"]
+        assert await db.operator_waits.get(conn, ISSUE_ID) is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_retry_whose_clear_operator_wait_fails_after_move_issue_succeeds_is_still_recoverable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mirror of the `post_comment` case above for the last step of the retry
+    tail: `_clear_operator_wait`'s delete raising after `move_issue` (and
+    `post_comment`) already succeeded must still release the accepted
+    transition instead of leaving the control row durably `pending` with the
+    park never actually cleared (SYM-244 review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = _cfg(tmp_path, binding)
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+
+        orch = _orchestrator(cfg, conn, _failing_implement_runner(workspace_path), workspace_path)
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+        await orch._track_implement_failed_wait(ISSUE_ID, "run-1", binding)  # noqa: SLF001
+
+        real_delete = db.operator_waits.delete
+        calls = 0
+
+        async def _raise_once(
+            conn: aiosqlite.Connection, issue_id: str, run_id: str | None = None, **kwargs: object
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                await real_delete(conn, issue_id, run_id, **kwargs)
+                return
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(db.operator_waits, "delete", _raise_once)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await orch._handle_implement_failed_slash_intent(  # noqa: SLF001
+                ISSUE_ID, "run-1", _retry_intent("c-retry")
+            )
+
+        assert await controls.history(conn, ISSUE_ID) == []
+        released = await controls.snapshot(conn, ISSUE_ID)
+        assert released.outcome is OUTCOMES.FAILED
+        assert ACTIONS.RETRY in released.allowed_actions
+        assert await db.operator_waits.get(conn, ISSUE_ID) is not None
+
+        # The re-delivered command lands this time — the binding dict entry
+        # was popped by the failed clear above, so this exercises the
+        # restore-from-durable-wait fallback rather than the fast path.
+        await orch._handle_implement_failed_slash_intent(  # noqa: SLF001
+            ISSUE_ID, "run-1", _retry_intent("c-retry-fresh")
+        )
+        assert [a.action for a in await controls.history(conn, ISSUE_ID)] == ["retry"]
+        assert await db.operator_waits.get(conn, ISSUE_ID) is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_release_does_not_clobber_a_control_row_settled_during_the_side_effect(
+    tmp_path: Path,
+) -> None:
+    """`release` undoes an accepted transition whose side effect then failed
+    by restoring the pre-transition snapshot — but if something else (e.g.
+    the reconciler's cancel-clear) settles the control row to a newer state
+    while that side effect is still in flight, blindly restoring the old
+    snapshot would clobber it. Proven here by having `move_issue` itself
+    perform that concurrent settle (clearing the wait, recording a terminal
+    `skipped` outcome) before raising, mirroring how the reconciler's
+    cancel-clear can race a live `move_issue` call (SYM-244 review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = _cfg(tmp_path, binding)
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+
+        orch = _orchestrator(cfg, conn, _failing_implement_runner(workspace_path), workspace_path)
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+        await orch._track_implement_failed_wait(ISSUE_ID, "run-1", binding)  # noqa: SLF001
+        tracker = orch.tracker(binding)
+
+        async def _cancel_clear_then_fail(*_args: object, **_kwargs: object) -> None:
+            await db.operator_waits.delete(conn, ISSUE_ID, "run-1")
+            await controls.record_stage_outcome(
+                conn,
+                ISSUE_ID,
+                stage=controls.IMPLEMENT_STAGE,
+                outcome=OUTCOMES.SKIPPED,
+                reason="tracker issue canceled",
+                run_id="run-1",
+                at="2026-08-27T10:05:30+00:00",
+            )
+            raise LinearError("tracker unreachable")
+
+        tracker.move_issue.side_effect = _cancel_clear_then_fail  # type: ignore[attr-defined]
+
+        with pytest.raises(SlashHandlerFailure):
+            await orch._handle_implement_failed_slash_intent(  # noqa: SLF001
+                ISSUE_ID, "run-1", _retry_intent("c-retry")
+            )
+
+        # The action row is gone (the command stays re-deliverable), but the
+        # newer, authoritative `skipped` state the concurrent settle wrote
+        # must survive untouched — not get clobbered back to `failed`.
+        assert await controls.history(conn, ISSUE_ID) == []
+        current = await controls.snapshot(conn, ISSUE_ID)
+        assert current.outcome is OUTCOMES.SKIPPED
+        assert ACTIONS.RETRY not in current.allowed_actions
+        assert ACTIONS.SKIP not in current.allowed_actions
+        assert await db.operator_waits.get(conn, ISSUE_ID) is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_startup_sweep_reconciles_interrupted_retry_to_failed(
     tmp_path: Path,
 ) -> None:

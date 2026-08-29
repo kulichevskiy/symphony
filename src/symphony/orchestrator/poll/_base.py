@@ -1914,14 +1914,18 @@ class _OrchestratorBase:
                         )
                     await db.operator_waits.delete(self._conn, issue_id, run_id, commit=True)
                 raise
-            released = await controls.release_savepoint(self._conn, savepoint)
+            await controls.release_savepoint(self._conn, savepoint)
             await self._conn.commit()
-            if not released and not await self._implement_failed_wait_landed_durably(
-                issue_id, run_id
-            ):
-                # The missing savepoint was a foreign *rollback*, not a
-                # foreign commit: it destroyed the control row and the
-                # operator wait along with itself, so what should have been
+            # Re-read unconditionally rather than only on a missing-savepoint
+            # miss: a *successful* `RELEASE SAVEPOINT` still leaves an
+            # unprotected suspension point at the `await self._conn.commit()`
+            # above, and a foreign `conn.rollback()` landing there (some
+            # unguarded write elsewhere on this shared connection) destroys
+            # both writes without `release_savepoint` ever seeing a missing
+            # savepoint (SYM-244 review).
+            if not await self._implement_failed_wait_landed_durably(issue_id, run_id):
+                # The control row and the operator wait along with it were
+                # destroyed by a foreign rollback, so what should have been
                 # a durable park is currently nothing at all — a restart
                 # would find no wait and no reason to offer Retry. Redo both
                 # writes for real instead of returning as if they landed.

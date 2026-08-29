@@ -791,8 +791,12 @@ class _SlashCommandsMixin(_OrchestratorBase):
                 # the same way so the park stays retryable, then propagate.
                 await controls.release(self._conn, accepted, at=self._now().isoformat())
                 raise
-            # The issue has already moved to ready: the transition happened and
-            # must not be released from here on, even if what follows fails.
+            # The issue has already moved to ready, but the transition is only
+            # truly un-releasable once `_clear_operator_wait` below commits:
+            # until then the park is still open and dispatch is still blocked
+            # (`_dispatch_run_ids`), so a failure anywhere in this tail still
+            # needs to release the transition for the next poll tick to
+            # re-deliver the same `$retry`.
             body = resumed(
                 CommentVars(
                     stage="implement",
@@ -806,7 +810,14 @@ class _SlashCommandsMixin(_OrchestratorBase):
                 await tracker.post_comment(tracker_issue_id, truncate_body(body))
             except LinearError as e:
                 log.warning("implement retry comment failed for issue %s: %s", issue_id, e)
-            await self._clear_operator_wait(issue_id, run_id)
+            except BaseException:
+                await controls.release(self._conn, accepted, at=self._now().isoformat())
+                raise
+            try:
+                await self._clear_operator_wait(issue_id, run_id)
+            except BaseException:
+                await controls.release(self._conn, accepted, at=self._now().isoformat())
+                raise
             return
 
         if intent.kind in (SlashKind.REJECT, SlashKind.STOP):
@@ -912,16 +923,21 @@ class _SlashCommandsMixin(_OrchestratorBase):
                         # still open (SYM-244 review).
                         await _finish_implement_blocked_clear()
                     raise
-                released = await controls.release_savepoint(self._conn, savepoint)
+                await controls.release_savepoint(self._conn, savepoint)
                 await self._conn.commit()
-                if not released and not await self._implement_blocked_clear_landed_durably(
-                    issue_id, run_id
-                ):
-                    # The missing savepoint was a foreign *rollback*: it
-                    # destroyed the control row and the operator wait delete
-                    # along with itself, so the park that should be gone by
-                    # now is still sitting there. Redo both writes for real
-                    # instead of returning as if they landed.
+                # Re-read unconditionally rather than only on a
+                # missing-savepoint miss: a *successful* `RELEASE SAVEPOINT`
+                # still leaves an unprotected suspension point at the
+                # `await self._conn.commit()` above, and a foreign
+                # `conn.rollback()` landing there destroys both writes
+                # without `release_savepoint` ever seeing a missing savepoint
+                # (SYM-244 review).
+                if not await self._implement_blocked_clear_landed_durably(issue_id, run_id):
+                    # A foreign rollback destroyed the control row and the
+                    # operator wait delete along with itself, so the park
+                    # that should be gone by now is still sitting there. Redo
+                    # both writes for real instead of returning as if they
+                    # landed.
                     await _finish_implement_blocked_clear()
             return
 
