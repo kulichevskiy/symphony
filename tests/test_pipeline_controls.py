@@ -607,6 +607,7 @@ async def test_implement_retry_records_transition_then_starts_one_fresh_attempt(
     tmp_path: Path,
 ) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
+    second_conn = await db.connect(tmp_path / "s.sqlite")
     try:
         binding = _no_review_binding(auto_merge=False)
         cfg = _cfg(tmp_path, binding)
@@ -632,9 +633,26 @@ async def test_implement_retry_records_transition_then_starts_one_fresh_attempt(
 
         checkpoint = _head_shas(workspace_path)[0]
 
+        tracker = first.tracker(binding)
+
+        async def _assert_transition_already_committed(*_args: object, **_kwargs: object) -> None:
+            # `second_conn` is a separate connection onto the same (WAL-mode)
+            # database file, so it only ever sees committed rows. Finding the
+            # accepted action here — inside the `move_issue` side effect,
+            # which runs strictly after `_accept_control_action` returns —
+            # proves the durable commit happened *before* this side effect,
+            # not merely before the handler as a whole returns (SYM-244
+            # review).
+            actions = await controls.history(second_conn, ISSUE_ID)
+            assert [(a.action, a.from_outcome, a.to_mode) for a in actions] == [
+                ("retry", "failed", "playing")
+            ]
+
+        tracker.move_issue.side_effect = _assert_transition_already_committed  # type: ignore[attr-defined]
         await first._handle_implement_failed_slash_intent(  # noqa: SLF001
             ISSUE_ID, failed_run.id, _retry_intent("c-retry")
         )
+        tracker.move_issue.side_effect = None  # type: ignore[attr-defined]
 
         # The accepted transition is durable, with actor and time.
         actions = await controls.history(conn, ISSUE_ID)
@@ -689,6 +707,7 @@ async def test_implement_retry_records_transition_then_starts_one_fresh_attempt(
         assert len(implement_runs) == 2
     finally:
         await conn.close()
+        await second_conn.close()
 
 
 @pytest.mark.asyncio
@@ -1743,6 +1762,72 @@ async def test_apply_cancelled_mid_window_leaves_no_orphan_action_row(
         assert await controls.history(conn, ISSUE_ID) == []
         row = await db.pipeline_controls.get(conn, ISSUE_ID)
         assert row is not None and row.outcome == str(OUTCOMES.FAILED)
+
+        run = (await db.runs.history_for_issue(conn, ISSUE_ID))[0]
+        assert run.status == "completed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_apply_compensation_deletes_rather_than_materializes_a_row_with_no_prior_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An issue with no `pipeline_controls` row yet reads as the derived
+    default (playing, pending, no stage) via `_derived_snapshot`. When
+    `apply`'s own compensation has to restore that `current` after a foreign
+    rollback destroyed its write, it must converge back to no row at all —
+    matching what a plain SAVEPOINT rollback of the original INSERT would
+    have left (`db.pipeline_controls.delete`'s docstring) — not materialize a
+    row holding the derived defaults, which `db.pipeline_controls.get` would
+    otherwise report as if a real transition had happened (SYM-244 review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        assert await db.pipeline_controls.get(conn, ISSUE_ID) is None
+
+        real_put = db.pipeline_controls.put
+        calls = 0
+
+        async def _foreign_commit_then_cancel_once(
+            conn: aiosqlite.Connection, **kwargs: object
+        ) -> None:
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                # The compensating call `apply`'s except block makes once the
+                # SAVEPOINT is gone: let it actually run, so the test exercises
+                # `_restore_previous_row`'s own logic rather than the mock.
+                await real_put(conn, **kwargs)
+                return
+            # An unrelated coroutine's ordinary write, landing mid-window,
+            # immediately followed by this task's own cancellation.
+            await db.runs.update_status(conn, "run-1", "completed")
+            raise asyncio.CancelledError
+
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+        monkeypatch.setattr(db.pipeline_controls, "put", _foreign_commit_then_cancel_once)
+
+        with pytest.raises(asyncio.CancelledError):
+            await controls.apply(
+                conn,
+                ISSUE_ID,
+                ACTIONS.PAUSE,
+                actor="tracker:c-1",
+                action_id="c-1",
+                at="2026-08-27T10:01:00+00:00",
+            )
+
+        assert await controls.history(conn, ISSUE_ID) == []
+        assert await db.pipeline_controls.get(conn, ISSUE_ID) is None
 
         run = (await db.runs.history_for_issue(conn, ISSUE_ID))[0]
         assert run.status == "completed"

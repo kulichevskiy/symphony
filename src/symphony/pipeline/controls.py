@@ -51,10 +51,17 @@ Two rules hold the design together:
     action row and restoring the previous control row) instead of propagating
     a bare `sqlite3.OperationalError`.
 
-Only the implement stage records outcomes today — the tracer through an
-implement failure. Later slices extend `record_stage_outcome` to the remaining
-stages and wire the remaining actions to side effects; this interface does not
-change.
+Only the implement stage records outcomes today, and only as `FAILED` (a
+parked attempt) or `SKIPPED` (a `$stop`/`$reject` clear with nothing parked to
+retry) — nothing in production records `RUNNING` or `SUCCEEDED`. A row
+therefore stays `implement`/`pending` (from an accepted Retry) even once the
+retried run actually succeeds, and `snapshot`'s `pending` outcome must be read
+as "no failure recorded since the last transition", not "currently running":
+callers should not treat it as proof an attempt is live. `PipelineMode.PAUSING`
+is likewise unreachable in production until something records `RUNNING`. Later
+slices extend `record_stage_outcome` to the remaining stages, record
+`RUNNING`/`SUCCEEDED` for implement, and wire the remaining actions to side
+effects; this interface does not change.
 """
 
 from __future__ import annotations
@@ -156,11 +163,16 @@ async def guard_writes(issue_id: str) -> AsyncIterator[None]:
     `release` use for that issue.
 
     Acquires `_lock(issue_id)` and then `_write_lock()`, in that order — the
-    same order `apply`/`release` acquire them in, so nesting can never
-    deadlock. Use this around any other SAVEPOINT-to-commit block that
-    touches this issue's control row (or that otherwise must not land its
-    `conn.commit()` inside `apply`/`release`'s own window), rather than
-    inventing a second lock.
+    same order `apply`/`release` acquire them in. `_lock` is a plain
+    non-reentrant `asyncio.Lock` with no timeout, so this deadlocks forever
+    if it is ever nested with another `apply`, `release`, or `guard_writes`
+    call for the *same* issue id (e.g. a caller invoking `guard_writes` from
+    inside a side effect that `apply` is already running for that issue).
+    Use this around any other SAVEPOINT-to-commit block that touches this
+    issue's control row (or that otherwise must not land its `conn.commit()`
+    inside `apply`/`release`'s own window), rather than inventing a second
+    lock — but never nest it with another `apply`/`release`/`guard_writes`
+    call for the same issue.
     """
     async with _lock(issue_id):
         async with _write_lock():
@@ -203,20 +215,25 @@ async def _release_landed_durably(
     previous: ControlSnapshot,
     *,
     restore_previous: bool,
+    had_row: bool,
 ) -> bool:
     """Mirror of `_apply_landed_durably` for `release`'s undo: the action row
     must be gone and — only when this `release` actually intended to restore
     `previous` (see `release`'s `restore_previous` staleness check) — the
-    control row must equal it. When `restore_previous` is `False`, some other
-    write already settled the control row before this `release` ran, and
-    `release` deliberately left that newer row alone, so the row's value is
-    not part of what "landed durably" means here."""
+    control row must match what `_restore_previous_row` converges on: no row
+    at all when `previous` had none (`had_row` is `False`), else a row equal
+    to `previous`. When `restore_previous` is `False`, some other write
+    already settled the control row before this `release` ran, and `release`
+    deliberately left that newer row alone, so the row's value is not part of
+    what "landed durably" means here."""
     action_row = await db.pipeline_controls.get_action(conn, issue_id, action_id)
     if action_row is not None:
         return False
     if not restore_previous:
         return True
     control_row = await db.pipeline_controls.get(conn, issue_id)
+    if not had_row:
+        return control_row is None
     return (
         control_row is not None
         and control_row.mode == str(previous.mode)
@@ -247,6 +264,39 @@ async def _sweep_landed_durably(
         and control_row.stage == IMPLEMENT_STAGE
         and control_row.outcome == str(AttemptOutcome.FAILED)
         and control_row.run_id == run_id
+    )
+
+
+async def _restore_previous_row(
+    conn: aiosqlite.Connection,
+    issue_id: str,
+    previous: ControlSnapshot,
+    *,
+    had_row: bool,
+    updated_at: str,
+    commit: bool,
+) -> None:
+    """Converge `pipeline_controls` back to what it held before the write
+    being undone: no row at all when none existed (matching what a plain
+    SAVEPOINT rollback of the original INSERT would have left, per
+    `db.pipeline_controls.delete`'s docstring), otherwise `previous`'s
+    values. Used by both `apply`'s and `release`'s compensation so an issue
+    whose state was only ever derived (e.g. via `_derived_snapshot`, no row
+    at all) never ends up with a materialized row from an undo."""
+    if not had_row:
+        await db.pipeline_controls.delete(conn, issue_id, commit=commit)
+        return
+    await db.pipeline_controls.put(
+        conn,
+        issue_id=issue_id,
+        mode=str(previous.mode),
+        stage=previous.stage,
+        outcome=str(previous.outcome),
+        reason=previous.reason,
+        run_id=previous.run_id,
+        actor=None,
+        updated_at=updated_at,
+        commit=commit,
     )
 
 
@@ -352,13 +402,18 @@ class ActionResult:
     unchanged state behind a rejection.
 
     `previous` and `action_id` are what `release` needs to undo an accepted
-    transition whose side effect then failed.
+    transition whose side effect then failed. `previous_had_row` records
+    whether `pipeline_controls` actually held a row for `previous` (as
+    opposed to `previous` being a value derived with no backing row, e.g.
+    from `_derived_snapshot`) — see `apply`'s and `release`'s use of it via
+    `_restore_previous_row`.
     """
 
     accepted: bool
     snapshot: ControlSnapshot
     rejection: str | None = None
     previous: ControlSnapshot | None = None
+    previous_had_row: bool = True
     action_id: str | None = None
 
 
@@ -404,6 +459,19 @@ async def snapshot(conn: aiosqlite.Connection, issue_id: str) -> ControlSnapshot
     state is derived from the durable park that predates this module — an issue
     parked before the upgrade still has to offer Retry — and otherwise defaults
     to a playing pipeline with no attempt yet.
+
+    Known gap left for this slice: a later implement run for the same issue
+    can complete without ever going through this module (e.g. an operator
+    manually re-readying the issue in the tracker instead of replying
+    `$retry`). `db.runs.update_status`'s stale-wait clear
+    (`_clear_stale_wait_for_completed_run`) drops the now-stale
+    `implement_failed` operator wait in that case, but cannot settle this
+    module's row — `db.runs` cannot import `pipeline.controls` without a
+    cycle — so a `pipeline_controls` row left behind by an earlier failed
+    attempt keeps reporting `FAILED` with `RETRY` allowed even though the
+    issue has since moved on. Only ingress that goes through `apply`/
+    `record_stage_outcome` keeps this module's state honest; this bypass path
+    is not covered yet.
     """
     row = await db.pipeline_controls.get(conn, issue_id)
     if row is None:
@@ -654,6 +722,14 @@ async def apply(
         # an intent-only one keeps them.
         reason = current.reason if outcome is current.outcome else None
         run_id = current.run_id if outcome is current.outcome else None
+        # Whether `pipeline_controls` actually held a row for `current` before
+        # this call, as opposed to `current` being a value `snapshot` derived
+        # with no backing row (e.g. via `_derived_snapshot`) — read separately
+        # from `snapshot`'s own read above since that value isn't exposed.
+        # Both this call's own compensation below and `release`'s later undo
+        # need it to converge on "no row" rather than materializing one that
+        # never existed (see `_restore_previous_row`).
+        had_previous_row = await db.pipeline_controls.get(conn, issue_id) is not None
         # A SAVEPOINT scopes the undo to just these two writes: `conn` is one
         # connection shared by the whole daemon, so a bare `conn.rollback()`
         # would discard any other, unrelated work some other coroutine has
@@ -744,15 +820,11 @@ async def apply(
                     await db.pipeline_controls.delete_action(
                         conn, issue_id=issue_id, action_id=action_id, commit=False
                     )
-                    await db.pipeline_controls.put(
+                    await _restore_previous_row(
                         conn,
-                        issue_id=issue_id,
-                        mode=str(current.mode),
-                        stage=current.stage,
-                        outcome=str(current.outcome),
-                        reason=current.reason,
-                        run_id=current.run_id,
-                        actor=None,
+                        issue_id,
+                        current,
+                        had_row=had_previous_row,
                         updated_at=at,
                         commit=True,
                     )
@@ -826,6 +898,7 @@ async def apply(
                 run_id=run_id,
             ),
             previous=current,
+            previous_had_row=had_previous_row,
             action_id=action_id,
         )
 
@@ -882,15 +955,11 @@ async def release(
                     commit=False,
                 )
                 if restore_previous:
-                    await db.pipeline_controls.put(
+                    await _restore_previous_row(
                         conn,
-                        issue_id=previous.issue_id,
-                        mode=str(previous.mode),
-                        stage=previous.stage,
-                        outcome=str(previous.outcome),
-                        reason=previous.reason,
-                        run_id=previous.run_id,
-                        actor=None,
+                        previous.issue_id,
+                        previous,
+                        had_row=result.previous_had_row,
                         updated_at=at,
                         commit=False,
                     )
@@ -912,15 +981,11 @@ async def release(
                         commit=not restore_previous,
                     )
                     if restore_previous:
-                        await db.pipeline_controls.put(
+                        await _restore_previous_row(
                             conn,
-                            issue_id=previous.issue_id,
-                            mode=str(previous.mode),
-                            stage=previous.stage,
-                            outcome=str(previous.outcome),
-                            reason=previous.reason,
-                            run_id=previous.run_id,
-                            actor=None,
+                            previous.issue_id,
+                            previous,
+                            had_row=result.previous_had_row,
                             updated_at=at,
                             commit=True,
                         )
@@ -939,6 +1004,7 @@ async def release(
                 result.action_id,
                 previous,
                 restore_previous=restore_previous,
+                had_row=result.previous_had_row,
             ):
                 # Same misclassification as `apply`: a foreign rollback
                 # destroyed this undo instead of a foreign commit already
@@ -951,15 +1017,11 @@ async def release(
                     commit=not restore_previous,
                 )
                 if restore_previous:
-                    await db.pipeline_controls.put(
+                    await _restore_previous_row(
                         conn,
-                        issue_id=previous.issue_id,
-                        mode=str(previous.mode),
-                        stage=previous.stage,
-                        outcome=str(previous.outcome),
-                        reason=previous.reason,
-                        run_id=previous.run_id,
-                        actor=None,
+                        previous.issue_id,
+                        previous,
+                        had_row=result.previous_had_row,
                         updated_at=at,
                         commit=True,
                     )
