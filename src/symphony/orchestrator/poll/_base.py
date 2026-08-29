@@ -1972,7 +1972,7 @@ class _OrchestratorBase:
             and control_row.run_id == run_id
         )
 
-    async def _implement_blocked_clear_landed_durably(self, issue_id: str, run_id: str) -> bool:
+    async def _implement_failed_clear_landed_durably(self, issue_id: str, run_id: str) -> bool:
         """Whether `_handle_implement_failed_slash_intent`'s stop/reject clear
         — the control row settled to `skipped` and the operator wait dropped —
         is actually on disk for this run, used after a `release_savepoint`

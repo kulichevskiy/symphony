@@ -19,8 +19,11 @@ Two rules hold the design together:
     caller runs any side effect, so a crash mid-command leaves either "no
     action" or "action recorded" — never a dispatched command with no trace.
     `action_id` (the ingress's own request identity, e.g. a tracker comment id)
-    is part of the actions primary key, so a replay is rejected instead of
-    dispatched twice. Concurrent `apply`/`release` calls in this module are
+    is part of the actions primary key, so a re-delivered tracker comment
+    dedups against the row its first delivery wrote instead of dispatching
+    twice. A web button mints a fresh `action_id` per click, so the primary
+    key does not guard against a double-click there — the `allowed_actions`
+    state check does that instead. Concurrent `apply`/`release` calls in this module are
     guarded against each other — including ones for a different issue, which
     is why the module also serializes their SAVEPOINT-to-commit windows
     against each other, and `guard_writes` lets a caller elsewhere in the
@@ -630,9 +633,15 @@ async def reconcile_interrupted_retries(conn: aiosqlite.Connection, *, at: str) 
             except BaseException:
                 await rollback_to_savepoint(conn, savepoint)
                 raise
-            released = await release_savepoint(conn, savepoint)
+            await release_savepoint(conn, savepoint)
             await conn.commit()
-            if not released and not await _sweep_landed_durably(
+            # Re-read unconditionally rather than only when `release_savepoint`
+            # reported a miss: a *successful* `RELEASE SAVEPOINT` still leaves
+            # an unprotected suspension point at the `await conn.commit()`
+            # above, and a foreign `conn.rollback()` landing there discards
+            # both writes without `release_savepoint` ever seeing a missing
+            # savepoint (SYM-244 review).
+            if not await _sweep_landed_durably(
                 conn, wait.issue_id, interrupted_retry, run_id=wait.run_id
             ):
                 # Foreign rollback, not foreign commit: redo the reset for

@@ -86,7 +86,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
             self, issue_id: str, run_id: str, *, commit: bool = True
         ) -> None: ...
 
-        async def _implement_blocked_clear_landed_durably(
+        async def _implement_failed_clear_landed_durably(
             self, issue_id: str, run_id: str
         ) -> bool: ...
 
@@ -879,9 +879,9 @@ class _SlashCommandsMixin(_OrchestratorBase):
             # the clear" — settle the control row to skipped and drop the
             # wait for real — since that is exactly the durable state this
             # branch is trying to reach regardless of which foreign write
-            # interfered. `_implement_blocked_clear_landed_durably` tells
+            # interfered. `_implement_failed_clear_landed_durably` tells
             # "already landed, nothing to do" apart from "redo for real".
-            savepoint = f"implement_blocked_clear_{uuid.uuid4().hex}"
+            savepoint = f"implement_failed_clear_{uuid.uuid4().hex}"
             reason = await self._blocked_reason_for_run(run_id) or None
 
             async def _finish_implement_blocked_clear() -> None:
@@ -914,7 +914,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
                 except BaseException:
                     if not await controls.rollback_to_savepoint(
                         self._conn, savepoint
-                    ) and not await self._implement_blocked_clear_landed_durably(issue_id, run_id):
+                    ) and not await self._implement_failed_clear_landed_durably(issue_id, run_id):
                         # The savepoint is gone — a foreign commit or a
                         # foreign rollback landed mid-window, and this call's
                         # own writes did not fully land either way. Finish
@@ -932,7 +932,7 @@ class _SlashCommandsMixin(_OrchestratorBase):
                 # `conn.rollback()` landing there destroys both writes
                 # without `release_savepoint` ever seeing a missing savepoint
                 # (SYM-244 review).
-                if not await self._implement_blocked_clear_landed_durably(issue_id, run_id):
+                if not await self._implement_failed_clear_landed_durably(issue_id, run_id):
                     # A foreign rollback destroyed the control row and the
                     # operator wait delete along with itself, so the park
                     # that should be gone by now is still sitting there. Redo

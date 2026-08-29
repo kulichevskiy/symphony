@@ -1411,6 +1411,98 @@ async def test_startup_sweep_recovers_from_a_foreign_rollback_inside_its_savepoi
 
 
 @pytest.mark.asyncio
+async def test_startup_sweep_re_reads_durability_even_when_release_savepoint_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Distinct bug from the foreign-rollback test above: there, the rollback
+    lands *before* `RELEASE SAVEPOINT`, so the missing savepoint itself is
+    the signal to re-read. Here it lands *after* a successful `RELEASE
+    SAVEPOINT`, at the sweep's own `await conn.commit()` — e.g. an outer
+    transaction already open on this shared connection means `RELEASE` does
+    not actually commit, and a foreign rollback discards the reset in the
+    gap before this call's own `commit()` would have. Before this fix, the
+    sweep only re-read durability when `release_savepoint` reported a miss,
+    so a `released=True` here left the row `pending` forever with no
+    missing-savepoint signal to catch it (SYM-244 review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+        await db.runs.update_status(
+            conn,
+            "run-1",
+            "failed",
+            ended_at="2026-08-27T09:05:00+00:00",
+            kind="agent_error",
+            detail="agent exited 2",
+        )
+        await _record_implement(conn, outcome=OUTCOMES.FAILED, reason="agent exited 2")
+        await db.operator_waits.upsert(
+            conn,
+            issue_id=ISSUE_ID,
+            run_id="run-1",
+            kind=db.operator_waits.KIND_IMPLEMENT_FAILED,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="eng-1",
+            created_at="2026-08-27T09:05:00+00:00",
+        )
+        result = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.RETRY,
+            actor="tracker:c-retry",
+            action_id="c-retry",
+            at="2026-08-27T10:05:00+00:00",
+        )
+        assert result.accepted
+        pending = await controls.snapshot(conn, ISSUE_ID)
+        assert pending.outcome is OUTCOMES.PENDING
+
+        # An outer transaction already open on this shared connection (e.g. a
+        # concurrent `commit=False` write elsewhere in the daemon) is what
+        # makes `RELEASE SAVEPOINT` below merely close the sweep's own nested
+        # savepoint instead of finalizing anything to disk — without this,
+        # `RELEASE SAVEPOINT` on an *unnested* savepoint commits by itself,
+        # and there would be nothing left for a foreign rollback to destroy
+        # at the sweep's own `conn.commit()`.
+        await conn.execute("SAVEPOINT outer_probe")
+
+        real_commit = conn.commit
+        commits_seen = 0
+
+        async def _first_commit_is_a_foreign_rollback() -> None:
+            nonlocal commits_seen
+            commits_seen += 1
+            if commits_seen == 1:
+                # `RELEASE SAVEPOINT` already reported success above — this
+                # is the unprotected suspension point past it. A foreign
+                # rollback lands here instead of this call's own commit.
+                await conn.rollback()
+            else:
+                await real_commit()
+
+        monkeypatch.setattr(conn, "commit", _first_commit_is_a_foreign_rollback)
+
+        await controls.reconcile_interrupted_retries(conn, at="2026-08-27T11:00:00+00:00")
+
+        reconciled = await controls.snapshot(conn, ISSUE_ID)
+        assert reconciled.outcome is OUTCOMES.FAILED
+        assert reconciled.run_id == "run-1"
+        assert await db.pipeline_controls.get_action(conn, ISSUE_ID, "c-retry") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_run_wires_the_interrupted_retry_sweep_into_startup(
     tmp_path: Path,
 ) -> None:

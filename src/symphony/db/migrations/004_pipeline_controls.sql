@@ -20,8 +20,10 @@ CREATE TABLE pipeline_controls (
 -- a restart can never find a dispatched action that left no record (or a state
 -- change no action explains). `action_id` is the ingress's own identity for the
 -- request — the tracker comment id for a `$retry`, the queued command id for a
--- web button — which makes the primary key the idempotency key: a replayed
--- command inserts nothing and dispatches nothing.
+-- web button. The primary key dedups a replayed *tracker comment* (the same
+-- comment id always maps to the same action row, so a re-delivery inserts
+-- nothing and dispatches nothing); a web button mints a fresh id per click,
+-- so double-clicks are instead stopped by the `allowed_actions` state check.
 CREATE TABLE pipeline_control_actions (
     issue_id     TEXT NOT NULL REFERENCES issues(id),
     action_id    TEXT NOT NULL,
