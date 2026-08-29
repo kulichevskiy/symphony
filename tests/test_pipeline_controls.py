@@ -17,7 +17,7 @@ import asyncio
 import sqlite3
 import subprocess
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, call
 
 import aiosqlite
 import pytest
@@ -715,6 +715,58 @@ async def test_retry_records_the_comment_authors_name_as_actor(tmp_path: Path) -
 
         actions = await controls.history(conn, ISSUE_ID)
         assert actions[0].actor == "Jane Operator"
+    finally:
+        await conn.close()
+
+
+def _stop_intent(comment_id: str) -> SlashIntent:
+    return SlashIntent(
+        kind=SlashKind.STOP,
+        comment_id=comment_id,
+        created_at="2026-08-27T10:00:00+00:00",
+        text="$stop",
+    )
+
+
+@pytest.mark.asyncio
+async def test_stop_settles_the_control_row_so_it_stops_offering_retry(
+    tmp_path: Path,
+) -> None:
+    """`$stop`/`$reject` on a failed-implement park moves the issue to
+    blocked and drops the operator wait, but with no park left behind, the
+    durable control row must not keep advertising Retry — that stale-Retry
+    shape is exactly what `_track_implement_failed_wait`'s own invariant
+    treats as a bug worth compensating for (SYM-244 review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = _cfg(tmp_path, binding)
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+
+        orch = _orchestrator(cfg, conn, _failing_implement_runner(workspace_path), workspace_path)
+        await _scan_and_wait(orch, binding)
+        failed_run = (await db.runs.history_for_issue(conn, ISSUE_ID))[0]
+
+        parked = await controls.snapshot(conn, ISSUE_ID)
+        assert ACTIONS.RETRY in parked.allowed_actions
+
+        await orch._handle_implement_failed_slash_intent(  # noqa: SLF001
+            ISSUE_ID, failed_run.id, _stop_intent("c-stop")
+        )
+
+        tracker = orch.tracker(binding)
+        assert tracker.move_issue.await_args_list[-1] == call(  # type: ignore[attr-defined]
+            ISSUE_ID, "state-bl"
+        )
+        assert await db.operator_waits.get(conn, ISSUE_ID) is None
+
+        settled = await controls.snapshot(conn, ISSUE_ID)
+        assert ACTIONS.RETRY not in settled.allowed_actions
+        assert ACTIONS.SKIP not in settled.allowed_actions
+        assert settled.outcome is OUTCOMES.SKIPPED
     finally:
         await conn.close()
 

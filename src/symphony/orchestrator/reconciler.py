@@ -26,6 +26,7 @@ from ..config import Config, RepoBinding
 from ..github.client import GitHubClient, GitHubError
 from ..github.webhook import GitHubWebhookEvent
 from ..linear.client import LinearError
+from ..pipeline import controls
 from ..tracker import (
     DEFAULT_PROVIDER,
     DEFAULT_SITE,
@@ -608,67 +609,75 @@ class Reconciler:
     ) -> tuple[_PostCommitReviewRequest | None, bool]:
         post_commit_review_request: _PostCommitReviewRequest | None = None
         post_cancel_comment = False
-        try:
-            await db.external_observations.insert(
-                self._conn,
-                issue_id=issue_id,
-                source=SOURCE_LINEAR,
-                observed_at=inputs.observed_at,
-                payload_json=_json_payload({**observation.linear_payload, "reason": reason}),
-                drift_kind=observation.linear_drift,
-                action_taken=plan.linear_action,
-                commit=False,
-            )
-            await db.external_observations.insert(
-                self._conn,
-                issue_id=issue_id,
-                source=SOURCE_GITHUB,
-                observed_at=inputs.observed_at,
-                payload_json=_json_payload({**observation.github_payload, "reason": reason}),
-                drift_kind=observation.github_drift,
-                action_taken=plan.github_action,
-                commit=False,
-            )
-            if plan.linear_action == ACTION_NOTED and observation.linear_issue is not None:
-                await self._note_external_state_change(
+        # This whole commit=False window shares `self._conn` with
+        # `controls.apply`/`release`'s own SAVEPOINT-to-commit windows for the
+        # same issue: `controls.guard_writes` joins the same per-issue lock
+        # plus write lock those use, so this transaction's writes and commit
+        # can never land in the middle of one of theirs and roll it back (or
+        # get rolled back by it) — see `guard_writes`' and the `controls`
+        # module docstring's foreign-interference notes (SYM-244 review).
+        async with controls.guard_writes(issue_id):
+            try:
+                await db.external_observations.insert(
+                    self._conn,
                     issue_id=issue_id,
                     source=SOURCE_LINEAR,
-                    state_name=observation.linear_issue.state_name,
-                    ts=inputs.observed_at,
-                )
-            if (
-                plan.linear_action == ACTION_CLEARED
-                and observation.linear_drift == DRIFT_LINEAR_CANCELED
-                and observation.linear_issue is not None
-            ):
-                await self._apply_linear_canceled_clear(
-                    issue_id=issue_id,
-                    wait=inputs.wait,
-                    state_name=observation.linear_issue.state_name,
-                    ts=inputs.observed_at,
-                )
-                post_cancel_comment = True
-            if plan.github_action == ACTION_CLEARED:
-                await self._apply_github_clear(
-                    issue_id=issue_id,
-                    wait=inputs.wait,
-                    drift_kind=observation.github_drift,
-                    github_prs=observation.drift_prs,
-                )
-            elif plan.github_action == ACTION_ADOPTED:
-                post_commit_review_request = await self._adopt_orphan_prs(
-                    issue_id=issue_id,
-                    tracker_issue_id=inputs.tracker_issue_id,
-                    tracker_ctx=inputs.tracker_ctx,
-                    team_key=str(inputs.issue_row["team_key"]),
-                    wait=inputs.wait,
-                    orphans=observation.orphans,
                     observed_at=inputs.observed_at,
+                    payload_json=_json_payload({**observation.linear_payload, "reason": reason}),
+                    drift_kind=observation.linear_drift,
+                    action_taken=plan.linear_action,
+                    commit=False,
                 )
-            await self._conn.commit()
-        except Exception:
-            await self._conn.rollback()
-            raise
+                await db.external_observations.insert(
+                    self._conn,
+                    issue_id=issue_id,
+                    source=SOURCE_GITHUB,
+                    observed_at=inputs.observed_at,
+                    payload_json=_json_payload({**observation.github_payload, "reason": reason}),
+                    drift_kind=observation.github_drift,
+                    action_taken=plan.github_action,
+                    commit=False,
+                )
+                if plan.linear_action == ACTION_NOTED and observation.linear_issue is not None:
+                    await self._note_external_state_change(
+                        issue_id=issue_id,
+                        source=SOURCE_LINEAR,
+                        state_name=observation.linear_issue.state_name,
+                        ts=inputs.observed_at,
+                    )
+                if (
+                    plan.linear_action == ACTION_CLEARED
+                    and observation.linear_drift == DRIFT_LINEAR_CANCELED
+                    and observation.linear_issue is not None
+                ):
+                    await self._apply_linear_canceled_clear(
+                        issue_id=issue_id,
+                        wait=inputs.wait,
+                        state_name=observation.linear_issue.state_name,
+                        ts=inputs.observed_at,
+                    )
+                    post_cancel_comment = True
+                if plan.github_action == ACTION_CLEARED:
+                    await self._apply_github_clear(
+                        issue_id=issue_id,
+                        wait=inputs.wait,
+                        drift_kind=observation.github_drift,
+                        github_prs=observation.drift_prs,
+                    )
+                elif plan.github_action == ACTION_ADOPTED:
+                    post_commit_review_request = await self._adopt_orphan_prs(
+                        issue_id=issue_id,
+                        tracker_issue_id=inputs.tracker_issue_id,
+                        tracker_ctx=inputs.tracker_ctx,
+                        team_key=str(inputs.issue_row["team_key"]),
+                        wait=inputs.wait,
+                        orphans=observation.orphans,
+                        observed_at=inputs.observed_at,
+                    )
+                await self._conn.commit()
+            except Exception:
+                await self._conn.rollback()
+                raise
         return post_commit_review_request, post_cancel_comment
 
     async def _post_reconcile_notifications(
@@ -1380,6 +1389,13 @@ class Reconciler:
         cancellation for the audit timeline. All writes stay in the caller's
         transaction (``commit=False``) so a later failure rolls the whole clear
         back.
+
+        A `KIND_IMPLEMENT_FAILED` wait is also the durable park behind a
+        `pipeline_controls` row's `failed` outcome (`controls.snapshot`'s
+        `_derived_snapshot` fallback and the tracer that writes it): clearing
+        that wait without also settling the control row would leave
+        `allowed_actions` advertising Retry for an issue that is now canceled
+        with no park behind it (SYM-244 review).
         """
         if wait is None:
             raise RuntimeError("cannot clear canceled drift without an operator wait")
@@ -1389,6 +1405,17 @@ class Reconciler:
             wait.run_id,
             commit=False,
         )
+        if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
+            await controls.record_stage_outcome(
+                self._conn,
+                issue_id,
+                stage=controls.IMPLEMENT_STAGE,
+                outcome=controls.AttemptOutcome.SKIPPED,
+                reason=f"tracker issue canceled (state: {state_name})",
+                run_id=wait.run_id,
+                at=ts,
+                commit=False,
+            )
         await self._supersede_canceled_runs(issue_id=issue_id, ts=ts)
         await self._note_external_state_change(
             issue_id=issue_id,

@@ -836,7 +836,23 @@ class _SlashCommandsMixin(_OrchestratorBase):
                     slash_text=self._slash_text(intent),
                     reason=f"could not move issue to blocked state: {e}",
                 ) from e
-            await self._clear_operator_wait(issue_id, run_id)
+            # The park is going away with no retry behind it: settle the
+            # control row to a terminal, non-retryable outcome in the same
+            # transaction as the wait delete below, so `controls.snapshot`
+            # never keeps advertising Retry for a blocked issue with nothing
+            # parked to retry (SYM-244 review).
+            async with controls.guard_writes(issue_id):
+                await controls.record_stage_outcome(
+                    self._conn,
+                    issue_id,
+                    stage=controls.IMPLEMENT_STAGE,
+                    outcome=controls.AttemptOutcome.SKIPPED,
+                    reason=await self._blocked_reason_for_run(run_id) or None,
+                    run_id=run_id,
+                    at=self._now().isoformat(),
+                    commit=False,
+                )
+                await self._clear_operator_wait(issue_id, run_id)
             return
 
         log.info(

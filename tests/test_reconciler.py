@@ -1030,6 +1030,58 @@ async def test_active_linear_canceled_clears_wait_and_supersedes_run(
 
 
 @pytest.mark.asyncio
+async def test_active_linear_canceled_clear_settles_the_control_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Clearing an `implement_failed` park for a now-canceled issue must not
+    leave `pipeline_controls` still advertising Retry with no park behind it
+    (SYM-244 review)."""
+    from symphony.pipeline import controls
+
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        # The real tracer (`_track_implement_failed_wait`) writes this durable
+        # row when the run first fails; seed it directly here rather than
+        # driving a full dispatch, so the pre-existing `pipeline_controls`
+        # row — not just the derived-from-wait fallback — is what the
+        # cancel-clear must settle.
+        await controls.record_stage_outcome(
+            conn,
+            "iss-1",
+            stage=controls.IMPLEMENT_STAGE,
+            outcome=controls.AttemptOutcome.FAILED,
+            reason="boom",
+            run_id="run-iss-1",
+            at="2026-05-17T10:00:30Z",
+        )
+        parked = await controls.snapshot(conn, "iss-1")
+        assert controls.ControlAction.RETRY in parked.allowed_actions
+
+        fake = _FakeLinear(state_name="Canceled", state_type="canceled")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            fake,  # type: ignore[arg-type]
+            _FakeGitHub(),  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        settled = await controls.snapshot(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert controls.ControlAction.RETRY not in settled.allowed_actions
+    assert settled.outcome is controls.AttemptOutcome.SKIPPED
+
+
+@pytest.mark.asyncio
 async def test_active_linear_canceled_supersedes_older_failed_run_too(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
