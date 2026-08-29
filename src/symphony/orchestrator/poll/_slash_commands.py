@@ -794,9 +794,15 @@ class _SlashCommandsMixin(_OrchestratorBase):
             # The issue has already moved to ready, but the transition is only
             # truly un-releasable once `_clear_operator_wait` below commits:
             # until then the park is still open and dispatch is still blocked
-            # (`_dispatch_run_ids`), so a failure anywhere in this tail still
-            # needs to release the transition for the next poll tick to
-            # re-deliver the same `$retry`.
+            # by `_dispatch_run_ids` (set when the park was created), so a
+            # failure anywhere before that call still needs to release the
+            # transition for the next poll tick to re-deliver the same
+            # `$retry`. `_clear_operator_wait` itself pops `_dispatch_run_ids`/
+            # `_operator_wait_run_ids`/`_implement_failed_run_bindings` before
+            # its own DB delete, so a failure inside it leaves the in-memory
+            # gate already open with the wait row still present (SYM-244
+            # review) — its `except` below re-arms that tracking before
+            # releasing so the gate stays shut until the wait is actually gone.
             body = resumed(
                 CommentVars(
                     stage="implement",
@@ -816,6 +822,13 @@ class _SlashCommandsMixin(_OrchestratorBase):
             try:
                 await self._clear_operator_wait(issue_id, run_id)
             except BaseException:
+                # `_clear_operator_wait` already popped the dispatch gate for
+                # this run before its DB delete failed; re-arm it so a
+                # webhook-driven dispatch can't slip in and start a second
+                # implement attempt before the released park is restored.
+                self._dispatch_run_ids[issue_id] = run_id
+                self._operator_wait_run_ids.add(run_id)
+                self._implement_failed_run_bindings[run_id] = binding
                 await controls.release(self._conn, accepted, at=self._now().isoformat())
                 raise
             return

@@ -55,15 +55,19 @@ Two rules hold the design together:
     a bare `sqlite3.OperationalError`.
 
 Only the implement stage records outcomes today, and only as `FAILED` (a
-parked attempt) or `SKIPPED` (a `$stop`/`$reject` clear with nothing parked to
-retry) — nothing in production records `RUNNING` or `SUCCEEDED`. A row
-therefore stays `implement`/`pending` (from an accepted Retry) even once the
-retried run actually succeeds, and `snapshot`'s `pending` outcome must be read
-as "no failure recorded since the last transition", not "currently running":
-callers should not treat it as proof an attempt is live. `PipelineMode.PAUSING`
-is likewise unreachable in production until something records `RUNNING`. Later
-slices extend `record_stage_outcome` to the remaining stages, record
-`RUNNING`/`SUCCEEDED` for implement, and wire the remaining actions to side
+parked attempt), `SKIPPED` (a `$stop`/`$reject` clear, or a tracker
+cancellation, with nothing parked to retry), or `SUCCEEDED` (the reconciler's
+orphan-PR adoption settling a stale `implement_failed` park once it finds the
+work already landed a PR) — nothing in production records `RUNNING`, and
+nothing routes a *retried* run's own success back through this module yet. A
+row therefore stays `implement`/`pending` (from an accepted Retry) even once
+the retried run actually succeeds, and `snapshot`'s `pending` outcome must be
+read as "no failure recorded since the last transition", not "currently
+running": callers should not treat it as proof an attempt is live.
+`PipelineMode.PAUSING` is likewise unreachable in production until something
+records `RUNNING`. Later slices extend `record_stage_outcome` to the
+remaining stages, record `RUNNING` for implement and route a retried run's
+own success through this module, and wire the remaining actions to side
 effects; this interface does not change.
 """
 
@@ -276,6 +280,7 @@ async def _restore_previous_row(
     previous: ControlSnapshot,
     *,
     had_row: bool,
+    actor: str | None,
     updated_at: str,
     commit: bool,
 ) -> None:
@@ -283,9 +288,11 @@ async def _restore_previous_row(
     being undone: no row at all when none existed (matching what a plain
     SAVEPOINT rollback of the original INSERT would have left, per
     `db.pipeline_controls.delete`'s docstring), otherwise `previous`'s
-    values. Used by both `apply`'s and `release`'s compensation so an issue
-    whose state was only ever derived (e.g. via `_derived_snapshot`, no row
-    at all) never ends up with a materialized row from an undo."""
+    values — including `actor`, so undoing an accepted transition restores
+    whoever last set that row instead of erasing them (SYM-244 review). Used
+    by both `apply`'s and `release`'s compensation so an issue whose state
+    was only ever derived (e.g. via `_derived_snapshot`, no row at all) never
+    ends up with a materialized row from an undo."""
     if not had_row:
         await db.pipeline_controls.delete(conn, issue_id, commit=commit)
         return
@@ -297,7 +304,7 @@ async def _restore_previous_row(
         outcome=str(previous.outcome),
         reason=previous.reason,
         run_id=previous.run_id,
-        actor=None,
+        actor=actor,
         updated_at=updated_at,
         commit=commit,
     )
@@ -409,7 +416,10 @@ class ActionResult:
     whether `pipeline_controls` actually held a row for `previous` (as
     opposed to `previous` being a value derived with no backing row, e.g.
     from `_derived_snapshot`) — see `apply`'s and `release`'s use of it via
-    `_restore_previous_row`.
+    `_restore_previous_row`. `previous_actor` is that same prior row's
+    `actor` (`None` when `previous_had_row` is `False`, or when the row
+    existed but was never attributed), so restoring it doesn't erase whoever
+    last set the row (SYM-244 review).
     """
 
     accepted: bool
@@ -417,6 +427,7 @@ class ActionResult:
     rejection: str | None = None
     previous: ControlSnapshot | None = None
     previous_had_row: bool = True
+    previous_actor: str | None = None
     action_id: str | None = None
 
 
@@ -737,8 +748,11 @@ async def apply(
         # from `snapshot`'s own read above since that value isn't exposed.
         # Both this call's own compensation below and `release`'s later undo
         # need it to converge on "no row" rather than materializing one that
-        # never existed (see `_restore_previous_row`).
-        had_previous_row = await db.pipeline_controls.get(conn, issue_id) is not None
+        # never existed (see `_restore_previous_row`), and its `actor` is
+        # what a later undo must restore instead of erasing (SYM-244 review).
+        previous_row = await db.pipeline_controls.get(conn, issue_id)
+        had_previous_row = previous_row is not None
+        previous_actor = previous_row.actor if previous_row is not None else None
         # A SAVEPOINT scopes the undo to just these two writes: `conn` is one
         # connection shared by the whole daemon, so a bare `conn.rollback()`
         # would discard any other, unrelated work some other coroutine has
@@ -834,6 +848,7 @@ async def apply(
                         issue_id,
                         current,
                         had_row=had_previous_row,
+                        actor=previous_actor,
                         updated_at=at,
                         commit=True,
                     )
@@ -908,6 +923,7 @@ async def apply(
             ),
             previous=current,
             previous_had_row=had_previous_row,
+            previous_actor=previous_actor,
             action_id=action_id,
         )
 
@@ -969,6 +985,7 @@ async def release(
                         previous.issue_id,
                         previous,
                         had_row=result.previous_had_row,
+                        actor=result.previous_actor,
                         updated_at=at,
                         commit=False,
                     )
@@ -995,6 +1012,7 @@ async def release(
                             previous.issue_id,
                             previous,
                             had_row=result.previous_had_row,
+                            actor=result.previous_actor,
                             updated_at=at,
                             commit=True,
                         )
@@ -1031,6 +1049,7 @@ async def release(
                         previous.issue_id,
                         previous,
                         had_row=result.previous_had_row,
+                        actor=result.previous_actor,
                         updated_at=at,
                         commit=True,
                     )

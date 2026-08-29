@@ -2220,11 +2220,27 @@ async def test_active_orphan_open_pr_adopted_and_routed_to_review(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Adopting an orphan PR clears the `implement_failed` park it landed
+    behind; the durable control row must settle with it. Otherwise
+    `pipeline_controls` keeps reporting `implement`/`failed` with Retry
+    offered for an issue that has already moved on to review (SYM-244
+    review)."""
+    from symphony.pipeline import controls
+
     monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
     conn = await db.connect(tmp_path / "state.sqlite")
     try:
         await _seed_issue(conn)
         await _seed_implement_failed_wait(conn)
+        await controls.record_stage_outcome(
+            conn,
+            "iss-1",
+            stage=controls.IMPLEMENT_STAGE,
+            outcome=controls.AttemptOutcome.FAILED,
+            reason="agent exited 2",
+            run_id="run-iss-1",
+            at="2026-05-17T10:01:00Z",
+        )
         fake_gh = _FakeGitHub(
             open_prs_by_head={
                 "symphony/eng-1": {
@@ -2251,6 +2267,7 @@ async def test_active_orphan_open_pr_adopted_and_routed_to_review(
         pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
         review = await db.review_state.get(conn, "iss-1")
         merge_candidates = await db.issue_prs.list_merge_candidates(conn)
+        control_snapshot = await controls.snapshot(conn, "iss-1")
     finally:
         await conn.close()
 
@@ -2262,6 +2279,8 @@ async def test_active_orphan_open_pr_adopted_and_routed_to_review(
     assert review.pr_number == 326
     assert [c.pr_number for c in merge_candidates] == [326]
     assert fake_gh.comments == [(326, "@codex review", "org/repo")]
+    assert control_snapshot.outcome is controls.AttemptOutcome.SUCCEEDED
+    assert controls.ControlAction.RETRY not in control_snapshot.allowed_actions
     # Default binding is remote-review (code_review="Needs Approval"); adoption
     # moves the issue into that lane so `_review_issue_is_active` accepts it.
     assert linear.moves == [("iss-1", "state-needs-approval")]
@@ -2280,11 +2299,15 @@ async def test_orphan_adoption_does_not_hold_the_controls_write_lock(
     timeout each) — holding the module's one daemon-wide write lock for as
     long as Linear took to answer, stalling every other issue's
     `controls.apply`/`release`/park write, including the operator's `$retry`
-    (SYM-244 review). `ACTION_ADOPTED` never writes a control row itself —
-    only the `DRIFT_LINEAR_CANCELED` clear does, and the two never coincide
-    (`_observe_reconcile_sources` forces `orphans` empty whenever
-    `linear_drift` is `DRIFT_LINEAR_CANCELED`) — so an adoption tick must not
-    enter `guard_writes` at all."""
+    (SYM-244 review). `ACTION_ADOPTED` does write a control row when it clears
+    an `implement_failed` park (settling it to `SUCCEEDED` so a stale row
+    doesn't keep offering Retry after the issue moves on — SYM-244 review),
+    but relies on the module's documented foreign-commit/foreign-rollback
+    tolerance instead of `guard_writes`'s serialization: that write never
+    coincides with the `DRIFT_LINEAR_CANCELED` clear's own guarded write in
+    the same tick (`_observe_reconcile_sources` forces `orphans` empty
+    whenever `linear_drift` is `DRIFT_LINEAR_CANCELED`) — so an adoption tick
+    must not enter `guard_writes` at all."""
     from collections.abc import AsyncIterator
     from contextlib import asynccontextmanager
 

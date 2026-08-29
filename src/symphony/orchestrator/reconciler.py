@@ -1171,6 +1171,25 @@ class Reconciler:
             team_key=team_key,
             state_name=target_state,
         )
+        if wait is not None and wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
+            # Settle the durable control row before the wait it backs is
+            # deleted or overwritten below, so `pipeline_controls` never keeps
+            # reporting `implement`/`failed` (Retry offered, no park behind
+            # it) for an issue whose implement work actually landed a PR
+            # (SYM-244 review). Covers both sub-cases: the explicit delete
+            # right below, and the needs-approval sub-case that instead
+            # upserts a `KIND_REVIEW_FAILED` wait over this row without ever
+            # calling `delete`.
+            await controls.record_stage_outcome(
+                self._conn,
+                issue_id,
+                stage=controls.IMPLEMENT_STAGE,
+                outcome=controls.AttemptOutcome.SUCCEEDED,
+                reason=f"orphan PR adopted ({obs.github_repo}#{obs.pr_number})",
+                run_id=wait.run_id,
+                at=observed_at,
+                commit=False,
+            )
         if wait is not None and not (
             local_review_configured and not remote_review_configured and not local_only_review_ready
         ):
