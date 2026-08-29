@@ -1852,6 +1852,7 @@ class _OrchestratorBase:
         # re-reads them below rather than assuming the former.
         savepoint = f"implement_failed_wait_{uuid.uuid4().hex}"
         async with controls.guard_writes(issue_id):
+            previous_control = await db.pipeline_controls.get(self._conn, issue_id)
             await self._conn.execute(f"SAVEPOINT {savepoint}")
             try:
                 await controls.record_stage_outcome(
@@ -1886,7 +1887,32 @@ class _OrchestratorBase:
                 # and leave these rows dangling in the open transaction for a
                 # later foreign commit to make durable with no matching
                 # transition.
-                await controls.rollback_to_savepoint(self._conn, savepoint)
+                if not await controls.rollback_to_savepoint(self._conn, savepoint):
+                    # The savepoint is gone — a foreign commit already made
+                    # (some of) our writes durable, or a foreign rollback
+                    # destroyed them along with itself; indistinguishable
+                    # here. Compensate explicitly either way, mirroring
+                    # `apply`'s own foreign-commit compensation (controls.py):
+                    # restore the control row to what it was before this call
+                    # (or drop it if none existed) and drop the operator
+                    # wait, so a durable "failed" control row can never be
+                    # left standing with no operator wait to explain it.
+                    if previous_control is None:
+                        await db.pipeline_controls.delete(self._conn, issue_id, commit=False)
+                    else:
+                        await db.pipeline_controls.put(
+                            self._conn,
+                            issue_id=issue_id,
+                            mode=previous_control.mode,
+                            stage=previous_control.stage,
+                            outcome=previous_control.outcome,
+                            reason=previous_control.reason,
+                            run_id=previous_control.run_id,
+                            actor=previous_control.actor,
+                            updated_at=self._now().isoformat(),
+                            commit=False,
+                        )
+                    await db.operator_waits.delete(self._conn, issue_id, run_id, commit=True)
                 raise
             released = await controls.release_savepoint(self._conn, savepoint)
             await self._conn.commit()

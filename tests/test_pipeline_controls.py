@@ -1344,6 +1344,70 @@ async def test_apply_cancelled_mid_window_leaves_no_orphan_action_row(
 
 
 @pytest.mark.asyncio
+async def test_apply_record_action_cancelled_mid_window_leaves_no_orphan_action_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same bug as `test_apply_cancelled_mid_window_leaves_no_orphan_action_row`,
+    but for `record_action`'s own catch, which used to only trap
+    `sqlite3.IntegrityError`: a cancellation landing right after
+    `record_action`'s INSERT actually reaches SQLite, with an unrelated
+    foreign commit already having flushed it durably, used to propagate
+    straight past `apply` with nothing to undo it — leaving the action row
+    durable with no matching control-row transition, and permanently wedging
+    the park since the redelivered command is then rejected as "already
+    applied". `record_action`'s except block must catch `BaseException` too
+    and, once the SAVEPOINT is gone, delete the now-durable action row
+    itself."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="running",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+        await _record_implement(conn, outcome=OUTCOMES.FAILED, reason="boom")
+
+        real_record_action = db.pipeline_controls.record_action
+
+        async def _record_action_then_foreign_commit_and_cancel(
+            conn: aiosqlite.Connection, **kwargs: object
+        ) -> None:
+            await real_record_action(conn, **kwargs)
+            # An unrelated coroutine's ordinary write, landing mid-window,
+            # immediately followed by this task's own cancellation.
+            await db.runs.update_status(conn, "run-1", "completed")
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(
+            db.pipeline_controls, "record_action", _record_action_then_foreign_commit_and_cancel
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await controls.apply(
+                conn,
+                ISSUE_ID,
+                ACTIONS.RETRY,
+                actor="tracker:c-1",
+                action_id="c-1",
+                at="2026-08-27T10:01:00+00:00",
+            )
+
+        assert await db.pipeline_controls.get_action(conn, ISSUE_ID, "c-1") is None
+        row = await db.pipeline_controls.get(conn, ISSUE_ID)
+        assert row is not None and row.outcome == str(OUTCOMES.FAILED)
+
+        run = (await db.runs.history_for_issue(conn, ISSUE_ID))[0]
+        assert run.status == "completed"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_release_cancelled_mid_window_leaves_no_orphan_action_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1661,6 +1725,59 @@ async def test_track_implement_failed_wait_rolls_back_on_upsert_failure(
             await orch._track_implement_failed_wait(ISSUE_ID, "run-1", binding)  # noqa: SLF001
 
         assert await db.pipeline_controls.get(conn, ISSUE_ID) is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_track_implement_failed_wait_compensates_when_upsert_fails_after_a_foreign_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same bug shape as
+    `test_apply_record_action_cancelled_mid_window_leaves_no_orphan_action_row`,
+    for the park path's own `except BaseException` catch: before this fix, a
+    missing `rollback_to_savepoint` (because an unrelated foreign commit —
+    e.g. `db.runs.update_status` — already ended the transaction and flushed
+    `record_stage_outcome`'s control-row write) was simply discarded, so a
+    durably "failed" control row was left behind with no operator wait to
+    explain it — contradicting this method's own invariant that a restart can
+    never find one without the other. The fix must compensate explicitly:
+    restore the control row to what it was before the park (here, no row at
+    all) and drop the operator wait."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = _cfg(tmp_path, binding)
+        orch = _orchestrator(cfg, conn, AsyncMock(), tmp_path)
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="implement",
+            status="failed",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+
+        async def _foreign_commit_then_boom(*args: object, **kwargs: object) -> None:
+            # An unrelated coroutine's ordinary write, landing mid-window and
+            # ending the whole transaction, immediately followed by the
+            # upsert itself failing.
+            await db.runs.update_status(conn, "run-1", "completed")
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(db.operator_waits, "upsert", _foreign_commit_then_boom)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await orch._track_implement_failed_wait(ISSUE_ID, "run-1", binding)  # noqa: SLF001
+
+        assert await db.pipeline_controls.get(conn, ISSUE_ID) is None
+        assert await db.operator_waits.get(conn, ISSUE_ID) is None
+
+        run = (await db.runs.history_for_issue(conn, ISSUE_ID))[0]
+        assert run.status == "completed"
     finally:
         await conn.close()
 

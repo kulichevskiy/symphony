@@ -136,6 +136,24 @@ async def put(
         await conn.commit()
 
 
+async def delete(
+    conn: aiosqlite.Connection,
+    issue_id: str,
+    *,
+    commit: bool = True,
+) -> None:
+    """Remove the control row entirely.
+
+    Used by the park path's foreign-commit compensation: when no control row
+    existed before the park attempt, converging on "no row" (rather than a
+    row holding default values) matches what a plain SAVEPOINT rollback of
+    the same INSERT would have left behind.
+    """
+    await conn.execute("DELETE FROM pipeline_controls WHERE issue_id = ?", (issue_id,))
+    if commit:
+        await conn.commit()
+
+
 async def get_action(
     conn: aiosqlite.Connection, issue_id: str, action_id: str
 ) -> ControlActionRow | None:
@@ -239,6 +257,7 @@ async def list_actions(conn: aiosqlite.Connection, issue_id: str) -> list[Contro
 __all__ = [
     "ControlActionRow",
     "ControlRow",
+    "delete",
     "delete_action",
     "get",
     "get_action",

@@ -683,6 +683,20 @@ async def apply(
                     snapshot=current,
                     rejection=f"{action.value} {action_id} was already applied",
                 )
+            except BaseException:
+                # `BaseException`, not `Exception`: a task cancellation lands
+                # here too, and it must undo the same as any other failure —
+                # an `Exception`-only catch would let it skip past both this
+                # and the `put` block's own catch, leaving the action row
+                # dangling in the open transaction for a later foreign commit
+                # to make durable with no matching control-row transition.
+                # Unlike the `put` block below, only the action row could
+                # have landed here, so there is no control row to restore.
+                if not await rollback_to_savepoint(conn, savepoint):
+                    await db.pipeline_controls.delete_action(
+                        conn, issue_id=issue_id, action_id=action_id, commit=True
+                    )
+                raise
             try:
                 await db.pipeline_controls.put(
                     conn,
