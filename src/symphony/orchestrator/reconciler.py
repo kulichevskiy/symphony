@@ -1223,27 +1223,46 @@ class Reconciler:
                 and control_row.outcome == str(controls.AttemptOutcome.FAILED)
                 and control_row.run_id == wait.run_id
             )
-            settle = (
-                still_parked
-                if own_wait_upsert
-                else (
+            if own_wait_upsert:
+                # This sub-case just upserted its own fresh `KIND_REVIEW_FAILED`
+                # wait (`review_run_id`) above instead of clearing the original
+                # park. Settling the control row to `<adopted_stage>`/`succeeded`
+                # here would leave that fresh wait backed by a row that no
+                # longer reports a failed stage, making the park it just opened
+                # unanswerable (SYM-245 review). Record the new review park
+                # instead of settling the old stage.
+                if still_parked:
+                    await controls.record_stage_outcome(
+                        self._conn,
+                        issue_id,
+                        stage=controls.REVIEW_STAGE,
+                        outcome=controls.AttemptOutcome.FAILED,
+                        reason=(
+                            f"orphan PR adopted ({obs.github_repo}#{obs.pr_number}); "
+                            "awaiting manual review approval"
+                        ),
+                        run_id=review_run_id,
+                        at=observed_at,
+                        commit=False,
+                    )
+            else:
+                settle = (
                     current_wait is not None
                     and current_wait.run_id == wait.run_id
                     and current_wait.kind == wait.kind
                     and (control_row is None or still_parked)
                 )
-            )
-            if settle:
-                await controls.record_stage_outcome(
-                    self._conn,
-                    issue_id,
-                    stage=adopted_stage,
-                    outcome=controls.AttemptOutcome.SUCCEEDED,
-                    reason=f"orphan PR adopted ({obs.github_repo}#{obs.pr_number})",
-                    run_id=wait.run_id,
-                    at=observed_at,
-                    commit=False,
-                )
+                if settle:
+                    await controls.record_stage_outcome(
+                        self._conn,
+                        issue_id,
+                        stage=adopted_stage,
+                        outcome=controls.AttemptOutcome.SUCCEEDED,
+                        reason=f"orphan PR adopted ({obs.github_repo}#{obs.pr_number})",
+                        run_id=wait.run_id,
+                        at=observed_at,
+                        commit=False,
+                    )
         if wait is not None and not (
             local_review_configured and not remote_review_configured and not local_only_review_ready
         ):

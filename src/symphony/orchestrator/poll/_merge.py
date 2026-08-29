@@ -1867,24 +1867,26 @@ class _MergeMixin(_OrchestratorBase):
             pr_number,
         )
 
+        review_cap_skip: controls.ActionResult | None = None
+        if wait is not None and wait.kind == db.operator_waits.KIND_REVIEW_CAP:
+            # `$approve` here force-advances a review-cap park straight to
+            # merge without another review pass — the operator's judgement
+            # steps over review, the same as any other validation-stage Skip
+            # — so it goes through the same canonical `_accept_control_action`
+            # gate (action row, `comment_id` idempotency, head-scoped
+            # fingerprint) before the merge is scheduled, rather than a bare
+            # `_clear_stage_park` settle with none of that (SYM-245 review).
+            review_cap_skip = await self._accept_control_action(
+                issue_id,
+                controls.ControlAction.SKIP,
+                intent,
+                fingerprint=await self._pr_head_sha_or_none(binding, pr_number),
+            )
+            if review_cap_skip is None:
+                return
+
         async def on_merge_started(new_run_id: str) -> None:
-            if wait is not None and wait.kind == db.operator_waits.KIND_REVIEW_CAP:
-                # `$approve` here force-advances a review-cap park straight to
-                # merge without another review pass — the operator's judgement
-                # steps over review, the same as any other validation-stage
-                # Skip — so settle that stage's control row instead of the
-                # plain `_clear_operator_wait` a non-modeled merge park uses;
-                # otherwise it durably keeps reporting review as failed with
-                # Retry/Skip on offer for a park that no longer exists
-                # (SYM-245 review).
-                await self._clear_stage_park(
-                    issue_id,
-                    run_id,
-                    kind=wait.kind,
-                    outcome=controls.AttemptOutcome.SKIPPED,
-                )
-            else:
-                await self._clear_operator_wait(issue_id, run_id)
+            await self._clear_operator_wait(issue_id, run_id)
             try:
                 await tracker.post_comment(
                     tracker_issue_id,
@@ -1908,17 +1910,22 @@ class _MergeMixin(_OrchestratorBase):
                     e,
                 )
 
-        # Reserved under `config_write_lock` — see `_review_fix_dispatch_slot`
-        # in `_dispatch.py` (SYM-193 review).
-        async with self._config_write_lock:
-            self._schedule_merge(
-                binding=binding,
-                issue=issue,
-                pr_number=pr_number,
-                pr_url=pr_url,
-                on_started=on_merge_started,
-                storage_issue_id=issue_id,
-            )
+        try:
+            # Reserved under `config_write_lock` — see
+            # `_review_fix_dispatch_slot` in `_dispatch.py` (SYM-193 review).
+            async with self._config_write_lock:
+                self._schedule_merge(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    on_started=on_merge_started,
+                    storage_issue_id=issue_id,
+                )
+        except BaseException:
+            if review_cap_skip is not None:
+                await controls.release(self._conn, review_cap_skip, at=self._now().isoformat())
+            raise
 
     async def _parked_closed_unmerged_pr_for_event(
         self, event: GitHubWebhookEvent

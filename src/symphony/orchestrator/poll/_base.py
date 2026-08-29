@@ -2079,6 +2079,17 @@ class _OrchestratorBase:
             reason = await self._blocked_reason_for_run(run_id) or None
 
         async def _settle(*, commit: bool) -> None:
+            current = await db.pipeline_controls.get(self._conn, issue_id)
+            if current is not None and (
+                current.run_id != run_id or current.stage != stage
+            ):
+                # A later stage already parked over this row mid-handoff (e.g.
+                # review failing synchronously while a delivery park is being
+                # cleared) — settling here would clobber that newer park with
+                # this stage's stale outcome, so leave the control row alone
+                # and only drop this call's own operator wait.
+                await self._clear_operator_wait(issue_id, run_id, commit=commit)
+                return
             await controls.record_stage_outcome(
                 self._conn,
                 issue_id,
@@ -3221,7 +3232,7 @@ class _OrchestratorBase:
             issue_title=issue.title,
             issue_body=issue.description,
             labels=list(issue.labels),
-            blocked_reason=handoff.blocked_reason if handoff else "",
+            blocked_reason=handoff.blocked_reason if handoff else None,
         )
         role = binding.resolved_role("implement", self.config.roles)
         command = build_runner_command(

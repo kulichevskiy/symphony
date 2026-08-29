@@ -74,26 +74,31 @@ COMPLETION_CONTRACT_ALREADY_DONE = (
 )
 
 
-def implement_handoff_block(*, blocked_reason: str = "") -> str:
+def implement_handoff_block(*, blocked_reason: str | None = None) -> str:
     """Render the operator-handoff section for a blocked-run resume.
 
-    Returns "" when there is no handoff context. Otherwise it states the
-    original `SYMPHONY_BLOCKED` reason and tells the fresh run that prior work
-    is preserved in the workspace.
+    Returns "" when there is no handoff at all (`blocked_reason=None`).
+    Otherwise it tells the fresh run that prior work is preserved in the
+    workspace, and states the original `SYMPHONY_BLOCKED` reason only when one
+    was captured — `_blocked_reason_for_run` returns "" for a missing run row
+    or an empty termination detail, which is still a real handoff (a prior
+    run's worktree to resume, not a fresh one) and must not be conflated with
+    "no handoff happened" (SYM-245 review).
 
     The operator's own Retry command text is deliberately not part of this
     block: Retry carries no instruction payload (SYM-245). Anything the fresh
     attempt needs to know belongs in the tracker issue, which this prompt
     re-reads in full on every attempt.
     """
-    blocked_reason = (blocked_reason or "").strip()
-    if not blocked_reason:
+    if blocked_reason is None:
         return ""
+    blocked_reason = blocked_reason.strip()
+    reason_section = f"## Original blocked reason\n\n{blocked_reason}\n\n" if blocked_reason else ""
     return (
         "# Operator handoff (resumed after a block)\n\n"
         "A prior run on this issue stopped blocked on a human action. The "
         "operator has since acted and resumed you.\n\n"
-        f"## Original blocked reason\n\n{blocked_reason}\n\n"
+        f"{reason_section}"
         "The issue text above/below is freshly re-read for this attempt — if "
         "the operator supplied anything (a token, a decision, a correction), "
         "it is there, not in this block.\n\n"
@@ -108,7 +113,7 @@ def implement_prompt(
     issue_title: str,
     issue_body: str,
     labels: list[str],
-    blocked_reason: str = "",
+    blocked_reason: str | None = None,
 ) -> str:
     """Build the system+user prompt for the Implement stage.
 
@@ -118,7 +123,10 @@ def implement_prompt(
     do its own commits.
 
     On a blocked-run resume, `blocked_reason` populates a handoff block placed
-    before the issue so the agent sees it first.
+    before the issue so the agent sees it first. `None` means this is not a
+    resume at all; `""` means it is one but no reason was captured — both the
+    handoff block and its "## Original blocked reason" section handle that
+    distinction (SYM-245 review).
     """
     label_line = ", ".join(labels) if labels else "(no labels)"
     body = issue_body.strip() if issue_body else "(no description)"

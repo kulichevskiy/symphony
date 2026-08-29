@@ -2548,17 +2548,16 @@ async def test_hybrid_orphan_open_pr_adoption_uses_remote_review_lane(
 
 
 @pytest.mark.asyncio
-async def test_orphan_adoption_settles_the_old_stage_for_the_needs_approval_sub_case(
+async def test_orphan_adoption_parks_review_for_the_needs_approval_sub_case(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The needs-approval sub-case upserts its own fresh `KIND_REVIEW_FAILED`
-    wait over `issue_id` instead of deleting the old one. A settle check that
-    re-reads the wait *after* that upsert would never match the original
-    `implement_failed` wait's `run_id`/`kind` again and would silently skip
-    settling every time, leaving `pipeline_controls` durably reporting
-    `implement`/`failed` (Retry offered) behind what is actually now a
-    `review_failed` park (SYM-245 review)."""
+    wait over `issue_id` instead of deleting the old one. Settling the control
+    row to the *original* stage (`implement`/`succeeded`) here would leave that
+    fresh review park backed by a row that no longer reports a failed stage,
+    making it unanswerable — the settle must instead record the new review
+    park (SYM-245 review)."""
     from symphony.pipeline import controls
 
     monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
@@ -2601,9 +2600,11 @@ async def test_orphan_adoption_settles_the_old_stage_for_the_needs_approval_sub_
 
     assert wait is not None
     assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
-    assert control_snapshot.stage == controls.IMPLEMENT_STAGE
-    assert control_snapshot.outcome is controls.AttemptOutcome.SUCCEEDED
-    assert controls.ControlAction.RETRY not in control_snapshot.allowed_actions
+    assert control_snapshot.stage == controls.REVIEW_STAGE
+    assert control_snapshot.outcome is controls.AttemptOutcome.FAILED
+    assert control_snapshot.run_id == wait.run_id
+    assert controls.ControlAction.RETRY in control_snapshot.allowed_actions
+    assert controls.ControlAction.SKIP in control_snapshot.allowed_actions
 
 
 @pytest.mark.asyncio

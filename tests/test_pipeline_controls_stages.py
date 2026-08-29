@@ -97,7 +97,7 @@ def test_parks_outside_this_slice_map_to_no_stage(kind: str) -> None:
     [
         (controls.IMPLEMENT_STAGE, False),
         (controls.DELIVERY_STAGE, False),
-        (controls.MERGE_STAGE, False),
+        ("merge", False),
         (controls.REVIEW_STAGE, True),
         (controls.ACCEPTANCE_STAGE, True),
     ],
@@ -599,6 +599,58 @@ async def test_skip_failed_review_releases_the_accepted_skip_when_a_side_effect_
 
 
 @pytest.mark.asyncio
+async def test_skip_failed_review_re_arms_ingress_when_schedule_merge_raises(
+    tmp_path: Path,
+) -> None:
+    """Unlike the sibling test above, the raise here happens in
+    `_schedule_merge` — *after* `_clear_operator_wait` has already popped
+    `_dispatch_run_ids`/`_operator_wait_run_ids`/`_review_failed_run_bindings`.
+    Releasing the accepted Skip without re-arming those would leave no ingress
+    for a re-delivered `$skip-review` to land on (SYM-245 review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_operator_wait(
+            conn, kind=db.operator_waits.KIND_REVIEW_FAILED, stage="review", status="failed"
+        )
+        await _seed_review_state(conn)
+        await controls.record_stage_outcome(
+            conn,
+            ISSUE_ID,
+            stage=controls.REVIEW_STAGE,
+            outcome=OUTCOMES.FAILED,
+            reason="CI red",
+            run_id=RUN_ID,
+            at="2026-08-28T09:30:00+00:00",
+        )
+
+        orch = _orch(conn, tmp_path)
+        orch._review_failed_run_bindings[RUN_ID] = _binding()  # noqa: SLF001
+        orch._dispatch_run_ids[ISSUE_ID] = RUN_ID  # noqa: SLF001
+        orch._operator_wait_run_ids.add(RUN_ID)  # noqa: SLF001
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(return_value={"headRefOid": "sha-old"})
+        orch._gh_client = AsyncMock(return_value=gh)  # type: ignore[method-assign]  # noqa: SLF001
+        orch._schedule_merge = MagicMock(  # type: ignore[method-assign]  # noqa: SLF001
+            side_effect=RuntimeError("merge scheduling died")
+        )
+
+        with pytest.raises(RuntimeError, match="merge scheduling died"):
+            await orch._handle_review_failed_slash_intent(  # noqa: SLF001
+                ISSUE_ID, RUN_ID, _intent(SlashKind.SKIP_REVIEW, comment_id="c-skip")
+            )
+
+        snap = await controls.snapshot(conn, ISSUE_ID)
+        assert snap.outcome is OUTCOMES.FAILED
+        assert ACTIONS.SKIP in snap.allowed_actions
+        assert ACTIONS.RETRY in snap.allowed_actions
+        assert orch._dispatch_run_ids.get(ISSUE_ID) == RUN_ID  # noqa: SLF001
+        assert RUN_ID in orch._operator_wait_run_ids  # noqa: SLF001
+        assert orch._review_failed_run_bindings.get(RUN_ID) is not None  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_deliver_failed_retry_goes_through_the_canonical_transition(
     tmp_path: Path,
 ) -> None:
@@ -686,6 +738,63 @@ async def test_acceptance_skip_records_a_canonical_skip_scoped_to_the_pr_head(
         # A push to the PR invalidates the skip: acceptance is required again.
         expired = await controls.snapshot(conn, ISSUE_ID, fingerprint="sha-new")
         assert expired.outcome is OUTCOMES.FAILED
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_skip_acceptance_rejected_releases_the_accepted_skip_when_a_side_effect_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirrors `test_skip_failed_review_releases_the_accepted_skip_when_a_side_effect_raises`:
+    if a side effect after the accepted Skip raises, the accepted transition
+    must be released — not left `SKIPPED` with no Retry/Skip on offer (SYM-245
+    review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_operator_wait(
+            conn,
+            kind=db.operator_waits.KIND_ACCEPTANCE_REJECTED,
+            stage="acceptance",
+            status="failed",
+        )
+        await db.acceptance_state.begin_acceptance(
+            conn,
+            ISSUE_ID,
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            pr_head_sha="sha-old",
+            mode="static",
+            preview_url="",
+            extracted_criteria="",
+        )
+        await controls.record_stage_outcome(
+            conn,
+            ISSUE_ID,
+            stage=controls.ACCEPTANCE_STAGE,
+            outcome=OUTCOMES.FAILED,
+            reason="acceptance rejected",
+            run_id=RUN_ID,
+            at="2026-08-28T09:30:00+00:00",
+        )
+        orch = _orch(conn, tmp_path)
+        orch._acceptance_rejected_run_bindings[RUN_ID] = _binding()  # noqa: SLF001
+
+        async def _boom(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("db died mid-skip")
+
+        monkeypatch.setattr(db.acceptance_state, "record_verdict", _boom)
+
+        with pytest.raises(RuntimeError, match="db died mid-skip"):
+            await orch._handle_acceptance_rejected_slash_intent(  # noqa: SLF001
+                ISSUE_ID, RUN_ID, _intent(SlashKind.SKIP_ACCEPTANCE, comment_id="c-skip")
+            )
+
+        snap = await controls.snapshot(conn, ISSUE_ID)
+        assert snap.outcome is OUTCOMES.FAILED
+        assert ACTIONS.SKIP in snap.allowed_actions
+        assert ACTIONS.RETRY in snap.allowed_actions
+        assert await db.operator_waits.get(conn, ISSUE_ID) is not None
     finally:
         await conn.close()
 

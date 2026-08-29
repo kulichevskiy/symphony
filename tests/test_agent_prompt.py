@@ -61,6 +61,21 @@ def test_implement_prompt_without_handoff_has_no_handoff_block() -> None:
     assert "Operator" not in prompt
 
 
+def test_implement_prompt_handoff_with_empty_reason_still_preserves_workspace() -> None:
+    """`blocked_reason=""` means a real handoff happened (e.g. a missing run
+    row or an empty termination detail) but no reason text was captured — the
+    fresh run must still be told its workspace holds prior work, distinct from
+    `blocked_reason=None` (no handoff at all) (SYM-245 review)."""
+    prompt = implement_prompt(
+        issue_title="Add OAuth login",
+        issue_body="Users should sign in via Google.",
+        labels=["feature"],
+        blocked_reason="",
+    )
+    assert "git status" in prompt
+    assert "Original blocked reason" not in prompt
+
+
 def test_implement_prompt_handles_empty_labels() -> None:
     prompt = implement_prompt(
         issue_title="Fix typo",

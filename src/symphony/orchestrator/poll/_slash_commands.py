@@ -1402,39 +1402,50 @@ class _SlashCommandsMixin(_OrchestratorBase):
         if intent.kind is SlashKind.SKIP_ACCEPTANCE:
             # See the acceptance-blocked branch: one canonical, head-scoped Skip
             # for the acceptance stage, whichever park it is answered from.
-            if (
-                await self._accept_control_action(
-                    issue_id,
-                    controls.ControlAction.SKIP,
-                    intent,
-                    fingerprint=state.pr_head_sha or None,
-                )
-            ) is None:
-                return
-            await db.acceptance_state.record_verdict(
-                self._conn,
+            accepted = await self._accept_control_action(
                 issue_id,
-                verdict="pass",
-                artifacts_url=state.last_artifacts_url,
+                controls.ControlAction.SKIP,
+                intent,
+                fingerprint=state.pr_head_sha or None,
             )
-            await self._clear_operator_wait(issue_id, run_id)
-            if _needs_human_approval_label_present(issue):
-                await self._open_merge_wait_for_human_approval_label(
-                    binding=binding,
-                    issue=issue,
-                    pr_url=pr_url,
+            if accepted is None:
+                return
+            try:
+                await db.acceptance_state.record_verdict(
+                    self._conn,
+                    issue_id,
+                    verdict="pass",
+                    artifacts_url=state.last_artifacts_url,
                 )
-            else:
-                # See the sibling `SKIP_ACCEPTANCE` branch above for why this
-                # reservation is made under `config_write_lock` (SYM-193
-                # review).
-                async with self._config_write_lock:
-                    self._schedule_merge(
+                await self._clear_operator_wait(issue_id, run_id)
+                if _needs_human_approval_label_present(issue):
+                    await self._open_merge_wait_for_human_approval_label(
                         binding=binding,
                         issue=issue,
-                        pr_number=pr_number,
                         pr_url=pr_url,
                     )
+                else:
+                    # See the sibling `SKIP_ACCEPTANCE` branch above for why this
+                    # reservation is made under `config_write_lock` (SYM-193
+                    # review).
+                    async with self._config_write_lock:
+                        self._schedule_merge(
+                            binding=binding,
+                            issue=issue,
+                            pr_number=pr_number,
+                            pr_url=pr_url,
+                        )
+            except BaseException:
+                # `_clear_operator_wait` pops `_dispatch_run_ids`/
+                # `_operator_wait_run_ids`/`_acceptance_rejected_run_bindings`
+                # before its own DB delete can fail; re-arm them so a
+                # webhook-driven dispatch can't slip in before the released
+                # park is restored (SYM-245 review).
+                self._dispatch_run_ids[issue_id] = run_id
+                self._operator_wait_run_ids.add(run_id)
+                self._acceptance_rejected_run_bindings[run_id] = binding
+                await controls.release(self._conn, accepted, at=self._now().isoformat())
+                raise
             body = skip_acceptance_forced(
                 CommentVars(
                     stage="acceptance",

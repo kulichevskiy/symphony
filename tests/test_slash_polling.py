@@ -703,6 +703,83 @@ async def test_review_cap_approve_settles_the_review_stage_control_row(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_review_cap_approve_records_a_canonical_skip_scoped_to_the_pr_head(
+    tmp_path: Path,
+) -> None:
+    """`$approve` on a review-cap park force-advances to merge the same as any
+    other validation-stage Skip, so it must go through `_accept_control_action`
+    — an action row, `comment_id` idempotency, and a head-scoped fingerprint —
+    not a bare `_clear_stage_park` settle with none of that (SYM-245 review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        cfg = Config(repos=[_binding()])
+        linear = AsyncMock()
+        linear.comments_since = AsyncMock(return_value=[_comment("$approve")])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+
+        await _seed_operator_wait(
+            conn,
+            run_id="review-run",
+            kind=db.operator_waits.KIND_REVIEW_CAP,
+            stage="review",
+            status="completed",
+        )
+        await _seed_review_state(conn, pr_number=166)
+        await controls.record_stage_outcome(
+            conn,
+            "iss-1",
+            stage=controls.REVIEW_STAGE,
+            outcome=controls.AttemptOutcome.FAILED,
+            reason="review hit the 3-iteration cap",
+            run_id="review-run",
+            at="2026-05-26T13:00:00Z",
+        )
+
+        orch = _make_orch(cfg, linear, conn)
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(return_value={"headRefOid": "sha-cap"})
+        orch._gh_client = AsyncMock(return_value=gh)  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._poll_slash_commands()  # noqa: SLF001
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        assert [(a.action, a.stage) for a in await controls.history(conn, "iss-1")] == [
+            ("skip", controls.REVIEW_STAGE)
+        ]
+        row = await db.pipeline_controls.get(conn, "iss-1")
+        assert row is not None
+        assert row.outcome == "skipped"
+        assert row.fingerprint == "sha-cap"
+
+        # A re-delivered `$approve` for the same comment cannot dispatch a
+        # second merge: the canonical transition already consumed it.
+        await db.operator_waits.upsert(
+            conn,
+            issue_id="iss-1",
+            run_id="review-run",
+            kind=db.operator_waits.KIND_REVIEW_CAP,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="",
+            created_at="2026-05-26T13:05:00Z",
+        )
+        orch._merge_needs_approval_bindings["review-run"] = _binding()  # noqa: SLF001
+        redelivered = SlashIntent(
+            kind=SlashKind.APPROVE,
+            comment_id="c1",
+            created_at="2026-05-26T13:05:00+00:00",
+        )
+        await orch._handle_merge_needs_approval_slash_intent(  # noqa: SLF001
+            "iss-1", "review-run", redelivered
+        )
+        assert orch._schedule_merge.call_count == 1  # type: ignore[attr-defined]  # noqa: SLF001
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_review_cap_skip_review_advances_to_merge(tmp_path: Path) -> None:
     """A review-cap park is a modeled review-stage failure, so `allowed_actions`
     advertises Skip for it same as `review_failed`/`review_stopped`. Before

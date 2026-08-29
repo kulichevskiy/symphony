@@ -139,11 +139,26 @@ describe("applicability", () => {
     expect(en.stop).toBe(false);
   });
 
-  it("keeps the paused defaults for wait kinds that only resume", () => {
-    const { en } = applicability("paused", "acceptance_rejected");
-    expect(en.retry).toBe(true);
+  it("enables skip-acceptance/retry-acceptance/reject for an acceptance_blocked park", () => {
+    const { en } = applicability("paused", "acceptance_blocked");
+    expect(en["skip-acceptance"]).toBe(true);
+    expect(en["retry-acceptance"]).toBe(true);
+    expect(en.reject).toBe(true);
     expect(en.stop).toBe(true);
+    expect(en.retry).toBe(false);
     expect(en.approve).toBe(false);
+    expect(en["skip-review"]).toBe(false);
+  });
+
+  it("enables skip-acceptance/retry-acceptance (no reject) for an acceptance_rejected park", () => {
+    const { en } = applicability("paused", "acceptance_rejected");
+    expect(en["skip-acceptance"]).toBe(true);
+    expect(en["retry-acceptance"]).toBe(true);
+    expect(en.stop).toBe(true);
+    expect(en.reject).toBe(false);
+    expect(en.retry).toBe(false);
+    expect(en.approve).toBe(false);
+    expect(en["skip-review"]).toBe(false);
   });
 });
 

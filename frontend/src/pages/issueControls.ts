@@ -49,6 +49,8 @@ const PARK_COMMANDS: Record<string, CommandId[]> = {
   review_stopped: ["approve", "retry", "skip-review", "reject", "stop"],
   implement_failed: ["approve", "retry", "reject", "stop"],
   deliver_failed: ["approve", "retry", "reject", "stop"],
+  acceptance_blocked: ["skip-acceptance", "retry-acceptance", "reject", "stop"],
+  acceptance_rejected: ["skip-acceptance", "retry-acceptance", "stop"],
 };
 
 export type Applicability = {
@@ -95,7 +97,7 @@ export function applicability(status: string, waitingOn?: string | null): Applic
     case "awaiting_merge":
       on("approve");
       on("stop");
-      // A review-cap park (Needs Input) only honors $approve/$reject — the
+      // A review-cap park (Needs Input) also honors $retry/$skip-review — the
       // backend routes it through the merge-needs-approval handler, which
       // silently no-ops skip-acceptance/retry-acceptance for this wait kind.
       if (waitingOn === "review_cap") {
@@ -107,14 +109,15 @@ export function applicability(status: string, waitingOn?: string | null): Applic
         on("skip-acceptance");
         on("retry-acceptance");
       }
-      off("skip-review", "Review already complete");
-      // A review-cap park is a modeled review-stage failure, so Retry is on
-      // offer for it same as review_failed/review_stopped — everything else
-      // reaching this status has nothing failed to retry.
+      // A review-cap park is a modeled review-stage failure, so Retry and
+      // Skip are on offer for it same as review_failed/review_stopped —
+      // everything else reaching this status is already past review.
       if (waitingOn === "review_cap") {
         on("retry");
+        on("skip-review");
       } else {
         off("retry", "Nothing has failed");
+        off("skip-review", "Review already complete");
       }
       break;
     case "running":

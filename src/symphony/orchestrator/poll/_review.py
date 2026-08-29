@@ -3052,8 +3052,15 @@ class _ReviewMixin(_OrchestratorBase):
                 run_id=run_id,
             )
         except BaseException:
-            # Nothing carried the transition through to a live monitor;
-            # release it so the next poll tick can re-deliver the command.
+            # `_resume_review_monitor` clears the operator wait (popping
+            # `_dispatch_run_ids`/`_operator_wait_run_ids`/
+            # `_review_failed_run_bindings`) before the work that can raise
+            # here; re-arm them so a re-delivered `$retry`/`$approve` has an
+            # ingress to land on, then release the accepted transition so the
+            # next poll tick can re-deliver the command.
+            self._dispatch_run_ids[issue_id] = run_id
+            self._operator_wait_run_ids.add(run_id)
+            self._review_failed_run_bindings[run_id] = binding
             await controls.release(self._conn, accepted, at=self._now().isoformat())
             raise
 
@@ -3136,10 +3143,15 @@ class _ReviewMixin(_OrchestratorBase):
                     skip_review=True,
                 )
         except BaseException:
-            # Nothing carried the accepted Skip through to a scheduled merge;
-            # release it so the next poll tick can re-deliver the same
-            # `$skip-review` instead of leaving a `SKIPPED` park that offers
-            # neither Retry nor Skip (SYM-245 review).
+            # `_clear_operator_wait` already popped `_dispatch_run_ids`/
+            # `_operator_wait_run_ids`/`_review_failed_run_bindings` before this
+            # raised; re-arm them so a re-delivered `$skip-review` has an
+            # ingress to land on, then release the accepted Skip so the next
+            # poll tick can re-deliver it instead of leaving a `SKIPPED` park
+            # that offers neither Retry nor Skip (SYM-245 review).
+            self._dispatch_run_ids[issue_id] = run_id
+            self._operator_wait_run_ids.add(run_id)
+            self._review_failed_run_bindings[run_id] = binding
             await controls.release(self._conn, accepted, at=self._now().isoformat())
             raise
         log.info(

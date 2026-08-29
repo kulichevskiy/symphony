@@ -411,7 +411,6 @@ IMPLEMENT_STAGE = "implement"
 DELIVERY_STAGE = "delivery"
 REVIEW_STAGE = "review"
 ACCEPTANCE_STAGE = "acceptance"
-MERGE_STAGE = "merge"
 
 # The only stages a Skip may step over (SYM-245). Review and acceptance
 # *validate* an artifact that already exists, so an operator who has judged it
@@ -1187,7 +1186,6 @@ __all__ = [
     "ACCEPTANCE_STAGE",
     "DELIVERY_STAGE",
     "IMPLEMENT_STAGE",
-    "MERGE_STAGE",
     "REVIEW_STAGE",
     "VALIDATION_STAGES",
     "ActionResult",
