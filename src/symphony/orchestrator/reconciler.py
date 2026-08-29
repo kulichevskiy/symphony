@@ -1180,16 +1180,36 @@ class Reconciler:
             # right below, and the needs-approval sub-case that instead
             # upserts a `KIND_REVIEW_FAILED` wait over this row without ever
             # calling `delete`.
-            await controls.record_stage_outcome(
-                self._conn,
-                issue_id,
-                stage=controls.IMPLEMENT_STAGE,
-                outcome=controls.AttemptOutcome.SUCCEEDED,
-                reason=f"orphan PR adopted ({obs.github_repo}#{obs.pr_number})",
-                run_id=wait.run_id,
-                at=observed_at,
-                commit=False,
-            )
+            #
+            # `wait` was captured back in `_reconcile_inputs`, before this
+            # call's GitHub/tracker I/O above, and nothing serializes this
+            # write against a concurrent Retry or Stop accepted on the same
+            # park in that window — `_adopt_orphan_prs` deliberately never
+            # takes `controls.guard_writes` (see
+            # `test_orphan_adoption_does_not_hold_the_controls_write_lock`).
+            # An accepted Retry already moved the control row on to a fresh
+            # `pending` attempt; an accepted Stop already settled it to
+            # `skipped` and dropped the wait. Settling to `succeeded` here
+            # with the now-stale `wait.run_id` would stomp either of those
+            # with data describing a park that no longer exists (SYM-244
+            # review), so re-read the wait immediately before writing and
+            # only settle if it is still the same one this call captured.
+            current_wait = await db.operator_waits.get(self._conn, issue_id)
+            if (
+                current_wait is not None
+                and current_wait.run_id == wait.run_id
+                and current_wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
+            ):
+                await controls.record_stage_outcome(
+                    self._conn,
+                    issue_id,
+                    stage=controls.IMPLEMENT_STAGE,
+                    outcome=controls.AttemptOutcome.SUCCEEDED,
+                    reason=f"orphan PR adopted ({obs.github_repo}#{obs.pr_number})",
+                    run_id=wait.run_id,
+                    at=observed_at,
+                    commit=False,
+                )
         if wait is not None and not (
             local_review_configured and not remote_review_configured and not local_only_review_ready
         ):

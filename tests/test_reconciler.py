@@ -2289,6 +2289,85 @@ async def test_active_orphan_open_pr_adopted_and_routed_to_review(
 
 
 @pytest.mark.asyncio
+async def test_orphan_adoption_does_not_settle_a_wait_superseded_mid_flight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`wait` is captured in `_reconcile_inputs`, before `_adopt_orphan_prs`'s
+    GitHub/tracker I/O. If an operator's Stop is accepted on that same
+    `implement_failed` park while that I/O is in flight, it settles the
+    control row to `skipped` and drops the wait before adoption ever reaches
+    its own settle. Adoption must not clobber that with a stale `succeeded`
+    for a park that no longer exists (SYM-244 review)."""
+    from symphony.pipeline import controls
+
+    monkeypatch.setenv("SYMPHONY_RECONCILE_DRYRUN", "0")
+    conn = await db.connect(tmp_path / "state.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _seed_implement_failed_wait(conn)
+        await controls.record_stage_outcome(
+            conn,
+            "iss-1",
+            stage=controls.IMPLEMENT_STAGE,
+            outcome=controls.AttemptOutcome.FAILED,
+            reason="agent exited 2",
+            run_id="run-iss-1",
+            at="2026-05-17T10:01:00Z",
+        )
+        fake_gh = _FakeGitHub(
+            open_prs_by_head={
+                "symphony/eng-1": {
+                    "number": 326,
+                    "url": "https://github.com/org/repo/pull/326",
+                }
+            }
+        )
+        linear = _FakeLinear(state_name="Blocked")
+        reconciler = Reconciler(
+            Config(repos=[_binding()]),
+            conn,
+            linear,  # type: ignore[arg-type]
+            fake_gh,  # type: ignore[arg-type]
+            clock=lambda: NOW,
+        )
+
+        real_move_issue_to_state = reconciler._move_issue_to_state
+
+        async def _move_issue_to_state_then_race(**kwargs: Any) -> None:
+            # Simulate a `$stop` accepted on the same park while this call's
+            # tracker I/O was in flight: it settles the control row and
+            # drops the wait in its own already-committed transaction, same
+            # as `_handle_implement_failed_slash_intent`'s STOP path.
+            await controls.record_stage_outcome(
+                conn,
+                "iss-1",
+                stage=controls.IMPLEMENT_STAGE,
+                outcome=controls.AttemptOutcome.SKIPPED,
+                reason="stopped by operator",
+                run_id="run-iss-1",
+                at="2026-05-17T10:02:00Z",
+            )
+            await db.operator_waits.delete(conn, "iss-1", "run-iss-1")
+            await real_move_issue_to_state(**kwargs)
+
+        monkeypatch.setattr(reconciler, "_move_issue_to_state", _move_issue_to_state_then_race)
+
+        assert await reconciler.tick() == 2
+        wait = await db.operator_waits.get(conn, "iss-1")
+        pr = await db.issue_prs.get(conn, issue_id="iss-1", github_repo="org/repo")
+        control_snapshot = await controls.snapshot(conn, "iss-1")
+    finally:
+        await conn.close()
+
+    assert wait is None
+    assert pr is not None
+    assert pr.pr_number == 326
+    assert control_snapshot.outcome is controls.AttemptOutcome.SKIPPED
+    assert controls.ControlAction.RETRY not in control_snapshot.allowed_actions
+
+
+@pytest.mark.asyncio
 async def test_orphan_adoption_does_not_hold_the_controls_write_lock(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
