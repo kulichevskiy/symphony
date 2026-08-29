@@ -206,8 +206,14 @@ async def delete_action(
     action_id: str,
     commit: bool = True,
 ) -> None:
-    """Remove an accepted action. Only for a transition whose side effect
-    failed: dropping the record is what makes the command re-deliverable."""
+    """Remove an accepted action record.
+
+    Used for a transition whose side effect failed (dropping the record is
+    what makes the command re-deliverable), for the startup sweep's reset of
+    an interrupted retry, and for `apply`/`release`'s foreign-commit and
+    foreign-rollback compensation, which delete a durable action row that has
+    no matching control-row transition (or vice versa) before redoing or
+    undoing the write for real."""
     await conn.execute(
         "DELETE FROM pipeline_control_actions WHERE issue_id = ? AND action_id = ?",
         (issue_id, action_id),

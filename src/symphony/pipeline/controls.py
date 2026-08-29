@@ -57,6 +57,7 @@ from __future__ import annotations
 import asyncio
 import sqlite3
 import uuid
+import weakref
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -66,17 +67,67 @@ import aiosqlite
 
 from .. import db
 
+
+# `asyncio.Lock` binds to whichever event loop first *contends* it (blocks on
+# an already-held lock), so a lock created at import time — before any loop is
+# running — would break the second contender on a different loop (a daemon
+# process only ever runs one loop for its whole lifetime, but the test suite
+# gives each `pytest.mark.asyncio` test its own fresh loop, and this module's
+# state is shared across all of them). Both locks below are therefore created
+# lazily, per running loop, via `_loop_state`.
+@dataclass
+class _LoopState:
+    # One entry per issue id *currently contending* `_lock` on this loop; an
+    # entry is dropped as soon as its last waiter releases it, so this does
+    # not grow one entry per issue id for the daemon's lifetime.
+    issue_locks: dict[str, _RefcountedLock]
+    write_lock: asyncio.Lock
+
+
+class _RefcountedLock:
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.refcount = 0
+
+
+_loop_state: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, _LoopState] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _state() -> _LoopState:
+    loop = asyncio.get_running_loop()
+    state = _loop_state.get(loop)
+    if state is None:
+        state = _LoopState(issue_locks={}, write_lock=asyncio.Lock())
+        _loop_state[loop] = state
+    return state
+
+
 # `apply` is a multi-`await` read-modify-write (snapshot -> record_action ->
 # put -> commit) with nothing else serializing it: two concurrent applies for
 # the same issue (e.g. a web-button Retry racing a tracker-comment Retry) can
 # otherwise both read the same "current" snapshot, both see their action
 # allowed, and both commit. One lock per issue, owned by this module, closes
 # that window regardless of which ingress path called in.
-_issue_locks: dict[str, asyncio.Lock] = {}
-
-
-def _lock(issue_id: str) -> asyncio.Lock:
-    return _issue_locks.setdefault(issue_id, asyncio.Lock())
+@asynccontextmanager
+async def _lock(issue_id: str) -> AsyncIterator[None]:
+    state = _state()
+    entry = state.issue_locks.get(issue_id)
+    if entry is None:
+        entry = _RefcountedLock()
+        state.issue_locks[issue_id] = entry
+    # No `await` between here and the matching decrement below runs on the
+    # same loop's single thread, so this refcount and the dict mutations
+    # around it never race another coroutine.
+    entry.refcount += 1
+    try:
+        async with entry.lock:
+            yield
+    finally:
+        entry.refcount -= 1
+        if entry.refcount == 0 and state.issue_locks.get(issue_id) is entry:
+            del state.issue_locks[issue_id]
 
 
 # `apply`/`release` for *different* issues are only serialized by `_lock`
@@ -89,7 +140,8 @@ def _lock(issue_id: str) -> asyncio.Lock:
 # This lock forces every apply/release savepoint window in the daemon — plus
 # any other caller's window joined in through `guard_writes` — to run one at
 # a time, regardless of issue, so no such interleaving can happen.
-_write_lock = asyncio.Lock()
+def _write_lock() -> asyncio.Lock:
+    return _state().write_lock
 
 
 @asynccontextmanager
@@ -98,7 +150,7 @@ async def guard_writes(issue_id: str) -> AsyncIterator[None]:
     window on the shared connection under the same serialization `apply`/
     `release` use for that issue.
 
-    Acquires `_lock(issue_id)` and then `_write_lock`, in that order — the
+    Acquires `_lock(issue_id)` and then `_write_lock()`, in that order — the
     same order `apply`/`release` acquire them in, so nesting can never
     deadlock. Use this around any other SAVEPOINT-to-commit block that
     touches this issue's control row (or that otherwise must not land its
@@ -106,7 +158,7 @@ async def guard_writes(issue_id: str) -> AsyncIterator[None]:
     inventing a second lock.
     """
     async with _lock(issue_id):
-        async with _write_lock:
+        async with _write_lock():
             yield
 
 
@@ -588,7 +640,7 @@ async def apply(
         # can neither steal this ROLLBACK TO/RELEASE nor commit out from under
         # this still-open savepoint.
         savepoint = f"control_apply_{uuid.uuid4().hex}"
-        async with _write_lock:
+        async with _write_lock():
             await conn.execute(f"SAVEPOINT {savepoint}")
             try:
                 await db.pipeline_controls.record_action(
@@ -758,7 +810,7 @@ async def release(
         # for the same reason `apply` needs both — see `_write_lock`'s
         # docstring.
         savepoint = f"control_release_{uuid.uuid4().hex}"
-        async with _write_lock:
+        async with _write_lock():
             await conn.execute(f"SAVEPOINT {savepoint}")
             try:
                 await db.pipeline_controls.delete_action(

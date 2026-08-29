@@ -14,6 +14,7 @@ on top of the checkpoint the failed attempt committed.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -217,6 +218,121 @@ async def test_duplicate_action_id_is_applied_exactly_once(tmp_path: Path) -> No
         assert first.accepted
         assert not second.accepted
         assert len(await controls.history(conn, ISSUE_ID)) == 1
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_replaying_an_already_applied_action_id_is_rejected_as_a_duplicate(
+    tmp_path: Path,
+) -> None:
+    """Unlike `test_duplicate_action_id_is_applied_exactly_once` above, this
+    replays an action that is still *allowed* after it lands — Abort stays
+    allowed in every mode/outcome — so the replay reaches `apply`'s duplicate
+    `action_id` guard (controls.py:622) instead of being turned away earlier
+    by the disallowed-action check on state alone."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _record_implement(conn, outcome=OUTCOMES.FAILED, reason="boom")
+        first = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.ABORT,
+            actor="web:cmd-1",
+            action_id="cmd-1",
+            at="2026-08-27T10:01:00+00:00",
+        )
+        assert first.accepted
+        assert ACTIONS.ABORT in first.snapshot.allowed_actions
+
+        second = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.ABORT,
+            actor="web:cmd-1",
+            action_id="cmd-1",
+            at="2026-08-27T10:02:00+00:00",
+        )
+        assert not second.accepted
+        assert second.rejection == "abort cmd-1 was already applied"
+        assert len(await controls.history(conn, ISSUE_ID)) == 1
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_duplicate_action_id_that_slips_past_the_precheck_is_still_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`apply`'s pre-check (controls.py:622) is what normally turns a
+    replayed `action_id` into a clean rejection before any write is
+    attempted. This forces that pre-check to miss the existing row — as a
+    race the per-issue lock doesn't cover could — so the duplicate instead
+    hits `record_action`'s primary-key `IntegrityError`, and asserts the
+    `except` block at controls.py:660 turns that into the same clean
+    rejection rather than raising."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await _record_implement(conn, outcome=OUTCOMES.FAILED, reason="boom")
+        first = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.ABORT,
+            actor="web:cmd-1",
+            action_id="cmd-1",
+            at="2026-08-27T10:01:00+00:00",
+        )
+        assert first.accepted
+
+        real_get_action = db.pipeline_controls.get_action
+        calls = 0
+
+        async def missing_precheck_then_real(
+            conn_: aiosqlite.Connection, issue_id_: str, action_id_: str
+        ) -> object:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return None
+            return await real_get_action(conn_, issue_id_, action_id_)
+
+        monkeypatch.setattr(db.pipeline_controls, "get_action", missing_precheck_then_real)
+
+        second = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.ABORT,
+            actor="web:cmd-1",
+            action_id="cmd-1",
+            at="2026-08-27T10:02:00+00:00",
+        )
+        assert not second.accepted
+        assert second.rejection == "abort cmd-1 was already applied"
+        assert len(await controls.history(conn, ISSUE_ID)) == 1
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_non_duplicate_integrity_error_still_propagates(tmp_path: Path) -> None:
+    """The `IntegrityError` fallback at controls.py:660 only exists to
+    reclassify a replayed `action_id`; a genuine constraint violation on the
+    same INSERT — here, `record_action`'s foreign key on an issue that was
+    never seeded — must not be swallowed as a false "already applied"."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            await controls.apply(
+                conn,
+                "no-such-issue",
+                ACTIONS.ABORT,
+                actor="web:cmd-1",
+                action_id="cmd-1",
+                at="2026-08-27T10:01:00+00:00",
+            )
+        assert await controls.history(conn, "no-such-issue") == []
     finally:
         await conn.close()
 
@@ -1007,6 +1123,28 @@ async def test_concurrent_retries_cannot_both_be_accepted(tmp_path: Path) -> Non
         assert len(history) == 1
     finally:
         await conn.close()
+
+
+def test_lock_and_write_lock_survive_a_fresh_event_loop() -> None:
+    """`_lock`/`_write_lock` used to be `asyncio.Lock`s created at import
+    time, outside any event loop. `asyncio.Lock` binds to whichever running
+    loop first *contends* it (waits on it while it is held), so a second,
+    unrelated `asyncio.run()` call that genuinely contends the same lock
+    object raised `RuntimeError: ... is bound to a different event loop` —
+    proven by two separate `asyncio.run()` calls each racing two tasks
+    through `guard_writes` for the same issue id. Both locks must instead be
+    created lazily per running loop so a second, later loop never collides
+    with a lock bound by an earlier one."""
+
+    async def _contend() -> None:
+        async def hold() -> None:
+            async with controls.guard_writes(ISSUE_ID):
+                await asyncio.sleep(0.01)
+
+        await asyncio.gather(hold(), hold())
+
+    asyncio.run(_contend())
+    asyncio.run(_contend())
 
 
 @pytest.mark.asyncio
