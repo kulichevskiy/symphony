@@ -1902,7 +1902,11 @@ class _MergeMixin(_OrchestratorBase):
             if review_cap_skip is None:
                 return
 
+        merge_started = False
+
         async def on_merge_started(new_run_id: str) -> None:
+            nonlocal merge_started
+            merge_started = True
             await self._clear_operator_wait(issue_id, run_id)
             try:
                 await tracker.post_comment(
@@ -1927,11 +1931,26 @@ class _MergeMixin(_OrchestratorBase):
                     e,
                 )
 
+        def _release_unclaimed_review_cap_skip(_: asyncio.Task[None]) -> None:
+            # `_merge_with_limits` can return early (e.g. `_refresh_merge_candidate`
+            # coming back `None` on a transient tracker error) without ever
+            # calling `on_merge_started`, and that failure surfaces on this
+            # done callback rather than as a synchronous raise out of
+            # `_schedule_merge` — so the `except BaseException` below alone
+            # cannot see it. Left unreleased, the accepted Skip would park the
+            # review-cap wait with no RETRY/SKIP action left to answer it
+            # (SYM-245 review).
+            if review_cap_skip is None or merge_started:
+                return
+            asyncio.create_task(
+                controls.release(self._conn, review_cap_skip, at=self._now().isoformat())
+            )
+
         try:
             # Reserved under `config_write_lock` — see
             # `_review_fix_dispatch_slot` in `_dispatch.py` (SYM-193 review).
             async with self._config_write_lock:
-                self._schedule_merge(
+                merge_task = self._schedule_merge(
                     binding=binding,
                     issue=issue,
                     pr_number=pr_number,
@@ -1939,6 +1958,7 @@ class _MergeMixin(_OrchestratorBase):
                     on_started=on_merge_started,
                     storage_issue_id=issue_id,
                 )
+                merge_task.add_done_callback(_release_unclaimed_review_cap_skip)
         except BaseException:
             if review_cap_skip is not None:
                 await controls.release(self._conn, review_cap_skip, at=self._now().isoformat())
@@ -2407,6 +2427,7 @@ class _MergeMixin(_OrchestratorBase):
             issue=issue,
             storage_issue_id=candidate.issue_id,
             pr_url=candidate.pr_url,
+            post_codex_review=binding.resolved_remote_review(),
         )
         return []
 

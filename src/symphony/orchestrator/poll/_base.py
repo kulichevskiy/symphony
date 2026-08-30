@@ -26,7 +26,7 @@ import re
 import shutil
 import tempfile
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
@@ -84,6 +84,7 @@ from ...github.client import GitHub, GitHubClient, GitHubError
 from ...github.webhook import GitHubWebhookEvent
 from ...linear.client import LinearError, comment_from_webhook_payload
 from ...linear.slash import SlashIntent, SlashKind
+from ...linear.slash import parse as parse_slash_intents
 from ...linear.templates import (
     CommentVars,
     awaiting_approval,
@@ -163,12 +164,15 @@ BindingKey = tuple[str, str, str, str, str]
 class _ImplementHandoff:
     """Context carried from a blocked-run Retry to the fresh implement run.
 
-    The verbatim blocked reason only — a Retry carries no command-text payload
-    (SYM-245). Instructions belong in the tracker, which the fresh attempt
-    re-reads on dispatch.
+    The verbatim blocked reason, plus the timestamp to re-read comments from —
+    a Retry carries no command-text payload of its own (SYM-245), so an
+    operator instruction left in a comment while the run was blocked is
+    surfaced by re-fetching comments since the blocked run started, rather
+    than accepted as part of the command.
     """
 
     blocked_reason: str
+    comments_since: str = ""
 
 
 @dataclass(frozen=True)
@@ -3249,16 +3253,34 @@ class _OrchestratorBase:
         storage_issue_id = storage_issue_id or issue.id
         # Consume a pending blocked-resume handoff (set when the operator
         # `$retry`d an IMPLEMENT_BLOCKED wait), so the fresh run's prompt
-        # carries the original block reason as diagnostic context. The
-        # operator's own command text is deliberately not carried: the fresh
-        # attempt refreshes its instructions from the tracker instead
+        # carries the original block reason as diagnostic context, plus any
+        # comments posted while the run was blocked. The operator's own
+        # command text is deliberately not carried: it is filtered out below
+        # by the same `slash.parse` the ingress uses to recognize it, so the
+        # fresh attempt refreshes its instructions from the tracker instead
         # (SYM-245).
         handoff = self._implement_handoffs.pop(storage_issue_id, None)
+        comments: Sequence[LinearComment] = ()
+        if handoff is not None and handoff.comments_since:
+            since = _parse_run_timestamp(handoff.comments_since)
+            if since is not None:
+                try:
+                    fetched = await self.tracker(binding).comments_since(issue.id, since)
+                except LinearError as e:
+                    log.warning(
+                        "could not fetch resume comments for %s: %s",
+                        issue.identifier,
+                        e,
+                    )
+                else:
+                    command_ids = {intent.comment_id for intent in parse_slash_intents(fetched)}
+                    comments = [c for c in fetched if c.id not in command_ids]
         prompt = implement_prompt(
             issue_title=issue.title,
             issue_body=issue.description,
             labels=list(issue.labels),
             blocked_reason=handoff.blocked_reason if handoff else None,
+            comments=comments,
         )
         role = binding.resolved_role("implement", self.config.roles)
         command = build_runner_command(

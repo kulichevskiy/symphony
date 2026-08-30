@@ -961,11 +961,14 @@ class _SlashCommandsMixin(_OrchestratorBase):
             return
         # The verbatim blocked reason survives as handoff context, but the
         # operator's command text does not: Retry carries no instruction
-        # payload. The fresh attempt re-reads the issue from the tracker
-        # instead, so whatever the operator wants it to know belongs in the
-        # description or a comment (SYM-245).
+        # payload. The fresh attempt re-reads the issue description from the
+        # tracker, plus any comments posted since the blocked run started, so
+        # whatever the operator wants it to know can be left in either place
+        # (SYM-245).
+        blocked_run = await db.runs.get_with_issue(self._conn, run_id)
         self._implement_handoffs[issue_id] = _ImplementHandoff(
             blocked_reason=await self._blocked_reason_for_run(run_id),
+            comments_since=blocked_run.run.started_at if blocked_run is not None else "",
         )
         try:
             await tracker.move_issue(tracker_issue_id, ready_id)

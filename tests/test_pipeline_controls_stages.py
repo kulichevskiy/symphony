@@ -512,6 +512,14 @@ async def test_failed_review_exposes_skip_and_it_advances_to_merge(tmp_path: Pat
             conn, kind=db.operator_waits.KIND_REVIEW_FAILED, stage="review", status="failed"
         )
         await _seed_review_state(conn)
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=ISSUE_ID,
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-08-28T09:00:00+00:00",
+        )
         await controls.record_stage_outcome(
             conn,
             ISSUE_ID,
@@ -539,6 +547,15 @@ async def test_failed_review_exposes_skip_and_it_advances_to_merge(tmp_path: Pat
         assert (await controls.snapshot(conn, ISSUE_ID)).outcome is OUTCOMES.SKIPPED
         assert orch._schedule_merge.call_count == 1  # type: ignore[attr-defined]  # noqa: SLF001
         assert await db.operator_waits.get(conn, ISSUE_ID) is None
+        # `_skip_failed_review` must scope the durable review-bypass row to the
+        # head it actually judged — dropping `head_sha` here would leave this
+        # whole suite green while resurrecting a stale bypass (SYM-245 review).
+        assert (
+            await db.issue_prs.review_bypass_head_sha(
+                conn, issue_id=ISSUE_ID, github_repo="org/repo", pr_number=42
+            )
+            == "sha-old"
+        )
         # The skip approved the commits that were on the PR at the time; a push
         # since then invalidates it and review is required again.
         assert (await controls.snapshot(conn, ISSUE_ID, fingerprint="sha-new")).outcome is (

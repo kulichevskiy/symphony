@@ -631,6 +631,23 @@ class _ReviewMixin(_OrchestratorBase):
             storage_issue_id: str | None = None,
         ) -> asyncio.Task[None]: ...
 
+        def _schedule_acceptance(
+            self,
+            *,
+            binding: RepoBinding,
+            issue: LinearIssue,
+            pr_number: int,
+            pr_url: str,
+            pr_head_sha: str,
+        ) -> asyncio.Task[None]: ...
+
+        async def _acceptance_passed_for_candidate(
+            self,
+            candidate: db.issue_prs.IssuePR,
+            binding: RepoBinding,
+            pr_head_sha: str,
+        ) -> bool: ...
+
         @staticmethod
         def _slash_text(intent: SlashIntent) -> str: ...
 
@@ -3137,19 +3154,41 @@ class _ReviewMixin(_OrchestratorBase):
         )
         if accepted is None:
             return
+        # Skip steps over *review* only: an acceptance stage still validates
+        # the artifact review would have, same as the approved-review path
+        # (`_dispatch_merge_candidate_decision`) — otherwise `$skip-review`
+        # would silently also skip a configured acceptance gate (SYM-245
+        # review).
+        candidate = await db.issue_prs.get(
+            self._conn, issue_id=issue_id, github_repo=binding.github_repo
+        )
+        needs_acceptance = binding.acceptance.mode != "off" and (
+            candidate is None
+            or not await self._acceptance_passed_for_candidate(candidate, binding, head_sha or "")
+        )
+        next_stage = "acceptance" if needs_acceptance else "merge"
         try:
             await self._clear_operator_wait(issue_id, run_id)
             # See the sibling reservations in `_slash_commands.py`: taken under
             # `config_write_lock` so the drain guard's `scheduled_slots` sample
             # cannot miss it (SYM-193 review).
             async with self._config_write_lock:
-                self._schedule_merge(
-                    binding=binding,
-                    issue=issue,
-                    pr_number=state.pr_number,
-                    pr_url=state.pr_url,
-                    skip_review=True,
-                )
+                if needs_acceptance:
+                    self._schedule_acceptance(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=state.pr_number,
+                        pr_url=state.pr_url,
+                        pr_head_sha=head_sha or "",
+                    )
+                else:
+                    self._schedule_merge(
+                        binding=binding,
+                        issue=issue,
+                        pr_number=state.pr_number,
+                        pr_url=state.pr_url,
+                        skip_review=True,
+                    )
             # Recorded after the fallible steps above, not before: if
             # `_schedule_merge` never runs, the bypass must not land either, so
             # a release genuinely restores the pre-skip state instead of
@@ -3185,9 +3224,10 @@ class _ReviewMixin(_OrchestratorBase):
             await controls.release(self._conn, accepted, at=self._now().isoformat())
             raise
         log.info(
-            "skip-review: advancing parked %s (PR #%d) directly to merge",
+            "skip-review: advancing parked %s (PR #%d) directly to %s",
             issue.identifier,
             state.pr_number,
+            next_stage,
         )
         v = CommentVars(
             stage="review",
@@ -3195,7 +3235,7 @@ class _ReviewMixin(_OrchestratorBase):
             issue=state.pr_number,
             pr_url=state.pr_url,
             run_id=run_id,
-            next_stage="merge",
+            next_stage=next_stage,
         )
         try:
             await self.tracker(binding).post_comment(issue.id, truncate_body(skip_review_forced(v)))
@@ -3471,6 +3511,7 @@ class _ReviewMixin(_OrchestratorBase):
             issue_id=issue_id,
             github_repo=binding.github_repo,
             pr_number=state.pr_number,
+            head_sha=await self._pr_head_sha_or_none(binding, state.pr_number) or "",
         )
         # Mark the review run completed and cancel its asyncio task immediately so
         # it cannot dispatch any more fix runs mid-iteration.

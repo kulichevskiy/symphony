@@ -68,7 +68,8 @@ async def upsert(
             created_at = excluded.created_at,
             merged_at  = NULL,
             parked_at  = NULL,
-            review_bypassed = excluded.review_bypassed
+            review_bypassed = excluded.review_bypassed,
+            review_bypassed_head_sha = ''
         """,
         (
             issue_id,
