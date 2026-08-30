@@ -566,6 +566,59 @@ async def test_failed_review_exposes_skip_and_it_advances_to_merge(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_skip_failed_review_settles_the_parked_run_so_it_is_not_resurrected(
+    tmp_path: Path,
+) -> None:
+    """`_skip_failed_review` records the bypass and advances the pipeline, but
+    the parked review *run* it skipped over is still `failed` unless this also
+    settles it — and a `failed`/`interrupted` review run for an open,
+    un-merged PR is exactly what `list_orphaned_review_prs` resurrects a
+    review monitor for, re-pinging `@codex` on the PR the operator just
+    skipped (SYM-245 review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_operator_wait(
+            conn, kind=db.operator_waits.KIND_REVIEW_FAILED, stage="review", status="failed"
+        )
+        await _seed_review_state(conn)
+        # Precede the run's `started_at` (2026-05-10) so `list_orphaned_review_prs`'s
+        # `r.started_at >= p.created_at` scoping actually picks up this PR.
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=ISSUE_ID,
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-05-01T00:00:00+00:00",
+        )
+        await controls.record_stage_outcome(
+            conn,
+            ISSUE_ID,
+            stage=controls.REVIEW_STAGE,
+            outcome=OUTCOMES.FAILED,
+            reason="CI red",
+            run_id=RUN_ID,
+            at="2026-08-28T09:30:00+00:00",
+        )
+
+        orch = _orch(conn, tmp_path)
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+        orch._review_failed_run_bindings[RUN_ID] = _binding()  # noqa: SLF001
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(return_value={"headRefOid": "sha-old"})
+        orch._gh_client = AsyncMock(return_value=gh)  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._handle_review_failed_slash_intent(  # noqa: SLF001
+            ISSUE_ID, RUN_ID, _intent(SlashKind.SKIP_REVIEW, comment_id="c-skip")
+        )
+
+        orphaned = await db.issue_prs.list_orphaned_review_prs(conn)
+        assert [p.pr_number for p in orphaned] == []
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_skip_failed_review_releases_the_accepted_skip_when_a_side_effect_raises(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -755,6 +808,61 @@ async def test_skip_failed_review_schedules_merge_against_storage_issue_id(
         orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
         kwargs = orch._schedule_merge.call_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
         assert kwargs["storage_issue_id"] == scoped_issue_id
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_deliver_failed_retry_settles_control_row_when_handoff_already_started(
+    tmp_path: Path,
+) -> None:
+    """The common `handoff failed: …` park: the previous attempt already wrote
+    handoff metadata, so this retry's `_deliver_review_handoff` takes the
+    `not first_handoff` branch, which only settles the *run's* status — the
+    `first_handoff` branch's control-row settle at `_lifecycle.py:1375` never
+    runs. Without settling here too, `pipeline_controls` is stuck
+    `delivery`/`pending` (Retry dropped from `allowed_actions`, but nothing
+    parked to answer it and `reconcile_interrupted_retries` never sees a
+    `pending` row) even though delivery actually succeeded (SYM-245 review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_operator_wait(
+            conn, kind=db.operator_waits.KIND_DELIVER_FAILED, stage="implement", status="failed"
+        )
+        await controls.record_stage_outcome(
+            conn,
+            ISSUE_ID,
+            stage=controls.DELIVERY_STAGE,
+            outcome=OUTCOMES.FAILED,
+            reason="handoff failed: boom",
+            run_id=RUN_ID,
+            at="2026-08-28T09:30:00+00:00",
+        )
+        orch = _orch(conn, tmp_path)
+        orch._deliver_failed_run_bindings[RUN_ID] = _binding()  # noqa: SLF001
+        ctx = MagicMock()
+        ctx.retry_workspace_acquired = False
+        orch._resolve_pending_delivery = AsyncMock(return_value=ctx)  # type: ignore[method-assign]  # noqa: SLF001
+
+        async def _fake_deliver(*, ctx: object) -> str:
+            # Stands in for the real `_deliver_implement_run` succeeding on
+            # the `not first_handoff` resume path: it only settles the run.
+            await db.runs.update_status(
+                conn, RUN_ID, "completed", ended_at="2026-08-28T09:35:00+00:00"
+            )
+            return RUN_ID
+
+        orch._deliver_implement_run = _fake_deliver  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._handle_deliver_failed_slash_intent(  # noqa: SLF001
+            ISSUE_ID, RUN_ID, _intent(SlashKind.RETRY, comment_id="c-retry")
+        )
+
+        assert await db.operator_waits.get(conn, ISSUE_ID) is None
+        snapshot = await controls.snapshot(conn, ISSUE_ID)
+        assert snapshot.outcome is OUTCOMES.SUCCEEDED, (
+            f"delivery succeeded but the control row is {snapshot.stage}/{snapshot.outcome}"
+        )
     finally:
         await conn.close()
 

@@ -2086,13 +2086,23 @@ class _OrchestratorBase:
         async def _settle(*, commit: bool) -> None:
             current = await db.pipeline_controls.get(self._conn, issue_id)
             if current is not None and (
-                current.run_id != run_id or current.stage != stage
+                current.run_id not in (None, run_id) or current.stage != stage
             ):
                 # A later stage already parked over this row mid-handoff (e.g.
                 # review failing synchronously while a delivery park is being
                 # cleared) — settling here would clobber that newer park with
                 # this stage's stale outcome, so leave the control row alone
-                # and only drop this call's own operator wait.
+                # and only drop this call's own operator wait. `run_id is None`
+                # is not that case: an accepted Retry/Skip on this same stage
+                # already committed the control row to `pending`/`skipped`
+                # with `run_id` dropped (`controls.apply`'s `_next_mode_and_
+                # outcome`), and no later stage has claimed the row (`stage`
+                # still matches) — that `None` is this call's own in-flight
+                # attempt, not an external one, so it must not block the
+                # settle (SYM-245 review: a caller settling a resumed retry
+                # with no intervening re-park — e.g. delivery's `not
+                # first_handoff` resume — always hit this branch and silently
+                # dropped the settle).
                 await self._clear_operator_wait(issue_id, run_id, commit=commit)
                 return
             await controls.record_stage_outcome(

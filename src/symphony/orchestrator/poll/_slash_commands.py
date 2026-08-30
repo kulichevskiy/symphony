@@ -1631,7 +1631,18 @@ class _SlashCommandsMixin(_OrchestratorBase):
                 raise
             run = await db.runs.get_with_issue(self._conn, run_id)
             if run is not None and run.run.status in db.runs.SUCCESS_STATUSES:
-                await self._clear_operator_wait(issue_id, run_id)
+                # A retry whose previous attempt already wrote handoff
+                # metadata (`first_handoff=False` in `_deliver_review_handoff`)
+                # only settles the run's status, not the control row — mirror
+                # the `first_handoff=True` settle at `_lifecycle.py:1375` here
+                # too, or the row stays `pending` with no wait behind it for
+                # `reconcile_interrupted_retries` to sweep (SYM-245 review).
+                await self._clear_stage_park(
+                    issue_id,
+                    run_id,
+                    kind=db.operator_waits.KIND_DELIVER_FAILED,
+                    outcome=controls.AttemptOutcome.SUCCEEDED,
+                )
         finally:
             if ctx.retry_workspace_acquired:
                 self._workspace.release(ctx.binding, ctx.issue)

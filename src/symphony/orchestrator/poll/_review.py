@@ -3202,6 +3202,22 @@ class _ReviewMixin(_OrchestratorBase):
                 pr_number=state.pr_number,
                 head_sha=head_sha or "",
             )
+            # The parked review run is still `failed`/`interrupted` (a
+            # review-cap park already settled its run to `completed` when it
+            # parked). Left unsettled, `list_orphaned_review_prs` sees a dead
+            # review run for an open, un-bypassed-looking PR and resurrects a
+            # review monitor that re-pings `@codex` for the PR the operator
+            # just skipped (SYM-245 review).
+            if wait is not None and wait.kind in (
+                db.operator_waits.KIND_REVIEW_FAILED,
+                db.operator_waits.KIND_REVIEW_STOPPED,
+            ):
+                await db.runs.update_status(
+                    self._conn,
+                    run_id,
+                    "completed",
+                    ended_at=self._now().isoformat(),
+                )
         except BaseException:
             # `_clear_operator_wait` already popped `_dispatch_run_ids`/
             # `_operator_wait_run_ids`/the binding-tracking dict for this run

@@ -802,6 +802,14 @@ async def test_review_cap_skip_review_advances_to_merge(tmp_path: Path) -> None:
             status="completed",
         )
         await _seed_review_state(conn, pr_number=166)
+        await db.issue_prs.upsert(
+            conn,
+            issue_id="iss-1",
+            github_repo="org/repo",
+            pr_number=166,
+            pr_url="https://github.com/org/repo/pull/166",
+            created_at="2026-05-26T12:00:00+00:00",
+        )
         await controls.record_stage_outcome(
             conn,
             "iss-1",
@@ -814,6 +822,9 @@ async def test_review_cap_skip_review_advances_to_merge(tmp_path: Path) -> None:
 
         orch = _make_orch(cfg, linear, conn)
         orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(return_value={"headRefOid": "sha-cap"})
+        orch._gh_client = AsyncMock(return_value=gh)  # type: ignore[method-assign]  # noqa: SLF001
 
         await orch._poll_slash_commands()  # noqa: SLF001
 
@@ -824,6 +835,13 @@ async def test_review_cap_skip_review_advances_to_merge(tmp_path: Path) -> None:
         assert await db.operator_waits.get(conn, "iss-1") is None
         snapshot = await controls.snapshot(conn, "iss-1")
         assert snapshot.outcome is controls.AttemptOutcome.SKIPPED
+        assert snapshot.fingerprint == "sha-cap"
+        assert (
+            await db.issue_prs.review_bypass_head_sha(
+                conn, issue_id="iss-1", github_repo="org/repo", pr_number=166
+            )
+            == "sha-cap"
+        )
     finally:
         await conn.close()
 
