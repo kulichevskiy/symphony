@@ -3188,6 +3188,7 @@ class _ReviewMixin(_OrchestratorBase):
                         pr_number=state.pr_number,
                         pr_url=state.pr_url,
                         skip_review=True,
+                        storage_issue_id=issue_id,
                     )
             # Recorded after the fallible steps above, not before: if
             # `_schedule_merge` never runs, the bypass must not land either, so

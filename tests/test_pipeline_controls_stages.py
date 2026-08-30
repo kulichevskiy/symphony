@@ -676,6 +676,90 @@ async def test_skip_failed_review_re_arms_ingress_when_schedule_merge_raises(
 
 
 @pytest.mark.asyncio
+async def test_skip_failed_review_schedules_merge_against_storage_issue_id(
+    tmp_path: Path,
+) -> None:
+    """For a scoped-tracker issue, `issue.id` (the tracker's own id, returned by
+    `lookup_issue`) differs from the storage id. `_schedule_merge`'s follow-up
+    state (`_dispatch_run_ids`, `_scheduled_issue_ids`, `runs`) all key off the
+    storage id, same as every sibling `_schedule_merge` call site, so
+    `_skip_failed_review` must pass `storage_issue_id` explicitly instead of
+    letting it default to `issue.id` (SYM-245 review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _binding().model_copy(
+            update={"tracker_provider": "linear-alt", "tracker_site": "secondary"}
+        )
+        tracker_issue = _issue()
+        # Force a storage-id collision so the secondary-tracker upsert falls
+        # back to a scoped storage id distinct from the tracker issue id.
+        await db.issues.upsert(
+            conn,
+            id=tracker_issue.id,
+            identifier="ENG-0",
+            title="Default issue",
+            team_key=tracker_issue.team_key,
+        )
+        scoped_issue_id = await db.issues.upsert(
+            conn,
+            id=tracker_issue.id,
+            identifier=tracker_issue.identifier,
+            title=tracker_issue.title,
+            team_key=tracker_issue.team_key,
+            provider=binding.tracker_provider,
+            site=binding.tracker_site,
+        )
+        assert scoped_issue_id != tracker_issue.id
+
+        await _seed_operator_wait(
+            conn,
+            issue_id=scoped_issue_id,
+            kind=db.operator_waits.KIND_REVIEW_FAILED,
+            stage="review",
+            status="failed",
+        )
+        await _seed_review_state(conn, issue_id=scoped_issue_id)
+        await db.issue_prs.upsert(
+            conn,
+            issue_id=scoped_issue_id,
+            github_repo="org/repo",
+            pr_number=42,
+            pr_url="https://github.com/org/repo/pull/42",
+            created_at="2026-08-28T09:00:00+00:00",
+        )
+        await controls.record_stage_outcome(
+            conn,
+            scoped_issue_id,
+            stage=controls.REVIEW_STAGE,
+            outcome=OUTCOMES.FAILED,
+            reason="CI red",
+            run_id=RUN_ID,
+            at="2026-08-28T09:30:00+00:00",
+        )
+
+        cfg = Config(repos=[binding], db_path=tmp_path / "s.sqlite")
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=tracker_issue)
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        orch = _make_orch(cfg, linear, conn)
+        orch._schedule_merge = MagicMock()  # type: ignore[method-assign]  # noqa: SLF001
+        orch._review_failed_run_bindings[RUN_ID] = binding  # noqa: SLF001
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(return_value={"headRefOid": "sha-old"})
+        orch._gh_client = AsyncMock(return_value=gh)  # type: ignore[method-assign]  # noqa: SLF001
+
+        await orch._handle_review_failed_slash_intent(  # noqa: SLF001
+            scoped_issue_id, RUN_ID, _intent(SlashKind.SKIP_REVIEW, comment_id="c-skip")
+        )
+
+        orch._schedule_merge.assert_called_once()  # type: ignore[attr-defined]  # noqa: SLF001
+        kwargs = orch._schedule_merge.call_args.kwargs  # type: ignore[attr-defined]  # noqa: SLF001
+        assert kwargs["storage_issue_id"] == scoped_issue_id
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_deliver_failed_retry_goes_through_the_canonical_transition(
     tmp_path: Path,
 ) -> None:

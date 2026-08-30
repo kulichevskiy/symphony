@@ -3193,6 +3193,112 @@ async def test_branch_ahead_with_pending_handoff_runs_agent_and_consumes_prompt(
 
 
 @pytest.mark.asyncio
+async def test_branch_ahead_handoff_refreshes_comments_but_drops_symphony_noise(
+    tmp_path: Path,
+) -> None:
+    """A blocked-run `$retry` handoff refreshes comments posted since the run
+    blocked, but a comment authored by Symphony itself (e.g. a park/blocked
+    handoff notice) must not be pasted back into the fresh prompt (SYM-245
+    review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+        linear.comments_since = AsyncMock(
+            return_value=[
+                LinearComment(
+                    id="c-operator",
+                    body="please also handle the edge case with empty input",
+                    created_at="2026-08-20T00:00:01Z",
+                    author_name="operator",
+                    author_is_me=False,
+                    external_thread_type=None,
+                ),
+                LinearComment(
+                    id="c-botnoise",
+                    body="BOTNOISE blocked handoff: reply with $retry once done",
+                    created_at="2026-08-20T00:00:02Z",
+                    author_name="Symphony",
+                    author_is_me=True,
+                    external_thread_type=None,
+                ),
+                LinearComment(
+                    id="c-mirrored",
+                    body="MIRRORED external-thread comment",
+                    created_at="2026-08-20T00:00:03Z",
+                    author_name="someone",
+                    author_is_me=False,
+                    external_thread_type="github",
+                ),
+            ]
+        )
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+        _git(workspace_path, "commit", "--allow-empty", "-m", "prior blocked work")
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        def _commit_handoff_retry(spec: RunnerSpec) -> None:
+            if spec.stage == "implement":
+                _git(workspace_path, "commit", "--allow-empty", "-m", "handoff retry")
+
+        runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(
+                    kind="stdout",
+                    line=_done_result_line("Resumed and finished.\n\nSYMPHONY_DONE"),
+                ),
+                RunnerEvent(kind="exit", returncode=0),
+            ],
+            on_run=_commit_handoff_retry,
+        )
+        push_fn = AsyncMock()
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._implement_handoffs["iss-1"] = _ImplementHandoff(  # noqa: SLF001
+            blocked_reason="authorize the deployment OAuth URL",
+            comments_since="2026-08-20T00:00:00Z",
+        )
+
+        await orch._dispatch_one(binding, _issue())  # noqa: SLF001
+
+        prompt = runner.specs[0].command[-1]
+        assert "please also handle the edge case with empty input" in prompt
+        assert "BOTNOISE" not in prompt
+        assert "MIRRORED external-thread comment" not in prompt
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_branch_ahead_short_circuit_releases_workspace_when_gate_raises(
     tmp_path: Path,
 ) -> None:

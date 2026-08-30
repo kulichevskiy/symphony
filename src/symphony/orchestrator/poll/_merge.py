@@ -1942,9 +1942,17 @@ class _MergeMixin(_OrchestratorBase):
             # (SYM-245 review).
             if review_cap_skip is None or merge_started:
                 return
-            asyncio.create_task(
+            # Retained on `_dispatch_tasks` like every other fire-and-forget
+            # task this class schedules (e.g. `_schedule_merge` below):
+            # without a live reference, the event loop only holds a weak one,
+            # so this release can be garbage-collected mid-flight and any
+            # exception in it would go unobserved, leaving the review-cap
+            # park `SKIPPED` with no action left to answer it (SYM-245 review).
+            release_task = asyncio.create_task(
                 controls.release(self._conn, review_cap_skip, at=self._now().isoformat())
             )
+            self._dispatch_tasks.add(release_task)
+            release_task.add_done_callback(self._dispatch_tasks.discard)
 
         try:
             # Reserved under `config_write_lock` — see

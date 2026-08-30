@@ -3255,8 +3255,9 @@ class _OrchestratorBase:
         # `$retry`d an IMPLEMENT_BLOCKED wait), so the fresh run's prompt
         # carries the original block reason as diagnostic context, plus any
         # comments posted while the run was blocked. The operator's own
-        # command text is deliberately not carried: it is filtered out below
-        # by the same `slash.parse` the ingress uses to recognize it, so the
+        # command text is deliberately not carried, nor is Symphony's own
+        # noise: comments recognized as slash commands, posted by Symphony
+        # itself, or mirrored from an external thread are all dropped so the
         # fresh attempt refreshes its instructions from the tracker instead
         # (SYM-245).
         handoff = self._implement_handoffs.pop(storage_issue_id, None)
@@ -3274,7 +3275,13 @@ class _OrchestratorBase:
                     )
                 else:
                     command_ids = {intent.comment_id for intent in parse_slash_intents(fetched)}
-                    comments = [c for c in fetched if c.id not in command_ids]
+                    comments = [
+                        c
+                        for c in fetched
+                        if c.id not in command_ids
+                        and not c.author_is_me
+                        and c.external_thread_type is None
+                    ]
         prompt = implement_prompt(
             issue_title=issue.title,
             issue_body=issue.description,

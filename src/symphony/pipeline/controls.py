@@ -671,20 +671,23 @@ async def record_stage_outcome(
 
 
 async def reconcile_interrupted_retries(conn: aiosqlite.Connection, *, at: str) -> None:
-    """Startup sweep for a daemon that died between an accepted Retry's commit
-    and its side effect (moving the issue on, then clearing the park): that
-    leaves a `pipeline_controls` row pending with the stage's park still open,
-    and nothing else will ever revisit it on its own. Reset any such row back
-    to failed on the way up so Retry/Skip are offered again instead of a
-    permanently stuck park. Covers every park kind modeled as a stage attempt
+    """Startup sweep for a daemon that died between an accepted Retry or Skip's
+    commit and its side effect (moving the issue on, then clearing the park):
+    that leaves a `pipeline_controls` row `PENDING` (Retry) or `SKIPPED`
+    (Skip) with the stage's park still open, and nothing else will ever
+    revisit it on its own. Reset any such row back to failed on the way up so
+    Retry/Skip are offered again instead of a permanently stuck park — a
+    stuck `SKIPPED` row is worse than a stuck `PENDING` one, since its
+    `allowed_actions` offer neither Retry nor Skip and only `$stop` can clear
+    it. Covers every park kind modeled as a stage attempt
     (`stage_for_wait_kind`), not just implement (SYM-245).
 
-    The interrupted Retry's own action row is dropped in the same transaction
-    as the reset. It was recorded before the side effect that never ran, so
-    its `action_id` (typically a tracker comment id) is still sitting in the
+    The interrupted action's own row is dropped in the same transaction as
+    the reset. It was recorded before the side effect that never ran, so its
+    `action_id` (typically a tracker comment id) is still sitting in the
     ingress's replay window; leaving the row behind would make `apply` reject
     that identical re-delivery as a duplicate even though the reset just
-    advertised Retry as available again.
+    advertised Retry/Skip as available again.
 
     Scoped to startup (rather than folded into `snapshot`) so a still-live
     process — where a wait reappearing while an attempt is genuinely pending
@@ -696,8 +699,17 @@ async def reconcile_interrupted_retries(conn: aiosqlite.Connection, *, at: str) 
         if stage is None:
             continue
         row = await db.pipeline_controls.get(conn, wait.issue_id)
-        pending = row is not None and row.outcome == str(AttemptOutcome.PENDING)
-        if row is None or row.stage != stage or not pending:
+        # A daemon can also die between an accepted Skip's commit (outcome
+        # `SKIPPED`) and its side effect (`_clear_operator_wait`/
+        # `_schedule_merge`), leaving the same kind of stuck park behind: the
+        # park's `allowed_actions` for `SKIPPED` offer neither Retry nor Skip,
+        # so only `$stop` could ever clear it without this reset (SYM-245
+        # review).
+        interrupted = row is not None and row.outcome in (
+            str(AttemptOutcome.PENDING),
+            str(AttemptOutcome.SKIPPED),
+        )
+        if row is None or row.stage != stage or not interrupted:
             continue
         run = await db.runs.get_with_issue(conn, wait.run_id)
         detail = run.run.termination_detail if run is not None else None
@@ -705,8 +717,14 @@ async def reconcile_interrupted_retries(conn: aiosqlite.Connection, *, at: str) 
             (
                 action
                 for action in reversed(await db.pipeline_controls.list_actions(conn, wait.issue_id))
-                if action.action == str(ControlAction.RETRY)
-                and action.to_outcome == str(AttemptOutcome.PENDING)
+                if (
+                    action.action == str(ControlAction.RETRY)
+                    and action.to_outcome == str(AttemptOutcome.PENDING)
+                )
+                or (
+                    action.action == str(ControlAction.SKIP)
+                    and action.to_outcome == str(AttemptOutcome.SKIPPED)
+                )
             ),
             None,
         )
