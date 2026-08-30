@@ -68,6 +68,7 @@ from ...linear.templates import (
     truncate_body,
 )
 from ...notify import EVENT_OPERATOR_WAIT, EVENT_PR_MERGED
+from ...pipeline import controls
 from ...pipeline.cost_guard import UsageDelta
 from ...pipeline.local_review_loop import (
     LoopOutcome,
@@ -1706,6 +1707,64 @@ class _MergeMixin(_OrchestratorBase):
                 issue_id,
             )
 
+    async def _retry_review_cap_park(
+        self, issue_id: str, run_id: str, intent: SlashIntent, binding: RepoBinding
+    ) -> None:
+        """Canonical Retry for a review-cap park: one more review pass.
+
+        Same transition, same durable gate and same resume path a
+        review-failed park's Retry uses — the park kind decides which stage is
+        retried, not which command handler the comment happened to reach
+        (SYM-245).
+
+        This does not reset `review_state.iteration`, which is already at the
+        cap: a CHANGES_REQUESTED verdict on the resumed monitor re-parks
+        immediately without dispatching a fix run (`_review_fix_dispatch_gate`),
+        so this Retry deliberately buys exactly one more verdict, not a fresh
+        fix-run budget. Only an APPROVED verdict makes progress; a second
+        CHANGES_REQUESTED needs another operator Retry (or a Skip).
+        """
+        tracker_issue_id, _ = await self._tracker_identity_for_issue(issue_id)
+        try:
+            issue = await self.tracker(binding).lookup_issue(tracker_issue_id)
+        except LinearError as e:
+            log.warning("could not look up %s for review-cap retry: %s", issue_id, e)
+            raise SlashHandlerFailure(
+                slash_text=self._slash_text(intent),
+                reason=f"could not look up issue for review-cap retry: {e}",
+            ) from e
+        # Captured before `_resume_review_monitor` clears the wait, so a
+        # release can put the exact same durable wait back (SYM-245 review).
+        wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
+        accepted = await self._accept_control_action(issue_id, controls.ControlAction.RETRY, intent)
+        if accepted is None:
+            return
+        try:
+            await self._resume_review_monitor(
+                binding=binding,
+                issue=issue,
+                issue_id=issue_id,
+                tracker_issue_id=tracker_issue_id,
+                run_id=run_id,
+            )
+        except BaseException:
+            # `_resume_review_monitor` clears the operator wait (popping
+            # `_dispatch_run_ids`/`_operator_wait_run_ids`/the binding dict)
+            # before the work that can raise here; re-arm them into
+            # `_merge_needs_approval_bindings` — the dict this review-cap park
+            # actually came from, not `_review_failed_run_bindings` — and
+            # re-insert the durable wait row too, since the in-memory re-arm
+            # alone leaves the stale-wait guard and
+            # `_restore_operator_wait_binding` with no row to authorize a
+            # re-delivered command against (SYM-245 review).
+            self._dispatch_run_ids[issue_id] = run_id
+            self._operator_wait_run_ids.add(run_id)
+            self._merge_needs_approval_bindings[run_id] = binding
+            if wait is not None:
+                await self._reopen_operator_wait(wait)
+            await controls.release(self._conn, accepted, at=self._now().isoformat())
+            raise
+
     async def _handle_merge_needs_approval_slash_intent(
         self, issue_id: str, run_id: str, intent: SlashIntent
     ) -> None:
@@ -1731,16 +1790,23 @@ class _MergeMixin(_OrchestratorBase):
             and wait is not None
             and wait.kind == db.operator_waits.KIND_REVIEW_CAP
         ):
-            # The review-cap park only advertises `$approve` (force-advance) and
-            # `$reject` (stop) — `$retry` falling into the shared "re-dispatch the
-            # merge" path below would merge without another review pass, which is
-            # not what an operator retrying a review-cap park intends.
-            await self._post_command_rejected(
-                issue_id,
-                self._slash_text(intent),
-                "$retry is not supported for a review-cap park; reply $approve to "
-                "force-advance or $reject to stop",
-            )
+            # A review-cap park is a *review* stage failure, so its Retry means
+            # "review again", not the shared "re-dispatch the merge" path below
+            # — which would merge without another review pass, the opposite of
+            # what retrying a review-cap park intends. `$approve` still
+            # force-advances to merge and `$reject` still stops (SYM-245).
+            await self._retry_review_cap_park(issue_id, run_id, intent, binding)
+            return
+        if (
+            intent.kind is SlashKind.SKIP_REVIEW
+            and wait is not None
+            and wait.kind == db.operator_waits.KIND_REVIEW_CAP
+        ):
+            # A review-cap park is a modeled review-stage failure, so Skip is
+            # on offer for it same as `review_failed`/`review_stopped` — route
+            # it through the same canonical Skip rather than falling into the
+            # `ignored` branch below (SYM-245 review).
+            await self._skip_failed_review(issue_id, run_id, intent, binding)
             return
         if intent.kind is SlashKind.APPROVE:
             parked_pr = await db.issue_prs.get(
@@ -1784,7 +1850,14 @@ class _MergeMixin(_OrchestratorBase):
                         slash_text=self._slash_text(intent),
                         reason=f"could not move issue to blocked state: {e}",
                     ) from e
-            await self._clear_operator_wait(issue_id, run_id)
+            # A review-cap park is a modeled review-stage failure, so clearing
+            # it must settle that stage's control row too; a plain merge park
+            # is not modeled and just drops its wait (SYM-245).
+            await self._clear_stage_park(
+                issue_id,
+                run_id,
+                kind=(wait.kind if wait is not None else db.operator_waits.KIND_MERGE),
+            )
             return
         if intent.kind not in (SlashKind.APPROVE, SlashKind.RETRY):
             log.info("slash %s for merge-needs-approval run %s ignored", intent.kind, run_id)
@@ -1811,7 +1884,29 @@ class _MergeMixin(_OrchestratorBase):
             pr_number,
         )
 
+        review_cap_skip: controls.ActionResult | None = None
+        if wait is not None and wait.kind == db.operator_waits.KIND_REVIEW_CAP:
+            # `$approve` here force-advances a review-cap park straight to
+            # merge without another review pass — the operator's judgement
+            # steps over review, the same as any other validation-stage Skip
+            # — so it goes through the same canonical `_accept_control_action`
+            # gate (action row, `comment_id` idempotency, head-scoped
+            # fingerprint) before the merge is scheduled, rather than a bare
+            # `_clear_stage_park` settle with none of that (SYM-245 review).
+            review_cap_skip = await self._accept_control_action(
+                issue_id,
+                controls.ControlAction.SKIP,
+                intent,
+                fingerprint=await self._pr_head_sha_or_none(binding, pr_number),
+            )
+            if review_cap_skip is None:
+                return
+
+        merge_started = False
+
         async def on_merge_started(new_run_id: str) -> None:
+            nonlocal merge_started
+            merge_started = True
             await self._clear_operator_wait(issue_id, run_id)
             try:
                 await tracker.post_comment(
@@ -1836,17 +1931,46 @@ class _MergeMixin(_OrchestratorBase):
                     e,
                 )
 
-        # Reserved under `config_write_lock` — see `_review_fix_dispatch_slot`
-        # in `_dispatch.py` (SYM-193 review).
-        async with self._config_write_lock:
-            self._schedule_merge(
-                binding=binding,
-                issue=issue,
-                pr_number=pr_number,
-                pr_url=pr_url,
-                on_started=on_merge_started,
-                storage_issue_id=issue_id,
+        def _release_unclaimed_review_cap_skip(_: asyncio.Task[None]) -> None:
+            # `_merge_with_limits` can return early (e.g. `_refresh_merge_candidate`
+            # coming back `None` on a transient tracker error) without ever
+            # calling `on_merge_started`, and that failure surfaces on this
+            # done callback rather than as a synchronous raise out of
+            # `_schedule_merge` — so the `except BaseException` below alone
+            # cannot see it. Left unreleased, the accepted Skip would park the
+            # review-cap wait with no RETRY/SKIP action left to answer it
+            # (SYM-245 review).
+            if review_cap_skip is None or merge_started:
+                return
+            # Retained on `_dispatch_tasks` like every other fire-and-forget
+            # task this class schedules (e.g. `_schedule_merge` below):
+            # without a live reference, the event loop only holds a weak one,
+            # so this release can be garbage-collected mid-flight and any
+            # exception in it would go unobserved, leaving the review-cap
+            # park `SKIPPED` with no action left to answer it (SYM-245 review).
+            release_task = asyncio.create_task(
+                controls.release(self._conn, review_cap_skip, at=self._now().isoformat())
             )
+            self._dispatch_tasks.add(release_task)
+            release_task.add_done_callback(self._dispatch_tasks.discard)
+
+        try:
+            # Reserved under `config_write_lock` — see
+            # `_review_fix_dispatch_slot` in `_dispatch.py` (SYM-193 review).
+            async with self._config_write_lock:
+                merge_task = self._schedule_merge(
+                    binding=binding,
+                    issue=issue,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    on_started=on_merge_started,
+                    storage_issue_id=issue_id,
+                )
+                merge_task.add_done_callback(_release_unclaimed_review_cap_skip)
+        except BaseException:
+            if review_cap_skip is not None:
+                await controls.release(self._conn, review_cap_skip, at=self._now().isoformat())
+            raise
 
     async def _parked_closed_unmerged_pr_for_event(
         self, event: GitHubWebhookEvent
@@ -2210,6 +2334,16 @@ class _MergeMixin(_OrchestratorBase):
             return pre.handled
         assert pre.view is not None
         view = pre.view
+        head_sha = str(view.get("headRefOid") or "")
+
+        # A `$skip-review` bypass approves the head it was given, not the
+        # review stage in perpetuity: a later push invalidates it and review
+        # is required again (SYM-245 AC — "Skip ... expires when that input
+        # changes").
+        if await self._review_bypass_stale(candidate, head_sha):
+            return await self._resume_review_for_stale_bypass(
+                candidate=candidate, binding=binding, issue=issue
+            )
 
         try:
             verdict = await self._review_verdict_for_pr(
@@ -2226,7 +2360,6 @@ class _MergeMixin(_OrchestratorBase):
             )
             return []
 
-        head_sha = str(view.get("headRefOid") or "")
         readiness = await self._merge_candidate_no_signal_readiness(
             candidate=candidate,
             binding=binding,
@@ -2256,6 +2389,55 @@ class _MergeMixin(_OrchestratorBase):
             head_sha=head_sha,
             readiness=readiness,
         )
+
+    async def _review_bypass_stale(
+        self, candidate: db.issue_prs.IssuePR, head_sha: str
+    ) -> bool:
+        """True when `candidate` was approved by `$skip-review` for a head
+        that is no longer current.
+
+        An empty `head_sha` (GitHub could not say) never counts as stale — a
+        transient lookup failure must not undo an operator's decision. An
+        empty recorded bypass head means the skip was itself unscoped (the
+        head could not be read at skip time); that also never expires.
+        """
+        if not head_sha:
+            return False
+        bypassed_head = await db.issue_prs.review_bypass_head_sha(
+            self._conn,
+            issue_id=candidate.issue_id,
+            github_repo=candidate.github_repo,
+            pr_number=candidate.pr_number,
+        )
+        return bool(bypassed_head) and bypassed_head != head_sha
+
+    async def _resume_review_for_stale_bypass(
+        self,
+        *,
+        candidate: db.issue_prs.IssuePR,
+        binding: RepoBinding,
+        issue: LinearIssue,
+    ) -> list[asyncio.Task[None]]:
+        """Re-require review for a PR whose `$skip-review` bypass no longer
+        covers its current head (SYM-245).
+
+        `_start_review_stage` upserts `issue_prs` with `review_bypassed`
+        defaulted to `False`, so starting a fresh review run also clears the
+        stale bypass in the same call.
+        """
+        log.info(
+            "review-bypass head moved for %s#%d — re-requiring review",
+            binding.github_repo,
+            candidate.pr_number,
+        )
+        await self._start_review_stage(
+            binding=binding,
+            issue=issue,
+            storage_issue_id=candidate.issue_id,
+            pr_url=candidate.pr_url,
+            post_codex_review=binding.resolved_remote_review(),
+        )
+        return []
 
     async def _resolve_merge_candidate(
         self, candidate: db.issue_prs.IssuePR

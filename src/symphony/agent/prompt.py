@@ -9,6 +9,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
+from ..tracker import Comment
+
 REVIEW_LOG_TAIL_BYTES = 12_000
 REQUIRED_CHECK_LOG_TAIL_LINES = 200
 
@@ -74,33 +76,53 @@ COMPLETION_CONTRACT_ALREADY_DONE = (
 )
 
 
-def implement_handoff_block(*, blocked_reason: str = "", operator_comment: str = "") -> str:
+def _format_handoff_comments(comments: Sequence[Comment]) -> str:
+    if not comments:
+        return ""
+    entries = "\n".join(
+        f"### {c.author_name} ({c.created_at})\n{c.body.strip()}\n" for c in comments
+    )
+    return f"## Comments since the blocked run\n\n{entries}\n"
+
+
+def implement_handoff_block(
+    *, blocked_reason: str | None = None, comments: Sequence[Comment] = ()
+) -> str:
     """Render the operator-handoff section for a blocked-run resume.
 
-    Returns "" when there is no handoff context. Otherwise it states the
-    original `SYMPHONY_BLOCKED` reason, the operator's `$retry` comment text
-    (which may carry tokens/instructions the agent now needs), and tells the
-    fresh run that prior work is preserved in the workspace.
+    Returns "" when there is no handoff at all (`blocked_reason=None`).
+    Otherwise it tells the fresh run that prior work is preserved in the
+    workspace, and states the original `SYMPHONY_BLOCKED` reason only when one
+    was captured — `_blocked_reason_for_run` returns "" for a missing run row
+    or an empty termination detail, which is still a real handoff (a prior
+    run's worktree to resume, not a fresh one) and must not be conflated with
+    "no handoff happened" (SYM-245 review).
+
+    The operator's own Retry command text is deliberately not part of this
+    block: Retry carries no instruction payload (SYM-245). The issue
+    *description* is re-read in full on every attempt regardless, and
+    `comments` (fetched by the caller since the blocked run started) is
+    rendered here so a decision left only in a comment while the run was
+    blocked is not lost (SYM-245 review).
     """
-    blocked_reason = (blocked_reason or "").strip()
-    operator_comment = (operator_comment or "").strip()
-    if not blocked_reason and not operator_comment:
+    if blocked_reason is None:
         return ""
-    parts = [
-        "# Operator handoff (resumed after a block)\n\n",
+    blocked_reason = blocked_reason.strip()
+    reason_section = f"## Original blocked reason\n\n{blocked_reason}\n\n" if blocked_reason else ""
+    comments_section = _format_handoff_comments(comments)
+    return (
+        "# Operator handoff (resumed after a block)\n\n"
         "A prior run on this issue stopped blocked on a human action. The "
-        "operator has since acted and resumed you with `$retry`.\n\n",
-    ]
-    if blocked_reason:
-        parts.append(f"## Original blocked reason\n\n{blocked_reason}\n\n")
-    if operator_comment:
-        parts.append(f"## Operator's resume instructions\n\n{operator_comment}\n\n")
-    parts.append(
+        "operator has since acted and resumed you.\n\n"
+        f"{reason_section}"
+        "The issue description above/below is freshly re-read for this "
+        "attempt — if the operator recorded a decision there (a token, a "
+        "correction), it is there, not in this block.\n\n"
+        f"{comments_section}"
         "Prior work from the blocked run is preserved in this workspace (it was "
         "NOT reset). Start with `git status` and review the diff before making "
         "changes, then continue from where the prior run left off.\n\n"
     )
-    return "".join(parts)
 
 
 def implement_prompt(
@@ -108,8 +130,8 @@ def implement_prompt(
     issue_title: str,
     issue_body: str,
     labels: list[str],
-    blocked_reason: str = "",
-    operator_comment: str = "",
+    blocked_reason: str | None = None,
+    comments: Sequence[Comment] = (),
 ) -> str:
     """Build the system+user prompt for the Implement stage.
 
@@ -118,14 +140,16 @@ def implement_prompt(
     current branch — the orchestrator pushes after the run, but does not
     do its own commits.
 
-    On a blocked-run resume, `blocked_reason` / `operator_comment` populate a
-    handoff block placed before the issue so the agent sees it first.
+    On a blocked-run resume, `blocked_reason` populates a handoff block placed
+    before the issue so the agent sees it first. `None` means this is not a
+    resume at all; `""` means it is one but no reason was captured — both the
+    handoff block and its "## Original blocked reason" section handle that
+    distinction (SYM-245 review). `comments` are rendered in that same block
+    (ignored when `blocked_reason` is `None`) — see `implement_handoff_block`.
     """
     label_line = ", ".join(labels) if labels else "(no labels)"
     body = issue_body.strip() if issue_body else "(no description)"
-    handoff = implement_handoff_block(
-        blocked_reason=blocked_reason, operator_comment=operator_comment
-    )
+    handoff = implement_handoff_block(blocked_reason=blocked_reason, comments=comments)
     return (
         "You are Symphony's Implement-stage agent.\n"
         "Make the code changes that satisfy the following Linear issue.\n\n"

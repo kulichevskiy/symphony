@@ -1,4 +1,4 @@
-"""Durable issue-level pipeline controls (SYM-244, slice 1/9).
+"""Durable issue-level pipeline controls (SYM-244 slice 1/9, SYM-245 slice 2/9).
 
 The external surface is deliberately two calls:
 
@@ -11,9 +11,14 @@ The external surface is deliberately two calls:
 Two rules hold the design together:
 
   * **The reason never selects a handler.** `allowed_actions` is a pure
-    function of mode and outcome; `reason` rides along as operator-facing data.
-    A new failure string can therefore widen what an operator is *told*
-    without widening what the daemon will *do*.
+    function of mode, outcome and stage; `reason` rides along as
+    operator-facing data. A new failure string can therefore widen what an
+    operator is *told* without widening what the daemon will *do*. `stage` is
+    in that function only to *narrow* it: Retry is canonical for any failed
+    stage, while Skip exists for the validation stages alone
+    (`VALIDATION_STAGES`) — implement, delivery and merge produce or publish
+    the artifact, so stepping over one would advance the pipeline past work
+    that never happened (SYM-245).
   * **Nothing is dispatched that isn't recorded.** `apply` writes the action
     row and the new control row in one transaction and commits *before* the
     caller runs any side effect, so a crash mid-command leaves either "no
@@ -54,21 +59,27 @@ Two rules hold the design together:
     action row and restoring the previous control row) instead of propagating
     a bare `sqlite3.OperationalError`.
 
-Only the implement stage records outcomes today, and only as `FAILED` (a
-parked attempt), `SKIPPED` (a `$stop`/`$reject` clear, or a tracker
-cancellation, with nothing parked to retry), or `SUCCEEDED` (the reconciler's
-orphan-PR adoption settling a stale `implement_failed` park once it finds the
-work already landed a PR) — nothing in production records `RUNNING`, and
-nothing routes a *retried* run's own success back through this module yet. A
-row therefore stays `implement`/`pending` (from an accepted Retry) even once
-the retried run actually succeeds, and `snapshot`'s `pending` outcome must be
-read as "no failure recorded since the last transition", not "currently
-running": callers should not treat it as proof an attempt is live.
-`PipelineMode.PAUSING` is likewise unreachable in production until something
-records `RUNNING`. Later slices extend `record_stage_outcome` to the
-remaining stages, record `RUNNING` for implement and route a retried run's
-own success through this module, and wire the remaining actions to side
-effects; this interface does not change.
+Every stage that can *park* for an operator records its outcome
+(`_STAGE_BY_WAIT_KIND` is the map from park kind to stage), and only as
+`FAILED` (a parked attempt), `SKIPPED` (a `$stop`/`$reject` clear or a tracker
+cancellation with nothing parked to retry, and an accepted Skip of a
+validation stage), or `SUCCEEDED` (the reconciler's orphan-PR adoption
+settling a stale `implement_failed` park once it finds the work already landed
+a PR). Nothing in production records `RUNNING`, and nothing routes a *retried*
+run's own success back through this module yet. A row therefore stays
+`<stage>`/`pending` (from an accepted Retry) even once the retried run
+actually succeeds, and `snapshot`'s `pending` outcome must be read as "no
+failure recorded since the last transition", not "currently running": callers
+should not treat it as proof an attempt is live. `PipelineMode.PAUSING` is
+likewise unreachable in production until something records `RUNNING`.
+
+Because no stage records a *live* attempt yet, a stage that has not failed is
+invisible here — which is why the live-monitor `$skip-review` bypass (skipping
+a review that is still running, rather than answering a park) is not routed
+through `apply` yet: there is no recorded stage attempt for it to move. Later
+slices record `RUNNING`, route a retried run's own success through this
+module, and wire the remaining actions to side effects; this interface does
+not change.
 """
 
 from __future__ import annotations
@@ -198,6 +209,7 @@ async def _apply_landed_durably(
     mode: PipelineMode,
     outcome: AttemptOutcome,
     run_id: str | None,
+    fingerprint: str | None,
 ) -> bool:
     """Whether `apply`'s action row and control row are actually on disk with
     the values this call wrote — used after a `release_savepoint` miss to
@@ -212,6 +224,7 @@ async def _apply_landed_durably(
         and control_row.mode == str(mode)
         and control_row.outcome == str(outcome)
         and control_row.run_id == run_id
+        and control_row.fingerprint == fingerprint
     )
 
 
@@ -246,6 +259,7 @@ async def _release_landed_durably(
         and control_row.mode == str(previous.mode)
         and control_row.outcome == str(previous.outcome)
         and control_row.run_id == previous.run_id
+        and control_row.fingerprint == previous.fingerprint
     )
 
 
@@ -255,6 +269,7 @@ async def _sweep_landed_durably(
     interrupted_retry: db.pipeline_controls.ControlActionRow | None,
     *,
     run_id: str,
+    stage: str,
 ) -> bool:
     """Mirror of `_apply_landed_durably` for `reconcile_interrupted_retries`'s
     per-wait reset: the interrupted retry's action row (if any) must be gone
@@ -268,7 +283,7 @@ async def _sweep_landed_durably(
     control_row = await db.pipeline_controls.get(conn, issue_id)
     return (
         control_row is not None
-        and control_row.stage == IMPLEMENT_STAGE
+        and control_row.stage == stage
         and control_row.outcome == str(AttemptOutcome.FAILED)
         and control_row.run_id == run_id
     )
@@ -306,6 +321,7 @@ async def _restore_previous_row(
         run_id=previous.run_id,
         actor=actor,
         updated_at=updated_at,
+        fingerprint=previous.fingerprint,
         commit=commit,
     )
 
@@ -392,6 +408,41 @@ _ACTION_ORDER: tuple[ControlAction, ...] = (
 )
 
 IMPLEMENT_STAGE = "implement"
+DELIVERY_STAGE = "delivery"
+REVIEW_STAGE = "review"
+ACCEPTANCE_STAGE = "acceptance"
+
+# The only stages a Skip may step over (SYM-245). Review and acceptance
+# *validate* an artifact that already exists, so an operator who has judged it
+# by hand can legitimately record that judgement and move on. Implement,
+# delivery and merge *produce or publish* the artifact itself: skipping one
+# would advance the pipeline past work that never happened, so they only ever
+# offer Retry.
+VALIDATION_STAGES: frozenset[str] = frozenset({REVIEW_STAGE, ACCEPTANCE_STAGE})
+
+# Which stage each durable operator park belongs to. The park kind is the one
+# durable fact every ingress agrees on, so deriving the stage from it (rather
+# than from whichever in-memory binding dict happened to route the command)
+# keeps Retry reachable across a restart and keeps one park kind from being
+# answered as if it were another. Kinds absent here — `merge`, `budget_exceeded`
+# — are outside this slice: they record no stage outcome and their existing
+# handlers still own them.
+_STAGE_BY_WAIT_KIND: dict[str, str] = {
+    db.operator_waits.KIND_IMPLEMENT_FAILED: IMPLEMENT_STAGE,
+    db.operator_waits.KIND_IMPLEMENT_BLOCKED: IMPLEMENT_STAGE,
+    db.operator_waits.KIND_DELIVER_FAILED: DELIVERY_STAGE,
+    db.operator_waits.KIND_REVIEW_FAILED: REVIEW_STAGE,
+    db.operator_waits.KIND_REVIEW_STOPPED: REVIEW_STAGE,
+    db.operator_waits.KIND_REVIEW_CAP: REVIEW_STAGE,
+    db.operator_waits.KIND_ACCEPTANCE_BLOCKED: ACCEPTANCE_STAGE,
+    db.operator_waits.KIND_ACCEPTANCE_REJECTED: ACCEPTANCE_STAGE,
+}
+
+
+def stage_for_wait_kind(kind: str) -> str | None:
+    """The pipeline stage a durable operator park belongs to, or `None` for a
+    park this slice does not model as a stage attempt."""
+    return _STAGE_BY_WAIT_KIND.get(kind)
 
 
 @dataclass(frozen=True)
@@ -404,6 +455,9 @@ class ControlSnapshot:
     reason: str | None
     run_id: str | None
     allowed_actions: tuple[ControlAction, ...]
+    # The stage input a recorded Skip approved; see `VALIDATION_STAGES` and
+    # `snapshot`'s `fingerprint` argument. `None` on every non-skip state.
+    fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -431,18 +485,24 @@ class ActionResult:
     action_id: str | None = None
 
 
-def allowed_actions(mode: PipelineMode, outcome: AttemptOutcome) -> tuple[ControlAction, ...]:
-    """The actions a pipeline in this (mode, outcome) accepts.
+def allowed_actions(
+    mode: PipelineMode, outcome: AttemptOutcome, stage: str | None = None
+) -> tuple[ControlAction, ...]:
+    """The actions a pipeline in this (mode, outcome, stage) accepts.
 
-    Derived from those two fields and nothing else — see the module docstring
-    on why the diagnostic reason is kept out of it.
+    Derived from those three fields and nothing else — see the module docstring
+    on why the diagnostic reason is kept out of it. `stage` only ever *narrows*
+    the result: Retry is canonical for any failed stage, while Skip is offered
+    for the validation stages alone (`VALIDATION_STAGES`).
     """
     allowed = {ControlAction.ABORT}
     allowed.add(ControlAction.PAUSE if mode is PipelineMode.PLAYING else ControlAction.PLAY)
     if outcome is AttemptOutcome.FAILED:
         # A finished-and-failed attempt is the only state where re-running the
         # stage or stepping over it is meaningful.
-        allowed.update({ControlAction.RETRY, ControlAction.SKIP})
+        allowed.add(ControlAction.RETRY)
+        if stage in VALIDATION_STAGES:
+            allowed.add(ControlAction.SKIP)
     return tuple(action for action in _ACTION_ORDER if action in allowed)
 
 
@@ -454,6 +514,7 @@ def _snapshot(
     outcome: AttemptOutcome,
     reason: str | None,
     run_id: str | None,
+    fingerprint: str | None = None,
 ) -> ControlSnapshot:
     return ControlSnapshot(
         issue_id=issue_id,
@@ -462,17 +523,44 @@ def _snapshot(
         outcome=outcome,
         reason=reason,
         run_id=run_id,
-        allowed_actions=allowed_actions(mode, outcome),
+        allowed_actions=allowed_actions(mode, outcome, stage),
+        fingerprint=fingerprint,
     )
 
 
-async def snapshot(conn: aiosqlite.Connection, issue_id: str) -> ControlSnapshot:
+def _skip_has_expired(row: db.pipeline_controls.ControlRow, fingerprint: str | None) -> bool:
+    """Whether a recorded Skip no longer covers the stage's current input.
+
+    A Skip approves *what was validated*, not the stage forever: it is written
+    with the input fingerprint at skip time (the PR head SHA where one
+    applies), so a caller that knows the current fingerprint gets the stage
+    back as `FAILED` — needing validation again — once that input moves on.
+    A caller that passes no fingerprint (or a row written without one, e.g. a
+    stage with no meaningful input) makes no claim about the input and leaves
+    the skip standing.
+    """
+    return (
+        row.outcome == str(AttemptOutcome.SKIPPED)
+        and bool(row.fingerprint)
+        and fingerprint is not None
+        and fingerprint != row.fingerprint
+    )
+
+
+async def snapshot(
+    conn: aiosqlite.Connection, issue_id: str, *, fingerprint: str | None = None
+) -> ControlSnapshot:
     """Read the control state for an issue.
 
     The `pipeline_controls` row wins whenever it exists. When it doesn't, the
     state is derived from the durable park that predates this module — an issue
     parked before the upgrade still has to offer Retry — and otherwise defaults
     to a playing pipeline with no attempt yet.
+
+    `fingerprint` is the stage's current input as the caller sees it (the PR
+    head SHA for a review/acceptance stage). It only affects a recorded Skip:
+    passing an input that differs from the one the Skip approved expires that
+    skip, so the stage reads as failed and needs validating again (SYM-245).
 
     Known gap left for this slice: a later implement run for the same issue
     can complete without ever going through this module (e.g. an operator
@@ -490,22 +578,28 @@ async def snapshot(conn: aiosqlite.Connection, issue_id: str) -> ControlSnapshot
     row = await db.pipeline_controls.get(conn, issue_id)
     if row is None:
         return await _derived_snapshot(conn, issue_id)
+    outcome = AttemptOutcome(row.outcome)
+    expired = _skip_has_expired(row, fingerprint)
+    if expired:
+        outcome = AttemptOutcome.FAILED
     return _snapshot(
         issue_id,
         mode=PipelineMode(row.mode),
         stage=row.stage,
-        outcome=AttemptOutcome(row.outcome),
+        outcome=outcome,
         reason=row.reason,
         run_id=row.run_id,
+        fingerprint=None if expired else row.fingerprint,
     )
 
 
 async def _derived_snapshot(conn: aiosqlite.Connection, issue_id: str) -> ControlSnapshot:
-    """Control state for an issue with no control row: read the durable
-    implement park, so a wait opened before this table existed still exposes
-    Retry after the upgrade."""
+    """Control state for an issue with no control row: read the durable park,
+    so a wait opened before this table existed — or before its stage started
+    recording outcomes — still exposes Retry after the upgrade."""
     wait = await db.operator_waits.get(conn, issue_id)
-    if wait is None or wait.kind != db.operator_waits.KIND_IMPLEMENT_FAILED:
+    stage = None if wait is None else stage_for_wait_kind(wait.kind)
+    if wait is None or stage is None:
         return _snapshot(
             issue_id,
             mode=PipelineMode.PLAYING,
@@ -519,7 +613,7 @@ async def _derived_snapshot(conn: aiosqlite.Connection, issue_id: str) -> Contro
     return _snapshot(
         issue_id,
         mode=PipelineMode.PLAYING,
-        stage=IMPLEMENT_STAGE,
+        stage=stage,
         outcome=AttemptOutcome.FAILED,
         reason=detail or None,
         run_id=wait.run_id,
@@ -535,6 +629,7 @@ async def record_stage_outcome(
     reason: str | None,
     run_id: str | None,
     at: str,
+    fingerprint: str | None = None,
     commit: bool = True,
 ) -> ControlSnapshot:
     """Record where the pipeline is and how its latest attempt ended.
@@ -561,6 +656,7 @@ async def record_stage_outcome(
         run_id=run_id,
         actor=None,
         updated_at=at,
+        fingerprint=fingerprint,
         commit=commit,
     )
     return _snapshot(
@@ -570,23 +666,28 @@ async def record_stage_outcome(
         outcome=outcome,
         reason=reason,
         run_id=run_id,
+        fingerprint=fingerprint,
     )
 
 
 async def reconcile_interrupted_retries(conn: aiosqlite.Connection, *, at: str) -> None:
-    """Startup sweep for a daemon that died between an accepted Retry's commit
-    and its side effect (moving the issue to ready, then clearing the park):
-    that leaves a `pipeline_controls` row pending with the implement-failed
-    wait still open, and nothing else will ever revisit it on its own. Reset
-    any such row back to failed on the way up so Retry/Skip are offered again
-    instead of a permanently stuck park.
+    """Startup sweep for a daemon that died between an accepted Retry or Skip's
+    commit and its side effect (moving the issue on, then clearing the park):
+    that leaves a `pipeline_controls` row `PENDING` (Retry) or `SKIPPED`
+    (Skip) with the stage's park still open, and nothing else will ever
+    revisit it on its own. Reset any such row back to failed on the way up so
+    Retry/Skip are offered again instead of a permanently stuck park — a
+    stuck `SKIPPED` row is worse than a stuck `PENDING` one, since its
+    `allowed_actions` offer neither Retry nor Skip and only `$stop` can clear
+    it. Covers every park kind modeled as a stage attempt
+    (`stage_for_wait_kind`), not just implement (SYM-245).
 
-    The interrupted Retry's own action row is dropped in the same transaction
-    as the reset. It was recorded before the side effect that never ran, so
-    its `action_id` (typically a tracker comment id) is still sitting in the
+    The interrupted action's own row is dropped in the same transaction as
+    the reset. It was recorded before the side effect that never ran, so its
+    `action_id` (typically a tracker comment id) is still sitting in the
     ingress's replay window; leaving the row behind would make `apply` reject
     that identical re-delivery as a duplicate even though the reset just
-    advertised Retry as available again.
+    advertised Retry/Skip as available again.
 
     Scoped to startup (rather than folded into `snapshot`) so a still-live
     process — where a wait reappearing while an attempt is genuinely pending
@@ -594,11 +695,21 @@ async def reconcile_interrupted_retries(conn: aiosqlite.Connection, *, at: str) 
     rejecting it.
     """
     for wait in await db.operator_waits.list_all(conn):
-        if wait.kind != db.operator_waits.KIND_IMPLEMENT_FAILED:
+        stage = stage_for_wait_kind(wait.kind)
+        if stage is None:
             continue
         row = await db.pipeline_controls.get(conn, wait.issue_id)
-        pending = row is not None and row.outcome == str(AttemptOutcome.PENDING)
-        if row is None or row.stage != IMPLEMENT_STAGE or not pending:
+        # A daemon can also die between an accepted Skip's commit (outcome
+        # `SKIPPED`) and its side effect (`_clear_operator_wait`/
+        # `_schedule_merge`), leaving the same kind of stuck park behind: the
+        # park's `allowed_actions` for `SKIPPED` offer neither Retry nor Skip,
+        # so only `$stop` could ever clear it without this reset (SYM-245
+        # review).
+        interrupted = row is not None and row.outcome in (
+            str(AttemptOutcome.PENDING),
+            str(AttemptOutcome.SKIPPED),
+        )
+        if row is None or row.stage != stage or not interrupted:
             continue
         run = await db.runs.get_with_issue(conn, wait.run_id)
         detail = run.run.termination_detail if run is not None else None
@@ -606,8 +717,14 @@ async def reconcile_interrupted_retries(conn: aiosqlite.Connection, *, at: str) 
             (
                 action
                 for action in reversed(await db.pipeline_controls.list_actions(conn, wait.issue_id))
-                if action.action == str(ControlAction.RETRY)
-                and action.to_outcome == str(AttemptOutcome.PENDING)
+                if (
+                    action.action == str(ControlAction.RETRY)
+                    and action.to_outcome == str(AttemptOutcome.PENDING)
+                )
+                or (
+                    action.action == str(ControlAction.SKIP)
+                    and action.to_outcome == str(AttemptOutcome.SKIPPED)
+                )
             ),
             None,
         )
@@ -634,7 +751,7 @@ async def reconcile_interrupted_retries(conn: aiosqlite.Connection, *, at: str) 
                 await record_stage_outcome(
                     conn,
                     wait.issue_id,
-                    stage=IMPLEMENT_STAGE,
+                    stage=stage,
                     outcome=AttemptOutcome.FAILED,
                     reason=detail or None,
                     run_id=wait.run_id,
@@ -653,7 +770,7 @@ async def reconcile_interrupted_retries(conn: aiosqlite.Connection, *, at: str) 
             # both writes without `release_savepoint` ever seeing a missing
             # savepoint (SYM-244 review).
             if not await _sweep_landed_durably(
-                conn, wait.issue_id, interrupted_retry, run_id=wait.run_id
+                conn, wait.issue_id, interrupted_retry, run_id=wait.run_id, stage=stage
             ):
                 # Foreign rollback, not foreign commit: redo the reset for
                 # real instead of leaving the pending row (and the
@@ -669,7 +786,7 @@ async def reconcile_interrupted_retries(conn: aiosqlite.Connection, *, at: str) 
                 await record_stage_outcome(
                     conn,
                     wait.issue_id,
-                    stage=IMPLEMENT_STAGE,
+                    stage=stage,
                     outcome=AttemptOutcome.FAILED,
                     reason=detail or None,
                     run_id=wait.run_id,
@@ -709,6 +826,7 @@ async def apply(
     actor: str,
     action_id: str,
     at: str,
+    fingerprint: str | None = None,
 ) -> ActionResult:
     """Accept or reject one action, atomically.
 
@@ -719,9 +837,15 @@ async def apply(
     The whole snapshot-to-commit sequence is serialized per issue (see
     `_lock`), so two concurrent applies for the same issue can never both read
     the same "current" snapshot and both get accepted.
+
+    `fingerprint` is the stage's current input (the PR head SHA for a
+    review/acceptance stage). It does two jobs, both only for Skip: it expires
+    a stale skip when reading the current state (so a stage whose input moved
+    on is failed and actionable again), and an accepted Skip is stamped with
+    it so a later input change expires *this* skip in turn (SYM-245).
     """
     async with _lock(issue_id):
-        current = await snapshot(conn, issue_id)
+        current = await snapshot(conn, issue_id, fingerprint=fingerprint)
         if action not in current.allowed_actions:
             return ActionResult(
                 accepted=False,
@@ -742,6 +866,19 @@ async def apply(
         # an intent-only one keeps them.
         reason = current.reason if outcome is current.outcome else None
         run_id = current.run_id if outcome is current.outcome else None
+        # Only a Skip *action* carries an input fingerprint; every other
+        # action drops whatever a previous skip had recorded, so a stale
+        # value can never outlive the skip it scoped — except one that
+        # replays the current outcome unchanged (PLAY/PAUSE/ABORT all do),
+        # which must preserve `current.fingerprint` rather than a caller's
+        # unrelated (usually absent) argument, or an already-skipped row
+        # loses its scope out from under a caller who passed none (SYM-245
+        # review; SYM-246 wires PLAY/PAUSE/ABORT onto a skipped row).
+        next_fingerprint = (
+            fingerprint
+            if action is ControlAction.SKIP
+            else (current.fingerprint if outcome is current.outcome else None)
+        )
         # Whether `pipeline_controls` actually held a row for `current` before
         # this call, as opposed to `current` being a value `snapshot` derived
         # with no backing row (e.g. via `_derived_snapshot`) — read separately
@@ -822,6 +959,7 @@ async def apply(
                     run_id=run_id,
                     actor=actor,
                     updated_at=at,
+                    fingerprint=next_fingerprint,
                     commit=False,
                 )
             except BaseException:
@@ -872,7 +1010,13 @@ async def apply(
             # savepoint. Only a fresh read tells that apart from the normal
             # case where everything actually landed (SYM-244 review).
             if not await _apply_landed_durably(
-                conn, issue_id, action_id, mode=mode, outcome=outcome, run_id=run_id
+                conn,
+                issue_id,
+                action_id,
+                mode=mode,
+                outcome=outcome,
+                run_id=run_id,
+                fingerprint=next_fingerprint,
             ):
                 # Either write above did not land as intended — a foreign
                 # rollback destroyed both, or a foreign commit landed only the
@@ -909,6 +1053,7 @@ async def apply(
                     run_id=run_id,
                     actor=actor,
                     updated_at=at,
+                    fingerprint=next_fingerprint,
                     commit=True,
                 )
         return ActionResult(
@@ -920,6 +1065,7 @@ async def apply(
                 outcome=outcome,
                 reason=reason,
                 run_id=run_id,
+                fingerprint=next_fingerprint,
             ),
             previous=current,
             previous_had_row=had_previous_row,
@@ -962,6 +1108,7 @@ async def release(
             and current_row.mode == str(result.snapshot.mode)
             and current_row.outcome == str(result.snapshot.outcome)
             and current_row.run_id == result.snapshot.run_id
+            and current_row.fingerprint == result.snapshot.fingerprint
         )
         # Scoped like `apply`'s SAVEPOINT: `conn` is the one connection shared
         # by the whole daemon, so a bare `conn.rollback()` here would discard
@@ -1063,7 +1210,11 @@ async def history(
 
 
 __all__ = [
+    "ACCEPTANCE_STAGE",
+    "DELIVERY_STAGE",
     "IMPLEMENT_STAGE",
+    "REVIEW_STAGE",
+    "VALIDATION_STAGES",
     "ActionResult",
     "AttemptOutcome",
     "ControlAction",
@@ -1079,4 +1230,5 @@ __all__ = [
     "release_savepoint",
     "rollback_to_savepoint",
     "snapshot",
+    "stage_for_wait_kind",
 ]

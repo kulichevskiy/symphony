@@ -33,6 +33,7 @@ from ...linear.templates import (
     truncate_body,
 )
 from ...notify import EVENT_RUN_FAILED
+from ...pipeline import controls
 from ...pipeline.cost_guard import UsageCostEstimator as _UsageCostEstimator
 from ...pipeline.cost_guard import UsageDelta
 from ...pipeline.local_review import LocalVerdict, StreamApiError
@@ -1364,7 +1365,19 @@ class _LifecycleMixin(_OrchestratorBase):
             await self._park_deliver_failed(f"handoff failed: {e}", ctx=ctx, exc=e)
             return run_id
         if first_handoff:
-            await self._clear_operator_wait(ctx.storage_issue_id, run_id)
+            # `_track_delivery_handoff_recovery_wait` recorded this stage as
+            # `failed` before the handoff ran, so a daemon death mid-handoff
+            # still offers Retry. The handoff just succeeded, so settle that
+            # row to `succeeded` — not the plain `_clear_operator_wait` a real
+            # deliver-failed clear uses — or `pipeline_controls` durably keeps
+            # reporting a failed delivery attempt for an issue that has
+            # already moved on to review/merge (SYM-245 review).
+            await self._clear_stage_park(
+                ctx.storage_issue_id,
+                run_id,
+                kind=db.operator_waits.KIND_DELIVER_FAILED,
+                outcome=controls.AttemptOutcome.SUCCEEDED,
+            )
             # The run now continues into the review/merge stage, so it stays the
             # active dispatch run for this issue. `_clear_operator_wait` drops the
             # `_dispatch_run_ids` entry (correct when tearing down a parked wait,

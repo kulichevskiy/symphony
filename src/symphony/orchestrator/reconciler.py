@@ -1122,6 +1122,7 @@ class Reconciler:
             issue_label=binding.issue_label,
             commit=False,
         )
+        own_wait_upsert = False
         if review_configured:
             review_run_status = "running"
             if local_review_configured and not remote_review_configured:
@@ -1159,6 +1160,13 @@ class Reconciler:
                     tracker_site=binding.tracker_site,
                     commit=False,
                 )
+                # This upsert just replaced whatever wait `issue_id` had with
+                # a fresh `KIND_REVIEW_FAILED` one of our own — not an
+                # external actor — so the settle check below must not compare
+                # a post-upsert re-read against the original `wait` (it would
+                # never match `wait.run_id` again and silently skip settling
+                # every time). Settle against the control row alone instead.
+                own_wait_upsert = True
         else:
             # No review configured: the success path routes straight to merge
             # with review_bypassed=True and starts no review stage. Land the
@@ -1171,12 +1179,14 @@ class Reconciler:
             team_key=team_key,
             state_name=target_state,
         )
-        if wait is not None and wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
+        adopted_stage = None if wait is None else controls.stage_for_wait_kind(wait.kind)
+        if wait is not None and adopted_stage is not None:
             # Settle the durable control row before the wait it backs is
             # deleted or overwritten below, so `pipeline_controls` never keeps
-            # reporting `implement`/`failed` (Retry offered, no park behind
-            # it) for an issue whose implement work actually landed a PR
-            # (SYM-244 review). Covers both sub-cases: the explicit delete
+            # reporting that stage as `failed` (Retry offered, no park behind
+            # it) for an issue whose work actually landed a PR (SYM-244
+            # review; every modeled park kind since SYM-245 — `_PARKED_WAIT_KINDS`
+            # also probes `deliver_failed`). Covers both sub-cases: the explicit delete
             # right below, and the needs-approval sub-case that instead
             # upserts a `KIND_REVIEW_FAILED` wait over this row without ever
             # calling `delete`.
@@ -1194,33 +1204,72 @@ class Reconciler:
             # `run_id`) but the ingress only clears the wait afterwards, once
             # its own tracker move and comment succeed — so the *wait* can
             # still match `wait.run_id` here even though the control row it
-            # backs has already moved on (SYM-244 review). Re-read the control
-            # row too and require it still reports the `failed` outcome this
-            # call observed before settling to `succeeded`.
+            # backs has already moved on (SYM-244 review). Require the control
+            # row to still report the `failed` outcome this call observed
+            # before settling to `succeeded`.
+            #
+            # The needs-approval sub-case is different: it already upserted
+            # its own fresh `KIND_REVIEW_FAILED` wait over this row above
+            # (`own_wait_upsert`), not an external actor, so a post-upsert
+            # re-read of the *wait* would never match `wait.run_id`/`wait.kind`
+            # again and this settle would silently no-op for that sub-case
+            # every time (SYM-245 review). Check the control row alone there —
+            # it still catches a genuine external race (e.g. a Retry accepted
+            # concurrently moves it to `pending` before this read).
             current_wait = await db.operator_waits.get(self._conn, issue_id)
             control_row = await db.pipeline_controls.get(self._conn, issue_id)
-            if (
-                current_wait is not None
-                and current_wait.run_id == wait.run_id
-                and current_wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED
-                and (
-                    control_row is None
-                    or (
-                        control_row.outcome == str(controls.AttemptOutcome.FAILED)
-                        and control_row.run_id == wait.run_id
-                    )
-                )
-            ):
+            still_parked = (
+                control_row is not None
+                and control_row.outcome == str(controls.AttemptOutcome.FAILED)
+                and control_row.run_id == wait.run_id
+            )
+            if own_wait_upsert:
+                # This sub-case just upserted its own fresh `KIND_REVIEW_FAILED`
+                # wait (`review_run_id`) above instead of clearing the original
+                # park. Settling the control row to `<adopted_stage>`/`succeeded`
+                # here would leave that fresh wait backed by a row that no
+                # longer reports a failed stage, making the park it just opened
+                # unanswerable (SYM-245 review). Record the new review park
+                # instead of settling the old stage — unconditionally, not
+                # gated on `still_parked`: `review_run_id` is generated by this
+                # call and not yet committed anywhere, so there is no external
+                # park this write could be racing to protect, only the wait
+                # this call just upserted above (SYM-245 review: an
+                # `own_wait_upsert` with `still_parked` false left that fresh
+                # wait backed by whatever row a concurrent Retry had committed,
+                # which neither `_accept_control_action` nor
+                # `reconcile_interrupted_retries` could ever answer).
                 await controls.record_stage_outcome(
                     self._conn,
                     issue_id,
-                    stage=controls.IMPLEMENT_STAGE,
-                    outcome=controls.AttemptOutcome.SUCCEEDED,
-                    reason=f"orphan PR adopted ({obs.github_repo}#{obs.pr_number})",
-                    run_id=wait.run_id,
+                    stage=controls.REVIEW_STAGE,
+                    outcome=controls.AttemptOutcome.FAILED,
+                    reason=(
+                        f"orphan PR adopted ({obs.github_repo}#{obs.pr_number}); "
+                        "awaiting manual review approval"
+                    ),
+                    run_id=review_run_id,
                     at=observed_at,
                     commit=False,
                 )
+            else:
+                settle = (
+                    current_wait is not None
+                    and current_wait.run_id == wait.run_id
+                    and current_wait.kind == wait.kind
+                    and (control_row is None or still_parked)
+                )
+                if settle:
+                    await controls.record_stage_outcome(
+                        self._conn,
+                        issue_id,
+                        stage=adopted_stage,
+                        outcome=controls.AttemptOutcome.SUCCEEDED,
+                        reason=f"orphan PR adopted ({obs.github_repo}#{obs.pr_number})",
+                        run_id=wait.run_id,
+                        at=observed_at,
+                        commit=False,
+                    )
         if wait is not None and not (
             local_review_configured and not remote_review_configured and not local_only_review_ready
         ):
@@ -1463,12 +1512,13 @@ class Reconciler:
         transaction (``commit=False``) so a later failure rolls the whole clear
         back.
 
-        A `KIND_IMPLEMENT_FAILED` wait is also the durable park behind a
-        `pipeline_controls` row's `failed` outcome (`controls.snapshot`'s
-        `_derived_snapshot` fallback and the tracer that writes it): clearing
-        that wait without also settling the control row would leave
-        `allowed_actions` advertising Retry for an issue that is now canceled
-        with no park behind it (SYM-244 review).
+        A park this module models as a stage attempt (`stage_for_wait_kind`) is
+        also the durable park behind a `pipeline_controls` row's `failed`
+        outcome (`controls.snapshot`'s `_derived_snapshot` fallback and the
+        park writers): clearing that wait without also settling the control row
+        would leave `allowed_actions` advertising Retry (and, for a validation
+        stage, Skip) for an issue that is now canceled with no park behind it
+        (SYM-244 review, generalized to every modeled stage in SYM-245).
         """
         if wait is None:
             raise RuntimeError("cannot clear canceled drift without an operator wait")
@@ -1478,11 +1528,12 @@ class Reconciler:
             wait.run_id,
             commit=False,
         )
-        if wait.kind == db.operator_waits.KIND_IMPLEMENT_FAILED:
+        parked_stage = controls.stage_for_wait_kind(wait.kind)
+        if parked_stage is not None:
             await controls.record_stage_outcome(
                 self._conn,
                 issue_id,
-                stage=controls.IMPLEMENT_STAGE,
+                stage=parked_stage,
                 outcome=controls.AttemptOutcome.SKIPPED,
                 reason=f"tracker issue canceled (state: {state_name})",
                 run_id=wait.run_id,

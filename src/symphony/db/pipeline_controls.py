@@ -26,6 +26,9 @@ class ControlRow:
     run_id: str | None
     actor: str | None
     updated_at: str
+    # The stage input a Skip approved (PR head SHA where one applies), so the
+    # skip can expire when that input changes (SYM-245). NULL on every other row.
+    fingerprint: str | None = None
 
 
 @dataclass(frozen=True)
@@ -57,6 +60,7 @@ def _to_control(row: aiosqlite.Row) -> ControlRow:
         run_id=_opt(row["run_id"]),
         actor=_opt(row["actor"]),
         updated_at=str(row["updated_at"]),
+        fingerprint=_opt(row["fingerprint"]),
     )
 
 
@@ -79,7 +83,8 @@ def _to_action(row: aiosqlite.Row) -> ControlActionRow:
 async def get(conn: aiosqlite.Connection, issue_id: str) -> ControlRow | None:
     cur = await conn.execute(
         """
-        SELECT issue_id, mode, stage, outcome, reason, run_id, actor, updated_at
+        SELECT issue_id, mode, stage, outcome, reason, run_id, actor, updated_at,
+               fingerprint
         FROM pipeline_controls
         WHERE issue_id = ?
         """,
@@ -100,15 +105,17 @@ async def put(
     run_id: str | None,
     actor: str | None,
     updated_at: str,
+    fingerprint: str | None = None,
     commit: bool = True,
 ) -> None:
     old = await get(conn, issue_id)
     await conn.execute(
         """
         INSERT INTO pipeline_controls (
-            issue_id, mode, stage, outcome, reason, run_id, actor, updated_at
+            issue_id, mode, stage, outcome, reason, run_id, actor, updated_at,
+            fingerprint
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(issue_id) DO UPDATE SET
             mode = excluded.mode,
             stage = excluded.stage,
@@ -116,9 +123,10 @@ async def put(
             reason = excluded.reason,
             run_id = excluded.run_id,
             actor = excluded.actor,
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at,
+            fingerprint = excluded.fingerprint
         """,
-        (issue_id, mode, stage, outcome, reason, run_id, actor, updated_at),
+        (issue_id, mode, stage, outcome, reason, run_id, actor, updated_at, fingerprint),
     )
     for field, new in (("mode", mode), ("outcome", outcome)):
         current = None if old is None else getattr(old, field)

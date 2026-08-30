@@ -194,6 +194,58 @@ async def test_disallowed_action_is_rejected_and_writes_nothing(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_pause_after_skip_preserves_the_skips_fingerprint(tmp_path: Path) -> None:
+    """PLAY/PAUSE/ABORT replay the current outcome unchanged, so on an
+    already-skipped row they must preserve its fingerprint even when the
+    caller (as `controls.apply`'s other callers all do) passes none — only a
+    Skip *action* may set a new fingerprint (SYM-245 review: `next_fingerprint`
+    used to key off the outcome rather than the action, so a PAUSE/PLAY/ABORT
+    with no fingerprint argument wiped an already-recorded skip's scope)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await controls.record_stage_outcome(
+            conn,
+            ISSUE_ID,
+            stage="review",
+            outcome=OUTCOMES.FAILED,
+            reason="review failed",
+            run_id="run-1",
+            at="2026-08-27T10:00:00+00:00",
+        )
+        skipped = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.SKIP,
+            actor="tracker:c-skip",
+            action_id="c-skip",
+            at="2026-08-27T10:05:00+00:00",
+            fingerprint="sha-abc123",
+        )
+        assert skipped.accepted
+        row = await db.pipeline_controls.get(conn, ISSUE_ID)
+        assert row is not None
+        assert row.outcome == "skipped"
+        assert row.fingerprint == "sha-abc123"
+
+        paused = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.PAUSE,
+            actor="tracker:c-pause",
+            action_id="c-pause",
+            at="2026-08-27T10:06:00+00:00",
+        )
+        assert paused.accepted
+        row = await db.pipeline_controls.get(conn, ISSUE_ID)
+        assert row is not None
+        assert row.outcome == "skipped"
+        assert row.fingerprint == "sha-abc123"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_duplicate_action_id_is_applied_exactly_once(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
@@ -427,7 +479,20 @@ async def test_pause_and_abort_of_a_failed_attempt_land_paused(tmp_path: Path) -
         # Stopping the pipeline does not rewrite what the last attempt did.
         assert aborted.snapshot.outcome is OUTCOMES.FAILED
         assert ACTIONS.PLAY in aborted.snapshot.allowed_actions
+        # Implement is a mandatory stage — there is nothing to step over.
+        assert ACTIONS.SKIP not in aborted.snapshot.allowed_actions
 
+        # Skip only exists for a validation stage (SYM-245), so move the failed
+        # attempt onto one; the paused mode carries over untouched.
+        await controls.record_stage_outcome(
+            conn,
+            ISSUE_ID,
+            stage=controls.REVIEW_STAGE,
+            outcome=OUTCOMES.FAILED,
+            reason="boom",
+            run_id="run-1",
+            at="2026-08-27T10:01:30+00:00",
+        )
         skipped = await controls.apply(
             conn,
             ISSUE_ID,
@@ -1328,6 +1393,94 @@ async def test_startup_sweep_reconciles_interrupted_retry_to_failed(
             actor="tracker:c-retry",
             action_id="c-retry",
             at="2026-08-27T11:00:01+00:00",
+        )
+        assert redelivered.accepted
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_startup_sweep_reconciles_interrupted_skip_to_failed(
+    tmp_path: Path,
+) -> None:
+    """Mirror of `test_startup_sweep_reconciles_interrupted_retry_to_failed`
+    for an accepted Skip: a process death between Skip's commit (outcome
+    `SKIPPED`) and its side effect (`_clear_operator_wait`/`_schedule_merge`)
+    leaves a control row `SKIPPED` with the review-failed park still open on
+    restart. `SKIPPED`'s `allowed_actions` offer neither Retry nor Skip, so
+    without this sweep only `$stop` could ever clear the park (SYM-245
+    review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await db.runs.create(
+            conn,
+            id="run-1",
+            issue_id=ISSUE_ID,
+            stage="review",
+            status="failed",
+            pid=None,
+            started_at="2026-08-27T09:00:00+00:00",
+        )
+        await controls.record_stage_outcome(
+            conn,
+            ISSUE_ID,
+            stage=controls.REVIEW_STAGE,
+            outcome=OUTCOMES.FAILED,
+            reason="CI red",
+            run_id="run-1",
+            at="2026-08-27T09:30:00+00:00",
+        )
+        # The park predates the skip, same as the real ingress: created once,
+        # by the original review failure.
+        await db.operator_waits.upsert(
+            conn,
+            issue_id=ISSUE_ID,
+            run_id="run-1",
+            kind=db.operator_waits.KIND_REVIEW_FAILED,
+            linear_team_key="ENG",
+            github_repo="org/repo",
+            issue_label="eng-1",
+            created_at="2026-08-27T09:35:00+00:00",
+        )
+        result = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.SKIP,
+            actor="tracker:c-skip",
+            action_id="c-skip",
+            at="2026-08-27T10:05:00+00:00",
+            fingerprint="sha-1",
+        )
+        assert result.accepted
+        # The side effect and `_clear_operator_wait` never ran: the park is
+        # still open, exactly as it would be after a crash right after commit.
+        skipped = await controls.snapshot(conn, ISSUE_ID, fingerprint="sha-1")
+        assert skipped.outcome is OUTCOMES.SKIPPED
+        assert ACTIONS.RETRY not in skipped.allowed_actions
+        assert ACTIONS.SKIP not in skipped.allowed_actions
+
+        await controls.reconcile_interrupted_retries(conn, at="2026-08-27T11:00:00+00:00")
+
+        reconciled = await controls.snapshot(conn, ISSUE_ID, fingerprint="sha-1")
+        assert reconciled.outcome is OUTCOMES.FAILED
+        assert ACTIONS.RETRY in reconciled.allowed_actions
+        assert ACTIONS.SKIP in reconciled.allowed_actions
+        assert reconciled.run_id == "run-1"
+
+        # The ingress that died mid-side-effect will re-deliver the very same
+        # tracker comment on its next tick. The sweep must have dropped the
+        # interrupted skip's own action row so that identical redelivery is
+        # accepted, not rejected as a duplicate of a command whose side
+        # effect never ran.
+        redelivered = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.SKIP,
+            actor="tracker:c-skip",
+            action_id="c-skip",
+            at="2026-08-27T11:00:01+00:00",
+            fingerprint="sha-1",
         )
         assert redelivered.accepted
     finally:

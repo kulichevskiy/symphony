@@ -23,22 +23,32 @@ def test_implement_prompt_includes_title_body_and_labels() -> None:
     assert "auth" in prompt
 
 
-def test_implement_prompt_handoff_block_carries_reason_comment_and_prior_work() -> None:
+def test_implement_prompt_handoff_block_carries_reason_and_prior_work() -> None:
     prompt = implement_prompt(
         issue_title="Add OAuth login",
         issue_body="Users should sign in via Google.",
         labels=["feature"],
         blocked_reason="authorize the Supabase MCP at https://example.com/oauth",
-        operator_comment="$retry token=sk-abc123",
     )
     # The original blocked reason is handed back to the fresh run verbatim.
     assert "authorize the Supabase MCP at https://example.com/oauth" in prompt
-    # The operator's resume comment (tokens/instructions) reaches the prompt.
-    assert "$retry token=sk-abc123" in prompt
     # The fresh run is told prior work exists and to start with git status.
     assert "git status" in prompt
     # Handoff context must precede the issue body so the agent sees it first.
     assert prompt.index("authorize the Supabase MCP") < prompt.index("# Issue")
+
+
+def test_implement_prompt_handoff_block_carries_no_operator_command_text() -> None:
+    """Retry has no command-text payload (SYM-245): the fresh attempt gets the
+    blocked reason as diagnostics and re-reads the issue for instructions."""
+    prompt = implement_prompt(
+        issue_title="Add OAuth login",
+        issue_body="Users should sign in via Google. Token: sk-from-the-issue",
+        labels=["feature"],
+        blocked_reason="need a token",
+    )
+    assert "sk-from-the-issue" in prompt
+    assert "$retry" not in prompt
 
 
 def test_implement_prompt_without_handoff_has_no_handoff_block() -> None:
@@ -49,6 +59,21 @@ def test_implement_prompt_without_handoff_has_no_handoff_block() -> None:
     )
     assert "git status" not in prompt
     assert "Operator" not in prompt
+
+
+def test_implement_prompt_handoff_with_empty_reason_still_preserves_workspace() -> None:
+    """`blocked_reason=""` means a real handoff happened (e.g. a missing run
+    row or an empty termination detail) but no reason text was captured — the
+    fresh run must still be told its workspace holds prior work, distinct from
+    `blocked_reason=None` (no handoff at all) (SYM-245 review)."""
+    prompt = implement_prompt(
+        issue_title="Add OAuth login",
+        issue_body="Users should sign in via Google.",
+        labels=["feature"],
+        blocked_reason="",
+    )
+    assert "git status" in prompt
+    assert "Original blocked reason" not in prompt
 
 
 def test_implement_prompt_handles_empty_labels() -> None:

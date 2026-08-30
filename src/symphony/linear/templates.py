@@ -363,11 +363,11 @@ def codex_lgtm(v: CommentVars) -> str:
 
 def skip_review_forced(v: CommentVars) -> str:
     return (
-        f"⏭️ **Review skipped — advancing to merge**\n\n"
+        f"⏭️ **Review skipped — advancing to {v.next_stage}**\n\n"
         f"`$skip-review` received on `{v.repo}#{v.issue}`.\n\n"
         f"- PR: {v.pr_url}\n"
         f"- Run ID: `{v.run_id}`\n\n"
-        f"Review stage cancelled. Dispatching merge now.\n"
+        f"Review stage cancelled. Dispatching {v.next_stage} now.\n"
     )
 
 

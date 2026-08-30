@@ -1288,7 +1288,10 @@ async def test_blocked_run_opens_wait_then_retry_resumes_fresh_run_with_handoff(
         assert fresh_runner.specs, "expected a fresh implement run to be dispatched"
         fresh_prompt = fresh_runner.specs[-1].command[-1]
         assert reason in fresh_prompt
-        assert "token=sk-operator-123" in fresh_prompt
+        # Retry carries no command-text payload: the operator's `$retry` body
+        # never becomes an instruction for the fresh attempt, which re-reads
+        # the issue from the tracker instead (SYM-245).
+        assert "token=sk-operator-123" not in fresh_prompt
         assert "git status" in fresh_prompt
     finally:
         await conn.close()
@@ -1786,6 +1789,83 @@ async def test_first_handoff_persists_recovery_wait_before_completed(
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert history[0].status == "completed"
         assert await db.issue_prs.get_for_issue(conn, issue_id="iss-1") is None
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_successful_first_handoff_settles_the_recovery_wait_to_succeeded(
+    tmp_path: Path,
+) -> None:
+    """`_track_delivery_handoff_recovery_wait` records the delivery stage as
+    `failed` before the first handoff runs, purely as a restart-recovery
+    checkpoint. Once that handoff actually succeeds, `pipeline_controls` must
+    not keep durably reporting delivery as failed with Retry offered — the
+    exact invariant `_record_stage_park`'s docstring claims can never happen
+    (SYM-245 review)."""
+    from symphony.pipeline import controls
+
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.issues_in_state = AsyncMock(return_value=[_issue()])
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace_with_base(workspace_path)
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_clone = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+        push_fn = AsyncMock()
+
+        def _commit(spec: RunnerSpec) -> None:
+            if spec.stage == "implement":
+                advance_head(spec.workspace_path)
+
+        runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(kind="exit", returncode=0),
+            ],
+            on_run=_commit,
+        )
+
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _scan_and_wait(orch, binding)
+
+        assert await db.operator_waits.get(conn, "iss-1") is None
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert history[0].status == "completed"
+        snapshot = await controls.snapshot(conn, "iss-1")
+        assert snapshot.outcome is controls.AttemptOutcome.SUCCEEDED
+        assert controls.ControlAction.RETRY not in snapshot.allowed_actions
     finally:
         await conn.close()
 
@@ -3096,7 +3176,6 @@ async def test_branch_ahead_with_pending_handoff_runs_agent_and_consumes_prompt(
         orch._states = {"ENG": _states()}  # noqa: SLF001
         orch._implement_handoffs["iss-1"] = _ImplementHandoff(  # noqa: SLF001
             blocked_reason="authorize the deployment OAuth URL",
-            operator_comment="$retry token=available",
         )
 
         await orch._dispatch_one(binding, _issue())  # noqa: SLF001
@@ -3104,10 +3183,117 @@ async def test_branch_ahead_with_pending_handoff_runs_agent_and_consumes_prompt(
         assert [s.stage for s in runner.specs] == ["implement"]
         prompt = runner.specs[0].command[-1]
         assert "authorize the deployment OAuth URL" in prompt
-        assert "$retry token=available" in prompt
+        # Retry carries no command-text payload (SYM-245).
+        assert "$retry" not in prompt
         assert "iss-1" not in orch._implement_handoffs  # noqa: SLF001
         push_fn.assert_awaited_once()
         gh.ensure_pr.assert_awaited_once()
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_branch_ahead_handoff_refreshes_comments_but_drops_symphony_noise(
+    tmp_path: Path,
+) -> None:
+    """A blocked-run `$retry` handoff refreshes comments posted since the run
+    blocked, but a comment authored by Symphony itself (e.g. a park/blocked
+    handoff notice) must not be pasted back into the fresh prompt (SYM-245
+    review)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        binding = _no_review_binding(auto_merge=False)
+        cfg = Config(
+            repos=[binding],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+
+        linear = AsyncMock()
+        linear.post_comment = AsyncMock(return_value="cmt-1")
+        linear.move_issue = AsyncMock()
+        linear.comments_since = AsyncMock(
+            return_value=[
+                LinearComment(
+                    id="c-operator",
+                    body="please also handle the edge case with empty input",
+                    created_at="2026-08-20T00:00:01Z",
+                    author_name="operator",
+                    author_is_me=False,
+                    external_thread_type=None,
+                ),
+                LinearComment(
+                    id="c-botnoise",
+                    body="BOTNOISE blocked handoff: reply with $retry once done",
+                    created_at="2026-08-20T00:00:02Z",
+                    author_name="Symphony",
+                    author_is_me=True,
+                    external_thread_type=None,
+                ),
+                LinearComment(
+                    id="c-mirrored",
+                    body="MIRRORED external-thread comment",
+                    created_at="2026-08-20T00:00:03Z",
+                    author_name="someone",
+                    author_is_me=False,
+                    external_thread_type="github",
+                ),
+            ]
+        )
+
+        workspace_path = tmp_path / "ws" / "org_srepo" / "eng-1"
+        workspace_path.mkdir(parents=True)
+        _init_git_workspace(workspace_path)
+        _git(workspace_path, "branch", "trunk")
+        _git(workspace_path, "commit", "--allow-empty", "-m", "prior blocked work")
+
+        workspace = MagicMock()
+        workspace.acquire = AsyncMock(return_value=workspace_path)
+        workspace.release = MagicMock()
+
+        gh = MagicMock()
+        gh.ensure_pr = AsyncMock(return_value="https://github.com/org/repo/pull/42")
+        gh.pr_comment = AsyncMock()
+        gh.repo_default_branch = AsyncMock(return_value="trunk")
+
+        def _commit_handoff_retry(spec: RunnerSpec) -> None:
+            if spec.stage == "implement":
+                _git(workspace_path, "commit", "--allow-empty", "-m", "handoff retry")
+
+        runner = _RecordingRunner(
+            [
+                RunnerEvent(kind="started", pid=4242),
+                RunnerEvent(
+                    kind="stdout",
+                    line=_done_result_line("Resumed and finished.\n\nSYMPHONY_DONE"),
+                ),
+                RunnerEvent(kind="exit", returncode=0),
+            ],
+            on_run=_commit_handoff_retry,
+        )
+        push_fn = AsyncMock()
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=runner,
+            gh=gh,
+            workspace=workspace,
+            push_fn=push_fn,
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+        orch._implement_handoffs["iss-1"] = _ImplementHandoff(  # noqa: SLF001
+            blocked_reason="authorize the deployment OAuth URL",
+            comments_since="2026-08-20T00:00:00Z",
+        )
+
+        await orch._dispatch_one(binding, _issue())  # noqa: SLF001
+
+        prompt = runner.specs[0].command[-1]
+        assert "please also handle the edge case with empty input" in prompt
+        assert "BOTNOISE" not in prompt
+        assert "MIRRORED external-thread comment" not in prompt
     finally:
         await conn.close()
 
