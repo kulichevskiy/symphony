@@ -194,6 +194,58 @@ async def test_disallowed_action_is_rejected_and_writes_nothing(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_pause_after_skip_preserves_the_skips_fingerprint(tmp_path: Path) -> None:
+    """PLAY/PAUSE/ABORT replay the current outcome unchanged, so on an
+    already-skipped row they must preserve its fingerprint even when the
+    caller (as `controls.apply`'s other callers all do) passes none — only a
+    Skip *action* may set a new fingerprint (SYM-245 review: `next_fingerprint`
+    used to key off the outcome rather than the action, so a PAUSE/PLAY/ABORT
+    with no fingerprint argument wiped an already-recorded skip's scope)."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_issue(conn)
+        await controls.record_stage_outcome(
+            conn,
+            ISSUE_ID,
+            stage="review",
+            outcome=OUTCOMES.FAILED,
+            reason="review failed",
+            run_id="run-1",
+            at="2026-08-27T10:00:00+00:00",
+        )
+        skipped = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.SKIP,
+            actor="tracker:c-skip",
+            action_id="c-skip",
+            at="2026-08-27T10:05:00+00:00",
+            fingerprint="sha-abc123",
+        )
+        assert skipped.accepted
+        row = await db.pipeline_controls.get(conn, ISSUE_ID)
+        assert row is not None
+        assert row.outcome == "skipped"
+        assert row.fingerprint == "sha-abc123"
+
+        paused = await controls.apply(
+            conn,
+            ISSUE_ID,
+            ACTIONS.PAUSE,
+            actor="tracker:c-pause",
+            action_id="c-pause",
+            at="2026-08-27T10:06:00+00:00",
+        )
+        assert paused.accepted
+        row = await db.pipeline_controls.get(conn, ISSUE_ID)
+        assert row is not None
+        assert row.outcome == "skipped"
+        assert row.fingerprint == "sha-abc123"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_duplicate_action_id_is_applied_exactly_once(tmp_path: Path) -> None:
     conn = await db.connect(tmp_path / "s.sqlite")
     try:

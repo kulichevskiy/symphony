@@ -87,8 +87,10 @@ def implement_handoff_block(*, blocked_reason: str | None = None) -> str:
 
     The operator's own Retry command text is deliberately not part of this
     block: Retry carries no instruction payload (SYM-245). Anything the fresh
-    attempt needs to know belongs in the tracker issue, which this prompt
-    re-reads in full on every attempt.
+    attempt needs belongs in the issue *description*, which this prompt
+    re-reads in full on every attempt — comments are not fetched, so a
+    decision left only in a comment is not visible to the fresh run
+    (SYM-245 review).
     """
     if blocked_reason is None:
         return ""
@@ -99,9 +101,10 @@ def implement_handoff_block(*, blocked_reason: str | None = None) -> str:
         "A prior run on this issue stopped blocked on a human action. The "
         "operator has since acted and resumed you.\n\n"
         f"{reason_section}"
-        "The issue text above/below is freshly re-read for this attempt — if "
-        "the operator supplied anything (a token, a decision, a correction), "
-        "it is there, not in this block.\n\n"
+        "The issue description above/below is freshly re-read for this "
+        "attempt — if the operator recorded a decision there (a token, a "
+        "correction), it is there, not in this block. It is NOT re-read from "
+        "issue comments.\n\n"
         "Prior work from the blocked run is preserved in this workspace (it was "
         "NOT reset). Start with `git status` and review the diff before making "
         "changes, then continue from where the prior run left off.\n\n"

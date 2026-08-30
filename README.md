@@ -321,15 +321,13 @@ Commands are context-specific (they act on whatever the issue is currently
 waiting on). Free-form comments are **not** steering — only `$`-prefixed ones.
 
 `$retry` carries **no instructions**: a retried attempt re-reads the issue
-description and comments, so put anything the agent now needs (a token, a
-decision, a correction) in the issue itself rather than in the `$retry`
-comment. Skipping is only offered for the two validation stages — review and
-acceptance — and each records the PR head it was given: an acceptance skip
-compares that recorded head against the PR's current one and re-runs
-acceptance if a push has moved it; a review skip records the head it approved
-but nothing currently re-checks it, so `$skip-review` stays in effect for the
-PR even after later pushes. Implement, delivery and merge can only be
-retried.
+description (not its comments), so put anything the agent now needs (a
+token, a decision, a correction) in the issue description itself rather than
+in the `$retry` comment. Skipping is only offered for the two validation
+stages — review and acceptance — and each records the PR head it was given:
+a push that moves the head re-requires that stage, running acceptance or
+review again the next time the merge poll sees the PR. Implement, delivery
+and merge can only be retried.
 
 The web dashboard renders these same commands as per-issue buttons, enabled
 only when valid for the issue's current status.

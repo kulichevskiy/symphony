@@ -1733,6 +1733,9 @@ class _MergeMixin(_OrchestratorBase):
                 slash_text=self._slash_text(intent),
                 reason=f"could not look up issue for review-cap retry: {e}",
             ) from e
+        # Captured before `_resume_review_monitor` clears the wait, so a
+        # release can put the exact same durable wait back (SYM-245 review).
+        wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
         accepted = await self._accept_control_action(issue_id, controls.ControlAction.RETRY, intent)
         if accepted is None:
             return
@@ -1745,6 +1748,20 @@ class _MergeMixin(_OrchestratorBase):
                 run_id=run_id,
             )
         except BaseException:
+            # `_resume_review_monitor` clears the operator wait (popping
+            # `_dispatch_run_ids`/`_operator_wait_run_ids`/the binding dict)
+            # before the work that can raise here; re-arm them into
+            # `_merge_needs_approval_bindings` — the dict this review-cap park
+            # actually came from, not `_review_failed_run_bindings` — and
+            # re-insert the durable wait row too, since the in-memory re-arm
+            # alone leaves the stale-wait guard and
+            # `_restore_operator_wait_binding` with no row to authorize a
+            # re-delivered command against (SYM-245 review).
+            self._dispatch_run_ids[issue_id] = run_id
+            self._operator_wait_run_ids.add(run_id)
+            self._merge_needs_approval_bindings[run_id] = binding
+            if wait is not None:
+                await self._reopen_operator_wait(wait)
             await controls.release(self._conn, accepted, at=self._now().isoformat())
             raise
 
@@ -2289,6 +2306,16 @@ class _MergeMixin(_OrchestratorBase):
             return pre.handled
         assert pre.view is not None
         view = pre.view
+        head_sha = str(view.get("headRefOid") or "")
+
+        # A `$skip-review` bypass approves the head it was given, not the
+        # review stage in perpetuity: a later push invalidates it and review
+        # is required again (SYM-245 AC — "Skip ... expires when that input
+        # changes").
+        if await self._review_bypass_stale(candidate, head_sha):
+            return await self._resume_review_for_stale_bypass(
+                candidate=candidate, binding=binding, issue=issue
+            )
 
         try:
             verdict = await self._review_verdict_for_pr(
@@ -2305,7 +2332,6 @@ class _MergeMixin(_OrchestratorBase):
             )
             return []
 
-        head_sha = str(view.get("headRefOid") or "")
         readiness = await self._merge_candidate_no_signal_readiness(
             candidate=candidate,
             binding=binding,
@@ -2335,6 +2361,54 @@ class _MergeMixin(_OrchestratorBase):
             head_sha=head_sha,
             readiness=readiness,
         )
+
+    async def _review_bypass_stale(
+        self, candidate: db.issue_prs.IssuePR, head_sha: str
+    ) -> bool:
+        """True when `candidate` was approved by `$skip-review` for a head
+        that is no longer current.
+
+        An empty `head_sha` (GitHub could not say) never counts as stale — a
+        transient lookup failure must not undo an operator's decision. An
+        empty recorded bypass head means the skip was itself unscoped (the
+        head could not be read at skip time); that also never expires.
+        """
+        if not head_sha:
+            return False
+        bypassed_head = await db.issue_prs.review_bypass_head_sha(
+            self._conn,
+            issue_id=candidate.issue_id,
+            github_repo=candidate.github_repo,
+            pr_number=candidate.pr_number,
+        )
+        return bool(bypassed_head) and bypassed_head != head_sha
+
+    async def _resume_review_for_stale_bypass(
+        self,
+        *,
+        candidate: db.issue_prs.IssuePR,
+        binding: RepoBinding,
+        issue: LinearIssue,
+    ) -> list[asyncio.Task[None]]:
+        """Re-require review for a PR whose `$skip-review` bypass no longer
+        covers its current head (SYM-245).
+
+        `_start_review_stage` upserts `issue_prs` with `review_bypassed`
+        defaulted to `False`, so starting a fresh review run also clears the
+        stale bypass in the same call.
+        """
+        log.info(
+            "review-bypass head moved for %s#%d — re-requiring review",
+            binding.github_repo,
+            candidate.pr_number,
+        )
+        await self._start_review_stage(
+            binding=binding,
+            issue=issue,
+            storage_issue_id=candidate.issue_id,
+            pr_url=candidate.pr_url,
+        )
+        return []
 
     async def _resolve_merge_candidate(
         self, candidate: db.issue_prs.IssuePR

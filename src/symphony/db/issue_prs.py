@@ -135,6 +135,7 @@ async def mark_review_bypassed(
     issue_id: str,
     github_repo: str,
     pr_number: int,
+    head_sha: str = "",
     commit: bool = True,
 ) -> bool:
     """Durably record that this PR's GitHub review is bypassed.
@@ -143,17 +144,23 @@ async def mark_review_bypassed(
     keeps treating the PR as a candidate (`list_merge_candidates`) and the
     review-monitor resurrection leaves it alone instead of re-opening the
     feedback the operator skipped.
+
+    `head_sha` scopes the bypass to the PR head it approved (SYM-245): ''
+    means the head could not be read at skip time, which keeps the bypass in
+    effect unconditionally rather than losing the operator's decision (see
+    `review_bypass_head_sha`/`_review_bypass_stale`).
     """
     cur = await conn.execute(
         """
         UPDATE issue_prs
-        SET review_bypassed = 1
+        SET review_bypassed = 1,
+            review_bypassed_head_sha = ?
         WHERE issue_id = ?
           AND github_repo = ?
           AND pr_number = ?
           AND merged_at IS NULL
         """,
-        (issue_id, github_repo, pr_number),
+        (head_sha, issue_id, github_repo, pr_number),
     )
     updated = (cur.rowcount or 0) > 0
     if updated:
@@ -163,6 +170,35 @@ async def mark_review_bypassed(
     if commit:
         await conn.commit()
     return updated
+
+
+async def review_bypass_head_sha(
+    conn: aiosqlite.Connection,
+    *,
+    issue_id: str,
+    github_repo: str,
+    pr_number: int,
+) -> str | None:
+    """The PR head SHA a `$skip-review` bypass approved, or `None` if this PR
+    is not currently bypassed.
+
+    An empty string means the bypass is unscoped (the head could not be read
+    at skip time) — the caller should treat that as "still valid", same as
+    `mark_review_bypassed`'s fallback.
+    """
+    cur = await conn.execute(
+        """
+        SELECT review_bypassed_head_sha
+        FROM issue_prs
+        WHERE issue_id = ?
+          AND github_repo = ?
+          AND pr_number = ?
+          AND review_bypassed = 1
+        """,
+        (issue_id, github_repo, pr_number),
+    )
+    row = await cur.fetchone()
+    return str(row[0]) if row is not None else None
 
 
 async def clear_parked_for_manual_merge(

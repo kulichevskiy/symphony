@@ -86,6 +86,8 @@ class _SlashCommandsMixin(_OrchestratorBase):
             self, issue_id: str, run_id: str, *, commit: bool = True
         ) -> None: ...
 
+        async def _reopen_operator_wait(self, wait: db.operator_waits.OperatorWait) -> None: ...
+
         async def _clear_stage_park(
             self,
             issue_id: str,
@@ -1168,6 +1170,9 @@ class _SlashCommandsMixin(_OrchestratorBase):
             # Acceptance is a validation stage, so Skip is on offer — scoped to
             # the PR head it approves, so a later push requires acceptance again
             # (SYM-245).
+            # Captured before the accept/clear below can touch the row, so a
+            # release can put the exact same durable wait back (SYM-245 review).
+            wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
             accepted = await self._accept_control_action(
                 issue_id,
                 controls.ControlAction.SKIP,
@@ -1206,7 +1211,16 @@ class _SlashCommandsMixin(_OrchestratorBase):
                 # Nothing carried the accepted Skip through to a scheduled
                 # merge; release it so the next poll tick can re-deliver the
                 # same `$skip-acceptance` instead of leaving a `SKIPPED` park
-                # that offers neither Retry nor Skip (SYM-245 review).
+                # that offers neither Retry nor Skip (SYM-245 review). Re-arm
+                # the dispatch gate and re-insert the durable wait row too —
+                # `_clear_operator_wait` already dropped both, and this park
+                # has no dedicated binding dict of its own, so
+                # `_restore_operator_wait_binding`'s next lookup depends
+                # entirely on the durable row being back (SYM-245 review).
+                self._dispatch_run_ids[issue_id] = run_id
+                self._operator_wait_run_ids.add(run_id)
+                if wait is not None:
+                    await self._reopen_operator_wait(wait)
                 await controls.release(self._conn, accepted, at=self._now().isoformat())
                 raise
             body = acceptance_skipped(
@@ -1402,6 +1416,9 @@ class _SlashCommandsMixin(_OrchestratorBase):
         if intent.kind is SlashKind.SKIP_ACCEPTANCE:
             # See the acceptance-blocked branch: one canonical, head-scoped Skip
             # for the acceptance stage, whichever park it is answered from.
+            # Captured before the accept/clear below can touch the row, so a
+            # release can put the exact same durable wait back (SYM-245 review).
+            wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
             accepted = await self._accept_control_action(
                 issue_id,
                 controls.ControlAction.SKIP,
@@ -1438,12 +1455,18 @@ class _SlashCommandsMixin(_OrchestratorBase):
             except BaseException:
                 # `_clear_operator_wait` pops `_dispatch_run_ids`/
                 # `_operator_wait_run_ids`/`_acceptance_rejected_run_bindings`
-                # before its own DB delete can fail; re-arm them so a
+                # before its own DB delete can fail; re-arm them, and
+                # re-insert the durable wait row too — the in-memory re-arm
+                # alone leaves the stale-wait guard and
+                # `_restore_operator_wait_binding` with no row to authorize a
+                # re-delivered command against (SYM-245 review), so a
                 # webhook-driven dispatch can't slip in before the released
-                # park is restored (SYM-245 review).
+                # park is restored.
                 self._dispatch_run_ids[issue_id] = run_id
                 self._operator_wait_run_ids.add(run_id)
                 self._acceptance_rejected_run_bindings[run_id] = binding
+                if wait is not None:
+                    await self._reopen_operator_wait(wait)
                 await controls.release(self._conn, accepted, at=self._now().isoformat())
                 raise
             body = skip_acceptance_forced(
@@ -1462,6 +1485,9 @@ class _SlashCommandsMixin(_OrchestratorBase):
                 log.warning("skip-acceptance comment failed for %s: %s", issue_id, e)
             return
 
+        # Captured before the accept/clear below can touch the row, so a
+        # release can put the exact same durable wait back (SYM-245 review).
+        wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
         accepted = await self._accept_control_action(
             issue_id, controls.ControlAction.RETRY, intent
         )
@@ -1483,12 +1509,17 @@ class _SlashCommandsMixin(_OrchestratorBase):
         except BaseException:
             # `_clear_operator_wait` pops `_dispatch_run_ids`/
             # `_operator_wait_run_ids`/`_acceptance_rejected_run_bindings`
-            # before its own DB delete can fail; re-arm them so a
-            # webhook-driven dispatch can't slip in before the released park
-            # is restored (SYM-245 review).
+            # before its own DB delete can fail; re-arm them, and re-insert
+            # the durable wait row too — the in-memory re-arm alone leaves the
+            # stale-wait guard and `_restore_operator_wait_binding` with no
+            # row to authorize a re-delivered command against (SYM-245
+            # review), so a webhook-driven dispatch can't slip in before the
+            # released park is restored.
             self._dispatch_run_ids[issue_id] = run_id
             self._operator_wait_run_ids.add(run_id)
             self._acceptance_rejected_run_bindings[run_id] = binding
+            if wait is not None:
+                await self._reopen_operator_wait(wait)
             await controls.release(self._conn, accepted, at=self._now().isoformat())
             raise
         body = retry_acceptance_requested(

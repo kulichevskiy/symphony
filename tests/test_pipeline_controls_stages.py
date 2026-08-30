@@ -604,9 +604,13 @@ async def test_skip_failed_review_re_arms_ingress_when_schedule_merge_raises(
 ) -> None:
     """Unlike the sibling test above, the raise here happens in
     `_schedule_merge` — *after* `_clear_operator_wait` has already popped
-    `_dispatch_run_ids`/`_operator_wait_run_ids`/`_review_failed_run_bindings`.
-    Releasing the accepted Skip without re-arming those would leave no ingress
-    for a re-delivered `$skip-review` to land on (SYM-245 review)."""
+    `_dispatch_run_ids`/`_operator_wait_run_ids`/`_review_failed_run_bindings`
+    *and* deleted the durable `operator_waits` row. Releasing the accepted
+    Skip without re-arming the in-memory dicts *and* re-inserting the durable
+    row would leave no ingress for a re-delivered `$skip-review` to land on:
+    `_handle_slash_intent`'s stale-wait guard and
+    `_restore_operator_wait_binding` both authorize a re-delivered command
+    against the durable row, not process memory (SYM-245 review)."""
     conn = await db.connect(tmp_path / "s.sqlite")
     try:
         await _seed_operator_wait(
@@ -646,6 +650,10 @@ async def test_skip_failed_review_re_arms_ingress_when_schedule_merge_raises(
         assert orch._dispatch_run_ids.get(ISSUE_ID) == RUN_ID  # noqa: SLF001
         assert RUN_ID in orch._operator_wait_run_ids  # noqa: SLF001
         assert orch._review_failed_run_bindings.get(RUN_ID) is not None  # noqa: SLF001
+        wait = await db.operator_waits.get(conn, ISSUE_ID)
+        assert wait is not None
+        assert wait.run_id == RUN_ID
+        assert wait.kind == db.operator_waits.KIND_REVIEW_FAILED
     finally:
         await conn.close()
 

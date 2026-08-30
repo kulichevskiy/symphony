@@ -49,8 +49,8 @@ const PARK_COMMANDS: Record<string, CommandId[]> = {
   review_stopped: ["approve", "retry", "skip-review", "reject", "stop"],
   implement_failed: ["approve", "retry", "reject", "stop"],
   deliver_failed: ["approve", "retry", "reject", "stop"],
-  acceptance_blocked: ["skip-acceptance", "retry-acceptance", "reject", "stop"],
-  acceptance_rejected: ["skip-acceptance", "retry-acceptance", "stop"],
+  acceptance_blocked: ["skip-acceptance", "retry-acceptance"],
+  acceptance_rejected: ["skip-acceptance", "retry-acceptance"],
 };
 
 export type Applicability = {

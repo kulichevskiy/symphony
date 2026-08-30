@@ -1954,6 +1954,7 @@ class _OrchestratorBase:
                             run_id=previous_control.run_id,
                             actor=previous_control.actor,
                             updated_at=self._now().isoformat(),
+                            fingerprint=previous_control.fingerprint,
                             commit=False,
                         )
                     await db.operator_waits.delete(self._conn, issue_id, run_id, commit=True)
@@ -2310,6 +2311,31 @@ class _OrchestratorBase:
         self._acceptance_rejected_run_bindings.pop(run_id, None)
         self._budget_exceeded_run_bindings.pop(run_id, None)
         await db.operator_waits.delete(self._conn, issue_id, run_id, commit=commit)
+
+    async def _reopen_operator_wait(self, wait: db.operator_waits.OperatorWait) -> None:
+        """Re-insert a durable operator wait exactly as it was.
+
+        For a release path whose fallible step raised after `_clear_operator_wait`
+        (or `_resume_review_monitor`, which clears it internally) already deleted
+        the row: re-arming the in-memory dicts alone is not enough to make the
+        command re-deliverable, since `_handle_slash_intent`'s stale-wait guard
+        and `_restore_operator_wait_binding` both authorize a re-delivered
+        command against this durable row, not process memory (SYM-245 review).
+        """
+        await db.operator_waits.upsert(
+            self._conn,
+            issue_id=wait.issue_id,
+            run_id=wait.run_id,
+            kind=wait.kind,
+            linear_team_key=wait.linear_team_key,
+            github_repo=wait.github_repo,
+            issue_label=wait.issue_label,
+            created_at=wait.created_at,
+            provider=wait.provider,
+            tracker_provider=wait.tracker_provider,
+            tracker_site=wait.tracker_site,
+            local_review_outcome=wait.local_review_outcome,
+        )
 
     async def _token_budget_ceiling(self, issue_id: str, binding: RepoBinding) -> float | None:
         """Soft ceiling = `per_issue_token_budget + granted_token_budget`.

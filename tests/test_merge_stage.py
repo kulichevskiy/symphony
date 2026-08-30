@@ -304,6 +304,47 @@ async def _seed_no_review_candidate(conn, *, binding_key: str = "") -> None:  # 
     )
 
 
+async def _seed_skip_review_bypassed_candidate(  # type: ignore[no-untyped-def]
+    conn, *, bypassed_head: str = "oldsha", binding_key: str = ""
+) -> None:
+    """A PR whose `$skip-review` bypass approved `bypassed_head`, mirroring
+    what `_skip_failed_review` records — not the binding-level
+    `remote_review: false` bypass `_seed_no_review_candidate` covers."""
+    await db.issues.upsert(
+        conn,
+        id="iss-1",
+        identifier="ENG-1",
+        title="Add auth",
+        team_key="ENG",
+    )
+    await db.runs.create(
+        conn,
+        id="implement",
+        issue_id="iss-1",
+        stage="implement",
+        status="completed",
+        pid=None,
+        started_at="2026-05-10T00:00:00+00:00",
+        cost_usd=0.50,
+    )
+    await db.issue_prs.upsert(
+        conn,
+        issue_id="iss-1",
+        github_repo="org/repo",
+        binding_key=binding_key,
+        pr_number=42,
+        pr_url="https://github.com/org/repo/pull/42",
+        created_at="2026-05-10T00:01:00+00:00",
+    )
+    await db.issue_prs.mark_review_bypassed(
+        conn,
+        issue_id="iss-1",
+        github_repo="org/repo",
+        pr_number=42,
+        head_sha=bypassed_head,
+    )
+
+
 async def _seed_merged_pr(conn, *, merged_at: str, binding_key: str = "") -> None:  # type: ignore[no-untyped-def]
     await db.issues.upsert(
         conn,
@@ -2562,6 +2603,123 @@ async def test_queued_merge_revalidates_issue_before_execution(
         gh.pr_merge.assert_not_awaited()
         history = await db.runs.history_for_issue(conn, "iss-1")
         assert [run.stage for run in history] == ["implement", "review"]
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_skip_review_bypass_re_requires_review_after_a_push(tmp_path: Path) -> None:
+    """A `$skip-review` bypass approves the head it was given, not the review
+    stage forever (SYM-245 AC: "Skip ... expires when that input changes").
+    A push past that head must re-require review instead of letting the
+    merge poll carry the stale bypass straight past it."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_skip_review_bypassed_candidate(conn, bypassed_head="oldsha")
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        linear.move_issue = AsyncMock(return_value=None)
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={"headRefOid": "newsha", "mergeable": "MERGEABLE", "mergedAt": None}
+        )
+        gh.pr_comment = AsyncMock(return_value="cmt-1")
+
+        cfg = Config(
+            repos=[_binding(agent="claude")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        assert await orch._poll_merge_candidates() == []  # noqa: SLF001
+
+        gh.pr_comment.assert_awaited_once_with(42, "@codex review", repo="org/repo")
+        assert (
+            await db.issue_prs.review_bypass_head_sha(
+                conn, issue_id="iss-1", github_repo="org/repo", pr_number=42
+            )
+            is None
+        )
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert [run.stage for run in history] == ["implement", "review"]
+        review_run = await db.runs.latest_for_issue_stage(conn, issue_id="iss-1", stage="review")
+        assert review_run is not None
+        assert review_run.status == "running"
+    finally:
+        await conn.close()
+
+
+@pytest.mark.asyncio
+async def test_skip_review_bypass_stays_in_effect_for_the_same_head(tmp_path: Path) -> None:
+    """The counterpart to the "head moved" test above: an unchanged head must
+    not re-trigger review — only a genuine push invalidates the bypass."""
+    conn = await db.connect(tmp_path / "s.sqlite")
+    try:
+        await _seed_skip_review_bypassed_candidate(conn, bypassed_head="abc123")
+        linear = AsyncMock()
+        linear.lookup_issue = AsyncMock(return_value=_issue())
+        gh = MagicMock()
+        gh.pr_view = AsyncMock(
+            return_value={"headRefOid": "abc123", "mergeable": "MERGEABLE", "mergedAt": None}
+        )
+        gh.pr_checks = AsyncMock(
+            return_value=PRChecks(runs=[CheckRun(name="test", state="SUCCESS", bucket="pass")])
+        )
+        gh.pr_review_comments = AsyncMock(return_value=[])
+        gh.pr_reviews = AsyncMock(
+            return_value=[
+                {
+                    "user": {"login": "reviewer"},
+                    "state": "APPROVED",
+                    "commit_id": "abc123",
+                    "submitted_at": "2026-05-10T00:03:00Z",
+                    "body": "",
+                }
+            ]
+        )
+        gh.pr_reactions = AsyncMock(return_value=[])
+        gh.pr_issue_comments = AsyncMock(return_value=[])
+        gh.commit_committed_at = AsyncMock(return_value="2026-05-10T00:02:00Z")
+        gh.pr_merge = AsyncMock()
+
+        cfg = Config(
+            repos=[_binding(agent="claude")],
+            log_root=tmp_path / "logs",
+            workspace_root=tmp_path / "ws",
+            db_path=tmp_path / "s.sqlite",
+        )
+        orch = Orchestrator(
+            cfg,
+            linear,
+            conn,
+            runner=MagicMock(),
+            gh=gh,
+            workspace=MagicMock(),
+            push_fn=AsyncMock(),
+        )
+        orch._states = {"ENG": _states()}  # noqa: SLF001
+
+        await _poll_and_wait(orch)
+
+        assert (
+            await db.issue_prs.review_bypass_head_sha(
+                conn, issue_id="iss-1", github_repo="org/repo", pr_number=42
+            )
+            == "abc123"
+        )
+        history = await db.runs.history_for_issue(conn, "iss-1")
+        assert "review" not in [run.stage for run in history]
     finally:
         await conn.close()
 

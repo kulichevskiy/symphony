@@ -848,10 +848,19 @@ async def apply(
         # an intent-only one keeps them.
         reason = current.reason if outcome is current.outcome else None
         run_id = current.run_id if outcome is current.outcome else None
-        # Only a Skip carries an input fingerprint; every other outcome drops
-        # whatever a previous skip had recorded, so a stale value can never
-        # outlive the skip it scoped.
-        next_fingerprint = fingerprint if outcome is AttemptOutcome.SKIPPED else None
+        # Only a Skip *action* carries an input fingerprint; every other
+        # action drops whatever a previous skip had recorded, so a stale
+        # value can never outlive the skip it scoped — except one that
+        # replays the current outcome unchanged (PLAY/PAUSE/ABORT all do),
+        # which must preserve `current.fingerprint` rather than a caller's
+        # unrelated (usually absent) argument, or an already-skipped row
+        # loses its scope out from under a caller who passed none (SYM-245
+        # review; SYM-246 wires PLAY/PAUSE/ABORT onto a skipped row).
+        next_fingerprint = (
+            fingerprint
+            if action is ControlAction.SKIP
+            else (current.fingerprint if outcome is current.outcome else None)
+        )
         # Whether `pipeline_controls` actually held a row for `current` before
         # this call, as opposed to `current` being a value `snapshot` derived
         # with no backing row (e.g. via `_derived_snapshot`) — read separately

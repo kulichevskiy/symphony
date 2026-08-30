@@ -518,6 +518,8 @@ class _ReviewMixin(_OrchestratorBase):
             self, issue_id: str, run_id: str, *, commit: bool = True
         ) -> None: ...
 
+        async def _reopen_operator_wait(self, wait: db.operator_waits.OperatorWait) -> None: ...
+
         async def _interrupt_stale_merge_needs_approval_for_state(
             self,
             *,
@@ -3040,6 +3042,9 @@ class _ReviewMixin(_OrchestratorBase):
         # review attempt starts, so a stale or re-delivered command cannot run
         # review twice (SYM-245). `$approve` on this park is the same
         # transition, so it goes through the same gate.
+        # Captured before `_resume_review_monitor` clears the wait, so a
+        # release can put the exact same durable wait back (SYM-245 review).
+        wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
         accepted = await self._accept_control_action(issue_id, controls.ControlAction.RETRY, intent)
         if accepted is None:
             return
@@ -3057,10 +3062,15 @@ class _ReviewMixin(_OrchestratorBase):
             # `_review_failed_run_bindings`) before the work that can raise
             # here; re-arm them so a re-delivered `$retry`/`$approve` has an
             # ingress to land on, then release the accepted transition so the
-            # next poll tick can re-deliver the command.
+            # next poll tick can re-deliver the command. Re-insert the durable
+            # wait row too — the in-memory re-arm alone leaves the stale-wait
+            # guard and `_restore_operator_wait_binding` with no row to
+            # authorize a re-delivered command against (SYM-245 review).
             self._dispatch_run_ids[issue_id] = run_id
             self._operator_wait_run_ids.add(run_id)
             self._review_failed_run_bindings[run_id] = binding
+            if wait is not None:
+                await self._reopen_operator_wait(wait)
             await controls.release(self._conn, accepted, at=self._now().isoformat())
             raise
 
@@ -3115,21 +3125,19 @@ class _ReviewMixin(_OrchestratorBase):
                 slash_text=self._slash_text(intent),
                 reason=f"could not look up issue for skip-review: {e}",
             ) from e
+        head_sha = await self._pr_head_sha_or_none(binding, state.pr_number)
+        # Captured before the accept/clear below can touch the row, so a
+        # release can put the exact same durable wait back (SYM-245 review).
+        wait = await db.operator_waits.get_by_run_id(self._conn, run_id)
         accepted = await self._accept_control_action(
             issue_id,
             controls.ControlAction.SKIP,
             intent,
-            fingerprint=await self._pr_head_sha_or_none(binding, state.pr_number),
+            fingerprint=head_sha,
         )
         if accepted is None:
             return
         try:
-            await db.issue_prs.mark_review_bypassed(
-                self._conn,
-                issue_id=issue_id,
-                github_repo=binding.github_repo,
-                pr_number=state.pr_number,
-            )
             await self._clear_operator_wait(issue_id, run_id)
             # See the sibling reservations in `_slash_commands.py`: taken under
             # `config_write_lock` so the drain guard's `scheduled_slots` sample
@@ -3142,16 +3150,38 @@ class _ReviewMixin(_OrchestratorBase):
                     pr_url=state.pr_url,
                     skip_review=True,
                 )
+            # Recorded after the fallible steps above, not before: if
+            # `_schedule_merge` never runs, the bypass must not land either, so
+            # a release genuinely restores the pre-skip state instead of
+            # leaving a permanently-bypassed PR behind a rolled-back control
+            # row (SYM-245 review).
+            await db.issue_prs.mark_review_bypassed(
+                self._conn,
+                issue_id=issue_id,
+                github_repo=binding.github_repo,
+                pr_number=state.pr_number,
+                head_sha=head_sha or "",
+            )
         except BaseException:
             # `_clear_operator_wait` already popped `_dispatch_run_ids`/
-            # `_operator_wait_run_ids`/`_review_failed_run_bindings` before this
-            # raised; re-arm them so a re-delivered `$skip-review` has an
-            # ingress to land on, then release the accepted Skip so the next
-            # poll tick can re-deliver it instead of leaving a `SKIPPED` park
-            # that offers neither Retry nor Skip (SYM-245 review).
+            # `_operator_wait_run_ids`/the binding-tracking dict for this run
+            # before this raised; re-arm them — into whichever dict the park
+            # actually came from, since this is also reached for a review-cap
+            # park routed via `_merge_needs_approval_bindings` (SYM-245 review)
+            # — so a re-delivered `$skip-review` has an ingress to land on.
+            # Re-insert the durable wait row itself too: the in-memory re-arm
+            # alone leaves `_handle_slash_intent`'s stale-wait guard and
+            # `_restore_operator_wait_binding` with nothing to authorize a
+            # re-delivered command against, since both read `operator_waits`
+            # directly rather than trusting process memory (SYM-245 review).
             self._dispatch_run_ids[issue_id] = run_id
             self._operator_wait_run_ids.add(run_id)
-            self._review_failed_run_bindings[run_id] = binding
+            if wait is not None and wait.kind == db.operator_waits.KIND_REVIEW_CAP:
+                self._merge_needs_approval_bindings[run_id] = binding
+            else:
+                self._review_failed_run_bindings[run_id] = binding
+            if wait is not None:
+                await self._reopen_operator_wait(wait)
             await controls.release(self._conn, accepted, at=self._now().isoformat())
             raise
         log.info(
